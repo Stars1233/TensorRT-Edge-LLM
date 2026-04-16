@@ -167,8 +167,7 @@ protected:
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
 #ifdef CUTE_DSL_FMHA_ENABLED
-    //! Use CuTe DSL FMHA. Enabled by default on SM100+; set DISABLE_CUTE_DSL_FMHA=1 to fall back to FMHA_v2.
-    bool mUseCuteDslFMHA{!std::getenv("DISABLE_CUTE_DSL_FMHA")};
+    bool mUseCuteDslFMHA{true};
 #else
     bool mUseCuteDslFMHA{false};
 #endif

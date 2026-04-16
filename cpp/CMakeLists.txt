@@ -127,13 +127,18 @@ target_include_directories(NvInfer_edgellm_plugin
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(NvInfer_edgellm_plugin
                            PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
-target_link_libraries(NvInfer_edgellm_plugin commonLibraryExt edgellmKernels
-                      ${CUDA_DRIVER_LIB} ${CUDART_LIB})
+target_link_libraries(
+  NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels
+                                 ${CUDA_DRIVER_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
 
-# CuTe DSL FMHA (Blackwell SM100+): build-time kernel compilation
+# CuTe DSL FMHA (Blackwell SM100+): link prebuilt kernel library. Artifacts are
+# generated offline by: python
+# kernelSrcs/fmha_cutedsl_blackwell/build_static_lib.py Set
+# ENABLE_CUTE_DSL_FMHA=ON to enable (requires prebuilt artifacts).
+option(ENABLE_CUTE_DSL_FMHA "Link prebuilt CuTe DSL FMHA kernels" OFF)
 if(ENABLE_CUTE_DSL_FMHA)
   include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
-  cute_dsl_fmha_setup(TARGETS edgellmKernels edgellmCore PLUGIN_TARGET
+  cute_dsl_fmha_setup(TARGETS edgellmKernels edgellmCore LINK_TARGETS
                       NvInfer_edgellm_plugin)
 endif()

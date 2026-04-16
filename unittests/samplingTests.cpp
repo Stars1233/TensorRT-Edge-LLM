@@ -109,8 +109,7 @@ protected:
         }
 
         // Copy host data to device memory
-        CUDA_CHECK(cudaMemcpy(logitsTensor.rawPointer(), flatHostLogits.data(), batchSize * vocabSize * sizeof(float),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(logitsTensor, flatHostLogits);
     }
 
     // Validate sampling results (FP32 only)
@@ -328,9 +327,7 @@ protected:
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
-        std::vector<int32_t> gpuResults(batchSize);
-        CUDA_CHECK(cudaMemcpy(gpuResults.data(), selectedIndicesTensor.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        auto const gpuResults = copyDeviceToHost<int32_t>(selectedIndicesTensor);
 
         // Run validation and get result
         bool validationPassed = validateSamplingResults(gpuResults, hostLogits, params);
@@ -402,16 +399,12 @@ protected:
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
-        std::vector<int32_t> gpuIndices(batchSize * topK);
-        CUDA_CHECK(cudaMemcpy(gpuIndices.data(), topKIndicesTensor.rawPointer(), batchSize * topK * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        auto const gpuIndices = copyDeviceToHost<int32_t>(topKIndicesTensor);
 
         std::vector<float> gpuValues;
         if (testValues)
         {
-            gpuValues.resize(batchSize * topK);
-            CUDA_CHECK(cudaMemcpy(gpuValues.data(), topKValuesTensor.rawPointer(), batchSize * topK * sizeof(float),
-                cudaMemcpyDeviceToHost));
+            gpuValues = copyDeviceToHost<float>(topKValuesTensor);
         }
 
         bool validationPassed

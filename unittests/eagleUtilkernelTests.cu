@@ -60,14 +60,11 @@ TEST(EagleKernels, PrepareEaglePrefillInputs)
         auto selectIndicesDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT64);
 
         // Directly populate sequenceContextLengths as input
-        CUDA_CHECK(cudaMemcpy(sequenceContextLengthsDevice.rawPointer(), inputSequenceContextLengths.data(),
-            batchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice<int32_t>(sequenceContextLengthsDevice, inputSequenceContextLengths);
 
         prepareEaglePrefillInputs(sequenceContextLengthsDevice, selectIndicesDevice, stream);
 
-        std::vector<int64_t> actualSelectIndices(batchSize);
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectIndicesDevice.rawPointer(), batchSize * sizeof(int64_t),
-            cudaMemcpyDeviceToHost));
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectIndicesDevice);
 
         for (int32_t b = 0; b < batchSize; b++)
         {
@@ -145,21 +142,14 @@ TEST(EagleKernels, InitializeDraftTreeTables)
             cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(rootTokensDevice.rawPointer(), inputRootTokens.data(), batchSize * sizeof(int32_t),
             cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            vocabMappingDevice.rawPointer(), inputVocabMapping.data(), 1000 * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice<int32_t>(vocabMappingDevice, inputVocabMapping);
 
         initializeDraftTreeTables(selectedIndicesDevice, logProbsDevice, rootTokensDevice, vocabMappingDevice,
             draftIdFullTableDevice, draftScoreFullTableDevice, draftParentFullTableDevice, draftTopK, stream);
 
-        std::vector<int32_t> actualIds(batchSize * tableLength);
-        std::vector<float> actualScores(batchSize * tableLength);
-        std::vector<int32_t> actualParents(batchSize * tableLength);
-        CUDA_CHECK(cudaMemcpy(actualIds.data(), draftIdFullTableDevice.rawPointer(),
-            batchSize * tableLength * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualScores.data(), draftScoreFullTableDevice.rawPointer(),
-            batchSize * tableLength * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualParents.data(), draftParentFullTableDevice.rawPointer(),
-            batchSize * tableLength * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualIds = copyDeviceToHost<int32_t>(draftIdFullTableDevice);
+        auto const actualScores = copyDeviceToHost<float>(draftScoreFullTableDevice);
+        auto const actualParents = copyDeviceToHost<int32_t>(draftParentFullTableDevice);
 
         // Verify batch 0 in detail
         for (int32_t i = 0; i < tableLength; i++)
@@ -301,15 +291,9 @@ TEST(EagleKernels, AssembleInitialDraftTreeInput)
         assembleInitialDraftTreeInput(draftIdFullTableDevice, draftHiddenStatesOutputDevice, inputIdsDevice,
             draftHiddenStatesInputDevice, draftTreeLengthDevice, draftTreeMaskDevice, draftTopK, stream);
 
-        std::vector<int32_t> actualInputIds(batchSize * paddedDraftTreeSize);
-        std::vector<int32_t> actualTreeLength(batchSize);
-        std::vector<int8_t> actualMask(batchSize * paddedDraftTreeSize * paddedDraftTreeSize);
-        CUDA_CHECK(cudaMemcpy(actualInputIds.data(), inputIdsDevice.rawPointer(),
-            batchSize * paddedDraftTreeSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualTreeLength.data(), draftTreeLengthDevice.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualMask.data(), draftTreeMaskDevice.rawPointer(),
-            batchSize * paddedDraftTreeSize * paddedDraftTreeSize * sizeof(int8_t), cudaMemcpyDeviceToHost));
+        auto const actualInputIds = copyDeviceToHost<int32_t>(inputIdsDevice);
+        auto const actualTreeLength = copyDeviceToHost<int32_t>(draftTreeLengthDevice);
+        auto const actualMask = copyDeviceToHost<int8_t>(draftTreeMaskDevice);
 
         // ========== Verify Batch 0 ==========
         for (int i = 0; i < paddedDraftTreeSize; i++)
@@ -437,12 +421,8 @@ TEST(EagleKernels, AssembleInitialIntermediateData)
         assembleInitialIntermediateData(
             logProbsDevice, intermediateParentsDevice, intermediateScoresDevice, draftTopK, stream);
 
-        std::vector<int32_t> actualParents(batchSize * draftTopK);
-        std::vector<float> actualScores(batchSize * draftTopK);
-        CUDA_CHECK(cudaMemcpy(actualParents.data(), intermediateParentsDevice.rawPointer(),
-            batchSize * draftTopK * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualScores.data(), intermediateScoresDevice.rawPointer(),
-            batchSize * draftTopK * sizeof(float), cudaMemcpyDeviceToHost));
+        auto const actualParents = copyDeviceToHost<int32_t>(intermediateParentsDevice);
+        auto const actualScores = copyDeviceToHost<float>(intermediateScoresDevice);
 
         // Verify batch 0
         for (int i = 0; i < draftTopK; i++)
@@ -521,18 +501,13 @@ TEST(EagleKernels, ComputeCuScoresAndTranslateToken)
             logProbsDevice.rawPointer(), inputLogProbs.data(), batchSize * 16 * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(intermediateScoresDevice.rawPointer(), inputIntermediateScores.data(),
             batchSize * draftTopK * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            vocabMappingDevice.rawPointer(), inputVocabMapping.data(), 1000 * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice<int32_t>(vocabMappingDevice, inputVocabMapping);
 
         computeCuScoresAndTranslateToken(selectedIndicesDevice, logProbsDevice, intermediateScoresDevice,
             vocabMappingDevice, draftIdTableDevice, draftScoreTableDevice, draftTopK, stream);
 
-        std::vector<int32_t> actualIds(batchSize * 16);
-        std::vector<float> actualScores(batchSize * 16);
-        CUDA_CHECK(cudaMemcpy(actualIds.data(), draftIdTableDevice.rawPointer(), batchSize * 16 * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualScores.data(), draftScoreTableDevice.rawPointer(), batchSize * 16 * sizeof(float),
-            cudaMemcpyDeviceToHost));
+        auto const actualIds = copyDeviceToHost<int32_t>(draftIdTableDevice);
+        auto const actualScores = copyDeviceToHost<float>(draftScoreTableDevice);
 
         // Verify batch 0
         EXPECT_EQ(actualIds[0], expectedId0);
@@ -594,18 +569,10 @@ TEST(EagleKernels, PrepareEagleAcceptDecodeTokenInputs)
         prepareEagleAcceptDecodeTokenInputs(sequenceStartIndicesDevice, acceptedTokenNumsDevice, packedMaskDevice,
             positionsDevice, selectIndicesDevice, contextLengthsDevice, stream);
 
-        std::vector<int32_t> actualMask(batchSize * maxAcceptedTokenNum);
-        std::vector<int32_t> actualPositions(batchSize * maxAcceptedTokenNum);
-        std::vector<int64_t> actualSelectIndices(batchSize);
-        std::vector<int32_t> actualContextLengths(batchSize);
-        CUDA_CHECK(cudaMemcpy(actualMask.data(), packedMaskDevice.rawPointer(),
-            batchSize * maxAcceptedTokenNum * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualPositions.data(), positionsDevice.rawPointer(),
-            batchSize * maxAcceptedTokenNum * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectIndicesDevice.rawPointer(), batchSize * sizeof(int64_t),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualContextLengths.data(), contextLengthsDevice.rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualMask = copyDeviceToHost<int32_t>(packedMaskDevice);
+        auto const actualPositions = copyDeviceToHost<int32_t>(positionsDevice);
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectIndicesDevice);
+        auto const actualContextLengths = copyDeviceToHost<int32_t>(contextLengthsDevice);
 
         // Verify batch 0
         for (int i = 0; i < inputAcceptedTokenNums[0]; i++)
@@ -877,22 +844,15 @@ TEST(EagleKernels, ConstructVerificationDraftTree)
     auto draftTreeMaskDevice
         = rt::Tensor({batchSize, verifyTreeSize, verifyTreeSize}, rt::DeviceType::kGPU, DataType::kINT8);
 
-    CUDA_CHECK(cudaMemcpy(draftIdFullTableDevice.rawPointer(), inputDraftIdFullTable.data(),
-        batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(draftParentFullTableDevice.rawPointer(), inputDraftParentFullTable.data(),
-        batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(selectedIndicesDevice.rawPointer(), inputSelectedIndices.data(),
-        batchSize * verifyTreeSize * sizeof(int32_t), cudaMemcpyHostToDevice));
+    copyHostToDevice<int32_t>(draftIdFullTableDevice, inputDraftIdFullTable);
+    copyHostToDevice<int32_t>(draftParentFullTableDevice, inputDraftParentFullTable);
+    copyHostToDevice<int32_t>(selectedIndicesDevice, inputSelectedIndices);
 
     constructVerificationDraftTree(draftIdFullTableDevice, draftParentFullTableDevice, selectedIndicesDevice,
         inputIdsDevice, draftTreeMaskDevice, stream);
 
-    std::vector<int32_t> actualIds(batchSize * verifyTreeSize);
-    std::vector<int8_t> actualMask(batchSize * verifyTreeSize * verifyTreeSize);
-    CUDA_CHECK(cudaMemcpy(actualIds.data(), inputIdsDevice.rawPointer(), batchSize * verifyTreeSize * sizeof(int32_t),
-        cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(actualMask.data(), draftTreeMaskDevice.rawPointer(),
-        batchSize * verifyTreeSize * verifyTreeSize * sizeof(int8_t), cudaMemcpyDeviceToHost));
+    auto const actualIds = copyDeviceToHost<int32_t>(inputIdsDevice);
+    auto const actualMask = copyDeviceToHost<int8_t>(draftTreeMaskDevice);
 
     // ========== Comprehensive verification for Batch 0 ==========
     // Verify token IDs for batch 0
@@ -999,25 +959,18 @@ TEST(EagleKernels, EagleBaseCommitKVCacheAndAssembleHiddenState)
     std::vector<half> kvCache(numLayers * maxBatchSize * 2 * numKVHead * maxSeqLen * headDim, __float2half(1.0f));
 
     // Copy data to device
-    CUDA_CHECK(cudaMemcpy(acceptedIndicesDevice.rawPointer(), inputAcceptedIndices.data(),
-        batchSize * maxDepth * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(acceptLengthsDevice.rawPointer(), inputAcceptLengths.data(), batchSize * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kvCacheLengthsDevice.rawPointer(), inputKvCacheLengths.data(), batchSize * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(
-        cudaMemcpy(kvCacheDevice.rawPointer(), kvCache.data(), kvCache.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(hiddenStateDevice.rawPointer(), inputHiddenState.data(),
-        batchSize * draftTreeSize * baseHiddenDim * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
+    copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
+    copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
+    copyHostToDevice<half>(kvCacheDevice, kvCache);
+    copyHostToDevice<half>(hiddenStateDevice, inputHiddenState);
 
     // Execute kernel - this should compact inplace from stride=10 to stride=maxDepth
     eagleBaseCommitKVCacheAndAssembleHiddenState(
         acceptedIndicesDevice, acceptLengthsDevice, kvCacheLengthsDevice, kvCacheDevice, hiddenStateDevice, stream);
 
     // Read back results
-    std::vector<half> actualHiddenState(batchSize * draftTreeSize * baseHiddenDim);
-    CUDA_CHECK(cudaMemcpy(actualHiddenState.data(), hiddenStateDevice.rawPointer(),
-        batchSize * draftTreeSize * baseHiddenDim * sizeof(half), cudaMemcpyDeviceToHost));
+    auto actualHiddenState = copyDeviceToHost<half>(hiddenStateDevice);
 
     // ========== Verify Batch 0 ==========
     // After compaction, Batch 0 should be at offset 0 with compacted layout
@@ -1117,12 +1070,8 @@ TEST(EagleKernels, PrepareEagleDraftProposalInputs)
             packedDraftTreeMaskDevice, tensorPositionIndicesDevice, selectTokenIndicesDevice,
             sequenceContextLengthsDevice, stream);
 
-        std::vector<int32_t> actualContextLengths(batchSize);
-        std::vector<int64_t> actualSelectIndices(batchSize * selectTokenLength);
-        CUDA_CHECK(cudaMemcpy(actualContextLengths.data(), sequenceContextLengthsDevice.rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectTokenIndicesDevice.rawPointer(),
-            batchSize * selectTokenLength * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        auto const actualContextLengths = copyDeviceToHost<int32_t>(sequenceContextLengthsDevice);
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectTokenIndicesDevice);
 
         // Verify batch 0
         EXPECT_EQ(actualContextLengths[0], expectedContextLenBatch0);
@@ -1187,8 +1136,7 @@ TEST(EagleKernels, AssembleDraftTreeInput)
             = rt::Tensor({batchSize, paddedDraftTreeSize, paddedDraftTreeSize}, rt::DeviceType::kGPU, DataType::kINT8);
 
         std::vector<int32_t> initialTreeLength(batchSize, draftTopK);
-        CUDA_CHECK(cudaMemcpy(draftTreeLengthDevice.rawPointer(), initialTreeLength.data(), batchSize * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice<int32_t>(draftTreeLengthDevice, initialTreeLength);
 
         CUDA_CHECK(cudaMemcpy(draftIdTableDevice.rawPointer(), inputDraftIdTable.data(),
             batchSize * 16 * sizeof(int32_t), cudaMemcpyHostToDevice));
@@ -1200,12 +1148,8 @@ TEST(EagleKernels, AssembleDraftTreeInput)
         assembleDraftTreeInput(draftIdTableDevice, draftHiddenOutputDevice, selectedIndicesDevice, inputIdsDevice,
             draftHiddenStatesInputDevice, draftTreeLengthDevice, draftTreeMaskDevice, draftTopK, round, stream);
 
-        std::vector<int32_t> actualInputIds(batchSize * paddedDraftTreeSize);
-        std::vector<int32_t> actualTreeLength(batchSize);
-        CUDA_CHECK(cudaMemcpy(actualInputIds.data(), inputIdsDevice.rawPointer(),
-            batchSize * paddedDraftTreeSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualTreeLength.data(), draftTreeLengthDevice.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        auto const actualInputIds = copyDeviceToHost<int32_t>(inputIdsDevice);
+        auto const actualTreeLength = copyDeviceToHost<int32_t>(draftTreeLengthDevice);
 
         // Verify batch 0
         EXPECT_EQ(actualTreeLength[0], expectedTreeLength);
@@ -1269,12 +1213,8 @@ TEST(EagleKernels, AssembleIntermediateData)
         assembleIntermediateData(cuLogProbsDevice, selectedIndicesDevice, intermediateScoresDevice,
             intermediateParentsDevice, draftTopK, round, stream);
 
-        std::vector<float> actualScores(batchSize * draftTopK);
-        std::vector<int32_t> actualParents(batchSize * draftTopK);
-        CUDA_CHECK(cudaMemcpy(actualScores.data(), intermediateScoresDevice.rawPointer(),
-            batchSize * draftTopK * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualParents.data(), intermediateParentsDevice.rawPointer(),
-            batchSize * draftTopK * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualScores = copyDeviceToHost<float>(intermediateScoresDevice);
+        auto const actualParents = copyDeviceToHost<int32_t>(intermediateParentsDevice);
 
         // Verify batch 0
         for (int i = 0; i < draftTopK; i++)
@@ -1341,25 +1281,16 @@ TEST(EagleKernels, UpdateDraftTreeFullTables)
             batchSize * 16 * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(intermediateParentsDevice.rawPointer(), inputIntermediateParents.data(),
             batchSize * draftTopK * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(draftIdFullTableDevice.rawPointer(), init_ids.data(),
-            batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(draftScoreFullTableDevice.rawPointer(), init_scores.data(),
-            batchSize * fullTableLength * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(draftParentFullTableDevice.rawPointer(), init_parents.data(),
-            batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice<int32_t>(draftIdFullTableDevice, init_ids);
+        copyHostToDevice<float>(draftScoreFullTableDevice, init_scores);
+        copyHostToDevice<int32_t>(draftParentFullTableDevice, init_parents);
 
         updateDraftTreeFullTables(draftIdTableDevice, draftScoreTableDevice, intermediateParentsDevice,
             draftIdFullTableDevice, draftScoreFullTableDevice, draftParentFullTableDevice, draftTopK, round, stream);
 
-        std::vector<int32_t> actualIds(batchSize * fullTableLength);
-        std::vector<float> actualScores(batchSize * fullTableLength);
-        std::vector<int32_t> actualParents(batchSize * fullTableLength);
-        CUDA_CHECK(cudaMemcpy(actualIds.data(), draftIdFullTableDevice.rawPointer(),
-            batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualScores.data(), draftScoreFullTableDevice.rawPointer(),
-            batchSize * fullTableLength * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualParents.data(), draftParentFullTableDevice.rawPointer(),
-            batchSize * fullTableLength * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualIds = copyDeviceToHost<int32_t>(draftIdFullTableDevice);
+        auto const actualScores = copyDeviceToHost<float>(draftScoreFullTableDevice);
+        auto const actualParents = copyDeviceToHost<int32_t>(draftParentFullTableDevice);
 
         // Verify batch 0 first few entries
         EXPECT_EQ(actualIds[dstOffset], inputDraftIdTable[0]);
@@ -1420,15 +1351,9 @@ TEST(EagleKernels, PrepareEagleBaseTreeDecodingInputs)
             packedBaseTreeDecodingMaskDevice, tensorPositionIndicesDevice, selectTokenIndicesDevice,
             sequenceContextLengthsDevice, stream);
 
-        std::vector<int32_t> actualPositions(batchSize * treeSize);
-        std::vector<int64_t> actualSelectIndices(batchSize * treeSize);
-        std::vector<int32_t> actualContextLengths(batchSize);
-        CUDA_CHECK(cudaMemcpy(actualPositions.data(), tensorPositionIndicesDevice.rawPointer(),
-            batchSize * treeSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectTokenIndicesDevice.rawPointer(),
-            batchSize * treeSize * sizeof(int64_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualContextLengths.data(), sequenceContextLengthsDevice.rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualPositions = copyDeviceToHost<int32_t>(tensorPositionIndicesDevice);
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectTokenIndicesDevice);
+        auto const actualContextLengths = copyDeviceToHost<int32_t>(sequenceContextLengthsDevice);
 
         // Verify batch 0
         EXPECT_EQ(actualContextLengths[0], expectedContextLenBatch0);
@@ -1480,18 +1405,13 @@ TEST(EagleKernels, PrepareEaglePrefillInputsTrtNative)
         // Zero-initialize the mask to avoid stale data
         CUDA_CHECK(cudaMemset(maskDevice.rawPointer(), 0, maskDevice.getMemoryCapacity()));
 
-        CUDA_CHECK(cudaMemcpy(contextLengthsDevice.rawPointer(), inputContextLengths.data(),
-            batchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice<int32_t>(contextLengthsDevice, inputContextLengths);
 
         prepareEaglePrefillInputsTrtNative(contextLengthsDevice, maskDevice, posIdsDevice, stream);
 
         // Copy results back (use uint8_t instead of bool because std::vector<bool> is a bit-packed proxy)
-        std::vector<uint8_t> actualMask(batchSize * inputSeqLen * maxPresentLength);
-        std::vector<int32_t> actualPosIds(batchSize * inputSeqLen);
-        CUDA_CHECK(cudaMemcpy(
-            actualMask.data(), maskDevice.rawPointer(), actualMask.size() * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualPosIds.data(), posIdsDevice.rawPointer(), batchSize * inputSeqLen * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        auto const actualMask = copyDeviceToHost<uint8_t>(maskDevice);
+        auto const actualPosIds = copyDeviceToHost<int32_t>(posIdsDevice);
 
         for (int32_t b = 0; b < batchSize; b++)
         {
@@ -1596,8 +1516,7 @@ TEST(EagleKernels, PrepareEagleDraftProposalInputsTrtNative)
         auto sequenceContextLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
 
         CUDA_CHECK(cudaMemset(trtNativeMaskDevice.rawPointer(), 0, trtNativeMaskDevice.getMemoryCapacity()));
-        CUDA_CHECK(cudaMemcpy(draftTreeMaskDevice.rawPointer(), inputDraftTreeMask.data(),
-            batchSize * paddedDraftTreeSize * paddedDraftTreeSize * sizeof(int8_t), cudaMemcpyHostToDevice));
+        copyHostToDevice<int8_t>(draftTreeMaskDevice, inputDraftTreeMask);
         CUDA_CHECK(cudaMemcpy(draftTreeLengthDevice.rawPointer(), inputDraftTreeLength.data(),
             batchSize * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(sequenceStartIndicesDevice.rawPointer(), inputSequenceStartIndices.data(),
@@ -1607,18 +1526,10 @@ TEST(EagleKernels, PrepareEagleDraftProposalInputsTrtNative)
             trtNativeMaskDevice, positionIndicesDevice, selectTokenIndicesDevice, sequenceContextLengthsDevice, stream);
 
         // Copy results
-        std::vector<uint8_t> actualMask(batchSize * paddedDraftTreeSize * maxPresentLength);
-        std::vector<int32_t> actualPositions(batchSize * paddedDraftTreeSize);
-        std::vector<int64_t> actualSelectIndices(batchSize * selectTokenLength);
-        std::vector<int32_t> actualContextLengths(batchSize);
-        CUDA_CHECK(cudaMemcpy(actualMask.data(), trtNativeMaskDevice.rawPointer(), actualMask.size() * sizeof(uint8_t),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualPositions.data(), positionIndicesDevice.rawPointer(),
-            batchSize * paddedDraftTreeSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectTokenIndicesDevice.rawPointer(),
-            batchSize * selectTokenLength * sizeof(int64_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualContextLengths.data(), sequenceContextLengthsDevice.rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualMask = copyDeviceToHost<uint8_t>(trtNativeMaskDevice);
+        auto const actualPositions = copyDeviceToHost<int32_t>(positionIndicesDevice);
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectTokenIndicesDevice);
+        auto const actualContextLengths = copyDeviceToHost<int32_t>(sequenceContextLengthsDevice);
 
         // Verify batch 0
         int32_t const seqStart0 = inputSequenceStartIndices[0];
@@ -1732,18 +1643,10 @@ TEST(EagleKernels, PrepareEagleAcceptDecodeTokenInputsTrtNative)
         prepareEagleAcceptDecodeTokenInputsTrtNative(seqStartDevice, acceptNumsDevice, maskDevice, posIdsDevice,
             selectIndicesDevice, contextLengthsDevice, stream);
 
-        std::vector<uint8_t> actualMask(batchSize * maxAcceptedTokenNum * maxPresentLength);
-        std::vector<int32_t> actualPosIds(batchSize * maxAcceptedTokenNum);
-        std::vector<int64_t> actualSelectIndices(batchSize);
-        std::vector<int32_t> actualContextLengths(batchSize);
-        CUDA_CHECK(cudaMemcpy(
-            actualMask.data(), maskDevice.rawPointer(), actualMask.size() * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualPosIds.data(), posIdsDevice.rawPointer(),
-            batchSize * maxAcceptedTokenNum * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectIndicesDevice.rawPointer(), batchSize * sizeof(int64_t),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualContextLengths.data(), contextLengthsDevice.rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualMask = copyDeviceToHost<uint8_t>(maskDevice);
+        auto const actualPosIds = copyDeviceToHost<int32_t>(posIdsDevice);
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectIndicesDevice);
+        auto const actualContextLengths = copyDeviceToHost<int32_t>(contextLengthsDevice);
 
         for (int32_t b = 0; b < batchSize; b++)
         {
@@ -1874,18 +1777,10 @@ TEST(EagleKernels, PrepareEagleBaseTreeDecodingInputsTrtNative)
         prepareEagleBaseTreeDecodingInputsTrtNative(treeMaskDevice, seqStartDevice, maskDevice, posIdsDevice,
             selectIndicesDevice, contextLengthsDevice, stream);
 
-        std::vector<uint8_t> actualMask(batchSize * treeSize * maxPresentLength);
-        std::vector<int32_t> actualPositions(batchSize * treeSize);
-        std::vector<int64_t> actualSelectIndices(batchSize * treeSize);
-        std::vector<int32_t> actualContextLengths(batchSize);
-        CUDA_CHECK(cudaMemcpy(
-            actualMask.data(), maskDevice.rawPointer(), actualMask.size() * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualPositions.data(), posIdsDevice.rawPointer(), batchSize * treeSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualSelectIndices.data(), selectIndicesDevice.rawPointer(),
-            batchSize * treeSize * sizeof(int64_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(actualContextLengths.data(), contextLengthsDevice.rawPointer(),
-            batchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const actualMask = copyDeviceToHost<uint8_t>(maskDevice);
+        auto const actualPositions = copyDeviceToHost<int32_t>(posIdsDevice);
+        auto const actualSelectIndices = copyDeviceToHost<int64_t>(selectIndicesDevice);
+        auto const actualContextLengths = copyDeviceToHost<int32_t>(contextLengthsDevice);
 
         // Verify batch 0
         int32_t const seqStart0 = inputSequenceStartIndices[0];

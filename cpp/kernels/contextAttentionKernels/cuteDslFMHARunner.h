@@ -17,14 +17,7 @@
 
 #pragma once
 
-#include "cuteDSLArtifact/fmha_d128.h"
-#include "cuteDSLArtifact/fmha_d128_sw.h"
-#include "cuteDSLArtifact/fmha_d64.h"
-#include "cuteDSLArtifact/fmha_d64_sw.h"
-#include "cuteDSLArtifact/vit_fmha_d128.h"
-#include "cuteDSLArtifact/vit_fmha_d64.h"
-#include "cuteDSLArtifact/vit_fmha_d72.h"
-#include "cuteDSLArtifact/vit_fmha_d80.h"
+#include "cutedsl_fmha_all.h"
 
 #include <climits>
 #include <cstdint>

@@ -59,12 +59,6 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')
 
-    # Enable CuTe DSL FMHA for Blackwell+ (SM >= 100) targets, except auto-thor
-    if (device_config.compute_capability is not None
-            and device_config.compute_capability in (100, 101, 110)
-            and device_config.target != 'auto-thor'):
-        cmake_cmd.append('-DENABLE_CUTE_DSL_FMHA=ON')
-
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),
         'make -j16'

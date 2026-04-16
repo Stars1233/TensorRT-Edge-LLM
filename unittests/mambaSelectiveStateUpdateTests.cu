@@ -437,33 +437,28 @@ void runMambaSelectiveStateUpdateTest(MambaTestConfig const& config)
     rt::Tensor dtBiasDevice;
     rt::Tensor zDevice;
 
-    CUDA_CHECK(cudaMemcpy(stateDevice.rawPointer(), stateHostForGpu.data(), stateHostForGpu.size() * sizeof(half),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        xDevice.rawPointer(), xHostForGpu.data(), xHostForGpu.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dtDevice.rawPointer(), dtHost.data(), dtHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ADevice.rawPointer(), AHost.data(), AHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(BDevice.rawPointer(), BHost.data(), BHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(CDevice.rawPointer(), CHost.data(), CHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice<half>(stateDevice, stateHostForGpu);
+    copyHostToDevice<half>(xDevice, xHostForGpu);
+    copyHostToDevice<float>(dtDevice, dtHost);
+    copyHostToDevice<float>(ADevice, AHost);
+    copyHostToDevice<half>(BDevice, BHost);
+    copyHostToDevice<half>(CDevice, CHost);
     CUDA_CHECK(cudaMemset(outputDevice.rawPointer(), 0, outputDevice.getMemoryCapacity()));
 
     if (config.useSkipConnection)
     {
         DDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        CUDA_CHECK(
-            cudaMemcpy(DDevice.rawPointer(), DHost.data(), DHost.size() * sizeof(float), cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(DDevice, DHost);
     }
     if (config.useDtBias)
     {
         dtBiasDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        CUDA_CHECK(cudaMemcpy(
-            dtBiasDevice.rawPointer(), dtBiasHost.data(), dtBiasHost.size() * sizeof(float), cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(dtBiasDevice, dtBiasHost);
     }
     if (config.useSiluGating)
     {
         zDevice = rt::Tensor({batch, nheads, paddedDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(
-            zDevice.rawPointer(), zHostForGpu.data(), zHostForGpu.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(zDevice, zHostForGpu);
     }
 
     if (usePaddedDstate)
@@ -502,12 +497,8 @@ void runMambaSelectiveStateUpdateTest(MambaTestConfig const& config)
         outputDevice, config.dtSoftplus, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<half> outputFromGpu(outputGpuSize);
-    std::vector<half> stateResultFromGpu(stateHostForGpu.size());
-    CUDA_CHECK(cudaMemcpy(
-        outputFromGpu.data(), outputDevice.rawPointer(), outputFromGpu.size() * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(stateResultFromGpu.data(), stateDevice.rawPointer(), stateResultFromGpu.size() * sizeof(half),
-        cudaMemcpyDeviceToHost));
+    auto const outputFromGpu = copyDeviceToHost<half>(outputDevice);
+    auto const stateResultFromGpu = copyDeviceToHost<half>(stateDevice);
 
     // Convert results from padded to contiguous for comparison if needed
     std::vector<half> outputHost;
@@ -804,30 +795,28 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
     rt::Tensor dtBiasDevice;
     rt::Tensor zDevice;
 
-    CUDA_CHECK(
-        cudaMemcpy(stateDevice.rawPointer(), stateHostInit.data(), stateSize * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(xDevice.rawPointer(), xHost.data(), xSize * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dtDevice.rawPointer(), dtHost.data(), dtHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ADevice.rawPointer(), AHost.data(), AHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(BDevice.rawPointer(), BHost.data(), BHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(CDevice.rawPointer(), CHost.data(), CHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice<half>(stateDevice, stateHostInit);
+    copyHostToDevice<half>(xDevice, xHost);
+    copyHostToDevice<half>(dtDevice, dtHost);
+    copyHostToDevice<float>(ADevice, AHost);
+    copyHostToDevice<half>(BDevice, BHost);
+    copyHostToDevice<half>(CDevice, CHost);
     CUDA_CHECK(cudaMemset(outputDevice.rawPointer(), 0, outputDevice.getMemoryCapacity()));
 
     if (config.useSkipConnection)
     {
         DDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(DDevice.rawPointer(), DHost.data(), DHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(DDevice, DHost);
     }
     if (config.useDtBias)
     {
         dtBiasDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(
-            dtBiasDevice.rawPointer(), dtBiasHost.data(), dtBiasHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(dtBiasDevice, dtBiasHost);
     }
     if (config.useSiluGating)
     {
         zDevice = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(zDevice.rawPointer(), zHost.data(), xSize * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(zDevice, zHost);
     }
 
     namespace rt = trt_edgellm::rt;
@@ -840,10 +829,8 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<half> gpuOutput(xSize);
-    std::vector<half> gpuState(stateSize);
-    CUDA_CHECK(cudaMemcpy(gpuOutput.data(), outputDevice.rawPointer(), xSize * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(gpuState.data(), stateDevice.rawPointer(), stateSize * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuOutput = copyDeviceToHost<half>(outputDevice);
+    auto const gpuState = copyDeviceToHost<half>(stateDevice);
 
     auto [rtol, atol] = getTolerance<half>();
     int32_t outputMismatches = 0;

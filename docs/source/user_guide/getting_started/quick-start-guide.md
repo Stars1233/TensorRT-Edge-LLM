@@ -2,8 +2,6 @@
 
 > **Repository:** [github.com/NVIDIA/TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM)
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
-
 This quick start guide will get you up and running with TensorRT Edge-LLM in ~15 minutes.
 
 **Prerequisites:** Complete the [Installation Guide](installation.md) for both x86 host and edge device before proceeding.
@@ -11,6 +9,8 @@ This quick start guide will get you up and running with TensorRT Edge-LLM in ~15
 ---
 
 ## Part 1: Export and Quantize on x86 Host
+
+This part runs on a standard x86 host with an NVIDIA GPU. **DriveOS users:** this process does not need to run in DriveOS Docker; use your regular x86 development machine.
 
 ### Standard LLM Export
 

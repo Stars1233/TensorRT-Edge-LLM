@@ -67,12 +67,9 @@ protected:
         rt::Tensor acceptLengthTensor({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "acceptLength");
 
         // Copy input data to GPU
-        CUDA_CHECK(cudaMemcpy(logitsTensor.rawPointer(), logits.data(),
-            batchSize * numTokens * vocabSize * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(tokenIdsTensor.rawPointer(), tokenIds.data(), batchSize * numTokens * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(attentionMaskTensor.rawPointer(), attentionMask.data(),
-            batchSize * numTokens * numTokens * sizeof(int8_t), cudaMemcpyHostToDevice));
+        copyHostToDevice(logitsTensor, logits);
+        copyHostToDevice(tokenIdsTensor, tokenIds);
+        copyHostToDevice(attentionMaskTensor, attentionMask);
 
         // Allocate workspace for kernel temporary storage
         size_t workspaceSize = kernel::getEagleAcceptWorkspaceSize(batchSize, numTokens);
@@ -86,8 +83,7 @@ protected:
         {
             vocabMappingTableTensor = rt::Tensor({static_cast<int64_t>(vocabMappingTableData.size())},
                 rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "vocabMappingTable");
-            CUDA_CHECK(cudaMemcpy(vocabMappingTableTensor.rawPointer(), vocabMappingTableData.data(),
-                vocabMappingTableData.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+            copyHostToDevice(vocabMappingTableTensor, vocabMappingTableData);
             vocabMappingTable = std::ref(vocabMappingTableTensor);
         }
 
@@ -113,12 +109,9 @@ protected:
         std::vector<int32_t> hostAcceptedLogitsIndices(batchSize * maxDepth);
         std::vector<int32_t> hostAcceptLengths(batchSize);
 
-        CUDA_CHECK(cudaMemcpy(hostAcceptedTokenIds.data(), acceptedTokenIdsTensor.rawPointer(),
-            batchSize * maxDepth * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hostAcceptedLogitsIndices.data(), acceptedLogitsIndicesTensor.rawPointer(),
-            batchSize * maxDepth * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hostAcceptLengths.data(), acceptLengthTensor.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        hostAcceptedTokenIds = copyDeviceToHost<int32_t>(acceptedTokenIdsTensor);
+        hostAcceptedLogitsIndices = copyDeviceToHost<int32_t>(acceptedLogitsIndicesTensor);
+        hostAcceptLengths = copyDeviceToHost<int32_t>(acceptLengthTensor);
 
         // Basic performance check
         EXPECT_LT(duration.count(), 1000) << testName << ": Kernel took too long, possible infinite loop";

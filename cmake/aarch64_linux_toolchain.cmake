@@ -49,7 +49,7 @@ if(DEFINED CUDA_VERSION)
 endif()
 
 if("${EMBEDDED_TARGET}" STREQUAL "auto-thor")
-  set_ifndef(CUDA_CTK_VERSION 13.0)
+  set_ifndef(CUDA_CTK_VERSION 13.2)
   if(CUDA_CTK_VERSION VERSION_LESS 13.0)
     set(CMAKE_CUDA_ARCHITECTURES 101)
   else()

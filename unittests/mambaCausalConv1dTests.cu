@@ -76,20 +76,16 @@ void runCausalConv1dTest(int32_t batch, int32_t seqLen, int32_t dim, int32_t wid
     auto biasDevice = rt::Tensor({dim}, rt::DeviceType::kGPU, DataType::kHALF);
     auto outputDevice = rt::Tensor({batch, seqLen, dim}, rt::DeviceType::kGPU, DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(xDevice.rawPointer(), xHost.data(), xHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        weightDevice.rawPointer(), weightHost.data(), weightHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(
-        cudaMemcpy(biasDevice.rawPointer(), biasHost.data(), biasHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(xDevice, xHost);
+    copyHostToDevice(weightDevice, weightHost);
+    copyHostToDevice(biasDevice, biasHost);
     CUDA_CHECK(cudaMemset(outputDevice.rawPointer(), 0, outputDevice.getMemoryCapacity()));
 
     trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasDevice));
     mamba_ssm::invokeCausalConv1d(xDevice, weightDevice, biasOpt, outputDevice, 1, width - 1, 1, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<half> outputHost(outputRef.size());
-    CUDA_CHECK(cudaMemcpy(
-        outputHost.data(), outputDevice.rawPointer(), outputHost.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const outputHost = copyDeviceToHost<half>(outputDevice);
 
     for (size_t i = 0; i < outputRef.size(); ++i)
     {
@@ -150,14 +146,12 @@ void runCaptureConvStateTest(int32_t batch, int32_t seqLen, int32_t dim, int32_t
     auto xDevice = rt::Tensor({batch, seqLen, dim}, rt::DeviceType::kGPU, DataType::kHALF);
     auto convStateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(xDevice.rawPointer(), xHost.data(), xHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(xDevice, xHost);
 
     mamba_ssm::invokeCaptureConvState(xDevice, convStateDevice, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<half> convStateHost(convStateRef.size());
-    CUDA_CHECK(cudaMemcpy(convStateHost.data(), convStateDevice.rawPointer(), convStateHost.size() * sizeof(half),
-        cudaMemcpyDeviceToHost));
+    auto const convStateHost = copyDeviceToHost<half>(convStateDevice);
 
     for (size_t i = 0; i < convStateRef.size(); ++i)
     {
@@ -224,20 +218,15 @@ void runCausalConv1dDecodeTest(int32_t batch, int32_t dim, int32_t width)
     auto biasDevice = rt::Tensor({dim}, rt::DeviceType::kGPU, DataType::kHALF);
     auto outDevice = rt::Tensor({batch, 1, dim}, rt::DeviceType::kGPU, DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(convStateDevice.rawPointer(), convStateHost.data(), convStateHost.size() * sizeof(half),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        weightDevice.rawPointer(), weightHost.data(), weightHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(
-        cudaMemcpy(biasDevice.rawPointer(), biasHost.data(), biasHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(convStateDevice, convStateHost);
+    copyHostToDevice(weightDevice, weightHost);
+    copyHostToDevice(biasDevice, biasHost);
 
     trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasDevice));
     mamba_ssm::invokeCausalConv1dDecode(convStateDevice, weightDevice, biasOpt, outDevice, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<half> outHost(outRef.size());
-    CUDA_CHECK(
-        cudaMemcpy(outHost.data(), outDevice.rawPointer(), outHost.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const outHost = copyDeviceToHost<half>(outDevice);
 
     for (size_t i = 0; i < outRef.size(); ++i)
     {

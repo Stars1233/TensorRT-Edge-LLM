@@ -24,6 +24,7 @@
 #include "common/trtUtils.h"
 #include "common/version.h"
 
+#include <cstdlib>
 #include <fstream>
 
 using namespace trt_edgellm;
@@ -127,6 +128,9 @@ bool LLMBuilder::build()
 
     // Build and save engine
     std::string const engineFilePath = (mEngineDir / engineFileName).string();
+#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
+    setenv("__LUNOWUD", "-mlir:autotune:num_threads=1 -mlir:collective:fp4=off -cask_fusion:async_policy=1", 1);
+#endif
     if (!buildAndSerializeEngine(builder.get(), network.get(), config.get(), engineFilePath))
     {
         return false;

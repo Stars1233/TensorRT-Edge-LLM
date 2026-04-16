@@ -118,18 +118,14 @@ TEST_F(EmbeddingLookupTest, StandardEmbeddingLookupAccuracy)
         rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Copy data to GPU
-        CUDA_CHECK(cudaMemcpy(
-            inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-            embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(inputIdsTensor, inputIds);
+        copyHostToDevice(embeddingTableTensor, embeddingTable);
 
         // Run GPU kernel
         kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor, stream);
 
         // Get result from GPU
-        std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
         // Run CPU reference
         auto cpuResult = embeddingLookupRef(inputIds, embeddingTable, batchSize, seqLen, vocabSize, hiddenSize);
@@ -168,10 +164,8 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeError)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-        embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(embeddingTableTensor, embeddingTable);
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
@@ -213,12 +207,9 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeErrorWithImageInsertion)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-        embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(embeddingTableTensor, embeddingTable);
+    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
@@ -256,18 +247,14 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-        embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(embeddingTableTensor, embeddingTable);
 
     // Run GPU kernel
     kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, outputTensor, stream);
 
     // Get result from GPU
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     // Run CPU reference
     auto cpuResult = embeddingLookupRef(inputIds, embeddingTable, batchSize, seqLen, vocabSize, hiddenSize);
@@ -333,21 +320,16 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandlingWithImageInsertion)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-        embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(embeddingTableTensor, embeddingTable);
+    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
 
     // Run GPU kernel
     kernel::embeddingLookupWithImageInsertion(
         inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor, stream);
 
     // Get result from GPU
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     // Run CPU reference
     auto cpuResult = embeddingLookupRef(
@@ -427,21 +409,16 @@ TEST_F(EmbeddingLookupTest, EmbeddingLookupWithImageInsertionAccuracy)
         rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Copy data to GPU
-        CUDA_CHECK(cudaMemcpy(
-            inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-            embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice(inputIdsTensor, inputIds);
+        copyHostToDevice(embeddingTableTensor, embeddingTable);
+        copyHostToDevice(imageEmbedsTensor, imageEmbeds);
 
         // Run GPU kernel
         kernel::embeddingLookupWithImageInsertion(
             inputIdsTensor, embeddingTableTensor, imageEmbedsTensor, outputTensor, stream);
 
         // Get result from GPU
-        std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
         // Run CPU reference
         auto cpuResult = embeddingLookupRef(
@@ -488,18 +465,14 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLookupAccuracy)
         rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Copy data to GPU
-        CUDA_CHECK(cudaMemcpy(
-            inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(deepstackFeaturesTensor.rawPointer(), deepstackFeatures.data(),
-            deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(inputIdsTensor, inputIds);
+        copyHostToDevice(deepstackFeaturesTensor, deepstackFeatures);
 
         // Run GPU kernel
         kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
 
         // Get result from GPU
-        std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
         // Run CPU reference
         auto cpuResult = assembleDeepstackEmbeddingRef(
@@ -548,18 +521,14 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLookupOutOfBounds)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(deepstackFeaturesTensor.rawPointer(), deepstackFeatures.data(),
-        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(deepstackFeaturesTensor, deepstackFeatures);
 
     // Run GPU kernel
     kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
 
     // Get result from GPU
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     // Run CPU reference
     auto cpuResult = assembleDeepstackEmbeddingRef(
@@ -632,10 +601,8 @@ TEST_F(EmbeddingLookupTest, DeepstackUnevenHiddenSizeError)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(deepstackFeaturesTensor.rawPointer(), deepstackFeatures.data(),
-        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(deepstackFeaturesTensor, deepstackFeatures);
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
@@ -668,19 +635,14 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitImageTokenId)
     rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(indicesTensor.rawPointer(), multimodalIndices.data(),
-        multimodalIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(featuresTensor.rawPointer(), deepstackFeatures.data(),
-        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(indicesTensor, multimodalIndices);
+    copyHostToDevice(featuresTensor, deepstackFeatures);
 
     kernel::assembleDeepstackEmbedding(
         inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream, imageTokenId, std::ref(indicesTensor));
 
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
     {
@@ -730,17 +692,13 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLegacyPath)
     rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(featuresTensor.rawPointer(), deepstackFeatures.data(),
-        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(featuresTensor, deepstackFeatures);
 
     // imageTokenId=0 → legacy mode, no multimodalIndices
     kernel::assembleDeepstackEmbedding(inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream);
 
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
     {
@@ -787,17 +745,13 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitIdNoIndices)
     rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(featuresTensor.rawPointer(), deepstackFeatures.data(),
-        deepstackFeatures.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(featuresTensor, deepstackFeatures);
 
     // Explicit imageTokenId but no multimodalIndices
     kernel::assembleDeepstackEmbedding(inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream, imageTokenId);
 
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     // All outputs should be zero: image tokens detected but tokenId - vocabSize is negative → out of bounds
     // Text tokens are < vocabSize and != imageTokenId → zero
@@ -887,25 +841,18 @@ TEST_F(EmbeddingLookupTest, MultimodalAccuracy)
         rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Copy data to GPU
-        CUDA_CHECK(cudaMemcpy(
-            inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(multimodalIndicesTensor.rawPointer(), multimodalIndices.data(),
-            multimodalIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-            embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half),
-            cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(audioEmbedsTensor.rawPointer(), audioEmbeds.data(), audioEmbeds.size() * sizeof(half),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice(inputIdsTensor, inputIds);
+        copyHostToDevice(multimodalIndicesTensor, multimodalIndices);
+        copyHostToDevice(embeddingTableTensor, embeddingTable);
+        copyHostToDevice(imageEmbedsTensor, imageEmbeds);
+        copyHostToDevice(audioEmbedsTensor, audioEmbeds);
 
         // Run GPU kernel
         kernel::embeddingLookupMultimodal(inputIdsTensor, embeddingTableTensor, multimodalIndicesTensor, imageTokenId,
             imageEmbedsTensor, audioTokenId, audioEmbedsTensor, outputTensor, stream);
 
         // Get result from GPU
-        std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
         // Run CPU reference
         auto cpuResult
@@ -992,25 +939,18 @@ TEST_F(EmbeddingLookupTest, MultimodalOutOfBounds)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(multimodalIndicesTensor.rawPointer(), multimodalIndices.data(),
-        multimodalIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-        embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        audioEmbedsTensor.rawPointer(), audioEmbeds.data(), audioEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(multimodalIndicesTensor, multimodalIndices);
+    copyHostToDevice(embeddingTableTensor, embeddingTable);
+    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
+    copyHostToDevice(audioEmbedsTensor, audioEmbeds);
 
     // Run GPU kernel
     kernel::embeddingLookupMultimodal(inputIdsTensor, embeddingTableTensor, multimodalIndicesTensor, imageTokenId,
         imageEmbedsTensor, audioTokenId, audioEmbedsTensor, outputTensor, stream);
 
     // Get result from GPU
-    std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-    CUDA_CHECK(cudaMemcpy(
-        gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
     // Run CPU reference
     auto cpuResult = embeddingLookupMultimodalRef(inputIds, embeddingTable, batchSize, seqLen, vocabSize, hiddenSize,
@@ -1098,16 +1038,11 @@ TEST_F(EmbeddingLookupTest, MultimodalUnevenHiddenSizeError)
     rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
     // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(
-        inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(multimodalIndicesTensor.rawPointer(), multimodalIndices.data(),
-        multimodalIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-        embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        audioEmbedsTensor.rawPointer(), audioEmbeds.data(), audioEmbeds.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(inputIdsTensor, inputIds);
+    copyHostToDevice(multimodalIndicesTensor, multimodalIndices);
+    copyHostToDevice(embeddingTableTensor, embeddingTable);
+    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
+    copyHostToDevice(audioEmbedsTensor, audioEmbeds);
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
@@ -1206,21 +1141,16 @@ TEST_F(EmbeddingLookupTest, MultimodalOptionalInputs)
         rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
         // Copy data to GPU
-        CUDA_CHECK(cudaMemcpy(
-            inputIdsTensor.rawPointer(), inputIds.data(), inputIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(multimodalIndicesTensor.rawPointer(), multimodalIndices.data(),
-            multimodalIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(embeddingTableTensor.rawPointer(), embeddingTable.data(),
-            embeddingTable.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(inputIdsTensor, inputIds);
+        copyHostToDevice(multimodalIndicesTensor, multimodalIndices);
+        copyHostToDevice(embeddingTableTensor, embeddingTable);
         if (tc.hasImage)
         {
-            CUDA_CHECK(cudaMemcpy(imageEmbedsTensor.rawPointer(), imageEmbeds.data(), imageEmbeds.size() * sizeof(half),
-                cudaMemcpyHostToDevice));
+            copyHostToDevice(imageEmbedsTensor, imageEmbeds);
         }
         if (tc.hasAudio)
         {
-            CUDA_CHECK(cudaMemcpy(audioEmbedsTensor.rawPointer(), audioEmbeds.data(), audioEmbeds.size() * sizeof(half),
-                cudaMemcpyHostToDevice));
+            copyHostToDevice(audioEmbedsTensor, audioEmbeds);
         }
 
         // Set up optional parameters for kernel call
@@ -1239,9 +1169,7 @@ TEST_F(EmbeddingLookupTest, MultimodalOptionalInputs)
             imageEmbedsOpt, audioTokenIdOpt, audioEmbedsOpt, outputTensor, stream);
 
         // Get result from GPU
-        std::vector<half> gpuResult(batchSize * seqLen * hiddenSize);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), outputTensor.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
         // Run CPU reference
         auto cpuResult

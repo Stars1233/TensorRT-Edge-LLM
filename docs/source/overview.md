@@ -2,8 +2,6 @@
 
 > **Repository:** [github.com/NVIDIA/TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM)
 
-> For the NVIDIA DRIVE platform, please refer to the documentation shipped with the DriveOS release
-
 ## What is TensorRT Edge-LLM?
 
 TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large Language Models (LLMs) and Vision-Language Models (VLMs) on embedded platforms. It enables efficient deployment of state-of-the-art language models on resource-constrained devices such as NVIDIA Jetson and NVIDIA DRIVE platforms.
@@ -17,7 +15,7 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 | Platform | Software Release | Link |
 |----------|------------------|------|
 | NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
-| NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | For details refer to NVIDIA DriveOS 7 release documentation |
+| NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | [NVIDIA DRIVE Developer](https://developer.nvidia.com/drive) |
 
 > **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
 

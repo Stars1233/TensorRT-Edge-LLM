@@ -71,8 +71,7 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
     {
         // Random initialize CosSinCache for non-64-multiple rotaryDim or cosSinCacheBatchSize != 1.
         uniformFloatInitialization(cosSinCache, -1, 1);
-        CUDA_CHECK(cudaMemcpy(cosSinCacheTensor.rawPointer(), cosSinCache.data(), cosSinCacheVolume * sizeof(float),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice(cosSinCacheTensor, cosSinCache);
     }
 
     std::vector<half> qInput;
@@ -131,9 +130,9 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
         rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor vTensor(
         rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kTensor.rawPointer(), kInput.data(), kInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(vTensor.rawPointer(), vInput.data(), vInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(qTensor, qInput);
+    copyHostToDevice(kTensor, kInput);
+    copyHostToDevice(vTensor, vInput);
     rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF);
 
@@ -143,19 +142,10 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
         kvScaleQuantOrigTensor, stream, true);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<half> qOut(qTensor.getShape().volume());
-    std::vector<half> kOut(kTensor.getShape().volume());
-    std::vector<half> vOut(vTensor.getShape().volume());
-    CUDA_CHECK(cudaMemcpy(
-        qOut.data(), qTensor.rawPointer(), qTensor.getShape().volume() * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(
-        kOut.data(), kTensor.rawPointer(), kTensor.getShape().volume() * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(
-        vOut.data(), vTensor.rawPointer(), vTensor.getShape().volume() * sizeof(half), cudaMemcpyDeviceToHost));
-
-    std::vector<half> kvCacheOut(kvCacheTensor.getShape().volume());
-    CUDA_CHECK(cudaMemcpy(kvCacheOut.data(), kvCacheTensor.rawPointer(),
-        kvCacheTensor.getShape().volume() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const qOut = copyDeviceToHost<half>(qTensor);
+    auto const kOut = copyDeviceToHost<half>(kTensor);
+    auto const vOut = copyDeviceToHost<half>(vTensor);
+    auto const kvCacheOut = copyDeviceToHost<half>(kvCacheTensor);
     KvCacheIndexer kvIndexer(batchSize, numKVHeads, kvCacheCapacity, headDim);
     for (int32_t i = 0; i < batchSize; ++i)
     {
@@ -208,12 +198,9 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
             rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
         rt::Tensor vTensorForFP8(
             rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(
-            qTensorForFP8.rawPointer(), qInput.data(), qInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            kTensorForFP8.rawPointer(), kInput.data(), kInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            vTensorForFP8.rawPointer(), vInput.data(), vInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(qTensorForFP8, qInput);
+        copyHostToDevice(kTensorForFP8, kInput);
+        copyHostToDevice(vTensorForFP8, vInput);
 
         // FP8 KV cache path: reuse same Q/K/V input and CosSin cache, compare KV FP8 vs FP16 (after dequant)
         rt::Tensor kvFp8(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
@@ -262,9 +249,7 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
             kvScaleQuantOrigTensorFp8, stream, true);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        std::vector<__nv_fp8_e4m3> kvOutFp8(kvFp8.getShape().volume());
-        CUDA_CHECK(cudaMemcpy(
-            kvOutFp8.data(), kvFp8.rawPointer(), kvOutFp8.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost));
+        auto const kvOutFp8 = copyDeviceToHost<__nv_fp8_e4m3>(kvFp8);
 
         for (int32_t b = 0; b < batchSize; ++b)
         {
@@ -339,8 +324,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     {
         // Random initialize CosSinCache for non-64-multiple rotaryDim or cosSinCacheBatchSize != 1.
         uniformFloatInitialization(cosSinCache, -1, 1);
-        CUDA_CHECK(cudaMemcpy(cosSinCacheTensor.rawPointer(), cosSinCache.data(), cosSinCacheVolume * sizeof(float),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice(cosSinCacheTensor, cosSinCache);
     }
 
     // Q/K/V tensor has layout [B, S, Hq/Hkv, D]. KV cache has layout [B, 2, Hkv, S, D].
@@ -422,15 +406,13 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
         }
     }
 
-    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kTensor.rawPointer(), kInput.data(), kInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(vTensor.rawPointer(), vInput.data(), vInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(qTensor, qInput);
+    copyHostToDevice(kTensor, kInput);
+    copyHostToDevice(vTensor, vInput);
     rt::Tensor seqLensTensor(rt::Coords{batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    CUDA_CHECK(cudaMemcpy(
-        seqLensTensor.rawPointer(), fullSeqLens.data(), fullSeqLens.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    copyHostToDevice(seqLensTensor, fullSeqLens);
     rt::Tensor customSeqLensTensor(rt::Coords{batchSize, qLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    CUDA_CHECK(cudaMemcpy(customSeqLensTensor.rawPointer(), customSeqLens.data(),
-        customSeqLens.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    copyHostToDevice(customSeqLensTensor, customSeqLens);
 
     // Empty scale tensor (ignored for FP16 KV cache).
     rt::Tensor kvScaleQuantOrigTensor{};
@@ -448,12 +430,8 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Output Q tensor.
-    std::vector<half> qOut(qTensor.getShape().volume());
-    CUDA_CHECK(cudaMemcpy(
-        qOut.data(), qTensor.rawPointer(), qTensor.getShape().volume() * sizeof(half), cudaMemcpyDeviceToHost));
-    std::vector<half> kvCacheOut(kvCacheTensor.getShape().volume());
-    CUDA_CHECK(cudaMemcpy(kvCacheOut.data(), kvCacheTensor.rawPointer(),
-        kvCacheTensor.getShape().volume() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const qOut = copyDeviceToHost<half>(qTensor);
+    auto const kvCacheOut = copyDeviceToHost<half>(kvCacheTensor);
 
     // Directly compare the output of Q since output and reference have the same layout.
     EXPECT_EQ(qOut.size(), qReference.size());
@@ -503,12 +481,9 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
             rt::Coords{batchSize, qLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
         rt::Tensor vTensorForFP8(
             rt::Coords{batchSize, qLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(
-            qTensorForFP8.rawPointer(), qInput.data(), qInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            kTensorForFP8.rawPointer(), kInput.data(), kInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            vTensorForFP8.rawPointer(), vInput.data(), vInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(qTensorForFP8, qInput);
+        copyHostToDevice(kTensorForFP8, kInput);
+        copyHostToDevice(vTensorForFP8, vInput);
 
         rt::Tensor kvFp8(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
             nvinfer1::DataType::kFP8);
@@ -561,9 +536,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        std::vector<__nv_fp8_e4m3> kvOutFp8(kvFp8.getShape().volume());
-        CUDA_CHECK(cudaMemcpy(
-            kvOutFp8.data(), kvFp8.rawPointer(), kvOutFp8.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost));
+        auto const kvOutFp8 = copyDeviceToHost<__nv_fp8_e4m3>(kvFp8);
 
         for (int32_t b = 0; b < batchSize; ++b)
         {
@@ -630,16 +603,15 @@ void BenchmarkRopeWriteKv(
         rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor vTensor(
         rt::Coords{batchSize, qSeqLen, numKVHeads, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kTensor.rawPointer(), kInput.data(), kInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(vTensor.rawPointer(), vInput.data(), vInput.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice(qTensor, qInput);
+    copyHostToDevice(kTensor, kInput);
+    copyHostToDevice(vTensor, vInput);
 
     rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF);
     rt::Tensor cosSinCacheTensor(
         rt::Coords{cosSinCacheBatchSize, kvCacheCapacity, rotaryDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    CUDA_CHECK(cudaMemcpy(cosSinCacheTensor.rawPointer(), cosSinCache.data(),
-        cosSinCacheTensor.getShape().volume() * sizeof(float), cudaMemcpyHostToDevice));
+    copyHostToDevice(cosSinCacheTensor, cosSinCache);
 
     cudaStream_t stream{nullptr};
 

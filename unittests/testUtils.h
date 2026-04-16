@@ -20,13 +20,19 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <functional>
+#include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
 #include <ostream>
 #include <random>
+#include <sstream>
 #include <utility>
 #include <vector>
+
+#include "common/checkMacros.h"
+#include "common/tensor.h"
 
 template <typename T>
 bool isclose(T a, T b, float rtol, float atol)
@@ -175,4 +181,47 @@ inline void applyThorSMRenumberWAR(int32_t& smVersion)
     {
         smVersion = 101;
     }
+}
+
+template <typename T>
+void copyHostToDevice(trt_edgellm::rt::Tensor& tensor, std::vector<T> const& hostData)
+{
+    auto const volume = static_cast<size_t>(tensor.getShape().volume());
+    ASSERT_EQ(volume, hostData.size());
+    CUDA_CHECK(cudaMemcpy(tensor.rawPointer(), hostData.data(), volume * sizeof(T), cudaMemcpyHostToDevice));
+}
+
+template <typename T>
+std::vector<T> copyDeviceToHost(trt_edgellm::rt::Tensor const& tensor)
+{
+    auto const volume = static_cast<size_t>(tensor.getShape().volume());
+    std::vector<T> hostData(volume);
+    CUDA_CHECK(cudaMemcpy(hostData.data(), tensor.rawPointer(), volume * sizeof(T), cudaMemcpyDeviceToHost));
+    return hostData;
+}
+
+inline std::string formatTensorIndex(trt_edgellm::rt::Coords const& shape, int64_t flatIndex)
+{
+    std::vector<int64_t> coords(static_cast<size_t>(shape.getNumDims()));
+    int64_t residual = flatIndex;
+
+    for (int32_t dim = shape.getNumDims() - 1; dim >= 0; --dim)
+    {
+        int64_t const dimSize = shape[dim];
+        coords[static_cast<size_t>(dim)] = residual % dimSize;
+        residual /= dimSize;
+    }
+
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t dim = 0; dim < coords.size(); ++dim)
+    {
+        if (dim > 0)
+        {
+            oss << ", ";
+        }
+        oss << coords[dim];
+    }
+    oss << "]";
+    return oss.str();
 }

@@ -801,6 +801,10 @@ def _process_eagle3_draft_state_dict(state_dict: dict) -> dict:
     - Keeps 'd2t' key as-is
     - Renames 'midlayer' to 'layers.0'
     - Skips 't2d' key
+    - Remaps self_attn.{q,k,v}_proj to self_attn.qkv_proj.{q,k,v}_proj
+      to match the EdgeLLMQKVProj wrapper introduced in the attention refactor
+    - Remaps self_attn.{q,k,qk}_norm to self_attn.qk_norm.{q,k,qk}_norm
+      to match the EdgeLLMQKNorm wrapper
     - Keeps all other keys unchanged
     
     Args:
@@ -821,7 +825,28 @@ def _process_eagle3_draft_state_dict(state_dict: dict) -> dict:
         else:
             processed_state_dict[key] = value
 
-    return processed_state_dict
+    # Remap QKV projection keys to match EdgeLLMQKVProj wrapper nesting:
+    # self_attn.q_proj -> self_attn.qkv_proj.q_proj (same for k_proj, v_proj)
+    remapped_dict = {}
+    for key, value in processed_state_dict.items():
+        new_key = key
+        for proj in ('q_proj', 'k_proj', 'v_proj'):
+            old_pattern = f'self_attn.{proj}'
+            new_pattern = f'self_attn.qkv_proj.{proj}'
+            if old_pattern in new_key and 'qkv_proj' not in new_key:
+                new_key = new_key.replace(old_pattern, new_pattern)
+                break
+        # Remap QK norm keys to match EdgeLLMQKNorm wrapper nesting:
+        # self_attn.q_norm -> self_attn.qk_norm.q_norm (same for k_norm, qk_norm)
+        for norm in ('q_norm', 'k_norm'):
+            old_pattern = f'self_attn.{norm}'
+            new_pattern = f'self_attn.qk_norm.{norm}'
+            if old_pattern in new_key and 'qk_norm.' not in new_key:
+                new_key = new_key.replace(old_pattern, new_pattern)
+                break
+        remapped_dict[new_key] = value
+
+    return remapped_dict
 
 
 def _load_eagle3_draft_embedding_weights(processed_state_dict: dict,

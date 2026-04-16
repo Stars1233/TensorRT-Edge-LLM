@@ -103,12 +103,8 @@ public:
 
         // Copy results back
         MoeTestResult result;
-        result.weights.resize(numTokens * topk);
-        result.indices.resize(numTokens * topk);
-        CUDA_CHECK(cudaMemcpy(result.weights.data(), topkWeightsDevice.rawPointer(), numTokens * topk * sizeof(float),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(result.indices.data(), topkIndicesDevice.rawPointer(), numTokens * topk * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        result.weights = copyDeviceToHost<float>(topkWeightsDevice);
+        result.indices = copyDeviceToHost<int32_t>(topkIndicesDevice);
 
         // Cleanup
         if (workspace)
@@ -555,8 +551,7 @@ TEST_F(MoeTopkSoftmaxTest, DISABLED_PerformanceBenchmark)
         auto topkWeightsDevice = rt::Tensor({cfg.numTokens, cfg.topk}, rt::DeviceType::kGPU, DataType::kFLOAT);
         auto topkIndicesDevice = rt::Tensor({cfg.numTokens, cfg.topk}, rt::DeviceType::kGPU, DataType::kINT32);
 
-        CUDA_CHECK(cudaMemcpy(gatingOutputDevice.rawPointer(), input.data(),
-            cfg.numTokens * cfg.numExperts * sizeof(float), cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(gatingOutputDevice, input);
 
         size_t workspaceSize = getMoeTopkSoftmaxWorkspaceSize(cfg.numTokens, cfg.numExperts);
         void* workspace = nullptr;

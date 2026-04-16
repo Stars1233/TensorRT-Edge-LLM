@@ -196,23 +196,16 @@ TEST_F(TalkerMLPTest, MLPAccuracy)
         rt::Tensor gpuOutput(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
         rt::Tensor gpuWorkspace(workspaceShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-        CUDA_CHECK(cudaMemcpy(
-            gpuInput.rawPointer(), hostInput.data(), hostInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc1W.rawPointer(), hostFc1W.data(), hostFc1W.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc1B.rawPointer(), hostFc1B.data(), hostFc1B.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc2W.rawPointer(), hostFc2W.data(), hostFc2W.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc2B.rawPointer(), hostFc2B.data(), hostFc2B.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(gpuInput, hostInput);
+        copyHostToDevice(gpuFc1W, hostFc1W);
+        copyHostToDevice(gpuFc1B, hostFc1B);
+        copyHostToDevice(gpuFc2W, hostFc2W);
+        copyHostToDevice(gpuFc2B, hostFc2B);
 
         kernel::invokeTalkerMLP(
             cublasHandle, gpuInput, gpuFc1W, gpuFc1B, gpuFc2W, gpuFc2B, gpuOutput, gpuWorkspace, stream);
 
-        std::vector<half> gpuResult(numTokens * outputDim);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), gpuOutput.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(gpuOutput);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // For large-dim GEMM, allow a small fraction of outliers due to FP16 accumulation differences
@@ -252,18 +245,14 @@ TEST_F(TalkerKernelTest, GatherScatterRoundTrip)
     rt::Tensor gpuGatherOut(gatherShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor gpuScatterOut(scatterShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(
-        gpuSource.rawPointer(), hostSource.data(), hostSource.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        gpuIndices.rawPointer(), hostIndices.data(), hostIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    copyHostToDevice(gpuSource, hostSource);
+    copyHostToDevice(gpuIndices, hostIndices);
     CUDA_CHECK(cudaMemset(gpuScatterOut.rawPointer(), 0, srcTokens * hiddenDim * sizeof(half)));
 
     kernel::invokeGather(gpuSource, gpuIndices, gpuGatherOut, stream);
     kernel::invokeScatter(gpuGatherOut, gpuIndices, gpuScatterOut, stream);
 
-    std::vector<half> scatterResult(srcTokens * hiddenDim);
-    CUDA_CHECK(cudaMemcpy(
-        scatterResult.data(), gpuScatterOut.rawPointer(), scatterResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const scatterResult = copyDeviceToHost<half>(gpuScatterOut);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int32_t idx = 0; idx < numIndices; ++idx)
@@ -303,10 +292,8 @@ static std::vector<float> runTalkerLogitAdjust(std::vector<float> const& hostLog
     kernel::invokeTalkerLogitAdjust(gpuSeen, gpuLogits, suppressStart, suppressEnd, codecEosId,
         static_cast<int32_t>(hostSeenTokens.size()), repetitionPenalty, stream);
 
-    std::vector<float> result(vocabSize);
-    CUDA_CHECK(cudaMemcpy(result.data(), gpuLogits.rawPointer(), vocabSize * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return result;
+    return copyDeviceToHost<float>(gpuLogits);
 }
 
 // Suppression range [suppressStart, suppressEnd) is set to -inf, except codecEosId.
