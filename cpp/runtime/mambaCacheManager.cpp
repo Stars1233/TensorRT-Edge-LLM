@@ -18,6 +18,7 @@
 #include "runtime/mambaCacheManager.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
+#include "kernels/speculative/mtpStateScatterKernels.h"
 
 using namespace nvinfer1;
 
@@ -71,6 +72,62 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
         totalBytes += recurrentBytes + convBytes;
     }
 
+    // Allocate MTP intermediate state buffers when enabled (maxIntermediateSeqLen > 0).
+    if (mConfig.maxIntermediateSeqLen > 0)
+    {
+        mIntermediateRecurrentStates.reserve(mConfig.numRecurrentLayers);
+        mIntermediateConvStates.reserve(mConfig.numRecurrentLayers);
+
+        for (int32_t i = 0; i < mConfig.numRecurrentLayers; ++i)
+        {
+            int64_t const intermRecVolume = static_cast<int64_t>(mConfig.maxBatchSize) * mConfig.maxIntermediateSeqLen
+                * mConfig.recurrentStateNumHeads * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
+            size_t const intermRecBytes = static_cast<size_t>(intermRecVolume) * recurrentElemSize;
+
+            mIntermediateRecurrentStates.emplace_back(
+                rt::Tensor({mConfig.maxBatchSize, mConfig.maxIntermediateSeqLen, mConfig.recurrentStateNumHeads,
+                               mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize},
+                    DeviceType::kGPU, mConfig.recurrentStateType,
+                    "MambaCacheManager::intermediateRecurrentState_" + std::to_string(i)));
+            CUDA_CHECK(cudaMemsetAsync(mIntermediateRecurrentStates.back().rawPointer(), 0, intermRecBytes, stream));
+
+            int64_t const intermConvVolume = static_cast<int64_t>(mConfig.maxBatchSize) * mConfig.maxIntermediateSeqLen
+                * mConfig.convDim * mConfig.convKernel;
+            size_t const intermConvBytes = static_cast<size_t>(intermConvVolume) * convElemSize;
+
+            mIntermediateConvStates.emplace_back(
+                rt::Tensor({mConfig.maxBatchSize, mConfig.maxIntermediateSeqLen, mConfig.convDim, mConfig.convKernel},
+                    DeviceType::kGPU, mConfig.convStateType,
+                    "MambaCacheManager::intermediateConvState_" + std::to_string(i)));
+            CUDA_CHECK(cudaMemsetAsync(mIntermediateConvStates.back().rawPointer(), 0, intermConvBytes, stream));
+
+            totalBytes += intermRecBytes + intermConvBytes;
+        }
+
+        // Build the MtpLayerInfo array for batched MTP scatter; pointers are stable, so
+        // upload runs once.
+        std::vector<kernel::MtpLayerInfo> hostInfos(mConfig.numRecurrentLayers);
+        for (int32_t i = 0; i < mConfig.numRecurrentLayers; ++i)
+        {
+            hostInfos[i] = {
+                mRecurrentStates[i].rawPointer(),
+                mIntermediateRecurrentStates[i].rawPointer(),
+                mConvStates[i].rawPointer(),
+                mIntermediateConvStates[i].rawPointer(),
+            };
+        }
+        size_t const infoBytes = hostInfos.size() * sizeof(kernel::MtpLayerInfo);
+        mDeviceMtpLayerInfos = rt::Tensor(
+            {static_cast<int64_t>(infoBytes)}, DeviceType::kGPU, DataType::kINT8, "MambaCacheManager::mtpLayerInfos");
+        CUDA_CHECK(cudaMemcpyAsync(
+            mDeviceMtpLayerInfos.rawPointer(), hostInfos.data(), infoBytes, cudaMemcpyHostToDevice, stream));
+        // Sync before hostInfos goes out of scope.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        LOG_INFO("MambaCacheManager: allocated MTP intermediate state buffers (%d layers, maxSeqLen=%d)",
+            mConfig.numRecurrentLayers, mConfig.maxIntermediateSeqLen);
+    }
+
     LOG_DEBUG("MambaCacheManager(layers=%d) allocated %.2f MB total GPU memory", mConfig.numRecurrentLayers,
         static_cast<float>(totalBytes) / (1024.0f * 1024.0f));
 }
@@ -82,6 +139,9 @@ MambaCacheManager::MambaCacheManager(MambaCacheManager&& other) noexcept
     mConfig = std::move(other.mConfig);
     mRecurrentStates = std::move(other.mRecurrentStates);
     mConvStates = std::move(other.mConvStates);
+    mIntermediateRecurrentStates = std::move(other.mIntermediateRecurrentStates);
+    mIntermediateConvStates = std::move(other.mIntermediateConvStates);
+    mDeviceMtpLayerInfos = std::move(other.mDeviceMtpLayerInfos);
 
     other.mConfig = Config{};
 }
@@ -93,6 +153,9 @@ MambaCacheManager& MambaCacheManager::operator=(MambaCacheManager&& other) noexc
         mConfig = std::move(other.mConfig);
         mRecurrentStates = std::move(other.mRecurrentStates);
         mConvStates = std::move(other.mConvStates);
+        mIntermediateRecurrentStates = std::move(other.mIntermediateRecurrentStates);
+        mIntermediateConvStates = std::move(other.mIntermediateConvStates);
+        mDeviceMtpLayerInfos = std::move(other.mDeviceMtpLayerInfos);
 
         other.mConfig = Config{};
     }
@@ -171,6 +234,42 @@ std::vector<rt::Tensor> MambaCacheManager::captureConvStates(int32_t batchIdx, c
     return result;
 }
 
+void MambaCacheManager::reshapeIntermediateStates(int32_t activeBatchSize, int32_t seqLen)
+{
+    if (mIntermediateRecurrentStates.empty())
+    {
+        return;
+    }
+    for (int32_t i = 0; i < mConfig.numRecurrentLayers; ++i)
+    {
+        check::check(mIntermediateRecurrentStates[i].reshape({activeBatchSize, seqLen, mConfig.recurrentStateNumHeads,
+                         mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize}),
+            "Intermediate recurrent state reshape failed");
+        check::check(mIntermediateConvStates[i].reshape({activeBatchSize, seqLen, mConfig.convDim, mConfig.convKernel}),
+            "Intermediate conv state reshape failed");
+    }
+}
+
+rt::Tensor& MambaCacheManager::getIntermediateRecurrentState(int32_t recurrentLayerIdx) noexcept
+{
+    return mIntermediateRecurrentStates[recurrentLayerIdx];
+}
+
+rt::Tensor& MambaCacheManager::getIntermediateConvState(int32_t recurrentLayerIdx) noexcept
+{
+    return mIntermediateConvStates[recurrentLayerIdx];
+}
+
+bool MambaCacheManager::hasIntermediateRecurrentStates() const noexcept
+{
+    return !mIntermediateRecurrentStates.empty();
+}
+
+bool MambaCacheManager::hasIntermediateConvStates() const noexcept
+{
+    return !mIntermediateConvStates.empty();
+}
+
 int32_t MambaCacheManager::numLayers() const noexcept
 {
     return mConfig.numRecurrentLayers;
@@ -179,6 +278,27 @@ int32_t MambaCacheManager::numLayers() const noexcept
 MambaCacheManager::Config const& MambaCacheManager::getConfig() const noexcept
 {
     return mConfig;
+}
+
+void MambaCacheManager::scatterMtpStates(rt::Tensor const& acceptLengths, cudaStream_t stream)
+{
+    if (mIntermediateRecurrentStates.empty())
+    {
+        return;
+    }
+
+    int32_t const verifyTreeSize = static_cast<int32_t>(mIntermediateRecurrentStates[0].getShape()[1]);
+    int32_t const recElements
+        = mConfig.recurrentStateNumHeads * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
+    int32_t const convElements = mConfig.convDim * mConfig.convKernel;
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptLengths.getShape()[0]);
+    auto const* const layerInfos = static_cast<kernel::MtpLayerInfo const*>(mDeviceMtpLayerInfos.rawPointer());
+    int32_t const* const acceptPtr = acceptLengths.dataPointer<int32_t>();
+
+    kernel::mtpScatterRecurrentStates(
+        layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize, recElements, acceptPtr, stream);
+    kernel::mtpScatterConvStates(
+        layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize, convElements, acceptPtr, stream);
 }
 
 } // namespace rt

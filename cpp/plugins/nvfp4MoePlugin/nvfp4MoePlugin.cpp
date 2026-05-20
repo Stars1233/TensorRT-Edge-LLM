@@ -669,10 +669,7 @@ IPluginV3* Nvfp4MoePlugin::attachToContext(IPluginResourceContext* context) noex
         auto allocI32 = [alloc](int64_t count) -> rt::Tensor {
             uint64_t const bytes = static_cast<uint64_t>(count) * sizeof(int32_t);
             void* ptr = alloc->allocate(bytes, /*alignment=*/256, /*flags=*/AllocatorFlags{0});
-            if (ptr == nullptr)
-            {
-                throw std::runtime_error("Nvfp4MoePlugin::attachToContext: IGpuAllocator->allocate returned null");
-            }
+            ELLM_CHECK(ptr != nullptr, "Nvfp4MoePlugin::attachToContext: IGpuAllocator->allocate returned null");
             return rt::Tensor(ptr, rt::Coords{count}, rt::DeviceType::kGPU, DataType::kINT32);
         };
 
@@ -687,10 +684,7 @@ IPluginV3* Nvfp4MoePlugin::attachToContext(IPluginResourceContext* context) noex
         auto allocFP32 = [alloc](int64_t count) -> rt::Tensor {
             uint64_t const bytes = static_cast<uint64_t>(count) * sizeof(float);
             void* ptr = alloc->allocate(bytes, /*alignment=*/256, /*flags=*/AllocatorFlags{0});
-            if (ptr == nullptr)
-            {
-                throw std::runtime_error("Nvfp4MoePlugin::attachToContext: IGpuAllocator->allocate returned null");
-            }
+            ELLM_CHECK(ptr != nullptr, "Nvfp4MoePlugin::attachToContext: IGpuAllocator->allocate returned null");
             return rt::Tensor(ptr, rt::Coords{count}, rt::DeviceType::kGPU, DataType::kFLOAT);
         };
         cloned->mFC1Alpha = allocFP32(static_cast<int64_t>(cloned->mNumExperts));

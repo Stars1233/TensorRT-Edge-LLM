@@ -631,6 +631,85 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Blackwell DC small-tile variants (tile=64x128 cluster=(1,2)) for M <= 512.
+  list(FIND _variants "gemm_blackwell_small_fp16" _gemm_blackwell_small_idx)
+  if(NOT ${_gemm_blackwell_small_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_small_fp16 — CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_small_bias_silu_fp16"
+       _gemm_blackwell_small_bias_silu_idx)
+  if(NOT ${_gemm_blackwell_small_bias_silu_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_small_bias_silu_fp16 — CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_small_bias_fp16"
+       _gemm_blackwell_small_bias_idx)
+  if(NOT ${_gemm_blackwell_small_bias_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_small_bias_fp16 — CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED set"
+    )
+  endif()
+
+  # Blackwell DC 2-CTA variants (tile=256x256 cluster=(2,1) use_2cta=True) for
+  # low-SM-count GPUs (Thor) at M >= 256.
+  list(FIND _variants "gemm_blackwell_2cta_fp16" _gemm_blackwell_2cta_idx)
+  if(NOT ${_gemm_blackwell_2cta_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_2cta_fp16 — CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_2cta_bias_silu_fp16"
+       _gemm_blackwell_2cta_bias_silu_idx)
+  if(NOT ${_gemm_blackwell_2cta_bias_silu_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_2cta_bias_silu_fp16 — CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_2cta_bias_fp16"
+       _gemm_blackwell_2cta_bias_idx)
+  if(NOT ${_gemm_blackwell_2cta_bias_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_2cta_bias_fp16 — CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED set"
+    )
+  endif()
+
   # BW GeForce fused epilogue variants
   list(FIND _variants "gemm_bw_geforce_bias_silu_fp16"
        _gemm_bw_geforce_bias_silu_idx)

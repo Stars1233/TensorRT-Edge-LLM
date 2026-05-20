@@ -31,6 +31,9 @@ from docutils import nodes
 sys.path.insert(0, str(Path(__file__).parent))  # For importing helper module
 sys.path.insert(0, str(
     Path(__file__).parent.parent.parent))  # For importing tensorrt_edgellm
+sys.path.insert(
+    0, str(Path(__file__).parent.parent.parent /
+           "experimental"))  # For importing llm_loader as a top-level package
 
 # Import helper functions for auto-generating API documentation
 from helper import generate_module_rst_files, generate_python_api_rst
@@ -55,18 +58,28 @@ except Exception:
 last_updated = datetime.datetime.now(
     datetime.timezone.utc).strftime("%B %d, %Y")
 
-# Get the version from the version.py file
-try:
+
+# Get the version from the checkpoint-based loader first, with a fallback for
+# release branches that still keep the legacy package as the canonical source.
+def _load_version(relative_path, module_name):
     version_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     "../../tensorrt_edgellm/version.py"))
-    spec = importlib.util.spec_from_file_location("version_module",
-                                                  version_path)
+        os.path.join(os.path.dirname(__file__), relative_path))
+    spec = importlib.util.spec_from_file_location(module_name, version_path)
     version_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(version_module)
-    version = version_module.__version__
-except Exception:
-    version = "0.0.1"
+    return version_module.__version__
+
+
+version = "0.0.1"
+for version_file, module_name in (
+    ("../../experimental/llm_loader/_version.py", "llm_loader_version"),
+    ("../../tensorrt_edgellm/version.py", "legacy_version"),
+):
+    try:
+        version = _load_version(version_file, module_name)
+        break
+    except Exception:
+        pass
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration

@@ -38,76 +38,8 @@ from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoTokenizer)
 
 from ..quantization_configs import build_quant_config
-
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
-
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x):
-        variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x.to(self.weight.dtype)
-
-
-class SwiGLUMLP(nn.Module):
-    """SwiGLU MLP: down_proj(silu(gate_proj(x)) * up_proj(x))."""
-
-    def __init__(self, hidden_size, intermediate_size):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def forward(self, x):
-        return self.down_proj(
-            nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-def _rotate_half(x):
-    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb(q, k, cos, sin):
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _repeat_kv(x, n_rep):
-    if n_rep == 1:
-        return x
-    B, H, L, D = x.shape
-    return x[:, :, None, :, :].expand(B, H, n_rep, L,
-                                      D).reshape(B, H * n_rep, L, D)
-
-
-class RotaryEmbedding(nn.Module):
-    """Rotary position embedding."""
-
-    def __init__(self, dim, max_position=2048, base=10000.0):
-        super().__init__()
-        inv_freq = 1.0 / (base**(torch.arange(0, dim, 2, dtype=torch.float32) /
-                                 dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.max_position = max_position
-
-    @torch.no_grad()
-    def forward(self, x, position_ids):
-        # x: [B, L, D] — only used for device/dtype
-        # position_ids: [B, L]
-        inv_freq = self.inv_freq.float()[None, :, None].to(x.device)
-        pos = position_ids[:, None, :].float()
-        freqs = (inv_freq @ pos).transpose(1, 2)  # [B, L, D//2]
-        emb = torch.cat((freqs, freqs), dim=-1)  # [B, L, D]
-        cos = emb.cos()[:, None, :, :]  # [B, 1, L, D]
-        sin = emb.sin()[:, None, :, :]
-        return cos.to(x.dtype), sin.to(x.dtype)
+from .layers import (RMSNorm, RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb,
+                     repeat_kv)
 
 
 class Eagle3DraftAttention(nn.Module):
@@ -134,9 +66,9 @@ class Eagle3DraftAttention(nn.Module):
         k = k.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
-        k = _repeat_kv(k, self.kv_groups)
-        v = _repeat_kv(v, self.kv_groups)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        k = repeat_kv(k, self.kv_groups)
+        v = repeat_kv(v, self.kv_groups)
 
         w = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
         if L > 1:

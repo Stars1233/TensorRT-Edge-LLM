@@ -19,6 +19,7 @@
 #include "checkMacros.h"
 #include "cudaUtils.h"
 #include <optional>
+#include <string_view>
 
 namespace trt_edgellm
 {
@@ -95,6 +96,20 @@ std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profile
            << ", MAX=" << dimsToString(maxDims) << "\n";
     }
     return ss.str();
+}
+
+bool engineHasOutputTensor(nvinfer1::ICudaEngine const* engine, char const* tensorName) noexcept
+{
+    int32_t const nbIO = engine->getNbIOTensors();
+    for (int32_t i = 0; i < nbIO; ++i)
+    {
+        char const* const name = engine->getIOTensorName(i);
+        if (std::string_view{name} == tensorName && engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kOUTPUT)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace trt_edgellm

@@ -2,16 +2,16 @@
     "model_path": "Qwen3-ASR",
     "roles": {
       "system": {
-        "prefix": "",
-        "suffix": "\n"
+        "prefix": "<|im_start|>system\n",
+        "suffix": "<|im_end|>\n"
       },
       "user": {
-        "prefix": "User: ",
-        "suffix": "\n"
+        "prefix": "<|im_start|>user\n",
+        "suffix": "<|im_end|>\n"
       },
       "assistant": {
-        "prefix": "Assistant: ",
-        "suffix": "\n"
+        "prefix": "",
+        "suffix": ""
       }
     },
     "content_types": {
@@ -25,6 +25,6 @@
         "format": "<|video_pad|>"
       }
     },
-    "generation_prompt": "Assistant: ",
+    "generation_prompt": "<|im_start|>assistant\n",
     "default_system_prompt": ""
 }

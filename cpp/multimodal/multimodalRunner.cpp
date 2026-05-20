@@ -16,6 +16,7 @@
  */
 
 #include "multimodalRunner.h"
+#include "common/checkMacros.h"
 #include "common/mmapReader.h"
 #include "multimodal/audioRunner.h"
 #include "multimodal/internViTRunner.h"
@@ -55,10 +56,8 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     // Device memory must be provided via setContextMemory() before infer().
     mVisualContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mVisualEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    if (!mVisualContext->setOptimizationProfileAsync(0, stream))
-    {
-        throw std::runtime_error("Failed to set optimization profile for visual engine");
-    }
+    bool const profileSet = mVisualContext->setOptimizationProfileAsync(0, stream);
+    ELLM_CHECK(profileSet, "Failed to set optimization profile for visual engine");
 
     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
     {
@@ -103,10 +102,7 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     // Read config.json to determine model type
     std::string configPath = multimodalEngineDir + "/config.json";
     std::ifstream configFileStream(configPath);
-    if (!configFileStream.is_open())
-    {
-        throw std::runtime_error("Failed to open config file: " + configPath);
-    }
+    ELLM_CHECK(configFileStream.is_open(), "Failed to open config file: " + configPath);
 
     nlohmann::json jsonConfig;
     try

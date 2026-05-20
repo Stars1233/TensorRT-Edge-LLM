@@ -28,6 +28,7 @@
 
 // CuTe DSL FMHA kernel (Blackwell SM100+)
 #ifdef CUTE_DSL_FMHA_ENABLED
+#include "common/checkMacros.h"
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
 
@@ -198,12 +199,10 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
     , mSlidingWindowSize(slidingWindowSize)
 {
-    if (mEnableFp8KVCache && mQkvScales.size() != 3)
-    {
-        throw std::runtime_error("FP8 KV cache enabled but qkv_scales has "
+    ELLM_CHECK(!mEnableFp8KVCache || mQkvScales.size() == 3,
+        "FP8 KV cache enabled but qkv_scales has "
             + std::to_string(mQkvScales.size()) + " elements (expected 3). "
             "Re-export the model to include QKV scales [q, k, v].");
-    }
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -256,12 +255,9 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
         {
             deserializeValue(&data, &length, &qkvScaleCount);
         }
-        if (!hasHeader || qkvScaleCount != 3 || length < 3 * sizeof(float))
-        {
-            throw std::runtime_error(
-                "FP8 KV cache enabled but qkv_scales missing or incomplete "
-                "in serialized data (expected 3). Re-export the model with QKV scales [q, k, v].");
-        }
+        ELLM_CHECK(hasHeader && qkvScaleCount == 3 && length >= 3 * sizeof(float),
+            "FP8 KV cache enabled but qkv_scales missing or incomplete "
+            "in serialized data (expected 3). Re-export the model with QKV scales [q, k, v].");
         for (int32_t i = 0; i < 3; ++i)
         {
             deserializeValue(&data, &length, &mQkvScales[i]);

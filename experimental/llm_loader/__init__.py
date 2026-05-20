@@ -40,12 +40,20 @@ from .model import AutoModel, register_model
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
 from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
 from .models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeCausalLM
+from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
 from .onnx.export import export_onnx
 
 register_model("nemotron_h", NemotronHCausalLM)
 register_model("qwen3_5_text", Qwen3_5CausalLM)
 register_model("qwen3_moe", Qwen3MoeCausalLM)
 register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM)
+register_model("NemotronH_Nano_Omni_Reasoning_V3", NemotronHCausalLM)
+# Qwen3-Omni thinker needs an extra ``hidden_states`` ONNX output for the
+# Talker handoff. Cover every model_type string that can appear in the
+# thinker's config.json across HF / exported variants.
+register_model("qwen3_omni", Qwen3OmniLanguageModel)
+register_model("qwen3_omni_thinker", Qwen3OmniLanguageModel)
+register_model("qwen3_omni_text", Qwen3OmniLanguageModel)
 
 __all__ = [
     "__version__",

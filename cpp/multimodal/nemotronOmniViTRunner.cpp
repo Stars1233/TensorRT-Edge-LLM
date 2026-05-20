@@ -35,14 +35,10 @@ namespace rt
 NemotronOmniViTRunner::NemotronOmniViTRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner(engineDir, stream)
 {
-    if (!validateAndFillConfig(engineDir))
-    {
-        throw std::runtime_error("NemotronOmniViTRunner: Failed to validate and fill config");
-    }
-    if (!allocateBuffer(stream))
-    {
-        throw std::runtime_error("NemotronOmniViTRunner: Failed to allocate buffer");
-    }
+    bool const configValid = validateAndFillConfig(engineDir);
+    ELLM_CHECK(configValid, "NemotronOmniViTRunner: Failed to validate and fill config");
+    bool const bufferAllocated = allocateBuffer(stream);
+    ELLM_CHECK(bufferAllocated, "NemotronOmniViTRunner: Failed to allocate buffer");
 }
 
 bool NemotronOmniViTRunner::validateAndFillConfig(std::string const& engineDir)
@@ -207,28 +203,20 @@ void NemotronOmniViTRunner::formatPatch(rt::imageUtils::ImageData const& image, 
     int64_t channels = image.channels;
     unsigned char* imageData = image.data(); // In hwc order
 
-    if (channels != mConfig.numChannels)
-    {
-        throw std::runtime_error("Image channels mismatch, got " + std::to_string(channels) + ", expected "
+    ELLM_CHECK(channels == mConfig.numChannels,
+        "Image channels mismatch, got " + std::to_string(channels) + ", expected "
             + std::to_string(mConfig.numChannels));
-    }
-    if (height % mConfig.blockImageSizeH != 0 || width % mConfig.blockImageSizeW != 0)
-    {
-        throw std::runtime_error(
-            "Image height or width is not divisible by blockImageSizeH or blockImageSizeW, "
-            "got height: "
+    ELLM_CHECK(height % mConfig.blockImageSizeH == 0 && width % mConfig.blockImageSizeW == 0,
+        "Image height or width is not divisible by blockImageSizeH or blockImageSizeW, "
+        "got height: "
             + std::to_string(height) + ", width: " + std::to_string(width)
             + ", blockImageSizeH: " + std::to_string(mConfig.blockImageSizeH)
             + ", blockImageSizeW: " + std::to_string(mConfig.blockImageSizeW));
-    }
 
     int64_t curNumBlocks = (height / mConfig.blockImageSizeH) * (width / mConfig.blockImageSizeW);
-    if (totalNumBlocks + curNumBlocks > mConfig.maxNumBlocks)
-    {
-        throw std::runtime_error("totalNumBlocks " + std::to_string(totalNumBlocks) + " + curNumBlocks "
-            + std::to_string(curNumBlocks) + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
-            + " of VIT engine.");
-    }
+    ELLM_CHECK(totalNumBlocks + curNumBlocks <= mConfig.maxNumBlocks,
+        "totalNumBlocks " + std::to_string(totalNumBlocks) + " + curNumBlocks " + std::to_string(curNumBlocks)
+            + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks) + " of VIT engine.");
 
     int64_t curTokenLength = curNumBlocks * mConfig.tokensPerBlock;
     if (isThumbnail)
@@ -313,12 +301,10 @@ void NemotronOmniViTRunner::imagePreprocess(rt::LLMGenerationRequest const& requ
         return;
     }
 
-    if (mTotalNumBlocks < mConfig.minNumBlocks || mTotalNumBlocks > mConfig.maxNumBlocks)
-    {
-        throw std::runtime_error("totalNumBlocks " + std::to_string(mTotalNumBlocks)
+    ELLM_CHECK(mTotalNumBlocks >= mConfig.minNumBlocks && mTotalNumBlocks <= mConfig.maxNumBlocks,
+        "totalNumBlocks " + std::to_string(mTotalNumBlocks)
             + " exceeds the limitation, max = " + std::to_string(mConfig.maxNumBlocks)
             + ", min = " + std::to_string(mConfig.minNumBlocks) + " of VIT engine.");
-    }
 
     // Calculate total image tokens for profiling
     int64_t const totalImageTokens = mTotalNumBlocks * mConfig.tokensPerBlock;

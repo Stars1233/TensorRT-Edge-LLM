@@ -24,3 +24,4 @@ VALID_LLM_PRECISIONS = [
 ]
 VALID_LM_HEAD_PRECISIONS = ['fp16', 'fp8', 'int4_awq', 'nvfp4', 'mxfp8']
 VALID_VISUAL_PRECISIONS = ['fp16', 'fp8']
+VALID_AUDIO_PRECISIONS = ['fp16', 'fp8']

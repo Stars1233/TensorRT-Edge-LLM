@@ -70,7 +70,16 @@ class GemmBlackwellFP16:
     """Blackwell SM100 dense GEMM: C[M,N] = A[M,K] @ B[N,K]^T.
 
     FP16 inputs/outputs with FP32 accumulation via tcgen05.mma (UMMA).
-    Single-CTA (use_2cta_instrs=False), no TMA store, cluster (1,1).
+    TMA store epilogue (cp.bulk.tensor.s2g) with auto box-bounds.
+
+    Configurable per construction:
+      mma_tiler_mn:     per-CTA tile (default (64, 128); use (128, 128) for
+                        large M >= 1024)
+      cluster_shape_mn: cluster size for TMA multicast (default (1, 2)
+                        multicasts B across two CTAs in N)
+      use_2cta:         pair two CTAs along M for a 2x M tile per UMMA op
+                        (requires cluster[0] >= 2; not used by current AOT)
+      mma_inst_tile_k:  K-tile multiplier per MMA instruction (default 4)
 
     Designed for the Qwen3-Omni Talker MLP where M is the token count
     (dynamic) and N, K are weight dimensions (also dynamic for AOT).
@@ -79,17 +88,28 @@ class GemmBlackwellFP16:
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
-        mma_tiler_mn: Tuple[int, int] = (128, 128),
-        cluster_shape_mn: Tuple[int, int] = (1, 1),
+        mma_tiler_mn: Tuple[int, int] = (64, 128),
+        cluster_shape_mn: Tuple[int, int] = (1, 2),
+        use_2cta: bool = False,
+        mma_inst_tile_k: int = 4,
     ):
         self.acc_dtype = acc_dtype
-        self.use_2cta_instrs = False
+        # 2-CTA MMA pairs two CTAs along the M dim and issues a single
+        # tcgen05.mma instruction that covers a 2x larger M tile per cta_group.
+        # Requires cluster_shape[0] >= 2 so the leader CTA can drive the peer.
+        self.use_2cta_instrs = use_2cta
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.use_tma_store = False
+        # K-tile multiplier per MMA instruction K-shape. Larger -> more K
+        # accumulated per MMA op (longer K iter span, fewer pipeline syncs).
+        self.mma_inst_tile_k = mma_inst_tile_k
+        # TMA store: TMEM -> regs -> SMEM -> gmem via cp.bulk.tensor.s2g.
+        # The TMA descriptor handles partial-tile boundaries automatically,
+        # so no manual M/N predication is needed in the epilogue.
+        self.use_tma_store = True
 
-        self.cta_group = tcgen05.CtaGroup.ONE
+        self.cta_group = tcgen05.CtaGroup.TWO if use_2cta else tcgen05.CtaGroup.ONE
         self.occupancy = 1
         self.threads_per_cta = 128
 
@@ -104,11 +124,10 @@ class GemmBlackwellFP16:
         )
 
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        mma_inst_tile_k = 4
         self.mma_tiler = (
             self.mma_tiler[0],
             self.mma_tiler[1],
-            mma_inst_shape_k * mma_inst_tile_k,
+            mma_inst_shape_k * self.mma_inst_tile_k,
         )
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
@@ -126,7 +145,15 @@ class GemmBlackwellFP16:
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        self.epi_tile = self.cta_tile_shape_mnk[:2]
+        if cutlass.const_expr(self.use_tma_store):
+            self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
+                self.cta_tile_shape_mnk,
+                self.use_2cta_instrs,
+                self.c_layout,
+                self.c_dtype,
+            )
+        else:
+            self.epi_tile = self.cta_tile_shape_mnk[:2]
 
         # cuTe DSL 4.4.1 does not reliably auto-detect Thor's Blackwell family
         # SMs (e.g. SM101/SM110) in get_smem_capacity_in_bytes(). Like the FMHA
@@ -152,7 +179,12 @@ class GemmBlackwellFP16:
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma, self.mma_tiler, self.b_dtype, self.num_ab_stage,
         )
-        self.c_smem_layout_staged = None
+        self.c_smem_layout_staged = (
+            sm100_utils.make_smem_layout_epi(
+                self.c_dtype, self.c_layout, self.epi_tile, self.num_c_stage,
+            )
+            if self.use_tma_store else None
+        )
 
         self.num_tmem_alloc_cols = self._compute_num_tmem_alloc_cols(
             tiled_mma, self.mma_tiler
@@ -214,20 +246,32 @@ class GemmBlackwellFP16:
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
+        # TMA store atom for C
+        tma_atom_c = None
+        tma_tensor_c = None
+        if cutlass.const_expr(self.use_tma_store):
+            epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
+            tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                c,
+                epi_smem_layout,
+                self.epi_tile,
+            )
+
         grid = self._compute_grid(c, self.cta_tile_shape_mnk, self.cluster_shape_mn)
 
         self.kernel(
             tiled_mma,
             tma_atom_a, tma_tensor_a,
             tma_atom_b, tma_tensor_b,
-            None, c,
+            tma_atom_c, tma_tensor_c if self.use_tma_store else c,
+            mBias,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
             use_silu,
-            mBias,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -246,13 +290,13 @@ class GemmBlackwellFP16:
         mB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
+        mBias: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         use_silu: cutlass.Constexpr,
-        mBias: cute.Tensor = None,
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -260,6 +304,8 @@ class GemmBlackwellFP16:
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
+            if cutlass.const_expr(self.use_tma_store):
+                cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -339,6 +385,15 @@ class GemmBlackwellFP16:
 
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
+        # SMEM tensors. sC is only allocated for TMA store (R2S staging).
+        sC = None
+        if cutlass.const_expr(self.use_tma_store):
+            sC = smem.allocate_tensor(
+                element_type=self.c_dtype,
+                layout=c_smem_layout_staged.outer,
+                byte_alignment=128,
+                swizzle=c_smem_layout_staged.inner,
+            )
         sA = smem.allocate_tensor(
             element_type=self.a_dtype,
             layout=a_smem_layout_staged.outer,
@@ -380,6 +435,14 @@ class GemmBlackwellFP16:
         tCgA = thr_mma.partition_A(gA_mkl)
         tCgB = thr_mma.partition_B(gB_nkl)
         tCgC = thr_mma.partition_C(gC_mnl)
+
+        # Identity tensor mirroring tCgC so the epilogue can derive per-element
+        # absolute (M, N) coordinates that physically align with tCgC.
+        mcC_id = cute.make_identity_tensor(mC_mnl.layout.shape)
+        gC_id_mnl = cute.local_tile(
+            mcC_id, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+        )
+        tCcC = thr_mma.partition_C(gC_id_mnl)
 
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -483,14 +546,26 @@ class GemmBlackwellFP16:
                 if k_tile_idx + 1 < k_tile_cnt and is_leader_cta:
                     peek_ab_full_status = ab_consumer.try_wait()
 
-                if is_leader_cta:
-                    acc_pipeline.producer_commit(acc_producer_state)
+            # Commit accumulator buffer full ONCE after all k-tiles are MMA'd.
+            # Committing inside the loop would let the consumer wake on a
+            # partial K accumulation and read garbage from TMEM.
+            if is_leader_cta:
+                acc_pipeline.producer_commit(acc_producer_state)
 
-        # ---- Epilogue: TMEM -> registers -> GMEM (no TMA store) ----
+        # ---- Epilogue: TMEM -> registers (-> SMEM -> gmem via TMA) ----
         tmem.relinquish_alloc_permit()
         acc_pipeline.consumer_wait(acc_consumer_state)
 
-        self.epilogue(tidx, mma_tile_coord_mnl, tCtAcc, tCgC, mC_mnl, epi_tile, mBias, use_silu)
+        if cutlass.const_expr(self.use_tma_store):
+            self.epilogue_tma_store(
+                tidx, warp_idx, mma_tile_coord_mnl, tma_atom_c,
+                tCtAcc, sC, tCgC, tCcC, mC_mnl, epi_tile, mBias, use_silu,
+            )
+        else:
+            self.epilogue(
+                tidx, mma_tile_coord_mnl, tCtAcc, tCgC, tCcC,
+                mC_mnl, epi_tile, mBias, use_silu,
+            )
 
         pipeline.sync(barrier_id=1)
         tmem.free(tmem_ptr)
@@ -500,12 +575,151 @@ class GemmBlackwellFP16:
         return
 
     @cute.jit
+    def epilogue_tma_store(
+        self,
+        epi_tidx: cutlass.Int32,
+        warp_idx: cutlass.Int32,
+        mma_tile_coord_mnl: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        tma_atom_c: cute.CopyAtom,
+        tCtAcc: cute.Tensor,
+        sC: cute.Tensor,
+        tCgC: cute.Tensor,
+        tCcC: cute.Tensor,
+        mC_mnl: cute.Tensor,
+        epi_tile: cute.Tile,
+        mBias: cute.Tensor,
+        use_silu: cutlass.Constexpr,
+    ) -> None:
+        """TMA-store epilogue: TMEM -> regs -> SMEM -> gmem via cp.bulk.tensor.
+
+        Adapted from cutlass/examples/python/CuTeDSL/blackwell/dense_gemm.py
+        with the bias-add and SiLU activation hooks added in the register
+        stage (between T2R and R2S).
+        """
+        # T2R: TMEM -> registers (per-thread fragment).
+        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+            self.cta_tile_shape_mnk, self.c_layout, self.c_dtype, self.acc_dtype,
+            epi_tile, self.use_2cta_instrs,
+        )
+        tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(
+            copy_atom_t2r, tAcc_epi[(None, None, 0, 0)]
+        )
+        thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tidx)
+        tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+
+        # tCgC partition for absolute coords (used for bias N indexing).
+        tCgC_epi = cute.flat_divide(
+            tCgC[((None, None), 0, 0, None, None, None)], epi_tile
+        )
+        tTR_gC = thr_copy_t2r.partition_D(tCgC_epi)
+        tTR_rAcc = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+        )
+        tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+
+        # Mirror tCgC's partition path on the identity coord tensor so we can
+        # gate bias loads by the absolute N coord.
+        tCcC_epi = cute.flat_divide(
+            tCcC[((None, None), 0, 0, None, None, None)], epi_tile
+        )
+        tTR_cC = thr_copy_t2r.partition_D(tCcC_epi)
+        tTR_cC = tTR_cC[(None, None, None, None, None, *mma_tile_coord_mnl)]
+        tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+
+        actual_N = mC_mnl.layout.shape[1]
+
+        # Bias broadcast tile (gmem). Same construction as the simt path.
+        if cutlass.const_expr(mBias is not None):
+            n_tile_offset = mma_tile_coord_mnl[1] * cutlass.Int32(self.mma_tiler[1])
+            gBias_tile = cute.make_tensor(
+                mBias.iterator + n_tile_offset,
+                cute.make_layout(
+                    (self.mma_tiler[0], self.mma_tiler[1]), stride=(0, 1)
+                ),
+            )
+            tCgBias_epi = cute.flat_divide(gBias_tile, epi_tile)
+            tTR_gBias = thr_copy_t2r.partition_D(tCgBias_epi)
+            tTR_gBias = cute.group_modes(tTR_gBias, 3, cute.rank(tTR_gBias))
+
+        # R2S: registers -> SMEM (staging buffer for TMA store).
+        copy_atom_r2s = sm100_utils.get_smem_store_op(
+            self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
+        )
+        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
+        thr_copy_r2s = tiled_copy_r2s.get_slice(epi_tidx)
+        tRS_sC = thr_copy_r2s.partition_D(sC)
+        tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+
+        # TMA store partition: SMEM -> gmem. The TMA descriptor itself
+        # handles partial-tile boundaries — no manual M/N predication needed.
+        bSG_sC, bSG_gC = cpasync.tma_partition(
+            tma_atom_c,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sC, 0, 2),
+            cute.group_modes(tCgC_epi, 0, 2),
+        )
+        bSG_gC = bSG_gC[(None, None, None, *mma_tile_coord_mnl)]
+        bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+
+        c_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, self.threads_per_cta
+        )
+        c_pipeline = pipeline.PipelineTmaStore.create(
+            num_stages=self.num_c_stage, producer_group=c_producer_group
+        )
+
+        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+        for subtile_idx in cutlass.range(subtile_cnt):
+            tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+            coord_slice = tTR_cC[(None, None, None, subtile_idx)]
+
+            # Bias add (broadcast over M, indexed by N), gated by actual_N.
+            if cutlass.const_expr(mBias is not None):
+                bias_slice = tTR_gBias[(None, None, None, subtile_idx)]
+                for i in cutlass.range(cute.size(tTR_rAcc)):
+                    if coord_slice[i][1] < actual_N:
+                        tTR_rAcc[i] = tTR_rAcc[i] + bias_slice[i].to(self.acc_dtype)
+            if cutlass.const_expr(use_silu):
+                for si in cutlass.range(cute.size(tTR_rAcc)):
+                    val = tTR_rAcc[si]
+                    tTR_rAcc[si] = val * cute.arch.rcp_approx(
+                        1.0 + cute.exp(-val, fastmath=True)
+                    )
+
+            # Convert acc -> c_dtype in registers.
+            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+            tRS_rC.store(acc_vec.to(self.c_dtype))
+
+            # R2S into the c-stage SMEM buffer.
+            c_buffer = subtile_idx % self.num_c_stage
+            cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+            cute.arch.fence_proxy("async.shared", space="cta")
+            pipeline.sync(barrier_id=1)
+
+            # TMA S2G — only warp 0 issues the store.
+            if warp_idx == 0:
+                cute.copy(
+                    tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, subtile_idx)]
+                )
+                c_pipeline.producer_commit()
+                c_pipeline.producer_acquire()
+            pipeline.sync(barrier_id=1)
+
+        c_pipeline.producer_tail()
+
+    @cute.jit
     def epilogue(
         self,
         epi_tidx: cutlass.Int32,
         mma_tile_coord_mnl: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
         tCtAcc: cute.Tensor,
         tCgC: cute.Tensor,
+        tCcC: cute.Tensor,
         mC_mnl: cute.Tensor,
         epi_tile: cute.Tile,
         mBias: cute.Tensor,
@@ -543,8 +757,9 @@ class GemmBlackwellFP16:
         tTR_gC = tTR_gC[(None, None, None, None, None, *mma_tile_coord_mnl)]
         tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
 
-        # Bias tile: shape (bM, bN) with stride (0, 1) — broadcast over M, index over N.
-        # The N-tile offset is mma_tile_coord_mnl[1] * mma_tiler[1].
+        # Bias tile: build from full mBias via local_tile so iterator offsets
+        # are derived by cute, not by manual pointer arithmetic. mBias is 1D
+        # (N,); we replicate it across M with a stride-(0,1) layout.
         if cutlass.const_expr(mBias is not None):
             n_tile_offset = mma_tile_coord_mnl[1] * cutlass.Int32(self.mma_tiler[1])
             gBias_tile = cute.make_tensor(
@@ -557,20 +772,18 @@ class GemmBlackwellFP16:
             tTR_gBias = thr_copy_t2r.partition_D(tCgBias_epi)
             tTR_gBias = cute.group_modes(tTR_gBias, 3, cute.rank(tTR_gBias))
 
-        # Build M-coordinate tensor for boundary predication.
-        # When M < tile_M (128), the epilogue must not store out-of-bounds rows.
+        # Boundary predication coords. tCcC mirrors tCgC's partition path, so
+        # after the same flat_divide / partition_D / index / group_modes chain,
+        # tTR_cC[i] holds the absolute (M, N) coord of the element tTR_gC[i]
+        # writes to. (M, N) values past mC_mnl's actual shape are out-of-bounds.
         actual_M = mC_mnl.layout.shape[0]
         actual_N = mC_mnl.layout.shape[1]
-        m_base = mma_tile_coord_mnl[0] * cutlass.Int32(self.mma_tiler_mn[0])
-        n_base = mma_tile_coord_mnl[1] * cutlass.Int32(self.mma_tiler_mn[1])
 
-        # Identity tensor for the CTA tile → same tiling/partition as gC
-        # to get per-thread M/N coordinates.
-        cC_identity = cute.make_identity_tensor(
-            (self.mma_tiler_mn[0], self.mma_tiler_mn[1])
+        tCcC_epi = cute.flat_divide(
+            tCcC[((None, None), 0, 0, None, None, None)], epi_tile
         )
-        cC_epi = cute.flat_divide(cC_identity, epi_tile)
-        tTR_cC = thr_copy_t2r.partition_D(cC_epi)
+        tTR_cC = thr_copy_t2r.partition_D(tCcC_epi)
+        tTR_cC = tTR_cC[(None, None, None, None, None, *mma_tile_coord_mnl)]
         tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
 
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
@@ -578,10 +791,16 @@ class GemmBlackwellFP16:
             tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
             cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
+            coord_slice = tTR_cC[(None, None, None, subtile_idx)]
+
+            # Bias add (broadcast over M, indexed by N). Predicated by the N
+            # coord so we never load past actual_N when the bias tile spans an
+            # N partial-tile boundary.
             if cutlass.const_expr(mBias is not None):
                 bias_slice = tTR_gBias[(None, None, None, subtile_idx)]
                 for i in cutlass.range(cute.size(tTR_rAcc)):
-                    tTR_rAcc[i] = tTR_rAcc[i] + bias_slice[i].to(self.acc_dtype)
+                    if coord_slice[i][1] < actual_N:
+                        tTR_rAcc[i] = tTR_rAcc[i] + bias_slice[i].to(self.acc_dtype)
             if cutlass.const_expr(use_silu):
                 for si in cutlass.range(cute.size(tTR_rAcc)):
                     val = tTR_rAcc[si]
@@ -589,14 +808,14 @@ class GemmBlackwellFP16:
 
             tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
 
-            # Predicated store: skip elements whose M or N coordinate exceeds
-            # the actual output dimensions (partial-tile boundary).
+            # Predicated store: skip elements past the actual M/N boundary so
+            # partial tiles do not write past the output buffer. Used by the
+            # use_tma_store=False fallback only — the TMA store path's
+            # descriptor enforces box-bounds for free.
             dst = tTR_gC[(None, None, None, subtile_idx)]
-            coord_slice = tTR_cC[(None, None, None, subtile_idx)]
             for i in cutlass.range(cute.size(tTR_rC)):
-                m_coord = m_base + coord_slice[i][0]
-                n_coord = n_base + coord_slice[i][1]
-                if m_coord < actual_M and n_coord < actual_N:
+                if (coord_slice[i][0] < actual_M
+                        and coord_slice[i][1] < actual_N):
                     dst[i] = tTR_rC[i]
 
     @staticmethod
@@ -678,6 +897,9 @@ def run(
     warmup_iterations: int = 3,
     iterations: int = 10,
     fused_epilogue: str = "none",
+    mma_tiler_mn: Tuple[int, int] = (64, 128),
+    cluster_shape_mn: Tuple[int, int] = (1, 2),
+    use_2cta: bool = False,
 ):
     m, n, k = mnk
     _tag = f"[{file_name}]"
@@ -688,12 +910,13 @@ def run(
     epilogue_str = f" +{fused_epilogue}" if fused_epilogue != "none" else ""
 
     if export_only:
-        print(f"{_tag} AOT compile: M={m}, N={n}, K={k}{epilogue_str}")
+        print(f"{_tag} AOT compile: M={m}, N={n}, K={k}{epilogue_str} "
+              f"tile={mma_tiler_mn} cluster={cluster_shape_mn}")
     else:
         print(f"{_tag} Running Blackwell GEMM (C = A @ B^T) test:")
         print(f"{_tag}   M={m}, N={n}, K={k}{epilogue_str}")
         print(f"{_tag}   FP16 in/out, FP32 accumulation")
-        print(f"{_tag}   mma_tiler=(128,128), cluster=(1,1), no TMA store")
+        print(f"{_tag}   mma_tiler={mma_tiler_mn}, cluster={cluster_shape_mn}, TMA store")
 
     if cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required!")
@@ -727,8 +950,9 @@ def run(
 
     gemm = GemmBlackwellFP16(
         acc_dtype=cutlass.Float32,
-        mma_tiler_mn=(128, 128),
-        cluster_shape_mn=(1, 1),
+        mma_tiler_mn=tuple(mma_tiler_mn),
+        cluster_shape_mn=tuple(cluster_shape_mn),
+        use_2cta=use_2cta,
     )
 
     start_time = time.time()
@@ -821,6 +1045,17 @@ def _parse_args(argv=None):
     p.add_argument("--fused_epilogue", type=str, default="none",
         choices=["none", "bias", "bias_silu"],
         help="Fuse epilogue: none (plain GEMM), bias (GEMM+bias), bias_silu (GEMM+bias+SiLU).")
+    p.add_argument("--mma_tiler_mn", type=parse_comma_separated_ints, default=(64, 128),
+        help="MMA tile (M_per_cta, N_per_cta) — (64, 128) optimal for small M, "
+             "(128, 128) better for M >= 1024.")
+    p.add_argument("--cluster_shape_mn", type=parse_comma_separated_ints, default=(1, 2),
+        help="Cluster shape (M_clusters, N_clusters) for TMA multicast.")
+    p.add_argument("--use_2cta", action="store_true",
+        help="Pair two CTAs along M for a 2x M tile per tcgen05.mma op. "
+             "Requires cluster_shape[0] >= 2 so the leader CTA can drive the "
+             "peer. Wins on low-SM-count GPUs (e.g. Thor 20 SMs) for M >= 384 "
+             "where larger arithmetic intensity per MMA matters more than "
+             "CTA count.")
     return p.parse_known_args(args=argv)[0]
 
 
@@ -842,6 +1077,9 @@ if __name__ == "__main__":
         warmup_iterations=args.warmup,
         iterations=args.iterations,
         fused_epilogue=args.fused_epilogue,
+        mma_tiler_mn=tuple(args.mma_tiler_mn),
+        cluster_shape_mn=tuple(args.cluster_shape_mn),
+        use_2cta=args.use_2cta,
     )
     if not args.export_only:
         print("PASS")

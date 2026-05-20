@@ -22,8 +22,13 @@ All variants require CUDA 12.6+.
 Run on a machine with a supported GPU and CUDA 12.x/13.x:
 
 ```bash
+# Pick cuda-python and cupy variant that matches your CUDA version
+# before installing `nvidia-cutlass-dsl`:
+pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
+# or
+pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
+
 pip install nvidia-cutlass-dsl==4.4.1
-pip install cupy-cuda12x==12.3.0   # or cupy-cuda13x==13.6.0 for CUDA 13
 
 cd tensorrt-edge-llm
 

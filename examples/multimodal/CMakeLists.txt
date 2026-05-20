@@ -28,3 +28,11 @@ target_link_libraries(action_build PRIVATE ${NV_ONNX_PARSER_LIB}
 target_include_directories(action_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                 ${COMMON_INCLUDE_DIRS})
 add_cross_build_link_options(action_build)
+
+add_executable(action_inference action_inference.cpp)
+target_link_libraries(action_inference PRIVATE edgellmCore exampleUtils
+                                               commonLibraryExt)
+target_include_directories(
+  action_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                           ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(action_inference)

@@ -22,15 +22,20 @@ pip install optimum==2.1.0
 Export can be run on CPU with `--device cpu`; no GPU is required:
 
 ```bash
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-30B-A3B-GPTQ-Int4
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
-tensorrt-edgellm-export-llm \
-  --model_dir Qwen/Qwen3-30B-A3B-GPTQ-Int4 \
-  --output_dir $MODEL_NAME/onnx \
+python -m llm_loader.export_all_cli \
+  Qwen/Qwen3-30B-A3B-GPTQ-Int4 \
+  $MODEL_NAME/exported \
   --device cpu
+
+mkdir -p $MODEL_NAME/onnx
+cp -a $MODEL_NAME/exported/llm/. $MODEL_NAME/onnx/
 ```
 
 ## Step 2: Transfer to Device

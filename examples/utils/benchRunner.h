@@ -116,7 +116,7 @@ int runLayerProfilingLoop(std::string const& modeName, int32_t iterations, bool 
     ResetFn const& resetState, StepFn const& step, std::map<std::string, LayerMetadata> const& layerMetadata,
     std::vector<KernelTimes>& timesPerIter, OrderedLayerTimings& layerTimings, cudaStream_t stream)
 {
-    LOG_INFO("=== %s Layer Profiling (%d iterations) ===", modeName.c_str(), iterations);
+    LOG_INFO("=== %s Layer Profiling (non-CUDA-graph, %d iterations) ===", modeName.c_str(), iterations);
 
     for (int iter = 0; iter < iterations; ++iter)
     {

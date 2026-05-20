@@ -31,9 +31,9 @@ MoE layer design
 ----------------
 The entire Qwen3SparseMoeBlock — router (Linear + Softmax + TopK) and all
 expert GEMMs (gate/up/down projections with SiLU gating) plus weighted
-combine — is captured as a single ``trt_edgellm::Int4MoePlugin``
-custom op.  This keeps the ONNX graph compact (one node per MoE layer
-instead of ``num_experts * 3`` GEMM nodes that would take hours to export).
+combine — is captured as a single custom MoE op. GPTQ/AWQ exports keep using
+``trt_edgellm::Int4MoePlugin``. NVFP4 exports use the CuTeDSL GeForce
+``trt_edgellm::NvFP4MoEPluginGeforce`` contract.
 
 Per-expert weights are loaded into an ``nn.ModuleList`` for checkpoint
 compatibility, then stacked into 3-D tensors ``[E, ...]`` during the
@@ -64,16 +64,22 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-from ...config import ModelConfig
+from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, OnnxSpec, RMSNorm,
                                         _make_flat_wrapper)
 from ..linear import FP16Linear, make_linear
-from ..ops import int4_moe_plugin
+from ..ops import int4_moe_plugin, nvfp4_moe_plugin_geforce
 
 logger = logging.getLogger(__name__)
 
 # SiLU activation type expected by the C++ Int4MoePlugin.
-_ACTIVATION_SILU = 0
+_INT4_ACTIVATION_SILU = 0
+
+# SwiGLU activation type expected by NvFP4MoEPluginGeforce.
+_GEFORCE_ACTIVATION_SWIGLU = 2
+_GEFORCE_BACKEND_AUTO = 0
+_GEFORCE_IO_DTYPE_FP16 = 1
+_GEFORCE_MAX_ROUTED_ROWS_AUTO = 0
 
 # ONNX export dummy-input dims.
 _BATCH_SIZE = 1
@@ -182,11 +188,11 @@ class Qwen3MoEExperts(nn.Module):
 
 
 class Qwen3SparseMoeBlock(nn.Module):
-    """Sparse MoE block exported via ``trt_edgellm::Int4MoePlugin``.
+    """Sparse MoE block exported via a fused TRT MoE plugin.
 
     In the ONNX graph this produces:
     - One ``MatMul`` for the gate (router) linear -- traced from ``gate_linear``
-    - One ``trt_edgellm::Int4MoePlugin`` node for softmax + topk + expert GEMMs
+    - One fused MoE plugin node for softmax + topk + expert GEMMs
 
     Weight loading: ``gate`` (Qwen3MoERouter) and ``experts`` (Qwen3MoEExperts as
     nn.ModuleList) hold per-expert parameters for checkpoint loading.
@@ -206,17 +212,26 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.moe_intermediate_size = config.moe_intermediate_size
         self.hidden_size = config.hidden_size
         self.group_size = config.quant.group_size
-        self.activation_type = _ACTIVATION_SILU
+        self._use_nvfp4_moe = config.quant.quant_type == QUANT_NVFP4
+        self.activation_type = (_GEFORCE_ACTIVATION_SWIGLU if
+                                self._use_nvfp4_moe else _INT4_ACTIVATION_SILU)
+        self.backend = _GEFORCE_BACKEND_AUTO
+        self.io_dtype = _GEFORCE_IO_DTYPE_FP16
+        self.max_routed_rows = _GEFORCE_MAX_ROUTED_ROWS_AUTO
         self.gate = Qwen3MoERouter(config)
         self.experts = Qwen3MoEExperts(config)
 
     def _prepare_moe_weights(self) -> None:
-        """Extract GPTQ -> Marlin-packed expert weights + gate nn.Linear.
+        """Extract expert weights and prepare plugin buffers.
 
         Called by :func:`~checkpoint.repacking._stack_moe_experts` BEFORE
         regular GPTQ repacking.  After extraction, per-expert ``qweight``
         buffers are set to ``None`` so ``_repack_gptq_weights`` skips them.
         """
+        if self._use_nvfp4_moe:
+            self._prepare_nvfp4_moe_weights()
+            return
+
         from ...checkpoint.repacking import (_extract_gptq_for_marlin,
                                              pack_int4_awq_marlin)
 
@@ -276,10 +291,77 @@ class Qwen3SparseMoeBlock(nn.Module):
         # the (now-consumed) per-expert qweight buffers.
         self.experts = nn.ModuleList()
 
+    def _prepare_nvfp4_moe_weights(self) -> None:
+        """Decode and repack ModelOpt NVFP4 expert weights for CuTeDSL."""
+        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
+
+        self.gate_linear = nn.Linear(self.hidden_size,
+                                     self.num_experts,
+                                     bias=False,
+                                     dtype=torch.float16)
+        self.gate_linear.weight.data = self.gate.weight.data
+
+        fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
+            repack_nvfp4_qwen3_moe_experts(self.experts, self.hidden_size,
+                                           self.moe_intermediate_size,
+                                           self.group_size))
+
+        device = self.gate.weight.device
+        self.register_buffer("fc1_qweights",
+                             fc1_qweights.to(device).contiguous())
+        self.register_buffer("fc1_blocks_scale",
+                             fc1_blocks_scale.to(device).contiguous())
+        self.register_buffer("fc2_qweights",
+                             fc2_qweights.to(device).contiguous())
+        self.register_buffer("fc2_blocks_scale",
+                             fc2_blocks_scale.to(device).contiguous())
+        self.register_buffer(
+            "fc1_alpha",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "fc2_alpha",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "input_global_scale",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "down_input_scale",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+
+        logger.info(
+            "CuTeDSL-packed %d NVFP4 experts: fc1_qw %s, fc2_qw %s",
+            self.num_experts,
+            list(self.fc1_qweights.shape),
+            list(self.fc2_qweights.shape),
+        )
+
+        self.experts = nn.ModuleList()
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate_linear(hidden_flat).float()
+        if self._use_nvfp4_moe:
+            return nvfp4_moe_plugin_geforce(
+                router_logits,
+                hidden_states,
+                self.fc1_qweights,
+                self.fc1_blocks_scale,
+                self.fc1_alpha,
+                self.fc2_qweights,
+                self.fc2_blocks_scale,
+                self.fc2_alpha,
+                self.input_global_scale,
+                self.down_input_scale,
+                self.num_experts,
+                self.top_k,
+                self.hidden_size,
+                self.moe_intermediate_size,
+                self.activation_type,
+                self.backend,
+                self.io_dtype,
+                self.max_routed_rows,
+            )
         return int4_moe_plugin(
             router_logits,
             hidden_states,

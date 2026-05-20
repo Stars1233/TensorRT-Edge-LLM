@@ -207,6 +207,7 @@ class EdgeLLMAttentionTRTNative(nn.Module):
         kvcache_start_index: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        slice_kv_cache: Optional[bool] = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass for TensorRT native operations attention computation.
@@ -220,7 +221,7 @@ class EdgeLLMAttentionTRTNative(nn.Module):
             kvcache_start_index: Start index of KV cache of shape (batch_size), optional
             attention_mask: Attention mask of shape (batch_size, seq_len, seq_len), optional
             position_ids: Position IDs of shape (batch_size, seq_len), optional
-            
+            slice_kv_cache: Whether to slice the KV cache to the current context length, optional
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
                 - Attention output of shape (batch_size, seq_len, hidden_size)
@@ -298,9 +299,13 @@ class EdgeLLMAttentionTRTNative(nn.Module):
         present_length = torch.max(kvcache_start_index) + torch.max(
             context_lengths)
 
-        # Slice present K and V from caches [batch, num_heads, present_length, head_dim]
-        k_present = present_k_cache[:, :, :present_length, :]
-        v_present = present_v_cache[:, :, :present_length, :]
+        if slice_kv_cache:
+            # Slice present K and V from caches [batch, num_heads, present_length, head_dim]
+            k_present = present_k_cache[:, :, :present_length, :]
+            v_present = present_v_cache[:, :, :present_length, :]
+        else:
+            k_present = present_k_cache
+            v_present = present_v_cache
 
         # Apply QK scale to query
         query_states = query_states * self.qk_scale

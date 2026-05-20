@@ -9,6 +9,10 @@ The experimental Python API wraps export, engine build, engine loading, generati
 Build the C++ runtime and pybind extension first:
 
 ```bash
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+cd $EDGE_LLM_PATH
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+
 mkdir -p build && cd build
 cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_PYTHON_BINDINGS=ON
 make -j$(nproc)
@@ -17,10 +21,15 @@ make -j$(nproc)
 Install server dependencies:
 
 ```bash
+cd $EDGE_LLM_PATH
+pip install -r requirements.txt
+pip install -r experimental/llm_loader/requirements.txt
 pip install pybind11 fastapi uvicorn
 ```
 
-Run examples from the repository root.
+Run examples from the repository root with the same `PYTHONPATH`. The
+repository root makes `experimental.server` importable; the `experimental`
+directory makes the `llm_loader` top-level package importable.
 
 ## Python API
 

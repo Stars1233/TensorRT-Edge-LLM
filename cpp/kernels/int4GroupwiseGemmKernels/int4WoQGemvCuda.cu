@@ -39,9 +39,11 @@
  * reference: https://github.com/mit-han-lab/llm-awq/blob/main/awq/kernels/csrc/quantization_new/gemv/gemv_cuda.cu
  */
 
+#include "common/checkMacros.h"
 #include "dequantize.cuh"
 #include <cuda_fp16.h>
 #include <stdexcept>
+#include <string>
 
 #define PACK_FACTOR 8
 #define WARP_SIZE 32
@@ -222,10 +224,8 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
     dim3 num_blocks(n / N_PER_BLOCK / K_INTERLEAVE);
     dim3 num_threads(BLOCK_SIZE);
 
-    if (group_size != 128)
-    {
-        throw std::runtime_error("Unsupported group size for gemv kernel.\n");
-    }
+    ELLM_CHECK(group_size == 128,
+        "Unsupported group size " + std::to_string(group_size) + " for gemv kernel; only 128 is supported.");
     switch (m)
     {
     case 1:

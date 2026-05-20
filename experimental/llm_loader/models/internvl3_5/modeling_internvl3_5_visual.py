@@ -34,9 +34,16 @@ Reference: ``transformers/models/internvl/modeling_internvl.py``
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..linear import make_linear
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Normalization helpers
@@ -133,17 +140,42 @@ class InternVL3_5VisionAttention(nn.Module):
         ``projection_layer.*``
     """
 
-    def __init__(self, hidden_size: int, num_heads: int,
-                 attention_bias: bool) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 attention_bias: bool,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
         self.embed_dim = hidden_size
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=attention_bias)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=attention_bias)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=attention_bias)
-        self.projection_layer = nn.Linear(hidden_size, hidden_size)
+        self.q_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=attention_bias,
+            module_name=f"{name_prefix}.q_proj" if name_prefix else "")
+        self.k_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=attention_bias,
+            module_name=f"{name_prefix}.k_proj" if name_prefix else "")
+        self.v_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=attention_bias,
+            module_name=f"{name_prefix}.v_proj" if name_prefix else "")
+        self.projection_layer = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.projection_layer"
+            if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         B, N, _ = hidden_states.shape
@@ -171,11 +203,25 @@ class InternVL3_5VisionMLP(nn.Module):
     Checkpoint keys: ``mlp.fc1.*``, ``mlp.fc2.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 hidden_act: str) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 hidden_act: str,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size)
+        self.fc1 = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc1" if name_prefix else "")
+        self.fc2 = make_linear(
+            model_config,
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc2" if name_prefix else "")
         act_map = {
             "gelu": F.gelu,
             "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
@@ -201,22 +247,37 @@ class InternVL3_5VisionLayer(nn.Module):
         ``layernorm_after.*``,  ``mlp.*``,       ``lambda_2``
     """
 
-    def __init__(self, hidden_size: int, num_heads: int,
-                 intermediate_size: int, hidden_act: str, attention_bias: bool,
-                 norm_type: str, layer_norm_eps: float,
-                 layer_scale_init: float) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 hidden_act: str,
+                 attention_bias: bool,
+                 norm_type: str,
+                 layer_norm_eps: float,
+                 layer_scale_init: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.layernorm_before = _make_norm(norm_type, hidden_size,
                                            layer_norm_eps)
-        self.attention = InternVL3_5VisionAttention(hidden_size, num_heads,
-                                                    attention_bias)
+        self.attention = InternVL3_5VisionAttention(
+            hidden_size,
+            num_heads,
+            attention_bias,
+            model_config,
+            name_prefix=f"{name_prefix}.attention" if name_prefix else "")
         self.lambda_1 = nn.Parameter(layer_scale_init *
                                      torch.ones(hidden_size),
                                      requires_grad=True)
         self.layernorm_after = _make_norm(norm_type, hidden_size,
                                           layer_norm_eps)
-        self.mlp = InternVL3_5VisionMLP(hidden_size, intermediate_size,
-                                        hidden_act)
+        self.mlp = InternVL3_5VisionMLP(
+            hidden_size,
+            intermediate_size,
+            hidden_act,
+            model_config,
+            name_prefix=f"{name_prefix}.mlp" if name_prefix else "")
         self.lambda_2 = nn.Parameter(layer_scale_init *
                                      torch.ones(hidden_size),
                                      requires_grad=True)
@@ -240,16 +301,32 @@ class InternVL3_5VisionEncoder(nn.Module):
     Checkpoint keys: ``vision_tower.encoder.layer.N.*``
     """
 
-    def __init__(self, num_hidden_layers: int, hidden_size: int,
-                 num_heads: int, intermediate_size: int, hidden_act: str,
-                 attention_bias: bool, norm_type: str, layer_norm_eps: float,
-                 layer_scale_init: float) -> None:
+    def __init__(self,
+                 num_hidden_layers: int,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 hidden_act: str,
+                 attention_bias: bool,
+                 norm_type: str,
+                 layer_norm_eps: float,
+                 layer_scale_init: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.layer = nn.ModuleList([
-            InternVL3_5VisionLayer(hidden_size, num_heads, intermediate_size,
-                                   hidden_act, attention_bias, norm_type,
-                                   layer_norm_eps, layer_scale_init)
-            for _ in range(num_hidden_layers)
+            InternVL3_5VisionLayer(
+                hidden_size,
+                num_heads,
+                intermediate_size,
+                hidden_act,
+                attention_bias,
+                norm_type,
+                layer_norm_eps,
+                layer_scale_init,
+                model_config,
+                name_prefix=f"{name_prefix}.layer.{i}" if name_prefix else "")
+            for i in range(num_hidden_layers)
         ])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -270,12 +347,26 @@ class _InternVL3_5Projector(nn.Module):
         ``layer_norm.*``, ``linear_1.*``, ``linear_2.*``
     """
 
-    def __init__(self, in_dim: int, text_hidden_size: int,
-                 projector_hidden_act: str) -> None:
+    def __init__(self,
+                 in_dim: int,
+                 text_hidden_size: int,
+                 projector_hidden_act: str,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.layer_norm = nn.LayerNorm(in_dim)
-        self.linear_1 = nn.Linear(in_dim, text_hidden_size)
-        self.linear_2 = nn.Linear(text_hidden_size, text_hidden_size)
+        self.linear_1 = make_linear(
+            model_config,
+            in_dim,
+            text_hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.linear_1" if name_prefix else "")
+        self.linear_2 = make_linear(
+            model_config,
+            text_hidden_size,
+            text_hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.linear_2" if name_prefix else "")
         act_map = {
             "gelu": F.gelu,
             "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
@@ -320,7 +411,7 @@ class InternVL3_5VisualModel(nn.Module):
     Output: ``[total_patches * tokens_per_patch, text_hidden_size]``
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         vc = config["vision_config"]
         tc = config["text_config"]
@@ -362,6 +453,8 @@ class InternVL3_5VisualModel(nn.Module):
             norm_type=vc.get("norm_type", "layer_norm"),
             layer_norm_eps=vc.get("layer_norm_eps", 1e-6),
             layer_scale_init=float(vc.get("layer_scale_init_value", 0.1)),
+            model_config=model_config,
+            name_prefix="vision_tower.encoder",
         )
 
         scale = int(1.0 / self.downsample_ratio)
@@ -371,6 +464,8 @@ class InternVL3_5VisualModel(nn.Module):
             in_dim=in_dim,
             text_hidden_size=text_hidden_size,
             projector_hidden_act=config.get("projector_hidden_act", "gelu"),
+            model_config=model_config,
+            name_prefix="multi_modal_projector",
         )
         self._text_hidden_size = text_hidden_size
 
@@ -432,31 +527,19 @@ class InternVL3_5VisualModel(nn.Module):
 
 def _load_internvl3_5_weights(model: InternVL3_5VisualModel,
                               weights: dict) -> None:
-    """Load vision_tower and multi_modal_projector weights."""
-    import logging
-    logger = logging.getLogger(__name__)
+    """Load vision_tower and multi_modal_projector weights into *model*."""
+    from ...checkpoint.loader import load_submodule_weights
 
-    vt_prefix = "vision_tower."
-    proj_prefix = "multi_modal_projector."
+    def _remap(k: str) -> "str | None":
+        if k.startswith("vision_tower.") or k.startswith(
+                "multi_modal_projector."):
+            return k
+        return None
 
-    vt_state: dict = {}
-    proj_state: dict = {}
-    for k, v in weights.items():
-        if k.startswith(vt_prefix):
-            vt_state[k[len(vt_prefix):]] = v
-        elif k.startswith(proj_prefix):
-            proj_state[k[len(proj_prefix):]] = v
-
-    missing_vt, _ = model.vision_tower.load_state_dict(vt_state, strict=False)
-    missing_proj, _ = model.multi_modal_projector.load_state_dict(proj_state,
-                                                                  strict=False)
-
-    if missing_vt:
-        logger.warning("InternVL3_5VisualModel: missing vision_tower keys: %s",
-                       missing_vt[:10])
-    if missing_proj:
-        logger.warning("InternVL3_5VisualModel: missing projector keys: %s",
-                       missing_proj[:10])
+    load_submodule_weights(model,
+                           weights,
+                           _remap,
+                           label="InternVL3_5VisualModel")
 
 
 # ---------------------------------------------------------------------------
@@ -467,16 +550,20 @@ def _load_internvl3_5_weights(model: InternVL3_5VisualModel,
 def build_internvl3_5_visual(
         config: dict,
         weights: dict,
+        model_config: "ModelConfig",
         dtype: torch.dtype = torch.float16) -> InternVL3_5VisualModel:
     """Build and return an :class:`InternVL3_5VisualModel` with loaded weights.
 
     Args:
-        config:  Full parsed ``config.json`` dict (contains ``vision_config``,
-                 ``text_config``, ``downsample_ratio``).
-        weights: Flat ``{key: tensor}`` dict from safetensors.
-        dtype:   Target dtype (default ``float16``).
+        config:       Full parsed ``config.json`` dict (contains
+                      ``vision_config``, ``text_config``, ``downsample_ratio``).
+        weights:      Flat ``{key: tensor}`` dict from safetensors.
+        model_config: Top-level ``ModelConfig``.  Visual layers dispatch
+                      through ``make_linear`` so quantized checkpoints are
+                      honoured; an FP16 checkpoint yields ``FP16Linear``.
+        dtype:        Target dtype (default ``float16``).
     """
-    model = InternVL3_5VisualModel(config)
+    model = InternVL3_5VisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_internvl3_5_weights(model, weights)
     model.eval()

@@ -55,10 +55,7 @@ ImageData loadImageFromFile(std::string const& path)
     // Only support RGB images
     int desiredChannels = 3;
     unsigned char* imageData = stbi_load(path.c_str(), &width, &height, &channels, desiredChannels);
-    if (imageData == nullptr)
-    {
-        throw std::runtime_error("Failed to load image: " + path + " - " + std::string(stbi_failure_reason()));
-    }
+    ELLM_CHECK(imageData != nullptr, "Failed to load image: " + path + " - " + std::string(stbi_failure_reason()));
 
     rt::Tensor imgTensor{};
     // Need to handle the logic where space allocation for image tensor failed. We need to free the image data and
@@ -84,10 +81,7 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     // Only support RGB images
     int desiredChannels = 3;
     unsigned char* imageData = stbi_load_from_memory(data, size, &width, &height, &channels, desiredChannels);
-    if (imageData == nullptr)
-    {
-        throw std::runtime_error("Failed to load image from memory: " + std::string(stbi_failure_reason()));
-    }
+    ELLM_CHECK(imageData != nullptr, "Failed to load image from memory: " + std::string(stbi_failure_reason()));
 
     rt::Tensor imgTensor{};
     // Need to handle the logic where space allocation for image tensor failed. We need to free the image data and
@@ -112,10 +106,7 @@ void resizeImage(
 {
     // Reshape pre-allocated buffer to target dimensions
     bool success = resizedImage.buffer->reshape({newHeight, newWidth, image.channels});
-    if (!success)
-    {
-        throw std::runtime_error("Failed to reshape resized image buffer");
-    }
+    ELLM_CHECK(success, "Failed to reshape resized image buffer");
     resizedImage.height = newHeight;
     resizedImage.width = newWidth;
     resizedImage.channels = image.channels;

@@ -39,7 +39,9 @@
  */
 
 #include "dequantize.cuh"
+#include "int4GroupwiseGemm.h"
 #include <cuda_pipeline_primitives.h>
+#include <mutex>
 
 namespace trt_edgellm
 {
@@ -484,7 +486,7 @@ void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
 
     constexpr int G = 128;
     constexpr int CTA_M = 64;
-    constexpr int CTA_N = 128;
+    constexpr int CTA_N = kGemmCtaN;
     constexpr int CTA_K = 64;
     constexpr int WARP_M = 64;
     constexpr int WARP_N = 32;
@@ -500,7 +502,12 @@ void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
     dim3 num_blocks((m + CTA_M - 1) / CTA_M * j_factors1);
     dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
     auto kernel_func = gemm_w4a16_T2<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
-    cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
+    // cudaFuncSetAttribute is forbidden during CUDA stream capture; set the attribute
+    // once on first invocation (warmup runs outside capture) so subsequent captured
+    // launches do not invalidate the graph.
+    static std::once_flag sAttrFlag;
+    std::call_once(sAttrFlag,
+        [&]() { cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize); });
     kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(
         in_feats, kernel, scaling_factors, out_feats, m, n, k);
 }

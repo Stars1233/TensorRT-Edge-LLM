@@ -132,3 +132,108 @@ bool saveAudioToWav(std::string const& filepath, trt_edgellm::rt::audioUtils::Au
         return false;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//        StreamingAudioWriter
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool StreamingAudioWriter::open(std::string const& filepath, int32_t sampleRate)
+{
+    mSampleRate = sampleRate;
+    mTotalSamples = 0;
+    mFinalized = false;
+
+    mFile.open(filepath, std::ios::binary);
+    if (!mFile.is_open())
+    {
+        LOG_ERROR("StreamingAudioWriter: failed to open %s", filepath.c_str());
+        return false;
+    }
+
+    WavHeader header{};
+    std::memcpy(header.riffTag, "RIFF", 4);
+    std::memcpy(header.waveTag, "WAVE", 4);
+    std::memcpy(header.fmtTag, "fmt ", 4);
+    std::memcpy(header.dataTag, "data", 4);
+    header.audioFormat = 1;
+    header.numChannels = 1;
+    header.sampleRate = static_cast<uint32_t>(sampleRate);
+    header.bitsPerSample = 16;
+    header.byteRate = header.sampleRate * header.numChannels * header.bitsPerSample / 8;
+    header.blockAlign = header.numChannels * header.bitsPerSample / 8;
+    header.fmtSize = 16;
+    header.dataSize = 0;
+    header.fileSize = 36;
+
+    mFile.write(reinterpret_cast<char const*>(&header), sizeof(WavHeader));
+    return mFile.good();
+}
+
+bool StreamingAudioWriter::appendChunk(trt_edgellm::rt::audioUtils::AudioData const& audio)
+{
+    if (!mFile.is_open() || mFinalized)
+    {
+        LOG_ERROR("StreamingAudioWriter: file not open or already finalized");
+        return false;
+    }
+
+    if (!audio.waveform || audio.waveform->isEmpty())
+    {
+        return true;
+    }
+
+    // The waveform is dereferenced directly below; reject GPU tensors to avoid a host-side
+    // dereference of device memory. Callers must copy to CPU before passing in.
+    if (audio.waveform->getDeviceType() != trt_edgellm::rt::DeviceType::kCPU)
+    {
+        LOG_ERROR("StreamingAudioWriter::appendChunk: waveform must be on CPU");
+        return false;
+    }
+
+    int64_t const numDims = audio.waveform->getShape().getNumDims();
+    int64_t const numSamples = audio.waveform->getShape()[numDims - 1];
+
+    bool const isFP32 = (audio.waveform->getDataType() == nvinfer1::DataType::kFLOAT);
+    float const* fp32Data = isFP32 ? static_cast<float const*>(audio.waveform->rawPointer()) : nullptr;
+    __half const* fp16Data = !isFP32 ? static_cast<__half const*>(audio.waveform->rawPointer()) : nullptr;
+
+    std::vector<int16_t> pcmData(numSamples);
+    for (int64_t i = 0; i < numSamples; ++i)
+    {
+        float sample = isFP32 ? fp32Data[i] : __half2float(fp16Data[i]);
+        sample = std::max(-1.0f, std::min(1.0f, sample));
+        pcmData[i] = static_cast<int16_t>(static_cast<int32_t>(sample * 32767.0f));
+    }
+
+    mFile.write(reinterpret_cast<char const*>(pcmData.data()), pcmData.size() * sizeof(int16_t));
+    mTotalSamples += numSamples;
+
+    return mFile.good();
+}
+
+void StreamingAudioWriter::finalize()
+{
+    if (mFinalized || !mFile.is_open())
+    {
+        return;
+    }
+    mFinalized = true;
+
+    // WAV RIFF format caps chunk sizes at uint32_t; clamp to avoid silent truncation past ~4 GB.
+    uint32_t const dataSize = static_cast<uint32_t>(
+        std::min(mTotalSamples * static_cast<int64_t>(sizeof(int16_t)), static_cast<int64_t>(UINT32_MAX - 36)));
+    uint32_t const fileSize = 36 + dataSize;
+
+    mFile.seekp(4, std::ios::beg);
+    mFile.write(reinterpret_cast<char const*>(&fileSize), sizeof(uint32_t));
+
+    mFile.seekp(40, std::ios::beg);
+    mFile.write(reinterpret_cast<char const*>(&dataSize), sizeof(uint32_t));
+
+    mFile.close();
+}
+
+StreamingAudioWriter::~StreamingAudioWriter()
+{
+    finalize();
+}

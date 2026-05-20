@@ -27,13 +27,13 @@ Run on a machine with a supported GPU and CUDA 12.x or 13.x.
 python3 -m venv build_kernel_venv
 source build_kernel_venv/bin/activate
 
-pip install nvidia-cutlass-dsl==4.4.1
-pip install cuda-python
+# Pick cuda-python and cupy variant that matches your CUDA version
+# before installing `nvidia-cutlass-dsl`:
+pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
+# or
+pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-# Pick the cupy variant that matches your CUDA version:
-pip install cupy-cuda12x==12.3.0  # CUDA 12.x
-or
-pip install cupy-cuda13x==13.6.0  # CUDA 13.x
+pip install nvidia-cutlass-dsl==4.4.1
 ```
 
 If your environment hits a `ModuleNotFoundError` while importing CUTLASS DSL,

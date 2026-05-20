@@ -42,12 +42,16 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 
 _saved_argv = None
-_early_dim = 128    # default, overridden by --dim
-_early_dstate = 128  # default, overridden by --dstate
+# DIM / DSTATE pinned at module-import time -- overridable via --dim/--dstate CLI
+# when run as __main__ (AOT build path) or via SSD_DIM/SSD_DSTATE env vars when
+# imported by an out-of-tree harness.
+_early_dim = int(os.environ.get("SSD_DIM", "128"))
+_early_dstate = int(os.environ.get("SSD_DSTATE", "128"))
 if __name__ == "__main__":
     _saved_argv = list(sys.argv)
     for i, a in enumerate(_saved_argv):
@@ -125,46 +129,70 @@ def wrap_nd_cpasync(arr):
 # ============================================================================
 # Kernel 1: CUMSUM — prefix sum of A*dt per chunk
 # ============================================================================
-# Translated from ssd_chunk_state.py L40-86
-# Grid: (batch, nheads, nchunks), Block: 1 thread
+# Grid: (batch, nheads, nchunks). Block: CHUNK_SIZE threads -- one per chunk position.
+# Hillis-Steele in-place prefix scan over CHUNK_SIZE values (128 -> 7 doubling steps).
 
 @cute.kernel
 def cumsum_kernel(
     dt_in: cute.Tensor,       # [batch, seq_len, nheads] fp16
     A: cute.Tensor,           # [nheads] fp32
-    dt_bias: cute.Tensor,     # [nheads] fp32
+    dt_bias: cute.Tensor,     # [nheads] fp16 (matches plugin kIN_DT_BIAS_IDX type)
     dA_cumsum: cute.Tensor,   # [batch, nheads, nchunks, CHUNK_SIZE] fp32
     dt_out: cute.Tensor,      # [batch, nheads, nchunks, CHUNK_SIZE] fp32
-    seq_len: Int32,
+    context_lengths: cute.Tensor,  # [batch] int32 -- per-batch effective seq_len (uniform=seq_len)
     dt_softplus: cutlass.Constexpr[bool],
 ):
+    tidx, _, _ = cute.arch.thread_idx()
     b, h, c = cute.arch.block_idx()
     a_val = cutlass.Float32(A[h])
     bias = cutlass.Float32(dt_bias[h])
-    cumsum = cutlass.Float32(0.0)
-    for i in range(CHUNK_SIZE):
-        t = cutlass.Int32(c) * CHUNK_SIZE + i
-        dt_val = cutlass.Float32(0.0)
-        if t < seq_len:
-            dt_val = cutlass.Float32(dt_in[b, t, h]) + bias
-            if dt_softplus:
-                if dt_val <= 20.0:
-                    dt_val = cute.log(cutlass.Float32(1.0) + cute.exp(dt_val))
-        cumsum = cumsum + a_val * dt_val
-        dA_cumsum[b, h, c, i] = cumsum
-        dt_out[b, h, c, i] = dt_val
+    # Per-batch effective seq_len: tokens at t >= cl[b] are padding -> zero contribution.
+    eff_seq_len = cutlass.Int32(context_lengths[b])
+
+    # Step 1: each thread computes its dt_val (softplus(dt + bias) with cl-mask).
+    t = cutlass.Int32(c) * CHUNK_SIZE + tidx
+    dt_val = cutlass.Float32(0.0)
+    if t < eff_seq_len:
+        dt_val = cutlass.Float32(dt_in[b, t, h]) + bias
+        if dt_softplus:
+            if dt_val <= cutlass.Float32(20.0):
+                dt_val = cute.log(cutlass.Float32(1.0) + cute.exp(dt_val))
+    dt_out[b, h, c, tidx] = dt_val
+
+    # Step 2: parallel inclusive prefix scan over a_val * dt_val across the 128 threads.
+    # Hillis-Steele single-buffer with explicit barrier between read and write phases.
+    smem = cutlass.utils.SmemAllocator()
+    sScan = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout(CHUNK_SIZE), 16)
+    sScan[tidx] = a_val * dt_val
+    cute.arch.barrier()
+
+    # 7 doubling steps cover CHUNK_SIZE = 128.
+    for log_offset in cutlass.range_constexpr(7):
+        offset = 1 << log_offset
+        partial = cutlass.Float32(0.0)
+        if tidx >= offset:
+            partial = sScan[tidx - offset]
+        cute.arch.barrier()
+        if tidx >= offset:
+            sScan[tidx] = sScan[tidx] + partial
+        cute.arch.barrier()
+
+    dA_cumsum[b, h, c, tidx] = sScan[tidx]
 
 
 @cute.jit
 def jit_cumsum(
     dt_in: cute.Tensor, A: cute.Tensor, dt_bias: cute.Tensor,
     dA_cumsum: cute.Tensor, dt_out: cute.Tensor,
-    seq_len: Int32, n_batch: Int32, nheads: Int32, nchunks: Int32,
+    context_lengths: cute.Tensor,
+    n_batch: Int32, nheads: Int32, nchunks: Int32,
     dt_softplus: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    cumsum_kernel(dt_in, A, dt_bias, dA_cumsum, dt_out, seq_len, dt_softplus).launch(
-        grid=(n_batch, nheads, nchunks), block=[1, 1, 1], smem=0, stream=stream)
+    cumsum_kernel(dt_in, A, dt_bias, dA_cumsum, dt_out, context_lengths, dt_softplus).launch(
+        grid=(n_batch, nheads, nchunks), block=[CHUNK_SIZE, 1, 1],
+        smem=cutlass.Int32(CHUNK_SIZE * 4 + 256), stream=stream)
 
 
 # ============================================================================
@@ -182,7 +210,7 @@ def chunk_state_kernel(
     dt_proc: cute.Tensor,      # [batch, nheads, nchunks, CHUNK_SIZE] fp32
     dA_cumsum: cute.Tensor,    # [batch, nheads, nchunks, CHUNK_SIZE] fp32
     states: cute.Tensor,       # [batch, nchunks, nheads, dim, dstate] fp32
-    seq_len: Int32,
+    context_lengths: cute.Tensor,  # [batch] int32 -- per-batch effective seq_len
     nchunks: Int32,
     nheads_ngroups_ratio: Int32,
     tiled_mma: cute.TiledMma,
@@ -202,9 +230,12 @@ def chunk_state_kernel(
 
     dA_last = dA_cumsum[b, h, c, CHUNK_SIZE - 1]
 
-    chunk_size_limit = seq_len - cutlass.Int32(c) * CHUNK_SIZE
+    eff_seq_len = cutlass.Int32(context_lengths[b])
+    chunk_size_limit = eff_seq_len - cutlass.Int32(c) * CHUNK_SIZE
     if chunk_size_limit > CHUNK_SIZE:
         chunk_size_limit = cutlass.Int32(CHUNK_SIZE)
+    if chunk_size_limit < 0:
+        chunk_size_limit = cutlass.Int32(0)
 
     # Shared memory: X[BM, BK_MMA] fp16, B_scaled[BN, BK_MMA] fp16, out[BM, BN] fp32
     smem = cutlass.utils.SmemAllocator()
@@ -293,8 +324,8 @@ def chunk_state_kernel(
 @cute.jit
 def jit_chunk_state(
     x: cute.Tensor, B: cute.Tensor, dt_proc: cute.Tensor, dA_cumsum: cute.Tensor,
-    states: cute.Tensor,
-    seq_len: Int32, nchunks: Int32, nheads: Int32, nheads_ngroups_ratio: Int32,
+    states: cute.Tensor, context_lengths: cute.Tensor,
+    nchunks: Int32, nheads: Int32, nheads_ngroups_ratio: Int32,
     n_batch: Int32,
     stream: cuda.CUstream,
 ):
@@ -311,7 +342,7 @@ def jit_chunk_state(
     n_tiles = cutlass.Int32(((DIM + BM - 1) // BM) * ((DSTATE + BN - 1) // BN))
     smem_bytes = cutlass.Int32((BM * BK_MMA + BN * BK_MMA) * 2 + BM * BN * 4 + 256)
     chunk_state_kernel(
-        x, B, dt_proc, dA_cumsum, states, seq_len, nchunks, nheads_ngroups_ratio,
+        x, B, dt_proc, dA_cumsum, states, context_lengths, nchunks, nheads_ngroups_ratio,
         tiled_mma, smem_copy_A, smem_copy_B, r2s_copy_C,
     ).launch(
         grid=(n_tiles, n_batch * nchunks, nheads),
@@ -332,8 +363,9 @@ def jit_chunk_state(
 def state_passing_kernel(
     states_in: cute.Tensor,      # [batch, nchunks, nheads, dim, dstate] fp32
     prev_states: cute.Tensor,    # [batch, nchunks, nheads, dim, dstate] fp32 — output
-    final_states: cute.Tensor,   # [batch, nheads, dim, dstate] fp32 — output
+    final_states: cute.Tensor,   # [batch, nheads, dim, dstate] fp16 -- output (matches plugin kIN_STATE_IDX type)
     dA_cumsum: cute.Tensor,      # [batch, nheads, nchunks, CHUNK_SIZE] fp32 (read last element)
+    init_states_in: cute.Tensor, # [batch, nheads, dim, dstate] fp16 -- initial SSM state (zeros for fresh request); aliased to final_states by runner
     nchunks: Int32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -346,9 +378,13 @@ def state_passing_kernel(
     ds = elem_idx - d * DSTATE
 
     if d < DIM and ds < DSTATE:
-        # Store initial state (zeros) as prev_states[0]
-        prev_states[b, 0, h, d, ds] = cutlass.Float32(0.0)
-        running = cutlass.Float32(0.0)
+        # Seed prev_states[0] and the running accumulator from the caller-provided init state.
+        # When the runner aliases init_states_in to the same buffer holding the input state, this
+        # implements has_init_states for chunked prefill / continuous batching. When init_states_in
+        # is zeroed (fresh request), this matches the original "start from 0" behaviour.
+        init_val = cutlass.Float32(init_states_in[b, h, d, ds])
+        prev_states[b, 0, h, d, ds] = init_val
+        running = init_val
 
         for c_idx in range(nchunks):
             new_state = cutlass.Float32(states_in[b, c_idx, h, d, ds])
@@ -358,20 +394,20 @@ def state_passing_kernel(
             if c_idx < nchunks - 1:
                 prev_states[b, c_idx + 1, h, d, ds] = running
             else:
-                final_states[b, h, d, ds] = running
+                final_states[b, h, d, ds] = cutlass.Float16(running)
 
 
 @cute.jit
 def jit_state_passing(
     states_in: cute.Tensor, prev_states: cute.Tensor, final_states: cute.Tensor,
-    dA_cumsum: cute.Tensor,
+    dA_cumsum: cute.Tensor, init_states_in: cute.Tensor,
     nchunks: Int32, n_batch: Int32, nheads: Int32,
     stream: cuda.CUstream,
 ):
     flat_dim = cutlass.Int32(DIM * DSTATE)  # 128*128 = 16384
     n_blocks_m = (flat_dim + THREADS - 1) // THREADS
     state_passing_kernel(
-        states_in, prev_states, final_states, dA_cumsum, nchunks,
+        states_in, prev_states, final_states, dA_cumsum, init_states_in, nchunks,
     ).launch(
         grid=(n_blocks_m, n_batch, nheads), block=[THREADS, 1, 1], smem=0, stream=stream)
 
@@ -388,7 +424,7 @@ def bmm_kernel(
     C_in: cute.Tensor,  # [batch, seq_len, ngroups, dstate] fp16
     B_in: cute.Tensor,  # [batch, seq_len, ngroups, dstate] fp16
     CB: cute.Tensor,    # [batch, nchunks, ngroups, CHUNK_SIZE, CHUNK_SIZE] fp32
-    seq_len: Int32,
+    context_lengths: cute.Tensor,  # [batch] int32
     nchunks: Int32,
     tiled_mma: cute.TiledMma,
     smem_copy_A: cute.TiledCopy,
@@ -405,9 +441,12 @@ def bmm_kernel(
     pid_m = tile_idx // num_pid_n
     pid_n = tile_idx - pid_m * num_pid_n
 
-    chunk_size_limit = seq_len - cutlass.Int32(c) * CHUNK_SIZE
+    eff_seq_len = cutlass.Int32(context_lengths[b])
+    chunk_size_limit = eff_seq_len - cutlass.Int32(c) * CHUNK_SIZE
     if chunk_size_limit > CHUNK_SIZE:
         chunk_size_limit = cutlass.Int32(CHUNK_SIZE)
+    if chunk_size_limit < 0:
+        chunk_size_limit = cutlass.Int32(0)
 
     # Shared memory: C_tile[BM, BK_MMA] fp16, B_tile[BN, BK_MMA] fp16, out[BM, BN] fp32
     smem = cutlass.utils.SmemAllocator()
@@ -512,7 +551,8 @@ def bmm_kernel(
 @cute.jit
 def jit_bmm(
     C_in: cute.Tensor, B_in: cute.Tensor, CB: cute.Tensor,
-    seq_len: Int32, nchunks: Int32, n_batch: Int32, ngroups: Int32,
+    context_lengths: cute.Tensor,
+    nchunks: Int32, n_batch: Int32, ngroups: Int32,
     stream: cuda.CUstream,
 ):
     from cutlass.cute.nvgpu.warp import MmaF16BF16Op
@@ -538,7 +578,7 @@ def jit_bmm(
 
     n_tiles = cutlass.Int32((CHUNK_SIZE // BM) * (CHUNK_SIZE // BN))
     smem_bytes = cutlass.Int32((BM * BK_MMA + BN * BK_MMA) * 2 + BM * BN * 4 + 256)
-    bmm_kernel(C_in, B_in, CB, seq_len, nchunks,
+    bmm_kernel(C_in, B_in, CB, context_lengths, nchunks,
                tiled_mma, smem_copy_A, smem_copy_B, r2s_copy_C,
                tiled_copy_g2s).launch(
         grid=(n_tiles, n_batch * nchunks, ngroups),
@@ -561,10 +601,10 @@ def chunk_scan_kernel(
     dA_cumsum: cute.Tensor,    # [batch, nheads, nchunks, CHUNK_SIZE] fp32
     C_in: cute.Tensor,         # [batch, seq_len, ngroups, dstate] fp16
     prev_states: cute.Tensor,  # [batch, nchunks, nheads, dim, dstate] fp32
-    D: cute.Tensor,            # [nheads] fp32
+    D: cute.Tensor,            # [nheads] fp16 (matches plugin kIN_D_IDX type; cast to fp32 on read)
     z: cute.Tensor,            # [batch, seq_len, nheads, dim] fp16 (or dummy)
     output: cute.Tensor,       # [batch, seq_len, nheads, dim] fp16
-    seq_len: Int32,
+    context_lengths: cute.Tensor,  # [batch] int32 -- per-batch effective seq_len
     nchunks: Int32,
     nheads_ngroups_ratio: Int32,
     has_D: cutlass.Constexpr[bool],
@@ -584,9 +624,12 @@ def chunk_scan_kernel(
     pid_m = tile_idx // num_pid_n
     pid_n = tile_idx - pid_m * num_pid_n
 
-    chunk_size_limit = seq_len - cutlass.Int32(c) * CHUNK_SIZE
+    eff_seq_len = cutlass.Int32(context_lengths[b])
+    chunk_size_limit = eff_seq_len - cutlass.Int32(c) * CHUNK_SIZE
     if chunk_size_limit > CHUNK_SIZE:
         chunk_size_limit = cutlass.Int32(CHUNK_SIZE)
+    if chunk_size_limit < 0:
+        chunk_size_limit = cutlass.Int32(0)
 
     # Shared memory: A[BM, BK_MMA] fp16, B[BN, BK_MMA] fp16, Out[BM, BN] fp32
     smem = cutlass.utils.SmemAllocator()
@@ -726,8 +769,8 @@ def chunk_scan_kernel(
 def jit_chunk_scan(
     CB: cute.Tensor, x: cute.Tensor, dt_proc: cute.Tensor, dA_cumsum: cute.Tensor,
     C_in: cute.Tensor, prev_states: cute.Tensor, D: cute.Tensor, z: cute.Tensor,
-    output: cute.Tensor,
-    seq_len: Int32, nchunks: Int32, nheads: Int32, nheads_ngroups_ratio: Int32,
+    output: cute.Tensor, context_lengths: cute.Tensor,
+    nchunks: Int32, nheads: Int32, nheads_ngroups_ratio: Int32,
     n_batch: Int32,
     has_D: cutlass.Constexpr[bool],
     has_z: cutlass.Constexpr[bool],
@@ -747,7 +790,7 @@ def jit_chunk_scan(
     smem_bytes = cutlass.Int32((BM * BK_MMA + BN * BK_MMA) * 2 + BM * BN * 4 + 256)
     chunk_scan_kernel(
         CB, x, dt_proc, dA_cumsum, C_in, prev_states, D, z, output,
-        seq_len, nchunks, nheads_ngroups_ratio, has_D, has_z,
+        context_lengths, nchunks, nheads_ngroups_ratio, has_D, has_z,
         tiled_mma, smem_copy_A, smem_copy_B, r2s_copy_C,
     ).launch(
         grid=(n_tiles, n_batch * nchunks, nheads),
@@ -797,9 +840,9 @@ def run_pipeline(n, nheads, dim, dstate, ngroups, seq_len, warmup=3, iterations=
     A_np = -(np.random.rand(nheads).astype(np.float32) * 0.5 + 0.5)
     B_np = np.random.randn(n, seq_len, ngroups, dstate).astype(np.float16)
     C_np = np.random.randn(n, seq_len, ngroups, dstate).astype(np.float16)
-    D_np = np.random.randn(nheads).astype(np.float32) * 0.1
-    dt_bias_np = np.random.randn(nheads).astype(np.float32) * 0.1
-    state_np = np.zeros((n, nheads, dim, dstate), dtype=np.float32)
+    D_np = (np.random.randn(nheads) * 0.1).astype(np.float16)  # plugin contract: fp16
+    dt_bias_np = (np.random.randn(nheads) * 0.1).astype(np.float16)  # plugin contract: fp16
+    state_np = np.zeros((n, nheads, dim, dstate), dtype=np.float16)  # plugin contract: fp16
 
     print("  NumPy reference...")
     ref_out, _ = _ssd_reference(x_np, dt_np, A_np, B_np, C_np, D_np, dt_bias_np, state_np)
@@ -815,7 +858,7 @@ def run_pipeline(n, nheads, dim, dstate, ngroups, seq_len, warmup=3, iterations=
     dtp_g = cp.zeros((n, nheads, nchunks, CHUNK_SIZE), dtype=cp.float32)
     sts_g = cp.zeros((n, nchunks, nheads, dim, dstate), dtype=cp.float32)
     prev_states_g = cp.zeros((n, nchunks, nheads, dim, dstate), dtype=cp.float32)
-    final_states_g = cp.zeros((n, nheads, dim, dstate), dtype=cp.float32)
+    final_states_g = cp.zeros((n, nheads, dim, dstate), dtype=cp.float16)  # plugin contract: fp16
     CB_g = cp.zeros((n, nchunks, ngroups, CHUNK_SIZE, CHUNK_SIZE), dtype=cp.float32)
 
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
@@ -823,22 +866,26 @@ def run_pipeline(n, nheads, dim, dstate, ngroups, seq_len, warmup=3, iterations=
     print("  Compiling 5 kernels...")
     t0 = time.time()
 
+    # Uniform context_lengths placeholder (cl[b] = seq_len for all b in non-varlen test runs).
+    cl_g = cp.full((n,), seq_len, dtype=cp.int32)
+
     c1 = cute.compile(jit_cumsum,
         wrap_nd(dt_g), wrap_1d(A_g), wrap_1d(dtb_g), wrap_nd(dA_g), wrap_nd(dtp_g),
-        seq_len, n, nheads, nchunks, dt_softplus=True, stream=stream)
+        wrap_1d(cl_g), n, nheads, nchunks, dt_softplus=True, stream=stream)
 
     c2 = cute.compile(jit_chunk_state,
         wrap_nd(x_g), wrap_nd(B_g), wrap_nd(dtp_g), wrap_nd(dA_g),
-        wrap_nd(sts_g), seq_len, nchunks, nheads, nheads_ngroups_ratio, n,
+        wrap_nd(sts_g), wrap_1d(cl_g), nchunks, nheads, nheads_ngroups_ratio, n,
         stream=stream)
 
     c3 = cute.compile(jit_state_passing,
         wrap_nd(sts_g), wrap_nd(prev_states_g), wrap_nd(final_states_g), wrap_nd(dA_g),
+        wrap_nd(state_g),
         nchunks, n, nheads, stream=stream)
 
     c4 = cute.compile(jit_bmm,
         wrap_nd_cpasync(C_g), wrap_nd_cpasync(B_g), wrap_nd(CB_g),
-        seq_len, nchunks, n, ngroups, stream=stream)
+        wrap_1d(cl_g), nchunks, n, ngroups, stream=stream)
 
     # z tensor (dummy zeros if not used)
     z_g = cp.zeros((n, seq_len, nheads, dim), dtype=cp.float16)
@@ -846,7 +893,7 @@ def run_pipeline(n, nheads, dim, dstate, ngroups, seq_len, warmup=3, iterations=
     c5 = cute.compile(jit_chunk_scan,
         wrap_nd(CB_g), wrap_nd(x_g), wrap_nd(dtp_g), wrap_nd(dA_g),
         wrap_nd(C_g), wrap_nd(prev_states_g), wrap_1d(D_g), wrap_nd(z_g), wrap_nd(out_g),
-        seq_len, nchunks, nheads, nheads_ngroups_ratio, n,
+        wrap_1d(cl_g), nchunks, nheads, nheads_ngroups_ratio, n,
         has_D=True, has_z=False, stream=stream)
 
     print(f"  Compilation: {time.time() - t0:.2f}s")
@@ -857,21 +904,23 @@ def run_pipeline(n, nheads, dim, dstate, ngroups, seq_len, warmup=3, iterations=
     w_x = wrap_nd(x_g); w_B = wrap_nd(B_g); w_C = wrap_nd(C_g)
     w_sts = wrap_nd(sts_g); w_prev = wrap_nd(prev_states_g)
     w_final = wrap_nd(final_states_g); w_CB = wrap_nd(CB_g)
+    w_state_init = wrap_nd(state_g)
     w_D = wrap_1d(D_g); w_z = wrap_nd(z_g); w_out = wrap_nd(out_g)
     w_x_cp = wrap_nd_cpasync(x_g)
     w_C_cp = wrap_nd_cpasync(C_g); w_B_cp = wrap_nd_cpasync(B_g)
+    w_cl = wrap_1d(cl_g)
 
     def run():
         # Reset intermediates
         dA_g.fill(0); dtp_g.fill(0); sts_g.fill(0); CB_g.fill(0); out_g.fill(0)
         prev_states_g.fill(0); final_states_g.fill(0)
 
-        c1(w_dt, w_A, w_dtb, w_dA, w_dtp, seq_len, n, nheads, nchunks, stream)
-        c2(w_x, w_B, w_dtp, w_dA, w_sts, seq_len, nchunks, nheads, nheads_ngroups_ratio, n, stream)
-        c3(w_sts, w_prev, w_final, w_dA, nchunks, n, nheads, stream)
-        c4(w_C_cp, w_B_cp, w_CB, seq_len, nchunks, n, ngroups, stream)
+        c1(w_dt, w_A, w_dtb, w_dA, w_dtp, w_cl, n, nheads, nchunks, stream)
+        c2(w_x, w_B, w_dtp, w_dA, w_sts, w_cl, nchunks, nheads, nheads_ngroups_ratio, n, stream)
+        c3(w_sts, w_prev, w_final, w_dA, w_state_init, nchunks, n, nheads, stream)
+        c4(w_C_cp, w_B_cp, w_CB, w_cl, nchunks, n, ngroups, stream)
         c5(w_CB, w_x, w_dtp, w_dA, w_C, w_prev, w_D, w_z, w_out,
-           seq_len, nchunks, nheads, nheads_ngroups_ratio, n, stream)
+           w_cl, nchunks, nheads, nheads_ngroups_ratio, n, stream)
 
     print("  Running...")
     run()
@@ -918,19 +967,23 @@ def _create_combined_jit():
         A: cute.Tensor,            # [nheads] fp32
         B: cute.Tensor,            # [batch, seq_len, ngroups, dstate] fp16
         C: cute.Tensor,            # [batch, seq_len, ngroups, dstate] fp16
-        D: cute.Tensor,            # [nheads] fp32
-        dt_bias: cute.Tensor,      # [nheads] fp32
+        D: cute.Tensor,            # [nheads] fp16 (plugin contract)
+        dt_bias: cute.Tensor,      # [nheads] fp16 (plugin contract)
         z: cute.Tensor,            # [batch, seq_len, nheads, dim] fp16 (dummy if has_z=False)
         output: cute.Tensor,       # [batch, seq_len, nheads, dim] fp16
-        final_states: cute.Tensor, # [batch, nheads, dim, dstate] fp32
+        final_states: cute.Tensor, # [batch, nheads, dim, dstate] fp16 (plugin contract)
+        init_states: cute.Tensor,  # [batch, nheads, dim, dstate] fp16 -- initial SSM state
+                                   # (runner aliases this to final_states buffer to enable
+                                   # has_init_states for chunked prefill / continuous batching)
         # Intermediate buffers (pre-allocated by caller)
         dA_cumsum: cute.Tensor,    # [batch, nheads, nchunks, CHUNK_SIZE] fp32
         dt_proc: cute.Tensor,      # [batch, nheads, nchunks, CHUNK_SIZE] fp32
         states: cute.Tensor,       # [batch, nchunks, nheads, dim, dstate] fp32
         prev_states: cute.Tensor,  # [batch, nchunks, nheads, dim, dstate] fp32
         CB: cute.Tensor,           # [batch, nchunks, ngroups, CHUNK_SIZE, CHUNK_SIZE] fp32
-        # Scalar params
-        seq_len: Int32,
+        # Varlen metadata (always present; uniform when no varlen)
+        context_lengths: cute.Tensor,  # [batch] int32 -- per-batch effective seq_len
+        # Scalar params (seq_len removed; per-batch length is read from context_lengths inside kernels)
         nchunks: Int32,
         n_batch: Int32,
         nheads_val: Int32,
@@ -942,9 +995,10 @@ def _create_combined_jit():
         has_z: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        # Step 1: cumsum
-        k_cumsum(dt_in, A, dt_bias, dA_cumsum, dt_proc, seq_len, dt_softplus).launch(
-            grid=(n_batch, nheads_val, nchunks), block=[1, 1, 1], smem=0, stream=stream)
+        # Step 1: cumsum (uses cl[b] for per-batch effective seq_len -> padding tokens contribute 0)
+        k_cumsum(dt_in, A, dt_bias, dA_cumsum, dt_proc, context_lengths, dt_softplus).launch(
+            grid=(n_batch, nheads_val, nchunks), block=[CHUNK_SIZE, 1, 1],
+            smem=cutlass.Int32(CHUNK_SIZE * 4 + 256), stream=stream)
 
         # Step 2: chunk_state (MMA + cp.async)
         cs_mma_op = _MmaOp(ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=(16, 8, 16))
@@ -957,7 +1011,7 @@ def _create_combined_jit():
         cs_r2s_C = cute.make_tiled_copy_C(cs_r2s, cs_tiled_mma)
         n_tiles_cs = cutlass.Int32(((DIM + BM - 1) // BM) * ((DSTATE + BN - 1) // BN))
         smem_cs = cutlass.Int32((BM * BK_MMA + BN * BK_MMA) * 2 + BM * BN * 4 + 256)
-        k_chunk_state(x, B, dt_proc, dA_cumsum, states, seq_len, nchunks, nheads_ngroups_ratio,
+        k_chunk_state(x, B, dt_proc, dA_cumsum, states, context_lengths, nchunks, nheads_ngroups_ratio,
                       cs_tiled_mma, cs_copy_A, cs_copy_B, cs_r2s_C).launch(
             grid=(n_tiles_cs, n_batch * nchunks, nheads_val),
             block=[THREADS, 1, 1], smem=smem_cs, stream=stream)
@@ -965,7 +1019,7 @@ def _create_combined_jit():
         # Step 3: state_passing (reads dA_cumsum[:,:,:,-1] directly)
         flat_dim = cutlass.Int32(DIM * DSTATE)
         n_blocks_sp = (flat_dim + THREADS - 1) // THREADS
-        k_state_passing(states, prev_states, final_states, dA_cumsum, nchunks).launch(
+        k_state_passing(states, prev_states, final_states, dA_cumsum, init_states, nchunks).launch(
             grid=(n_blocks_sp, n_batch, nheads_val), block=[THREADS, 1, 1], smem=0, stream=stream)
 
         # Step 4: bmm (MMA + cp.async)
@@ -986,7 +1040,7 @@ def _create_combined_jit():
             bmm_g2s_atom, bmm_g2s_thr, bmm_g2s_val)
         n_tiles_bmm = cutlass.Int32((CHUNK_SIZE // BM) * (CHUNK_SIZE // BN))
         smem_bmm = cutlass.Int32((BM * BK_MMA + BN * BK_MMA) * 2 + BM * BN * 4 + 256)
-        k_bmm(C, B, CB, seq_len, nchunks,
+        k_bmm(C, B, CB, context_lengths, nchunks,
               bmm_tiled_mma, bmm_copy_A, bmm_copy_B, bmm_r2s_C,
               bmm_tiled_copy_g2s).launch(
             grid=(n_tiles_bmm, n_batch * nchunks, ngroups),
@@ -1004,7 +1058,7 @@ def _create_combined_jit():
         n_tiles_scan = cutlass.Int32(((CHUNK_SIZE + BM - 1) // BM) * ((DIM + BN - 1) // BN))
         smem_scan = cutlass.Int32((BM * BK_MMA + BN * BK_MMA) * 2 + BM * BN * 4 + 256)
         k_chunk_scan(CB, x, dt_proc, dA_cumsum, C, prev_states, D, z, output,
-                     seq_len, nchunks, nheads_ngroups_ratio, has_D, has_z,
+                     context_lengths, nchunks, nheads_ngroups_ratio, has_D, has_z,
                      scan_tiled_mma, scan_copy_A, scan_copy_B, scan_r2s_C).launch(
             grid=(n_tiles_scan, n_batch * nchunks, nheads_val),
             block=[THREADS, 1, 1], smem=smem_scan, stream=stream)
@@ -1041,10 +1095,10 @@ def _make_aot_placeholders(n, nheads, dim, dstate, ngroups, seq_len):
         "x":       cp.zeros((n, seq_len, nheads, dim), dtype=f16),
         "dt_in":   cp.zeros((n, seq_len, nheads), dtype=f16),
         "A":       cp.zeros((nheads,), dtype=f32),
-        "dt_bias": cp.zeros((nheads,), dtype=f32),
+        "dt_bias": cp.zeros((nheads,), dtype=f16),  # plugin contract: fp16
         "B":       cp.zeros((n, seq_len, ngroups, dstate), dtype=f16),
         "C":       cp.zeros((n, seq_len, ngroups, dstate), dtype=f16),
-        "D":       cp.zeros((nheads,), dtype=f32),
+        "D":       cp.zeros((nheads,), dtype=f16),  # plugin contract: fp16
         "z":       cp.zeros((n, seq_len, nheads, dim), dtype=f16),
         "output":  cp.zeros((n, seq_len, nheads, dim), dtype=f16),
         # Intermediates
@@ -1057,7 +1111,12 @@ def _make_aot_placeholders(n, nheads, dim, dstate, ngroups, seq_len):
         "dA_chunk":    cp.zeros((n, nheads, nchunks), dtype=f32),
         "CB":          cp.zeros((n, nchunks, ngroups, CHUNK_SIZE, CHUNK_SIZE), dtype=f32),
         "prev_states": cp.zeros((n, nchunks, nheads, dim, dstate), dtype=f32),
-        "state":       cp.zeros((n, nheads, dim, dstate), dtype=f32),
+        "state":       cp.zeros((n, nheads, dim, dstate), dtype=f16),  # plugin contract: fp16
+        # Initial SSM state input -- runner aliases this to the same buffer as `state`
+        # (which is staged with the input state via cudaMemcpyAsync in the plugin).
+        "init_states": cp.zeros((n, nheads, dim, dstate), dtype=f16),
+        # Varlen metadata (always present, uniform when no varlen)
+        "context_lengths": cp.full((n,), seq_len, dtype=cp.int32),
     }
 
 
@@ -1090,11 +1149,15 @@ def export_ssd_chunk_scan(n, nheads, dim, dstate, ngroups, seq_len,
         wrap_nd_cpasync(ph["B"]), wrap_nd_cpasync(ph["C"]), wrap_1d(ph["D"]),
         wrap_1d(ph["dt_bias"]), wrap_nd(ph["z"]),
         wrap_nd(ph["output"]), wrap_nd(ph["state"]),
+        # Initial state input (aliased by runner to the state buffer for has_init_states)
+        wrap_nd(ph["init_states"]),
         # Intermediate buffers
         wrap_nd(ph["dA_cumsum"]), wrap_nd(ph["dt_proc"]),
         wrap_nd(ph["states"]), wrap_nd(ph["prev_states"]), wrap_nd(ph["CB"]),
-        # Scalars
-        seq_len, nchunks, n, nheads, nheads_ngroups_ratio, ngroups,
+        # Varlen metadata (per-batch effective seq_len)
+        wrap_1d(ph["context_lengths"]),
+        # Scalars (seq_len removed from kernel signature; baked into context_lengths)
+        nchunks, n, nheads, nheads_ngroups_ratio, ngroups,
         # Constexpr
         dt_softplus=True, has_D=True, has_z=False,
         stream=stream, **co,

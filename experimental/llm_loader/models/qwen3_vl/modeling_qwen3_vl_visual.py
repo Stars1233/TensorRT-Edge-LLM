@@ -28,13 +28,17 @@ merger. Qwen3.5-VL is the same but without deepstack_visual_indexes.
 
 from __future__ import annotations
 
-from typing import List, Tuple, Union
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..linear import make_linear
 from ..ops import vit_attention_plugin
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Shared utilities
@@ -152,10 +156,24 @@ class Qwen3VLMLP(nn.Module):
     Checkpoint keys: ``visual.blocks.N.mlp.linear_fc1.*``, ``linear_fc2.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
-        self.linear_fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(intermediate_size, hidden_size, bias=True)
+        self.linear_fc1 = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.linear_fc1" if name_prefix else "")
+        self.linear_fc2 = make_linear(
+            model_config,
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.linear_fc2" if name_prefix else "")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear_fc2(F.gelu(self.linear_fc1(x), approximate="tanh"))
@@ -164,12 +182,26 @@ class Qwen3VLMLP(nn.Module):
 class Qwen3VLVisionAttention(nn.Module):
     """Qwen3-VL vision attention replaced with vit_attention_plugin."""
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.qkv = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size * 3,
+            bias=True,
+            module_name=f"{name_prefix}.qkv" if name_prefix else "")
+        self.proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.proj" if name_prefix else "")
 
     def forward(
         self,
@@ -204,13 +236,25 @@ class Qwen3VLVisionBlock(nn.Module):
     Checkpoint keys: ``visual.blocks.N.norm1.*``, ``norm2.*``, ``attn.*``, ``mlp.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
-        self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)
-        self.mlp = Qwen3VLMLP(hidden_size, intermediate_size)
+        self.attn = Qwen3VLVisionAttention(
+            hidden_size,
+            num_heads,
+            model_config,
+            name_prefix=f"{name_prefix}.attn" if name_prefix else "")
+        self.mlp = Qwen3VLMLP(
+            hidden_size,
+            intermediate_size,
+            model_config,
+            name_prefix=f"{name_prefix}.mlp" if name_prefix else "")
 
     def forward(
         self,
@@ -246,7 +290,9 @@ class Qwen3VLPatchMerger(nn.Module):
                  hidden_size: int,
                  out_hidden_size: int,
                  spatial_merge_size: int,
-                 use_postshuffle_norm: bool = False) -> None:
+                 model_config: "ModelConfig",
+                 use_postshuffle_norm: bool = False,
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.spatial_merge_size = spatial_merge_size
         self.merge_unit = spatial_merge_size * spatial_merge_size
@@ -254,8 +300,18 @@ class Qwen3VLPatchMerger(nn.Module):
         self.use_postshuffle_norm = use_postshuffle_norm
         norm_dim = self.merged_size if use_postshuffle_norm else hidden_size
         self.norm = LayerNorm(norm_dim, eps=1e-6)
-        self.linear_fc1 = nn.Linear(self.merged_size, self.merged_size)
-        self.linear_fc2 = nn.Linear(self.merged_size, out_hidden_size)
+        self.linear_fc1 = make_linear(
+            model_config,
+            self.merged_size,
+            self.merged_size,
+            bias=True,
+            module_name=f"{name_prefix}.linear_fc1" if name_prefix else "")
+        self.linear_fc2 = make_linear(
+            model_config,
+            self.merged_size,
+            out_hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.linear_fc2" if name_prefix else "")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_postshuffle_norm:
@@ -276,7 +332,7 @@ class Qwen3VLVisualModel(nn.Module):
     All parameters are loaded from the checkpoint under the ``visual.*`` prefix.
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         self.hidden_size: int = config["hidden_size"]
         self.num_heads: int = config["num_heads"]
@@ -301,20 +357,31 @@ class Qwen3VLVisualModel(nn.Module):
                                              bias=True)
         self.pos_embed = nn.Embedding(num_position_embeddings,
                                       self.hidden_size)
+        # Module-name prefixes match the keys ``layer_overrides`` carries for
+        # MIXED_PRECISION checkpoints (full HF path with the leading ``model.``
+        # stripped) so per-layer FP8 / NVFP4 / ... overrides resolve correctly.
         self.blocks = nn.ModuleList([
-            Qwen3VLVisionBlock(self.hidden_size, intermediate_size,
-                               self.num_heads) for _ in range(depth)
+            Qwen3VLVisionBlock(self.hidden_size,
+                               intermediate_size,
+                               self.num_heads,
+                               model_config,
+                               name_prefix=f"visual.blocks.{i}")
+            for i in range(depth)
         ])
         self.merger = Qwen3VLPatchMerger(self.hidden_size,
                                          self.out_hidden_size,
                                          self.spatial_merge_size,
-                                         use_postshuffle_norm=False)
+                                         use_postshuffle_norm=False,
+                                         model_config=model_config,
+                                         name_prefix="visual.merger")
         self.deepstack_merger_list = nn.ModuleList([
             Qwen3VLPatchMerger(self.hidden_size,
                                self.out_hidden_size,
                                self.spatial_merge_size,
-                               use_postshuffle_norm=True)
-            for _ in range(len(self.deepstack_visual_indexes))
+                               use_postshuffle_norm=True,
+                               model_config=model_config,
+                               name_prefix=f"visual.deepstack_merger_list.{i}")
+            for i in range(len(self.deepstack_visual_indexes))
         ])
 
         # Rotary embedding (not a stored parameter — computed at runtime)
@@ -509,16 +576,20 @@ class Qwen3VLVisualModel(nn.Module):
 def build_qwen3_vl_visual(
         config: dict,
         weights: dict,
+        model_config: "ModelConfig",
         dtype: torch.dtype = torch.float16) -> Qwen3VLVisualModel:
     """Instantiate and load weights for a Qwen3-VL visual encoder.
 
     Args:
-        config:  Parsed ``vision_config`` dict from ``config.json``.
-        weights: Safetensors weight dict (all model weights; keys with
-                 ``model.visual.*`` prefix are consumed here).
-        dtype:   Target dtype (default float16).
+        config:       Parsed ``vision_config`` dict from ``config.json``.
+        weights:      Safetensors weight dict (all model weights; keys with
+                      ``model.visual.*`` prefix are consumed here).
+        model_config: Top-level ``ModelConfig``.  Visual layers dispatch
+                      through ``make_linear`` so quantized checkpoints are
+                      honoured; an FP16 checkpoint yields ``FP16Linear``.
+        dtype:        Target dtype (default float16).
     """
-    model = Qwen3VLVisualModel(config)
+    model = Qwen3VLVisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_weights(model, weights, prefix="model.visual")
     model.eval()
@@ -533,25 +604,21 @@ def build_qwen3_vl_visual(
 def _load_weights(model: nn.Module, weights: dict, prefix: str = "") -> None:
     """Load weights from a flat safetensors dict into *model*.
 
-    Strips *prefix* from weight keys and calls ``model.load_state_dict``
-    with strict=False so that any non-matching keys (e.g. rotary buffers,
-    LLM weights) are silently ignored.
+    Strips ``<prefix>.`` from each checkpoint key, then defers to
+    :func:`llm_loader.checkpoint.loader.load_submodule_weights` (which uses
+    ``_set_tensor`` so quantized weight dtypes are preserved and
+    ``apply_all_repacking`` runs at the end).
     """
+    from ...checkpoint.loader import load_submodule_weights
+
     strip = prefix + "." if prefix else ""
-    state: dict = {}
-    for k, v in weights.items():
-        if strip and k.startswith(strip):
-            state[k[len(strip):]] = v
-        elif not strip:
-            state[k] = v
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Missing keys when loading %s weights: %s",
-            prefix or "model",
-            missing[:10],
-        )
+
+    def _remap(k: str) -> "str | None":
+        if strip and not k.startswith(strip):
+            return None
+        return k[len(strip):] if strip else k
+
+    load_submodule_weights(model, weights, _remap, label=prefix or "model")
 
 
 __all__ = [

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -331,9 +331,59 @@ def _causal_conv1d_translation(
         padding=padding,
         dilation=dilation,
         groups=groups,
+        use_mtp=0,
         _outputs=2,
     )
     return output, conv_state_out
+
+
+@script()
+def _causal_conv1d_with_intermediate_translation(
+    hidden_states: onnxscript.FLOAT16,
+    weight: onnxscript.FLOAT16,
+    bias: onnxscript.FLOAT16,
+    conv_state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT16]:
+    output, conv_state_out, intermediate_conv_state_out = _trt_edgellm.causal_conv1d(
+        hidden_states,
+        weight,
+        bias,
+        conv_state,
+        context_lengths,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+        use_mtp=1,
+        _outputs=3,
+    )
+    return output, conv_state_out, intermediate_conv_state_out
+
+
+def _causal_conv1d_dispatch(
+    hidden_states,
+    weight,
+    bias,
+    conv_state,
+    context_lengths,
+    stride,
+    padding,
+    dilation,
+    groups,
+    collect_intermediate_states=False,
+):
+    if collect_intermediate_states:
+        return _causal_conv1d_with_intermediate_translation(
+            hidden_states, weight, bias, conv_state, context_lengths, stride,
+            padding, dilation, groups)
+    return _causal_conv1d_translation(hidden_states, weight, bias, conv_state,
+                                      context_lengths, stride, padding,
+                                      dilation, groups)
 
 
 @script()
@@ -362,9 +412,65 @@ def _gated_delta_net_translation(
         context_lengths,
         k_dim=k_dim,
         v_dim=v_dim,
+        use_mtp=0,
         _outputs=2,
     )
     return output, h0_out
+
+
+@script()
+def _gated_delta_net_with_intermediate_translation(
+    q: onnxscript.FLOAT16,
+    k: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    a: onnxscript.FLOAT16,
+    b: onnxscript.FLOAT16,
+    A_log: onnxscript.FLOAT,
+    dt_bias: onnxscript.FLOAT16,
+    h0_source: onnxscript.FLOAT,
+    context_lengths: onnxscript.INT32,
+    k_dim: int,
+    v_dim: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
+    output, h0_out, intermediate_h0_out = _trt_edgellm.gated_delta_net(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0_source,
+        context_lengths,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        use_mtp=1,
+        _outputs=3,
+    )
+    return output, h0_out, intermediate_h0_out
+
+
+def _gated_delta_net_dispatch(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    h0_source,
+    context_lengths,
+    k_dim,
+    v_dim,
+    collect_intermediate_states=False,
+):
+    if collect_intermediate_states:
+        return _gated_delta_net_with_intermediate_translation(
+            q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim,
+            v_dim)
+    return _gated_delta_net_translation(q, k, v, a, b, A_log, dt_bias,
+                                        h0_source, context_lengths, k_dim,
+                                        v_dim)
 
 
 @script()
@@ -447,6 +553,50 @@ def _vit_attention_plugin_translation(
         max_seqlen_carrier,
         num_heads=num_heads,
         head_size=head_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TRT native attention ops (RotaryEmbedding, TensorScatter, Attention)
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _rope_onnx_translation(
+    x: onnxscript.FLOAT16,
+    cos: onnxscript.FLOAT16,
+    sin: onnxscript.FLOAT16,
+    position_ids: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    return _trt.RotaryEmbedding(x, cos, sin, position_ids)
+
+
+@script()
+def _kv_cache_update_onnx_translation(
+    cache: onnxscript.FLOAT16,
+    new_kv: onnxscript.FLOAT16,
+    cache_indices: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    return _trt.TensorScatter(cache, new_kv, cache_indices)
+
+
+@script()
+def _attention_onnx_translation(
+    query: onnxscript.FLOAT16,
+    key: onnxscript.FLOAT16,
+    value: onnxscript.FLOAT16,
+    attn_mask: onnxscript.FLOAT16,
+    is_causal: int,
+    scale: float,
+) -> onnxscript.FLOAT16:
+    return _trt.Attention(
+        query,
+        key,
+        value,
+        attn_mask,
+        is_causal=is_causal,
+        TRT_decomposable=1,
+        scale=scale,
     )
 
 
@@ -543,6 +693,50 @@ def _nvfp4_moe_plugin_translation(
     return output
 
 
+@script()
+def _nvfp4_moe_plugin_geforce_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_qweights: onnxscript.INT8,
+    fc1_blocks_scale: onnxscript.INT8,
+    fc1_alpha: onnxscript.FLOAT,
+    fc2_qweights: onnxscript.INT8,
+    fc2_blocks_scale: onnxscript.INT8,
+    fc2_alpha: onnxscript.FLOAT,
+    input_global_scale: onnxscript.FLOAT,
+    down_input_scale: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.NvFP4MoEPluginGeforce(
+        router_logits,
+        hidden_states,
+        fc1_qweights,
+        fc1_blocks_scale,
+        fc1_alpha,
+        fc2_qweights,
+        fc2_blocks_scale,
+        fc2_alpha,
+        input_global_scale,
+        down_input_scale,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        backend=backend,
+        io_dtype=io_dtype,
+        max_routed_rows=max_routed_rows,
+    )
+    return output
+
+
 def build_custom_translation_table() -> dict:
     """Return the ``custom_translation_table`` for ``torch.onnx.export(dynamo=True)``.
 
@@ -579,11 +773,11 @@ def build_custom_translation_table() -> dict:
         torch.ops.trt.int8_sq_weight_dq.default:
         _int8_sq_weight_dq_translation,
         torch.ops.trt_edgellm.causal_conv1d.default:
-        _causal_conv1d_translation,
+        _causal_conv1d_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
-        _gated_delta_net_translation,
+        _gated_delta_net_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
         torch.ops.trt.gather_nd.default:
@@ -592,4 +786,13 @@ def build_custom_translation_table() -> dict:
         _int4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
+        torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
+        _nvfp4_moe_plugin_geforce_translation,
+        # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
+        torch.ops.trt.rope_onnx.default:
+        _rope_onnx_translation,
+        torch.ops.trt.kv_cache_update_onnx.default:
+        _kv_cache_update_onnx_translation,
+        torch.ops.trt.attention_onnx.default:
+        _attention_onnx_translation,
     }

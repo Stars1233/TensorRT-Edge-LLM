@@ -84,7 +84,8 @@ class OnnxSpec:
 def _make_flat_wrapper(model: nn.Module,
                        Na: int,
                        Nd: int,
-                       eagle_base: bool = False) -> nn.Module:
+                       eagle_base: bool = False,
+                       emit_hidden_states: bool = False) -> nn.Module:
     """Build a wrapper with an explicit flat forward signature (no ``*args``).
 
     Using ``*flat_args`` in ``forward`` triggers a PyTorch 2.10 bug where the
@@ -100,7 +101,14 @@ def _make_flat_wrapper(model: nn.Module,
     When ``eagle_base=True``, the wrapper adds ``attention_mask`` and
     ``attention_pos_id`` inputs and an extra ``hidden_states`` output for
     EAGLE3 speculative decoding.
+
+    When ``emit_hidden_states=True`` (and ``eagle_base=False``), the wrapper
+    adds only the extra ``hidden_states`` output (no extra inputs) — used by
+    Qwen3-Omni where the Talker pipeline consumes the thinker's full-sequence
+    last-layer normed hidden states.
     """
+    has_hidden_output = eagle_base or emit_hidden_states
+
     param_names: List[str] = (["inputs_embeds"] +
                               [f"past_key_values_{i}" for i in range(Na)] + [
                                   "rope_rotary_cos_sin", "context_lengths",
@@ -118,7 +126,7 @@ def _make_flat_wrapper(model: nn.Module,
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
 
-    if eagle_base:
+    if has_hidden_output:
         body = (
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
@@ -207,19 +215,23 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
+        module_prefix = f"layers.{layer_idx}.self_attn"
 
         self.q_proj = make_linear(config,
                                   qkv_in_features,
                                   num_attention_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.q_proj")
         self.k_proj = make_linear(config,
                                   qkv_in_features,
                                   num_key_value_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.k_proj")
         self.v_proj = make_linear(config,
                                   qkv_in_features,
                                   num_key_value_heads * head_dim,
-                                  bias=config.attention_bias)
+                                  bias=config.attention_bias,
+                                  module_name=f"{module_prefix}.v_proj")
         # FP8 KV-cache scales live on the proj modules (checkpoint keys
         # ``...k_proj.k_scale`` / ``...v_proj.v_scale``); they are not part of
         # FP8Linear's per-tensor weight/input scales.
@@ -227,8 +239,10 @@ class Attention(nn.Module):
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 
-        self.o_proj = make_linear(config, num_attention_heads * head_dim,
-                                  hidden_size)
+        self.o_proj = make_linear(config,
+                                  num_attention_heads * head_dim,
+                                  hidden_size,
+                                  module_name=f"{module_prefix}.o_proj")
 
         if config.has_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -308,14 +322,24 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     """SwiGLU MLP: gate_proj, up_proj, down_proj."""
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, layer_idx: int = -1) -> None:
         super().__init__()
-        self.gate_proj = make_linear(config, config.hidden_size,
-                                     config.intermediate_size)
-        self.up_proj = make_linear(config, config.hidden_size,
-                                   config.intermediate_size)
-        self.down_proj = make_linear(config, config.intermediate_size,
-                                     config.hidden_size)
+        module_prefix = f"layers.{layer_idx}.mlp" if layer_idx >= 0 else ""
+        self.gate_proj = make_linear(
+            config,
+            config.hidden_size,
+            config.intermediate_size,
+            module_name=f"{module_prefix}.gate_proj" if module_prefix else "")
+        self.up_proj = make_linear(
+            config,
+            config.hidden_size,
+            config.intermediate_size,
+            module_name=f"{module_prefix}.up_proj" if module_prefix else "")
+        self.down_proj = make_linear(
+            config,
+            config.intermediate_size,
+            config.hidden_size,
+            module_name=f"{module_prefix}.down_proj" if module_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(
@@ -339,7 +363,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx=layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps)
@@ -385,6 +409,10 @@ class Transformer(nn.Module):
     carry the ``model.`` prefix matching safetensors checkpoint keys.
 
     Submodules: ``embed_tokens``, ``layers``, ``norm``.
+
+    After ``forward``, the last-layer pre-norm hidden states are also exposed
+    on ``self.last_pre_norm_hidden_states`` for subclasses that need to emit
+    them as an extra ONNX output (see :class:`CausalLM.emit_hidden_states`).
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -395,6 +423,8 @@ class Transformer(nn.Module):
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Populated at the end of each forward; see module docstring.
+        self.last_pre_norm_hidden_states: "torch.Tensor | None" = None
 
     def forward(
         self,
@@ -431,6 +461,13 @@ class Transformer(nn.Module):
             if layer_index < len(deepstack_embeds):
                 hidden_states = hidden_states + deepstack_embeds[layer_index]
 
+        # Expose the last-layer pre-norm residual stream (= final DecoderLayer
+        # output) for subclasses that need it as an extra ONNX output.  This
+        # matches the HuggingFace ``_can_record_outputs["hidden_states"] =
+        # DecoderLayer`` hook point used by Qwen3-Omni Thinker, whose Talker
+        # consumes exactly this tensor.
+        self.last_pre_norm_hidden_states = hidden_states
+
         normed = self.norm(hidden_states)
 
         if output_hidden_states:
@@ -450,7 +487,16 @@ class CausalLM(nn.Module):
 
     The inner ``Transformer`` is stored as attribute ``model`` so all its
     parameters carry the ``model.`` prefix matching checkpoint key prefixes.
+
+    Subclasses can set the class attribute ``emit_hidden_states = True`` to
+    expose the full-sequence last-layer normed ``hidden_states`` as an extra
+    ONNX output (needed by Qwen3-Omni for the thinker → talker handoff).
+    This is independent of ``config.eagle_base``.
     """
+
+    #: Subclasses override to True when the model must emit ``hidden_states``
+    #: as an ONNX output in addition to ``logits``.
+    emit_hidden_states: bool = False
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -557,6 +603,9 @@ class CausalLM(nn.Module):
                        ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
+        if self.emit_hidden_states and not eagle_base:
+            output_names = (["logits", "hidden_states"] +
+                            [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
@@ -610,7 +659,12 @@ class CausalLM(nn.Module):
                 2: mask_kv_len
             })  # attention_mask
 
-        wrapped = _make_flat_wrapper(self, Na, Nd, eagle_base=eagle_base)
+        wrapped = _make_flat_wrapper(
+            self,
+            Na,
+            Nd,
+            eagle_base=eagle_base,
+            emit_hidden_states=self.emit_hidden_states)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -643,13 +697,15 @@ class CausalLM(nn.Module):
             attention_pos_id=attention_pos_id,
             output_hidden_states=eagle_base,
         )
+
         # Select hidden states for specified token positions before lm_head.
         # last_token_ids: [batch, num_tokens] int64 -- indices into the seq dim.
         # Use trt::gather_nd so the ONNX export emits GatherND(batch_dims=1)
         # instead of GatherElements; TRT handles GatherND natively.
-        hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
+        selected_hidden_states = torch.ops.trt.gather_nd(
+            hidden_states, last_token_ids)
 
-        logits = self.lm_head(hidden_states).to(torch.float32)
+        logits = self.lm_head(selected_hidden_states).to(torch.float32)
 
         if eagle_base and all_hidden_states is not None:
             # EAGLE3 base: concatenate hidden states from 3 selected layers.
@@ -666,5 +722,12 @@ class CausalLM(nn.Module):
             ],
                                      dim=-1).to(torch.float16)
             return logits, eagle_hidden, present_key_values
+
+        if self.emit_hidden_states:
+            # Full-sequence last-layer pre-norm residual, populated by
+            # :meth:`Transformer.forward` (see its docstring for the HF
+            # hidden_states hook-point alignment).
+            return logits, self.model.last_pre_norm_hidden_states, \
+                present_key_values
 
         return logits, present_key_values

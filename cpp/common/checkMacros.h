@@ -88,6 +88,30 @@ inline void _checkCudaDriver(
 
 } // namespace check
 
+// Stringify helpers for embedding __LINE__ as a string literal at preprocessor time.
+#define TRT_EDGELLM_STRINGIFY_IMPL(x) #x
+#define TRT_EDGELLM_STRINGIFY(x) TRT_EDGELLM_STRINGIFY_IMPL(x)
+
+/*!
+ * @brief Lazy-message precondition check
+ *
+ * Throws std::runtime_error if @p cond is false. The @p msg expression is only
+ * evaluated on failure, which matters when the message uses string concatenation
+ * (e.g. std::to_string, ostringstream) on hot paths. The thrown message is
+ * prefixed with __FILE__:__LINE__ to aid debugging.
+ *
+ * Usage: ELLM_CHECK(ptr != nullptr, "ptr must not be null");
+ *        ELLM_CHECK(n > 0, "n must be positive, got " + std::to_string(n));
+ */
+#define ELLM_CHECK(cond, msg)                                                                                          \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (!(cond))                                                                                                   \
+        {                                                                                                              \
+            throw std::runtime_error(std::string(__FILE__ ":" TRT_EDGELLM_STRINGIFY(__LINE__) ": ") + (msg));          \
+        }                                                                                                              \
+    } while (0)
+
 /*!
  * @brief Check CUDA runtime API calls
  *

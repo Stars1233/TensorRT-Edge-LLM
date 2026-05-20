@@ -18,7 +18,12 @@
 #pragma once
 
 #include "runtime/audioUtils.h"
+#include <cstdint>
+#include <fstream>
 #include <string>
+
+//! Default PCM sample rate for Qwen3-Omni TTS output (Hz).
+constexpr int32_t kDefaultAudioSampleRate = 24000;
 
 /*!
  * @brief Save audio data to WAV file
@@ -31,3 +36,41 @@
  * @return True if save succeeded, false otherwise
  */
 bool saveAudioToWav(std::string const& filepath, trt_edgellm::rt::audioUtils::AudioData const& audio);
+
+/*!
+ * @brief Streaming WAV writer for incremental chunk-based audio output
+ *
+ * Opens file and writes WAV header on construction. Each appendChunk() call
+ * appends PCM samples. finalize() patches the header with correct sizes.
+ * Destructor calls finalize() automatically if not called explicitly.
+ */
+class StreamingAudioWriter
+{
+public:
+    //! @brief Open file and write initial WAV header (sizes set to 0, patched on finalize)
+    //! @param filepath Output .wav path
+    //! @param sampleRate Audio sample rate (default kDefaultAudioSampleRate)
+    //! @return True if file opened successfully
+    bool open(std::string const& filepath, int32_t sampleRate = kDefaultAudioSampleRate);
+
+    //! @brief Append one chunk of audio samples
+    //! @param audio AudioData with waveform tensor (FP16 or FP32, mono)
+    //! @return True if write succeeded
+    bool appendChunk(trt_edgellm::rt::audioUtils::AudioData const& audio);
+
+    //! @brief Patch WAV header with final sizes and close file
+    void finalize();
+
+    ~StreamingAudioWriter();
+
+    int64_t totalSamplesWritten() const
+    {
+        return mTotalSamples;
+    }
+
+private:
+    std::ofstream mFile;
+    int32_t mSampleRate{kDefaultAudioSampleRate};
+    int64_t mTotalSamples{0};
+    bool mFinalized{false};
+};

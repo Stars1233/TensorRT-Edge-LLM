@@ -1067,6 +1067,39 @@ def load_eagle3_draft_model(draft_model_dir: str,
     return draft_model
 
 
+def load_mtp_draft_model(model_dir: str, dtype: str, device: str) -> nn.Module:
+    """Load the MTP draft model from a Qwen3.5 checkpoint.
+
+    Reads ``mtp.*`` keys from safetensors, builds a pure-PyTorch
+    :class:`~models.mtp_draft.MtpDraftModel` suitable for modelopt
+    quantization, and returns it in eval mode.
+
+    Args:
+        model_dir: Directory containing the Qwen3.5 HF checkpoint
+            (must have ``mtp.*`` weights in safetensors).
+        dtype: Model data type (``"fp16"``).
+        device: Target device.
+
+    Returns:
+        MtpDraftModel in eval mode.
+    """
+    # Convert dtype string to torch dtype
+    print(f"Loading MTP draft model from {model_dir}")
+    if dtype == "fp16":
+        torch_dtype = torch.float16
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+    from .models.mtp_draft import MtpDraftModel
+    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    text_config = getattr(config, "text_config", config)
+    draft_model = MtpDraftModel.from_pretrained(model_dir,
+                                                text_config=text_config,
+                                                device=device)
+    draft_model = draft_model.eval().to(torch_dtype).to(device)
+    return draft_model
+
+
 def load_tensor_by_candidate_keys(model_dir: str, keys_candidate: List[str],
                                   device: str) -> Optional[torch.Tensor]:
     """

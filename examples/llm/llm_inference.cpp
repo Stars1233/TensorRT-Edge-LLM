@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+#include "audioWriter.h"
 #include "common/checkMacros.h"
 #include "common/inputLimits.h"
 #include "common/trtUtils.h"
 #include "memoryMonitor.h"
+#include "multimodal/code2WavRunner.h"
 #include "profileFormatter.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
@@ -26,7 +28,9 @@
 #include "requestFileParser.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/qwen3OmniTTSRuntime.h"
 #include "tokenizer/tokenizer.h"
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
@@ -60,10 +64,15 @@ enum LLMInferenceOptionId : int
     EAGLE_DRAFT_STEP = 912,
     EAGLE_VERIFY_TREE_SIZE = 913,
     BATCH_SIZE = 914,
-    MAX_GENERATE_LENGTH = 915
+    MAX_GENERATE_LENGTH = 915,
+    ENABLE_AUDIO_OUTPUT = 916,
+    TALKER_ENGINE_DIR = 917,
+    CODE2WAV_ENGINE_DIR = 918,
+    OUTPUT_AUDIO_DIR = 919,
+    ENABLE_THINKER_TALKER_STREAMING = 920
 };
 
-// Struct to hold Eagle-specific arguments for speculative decoding
+// Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
 struct EagleArgs
 {
     bool enabled{false};
@@ -99,6 +108,27 @@ struct LLMInferenceArgs
     int32_t batchSize{-1};         // -1 means use value from input file
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     EagleArgs eagleArgs;
+
+    // Qwen3-Omni audio output options
+    bool enableAudioOutput{false};
+    std::string talkerEngineDir{""};
+    std::string code2wavEngineDir{""};
+    std::string outputAudioDir{""};
+
+    // Talker sampling params (read from input JSON, defaults match qwen3_tts_inference)
+    float talkerTemperature{0.9f};
+    int32_t talkerTopK{50};
+    float talkerTopP{1.0f};
+    float talkerRepetitionPenalty{1.05f};
+
+    // Thinker-Talker streaming mode (single CUDA stream interleaved).
+    // All fields below can be set either via CLI flag or the top-level
+    // "streaming": { "enable", "codec_chunk_frames", "talker_prefill_threshold" }
+    // block in the input JSON — JSON is the preferred path so scenarios are
+    // self-describing; the CLI flag remains for ad-hoc runs.
+    bool enableThinkerTalkerStreaming{false};
+    int32_t codecChunkFrames{10};      //!< Vocode every N Talker frames during streaming (0 = disabled)
+    int32_t talkerPrefillThreshold{4}; //!< Start Talker prefill after this many Thinker assistant tokens
 };
 
 void printUsage(char const* programName)
@@ -107,9 +137,9 @@ void printUsage(char const* programName)
               << " [--help] [--engineDir=<path to engine directory>] [--multimodalEngineDir=<path to multimodal engine "
                  "directory>] [--inputFile=<path to input file>] [--outputFile=<path to output file>] "
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
-                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--eagle] "
-                 "[--eagleDraftTopK=<number>] [--eagleDraftStep=<number>] "
-                 "[--eagleVerifyTreeSize=<number>]"
+                 "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
+                 "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
+                 "[--specVerifyTreeSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -126,13 +156,18 @@ void printUsage(char const* programName)
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
-    std::cerr << "  --eagle                   Enable Eagle speculative decoding mode" << std::endl;
-    std::cerr << "  --eagleDraftTopK          Number of tokens selected per drafting step (default: 10)" << std::endl;
+    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE or MTP)" << std::endl;
+    std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
     std::cerr << "                            Controls branching factor at each draft tree level" << std::endl;
-    std::cerr << "  --eagleDraftStep          Number of drafting steps to perform (default: 6)" << std::endl;
+    std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
     std::cerr << "                            Each step extends the draft tree by one more level" << std::endl;
-    std::cerr << "  --eagleVerifyTreeSize     Number of tokens for base model verification (default: 60)" << std::endl;
+    std::cerr << "  --specVerifyTreeSize      Number of tokens for base model verification (default: 60)" << std::endl;
     std::cerr << "                            Total draft tree size: 1 + topK + (step-1) * topK^2" << std::endl;
+    std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
+    std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
+    std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
+    std::cerr << "  --code2wavEngineDir       Path to Code2Wav engine directory (optional)" << std::endl;
+    std::cerr << "  --outputAudioDir          Directory to save generated audio (.wav) files" << std::endl;
 }
 
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
@@ -147,12 +182,22 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
         {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
         {"dumpOutput", no_argument, 0, LLMInferenceOptionId::DUMP_OUTPUT},
-        {"eagle", no_argument, 0, LLMInferenceOptionId::EAGLE},
-        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K},
-        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
-        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
+        {"specDecode", no_argument, 0, LLMInferenceOptionId::EAGLE},
+        {"eagle", no_argument, 0, LLMInferenceOptionId::EAGLE}, // deprecated alias
+        {"specDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K},
+        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K}, // deprecated alias
+        {"specDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
+        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP}, // deprecated alias
+        {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
+        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE}, // deprecated alias
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
-        {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH}, {0, 0, 0, 0}};
+        {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
+        {"enableAudioOutput", no_argument, 0, LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT},
+        {"talkerEngineDir", required_argument, 0, LLMInferenceOptionId::TALKER_ENGINE_DIR},
+        {"code2wavEngineDir", required_argument, 0, LLMInferenceOptionId::CODE2WAV_ENGINE_DIR},
+        {"outputAudioDir", required_argument, 0, LLMInferenceOptionId::OUTPUT_AUDIO_DIR},
+        {"enableThinkerTalkerStreaming", no_argument, 0, LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING},
+        {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", inferenceOptions, nullptr)) != -1)
@@ -191,13 +236,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.eagleArgs.draftTopK = std::stoi(optarg);
                 if (args.eagleArgs.draftTopK <= 0)
                 {
-                    LOG_ERROR("Invalid eagleDraftTopK value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specDraftTopK value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid eagleDraftTopK value: %s", optarg);
+                LOG_ERROR("Invalid specDraftTopK value: %s", optarg);
                 return false;
             }
             break;
@@ -207,13 +252,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.eagleArgs.draftStep = std::stoi(optarg);
                 if (args.eagleArgs.draftStep <= 0)
                 {
-                    LOG_ERROR("Invalid eagleDraftStep value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specDraftStep value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid eagleDraftStep value: %s", optarg);
+                LOG_ERROR("Invalid specDraftStep value: %s", optarg);
                 return false;
             }
             break;
@@ -223,13 +268,13 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 args.eagleArgs.verifyTreeSize = std::stoi(optarg);
                 if (args.eagleArgs.verifyTreeSize <= 0)
                 {
-                    LOG_ERROR("Invalid eagleVerifyTreeSize value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specVerifyTreeSize value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid eagleVerifyTreeSize value: %s", optarg);
+                LOG_ERROR("Invalid specVerifyTreeSize value: %s", optarg);
                 return false;
             }
             break;
@@ -265,6 +310,11 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT: args.enableAudioOutput = true; break;
+        case LLMInferenceOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
+        case LLMInferenceOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
+        case LLMInferenceOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
+        case LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING: args.enableThinkerTalkerStreaming = true; break;
         default: return false;
         }
     }
@@ -315,10 +365,40 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 
     if (args.eagleArgs.enabled)
     {
-        LOG_INFO("Eagle mode enabled");
-        LOG_INFO("Eagle draft topK: %d", args.eagleArgs.draftTopK);
-        LOG_INFO("Eagle draft step: %d", args.eagleArgs.draftStep);
-        LOG_INFO("Eagle verify tree size: %d", args.eagleArgs.verifyTreeSize);
+        LOG_INFO("Speculative decoding enabled");
+        LOG_INFO("Spec draft topK: %d", args.eagleArgs.draftTopK);
+        LOG_INFO("Spec draft step: %d", args.eagleArgs.draftStep);
+        LOG_INFO("Spec verify tree size: %d", args.eagleArgs.verifyTreeSize);
+    }
+
+    if (args.enableAudioOutput)
+    {
+        if (args.talkerEngineDir.empty())
+        {
+            LOG_ERROR("--talkerEngineDir is required when --enableAudioOutput is set");
+            return false;
+        }
+        LOG_INFO("Audio output enabled");
+        LOG_INFO("  Talker engine: %s", args.talkerEngineDir.c_str());
+        if (!args.code2wavEngineDir.empty())
+        {
+            LOG_INFO("  Code2Wav engine: %s", args.code2wavEngineDir.c_str());
+        }
+        if (!args.outputAudioDir.empty())
+        {
+            LOG_INFO("  Audio output dir: %s", args.outputAudioDir.c_str());
+        }
+    }
+
+    if (args.enableThinkerTalkerStreaming)
+    {
+        args.enableAudioOutput = true;
+        if (args.talkerEngineDir.empty())
+        {
+            LOG_ERROR("--enableThinkerTalkerStreaming requires --talkerEngineDir");
+            return false;
+        }
+        LOG_INFO("Thinker-Talker streaming enabled (single CUDA stream)");
     }
 
     if (args.debug)
@@ -335,9 +415,49 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 
 // Thin wrapper around the shared parser in examples/utils/requestFileParser.h.
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
-    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1, int64_t maxGenerateLengthOverride = -1)
+    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1, int64_t maxGenerateLengthOverride = -1,
+    LLMInferenceArgs* argsOut = nullptr)
 {
-    return exampleUtils::parseRequestFile(inputFilePath, batchSizeOverride, maxGenerateLengthOverride);
+    auto result = exampleUtils::parseRequestFile(inputFilePath, batchSizeOverride, maxGenerateLengthOverride);
+
+    if (argsOut != nullptr && argsOut->enableAudioOutput)
+    {
+        std::ifstream inputFileStream(inputFilePath);
+        if (inputFileStream.is_open())
+        {
+            Json inputData = Json::parse(inputFileStream);
+            argsOut->talkerTemperature = inputData.value("talker_temperature", 0.9f);
+            argsOut->talkerTopK = inputData.value("talker_top_k", 50);
+            argsOut->talkerTopP = inputData.value("talker_top_p", 1.0f);
+            argsOut->talkerRepetitionPenalty = inputData.value("repetition_penalty", 1.05f);
+            LOG_INFO("Talker params from JSON: temperature=%.2f, topK=%d, topP=%.2f, repetitionPenalty=%.2f",
+                argsOut->talkerTemperature, argsOut->talkerTopK, argsOut->talkerTopP, argsOut->talkerRepetitionPenalty);
+
+            // Thinker-Talker streaming config: top-level "streaming": {...} block.
+            // CLI --enableThinkerTalkerStreaming takes precedence when set; JSON fills the rest.
+            if (inputData.contains("streaming") && inputData["streaming"].is_object())
+            {
+                auto const& streamingCfg = inputData["streaming"];
+                bool const jsonEnable = streamingCfg.value("enable", false);
+                if (jsonEnable)
+                {
+                    argsOut->enableThinkerTalkerStreaming = true;
+                }
+                argsOut->codecChunkFrames = streamingCfg.value("codec_chunk_frames", argsOut->codecChunkFrames);
+                argsOut->talkerPrefillThreshold
+                    = streamingCfg.value("talker_prefill_threshold", argsOut->talkerPrefillThreshold);
+                if (argsOut->enableThinkerTalkerStreaming)
+                {
+                    LOG_INFO(
+                        "Thinker-Talker streaming from JSON: enable=true, codecChunkFrames=%d, "
+                        "talkerPrefillThreshold=%d",
+                        argsOut->codecChunkFrames, argsOut->talkerPrefillThreshold);
+                }
+            }
+        }
+    }
+
+    return result;
 }
 
 int main(int argc, char* argv[])
@@ -369,7 +489,7 @@ int main(int argc, char* argv[])
     try
     {
         std::tie(loraWeightsMap, batchedRequests)
-            = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength);
+            = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength, &args);
         LOG_INFO("Successfully parsed %zu LoRA weights from input file.", loraWeightsMap.size());
         LOG_INFO("Successfully parsed %zu batches of requests from input file.", batchedRequests.size());
     }
@@ -425,6 +545,53 @@ int main(int argc, char* argv[])
         LOG_WARNING("Failed to capture CUDA graph for decoding, proceeding with normal engine execution.");
     }
 
+    // Initialize Qwen3-Omni audio output pipeline (TTS runtime + Code2Wav)
+    std::unique_ptr<rt::Qwen3OmniTTSRuntime> ttsRuntime;
+    std::unique_ptr<rt::Code2WavRunner> code2wavRunner;
+    if (args.enableAudioOutput)
+    {
+        try
+        {
+            std::filesystem::path const codePredictorDir
+                = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
+            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
+                args.talkerEngineDir, codePredictorDir.string(), args.engineDir, stream);
+            LOG_INFO("TTS runtime initialized for audio output");
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("Failed to initialize TTS Runtime: %s", e.what());
+            return EXIT_FAILURE;
+        }
+
+        // Code2Wav runner (optional — falls back to RVQ code output)
+        std::filesystem::path const code2wavDir = args.code2wavEngineDir.empty()
+            ? std::filesystem::path(args.talkerEngineDir).parent_path() / "code2wav"
+            : std::filesystem::path(args.code2wavEngineDir);
+        if (std::filesystem::exists(code2wavDir))
+        {
+            try
+            {
+                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream);
+                LOG_INFO("Code2Wav runner initialized");
+            }
+            catch (std::exception const& e)
+            {
+                LOG_WARNING("Failed to initialize Code2Wav: %s. Will output RVQ codes only.", e.what());
+            }
+        }
+
+        if (!ttsRuntime->captureDecodingCUDAGraph(stream))
+        {
+            LOG_WARNING("CUDA graph capture failed for TTS decoding, proceeding without.");
+        }
+
+        if (!args.outputAudioDir.empty())
+        {
+            std::filesystem::create_directories(args.outputAudioDir);
+        }
+    }
+
     // Perform warmup runs if requested
     if (args.warmup > 0)
     {
@@ -476,23 +643,279 @@ int main(int argc, char* argv[])
                 100.0 * (requestIdx + 1) / batchedRequests.size());
         }
 
-        bool requestStatus = runtime->handleRequest(request, response, stream);
+        bool requestStatus = false;
+        StreamingAudioWriter streamingWriter;
+
+        cudaEvent_t e2eStart{nullptr}, e2eEnd{nullptr}, ttfpaEvent{nullptr};
+        bool ttfpaRecorded = false;
+        if (getProfilingEnabled() && ttsRuntime)
+        {
+            CUDA_CHECK(cudaEventCreateWithFlags(&e2eStart, cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&e2eEnd, cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ttfpaEvent, cudaEventDefault));
+            CUDA_CHECK(cudaEventRecord(e2eStart, stream));
+        }
+
+        // Streaming path: Thinker + Talker interleaved on the same CUDA stream
+        rt::Qwen3OmniTTSRuntime::TalkerGenerationResponse streamingTalkerResp;
+        if (args.enableThinkerTalkerStreaming && ttsRuntime)
+        {
+            rt::Qwen3OmniTTSRuntime::OmniGenerationRequest omniBaseReq;
+            omniBaseReq.talkerTemperature = args.talkerTemperature;
+            omniBaseReq.talkerTopK = args.talkerTopK;
+            omniBaseReq.talkerTopP = args.talkerTopP;
+            omniBaseReq.repetitionPenalty = args.talkerRepetitionPenalty;
+
+            rt::Qwen3OmniTTSRuntime::ThinkerTalkerStreamingConfig streamCfg;
+            streamCfg.talkerPrefillThreshold = args.talkerPrefillThreshold;
+
+            if (!args.outputAudioDir.empty() && code2wavRunner)
+            {
+                std::string filename = format::fmtstr("audio_req%zu_batch0.wav", requestIdx);
+                std::filesystem::path audioPath = std::filesystem::path(args.outputAudioDir) / filename;
+                streamingWriter.open(audioPath.string(), 24000);
+
+                streamCfg.codecChunkFrames = args.codecChunkFrames;
+                streamCfg.onAudioChunkReady = [&](std::vector<std::vector<int32_t>> const& chunkCodes) {
+                    if (chunkCodes.empty() || !code2wavRunner)
+                        return;
+                    size_t const numFrames = chunkCodes.size();
+                    size_t const numLayers = chunkCodes[0].size();
+                    std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+                    for (size_t f = 0; f < numFrames; ++f)
+                        for (size_t l = 0; l < numLayers; ++l)
+                            transposed[l][f] = chunkCodes[f][l];
+
+                    rt::audioUtils::AudioData chunkAudio;
+                    code2wavRunner->generateWaveform(transposed, chunkAudio, stream);
+                    if (chunkAudio.hasWaveform)
+                    {
+                        streamingWriter.appendChunk(chunkAudio);
+                        if (!ttfpaRecorded && ttfpaEvent)
+                        {
+                            CUDA_CHECK(cudaEventRecord(ttfpaEvent, stream));
+                            ttfpaRecorded = true;
+                        }
+                    }
+                };
+            }
+
+            request.generateAudio = true;
+
+            requestStatus = ttsRuntime->handleStreamingGeneration(
+                *runtime, request, response, streamCfg, omniBaseReq, streamingTalkerResp, stream);
+
+            if (requestStatus)
+            {
+                LOG_INFO("Request %zu: Thinker-Talker streaming generated %d audio frames", requestIdx,
+                    streamingTalkerResp.numFramesPerSample.empty() ? 0 : streamingTalkerResp.numFramesPerSample[0]);
+            }
+        }
+        else
+        {
+            // Sequential Omni: tell the runtime which hidden layer the Talker needs so it
+            // registers mOutputHiddenStates under that layer in the portal (not layer 0).
+            if (args.enableAudioOutput && ttsRuntime)
+            {
+                std::vector<int32_t> const requiredLayers = ttsRuntime->getThinkerHiddenLayerIndices();
+                request.acceptHiddenLayer = (requiredLayers.size() >= 2) ? requiredLayers[1] : 14;
+            }
+            requestStatus = runtime->handleRequest(request, response, stream, args.enableAudioOutput);
+        }
+
+        // Qwen3-Omni audio generation: Code2Wav vocoding
+        std::vector<rt::audioUtils::AudioData> audioOutputs;
+
+        // Helper: transpose RVQ codes [frames][layers] → [layers][frames] and vocode
+        auto vocodeAndSave = [&](std::vector<std::vector<int32_t>> const& framesCodes, size_t batchIdx) {
+            if (framesCodes.empty() || framesCodes[0].empty() || !code2wavRunner)
+                return;
+            size_t const numFrames = framesCodes.size();
+            size_t const numLayers = framesCodes[0].size();
+            std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
+            for (size_t f = 0; f < numFrames; ++f)
+                for (size_t l = 0; l < numLayers; ++l)
+                    transposed[l][f] = framesCodes[f][l];
+
+            if (args.dumpOutput)
+            {
+                int32_t codeMin = transposed[0][0], codeMax = transposed[0][0];
+                for (auto const& row : transposed)
+                    for (int32_t c : row)
+                    {
+                        codeMin = std::min(codeMin, c);
+                        codeMax = std::max(codeMax, c);
+                    }
+                LOG_INFO("Batch %zu: RVQ codes %zu frames x %zu layers, range [%d, %d]", batchIdx, numFrames, numLayers,
+                    codeMin, codeMax);
+            }
+
+            rt::audioUtils::AudioData audioData;
+            if (code2wavRunner->generateWaveform(transposed, audioData, stream) && audioData.hasWaveform)
+            {
+                if (!args.outputAudioDir.empty())
+                {
+                    std::string filename = format::fmtstr("audio_req%zu_batch%zu.wav", requestIdx, batchIdx);
+                    std::filesystem::path audioPath = std::filesystem::path(args.outputAudioDir) / filename;
+                    saveAudioToWav(audioPath.string(), audioData);
+                    LOG_INFO("Audio saved: %s", audioPath.string().c_str());
+                }
+                audioOutputs.push_back(std::move(audioData));
+            }
+        };
+
+        // Streaming path: vocode the streaming RVQ codes
+        if (requestStatus && args.enableThinkerTalkerStreaming && !streamingTalkerResp.batchRvqCodes.empty())
+        {
+            if (streamingWriter.totalSamplesWritten() > 0)
+            {
+                streamingWriter.finalize();
+                LOG_INFO("Streaming audio written: %ld samples (%.2fs)", streamingWriter.totalSamplesWritten(),
+                    static_cast<float>(streamingWriter.totalSamplesWritten()) / 24000.0f);
+            }
+            else
+            {
+                for (size_t batchIdx = 0; batchIdx < streamingTalkerResp.batchRvqCodes.size(); ++batchIdx)
+                {
+                    vocodeAndSave(streamingTalkerResp.batchRvqCodes[batchIdx], batchIdx);
+                }
+            }
+        }
+
+        // Non-streaming path: build batched Omni requests and call Talker once.
+        // Fetch Thinker prefill embeddings / hidden states from the runtime portal
+        // (see LLMInferenceSpecDecodeRuntime::getBaseModelHiddenStates contract).
+        rt::Tensor const* prefillEmbedsAll = runtime->getBaseModelHiddenStates(0);
+        std::vector<int32_t> const requiredLayers
+            = ttsRuntime ? ttsRuntime->getThinkerHiddenLayerIndices() : std::vector<int32_t>{};
+        int32_t const acceptHiddenLayer = (requiredLayers.size() >= 2) ? requiredLayers[1] : 14;
+        rt::Tensor const* hiddenStatesAll = runtime->getBaseModelHiddenStates(acceptHiddenLayer);
+        auto const& thinkerInputTokenIds = runtime->getBaseModelInputTokenIds();
+
+        if (requestStatus && !args.enableThinkerTalkerStreaming && args.enableAudioOutput && ttsRuntime
+            && prefillEmbedsAll != nullptr && !prefillEmbedsAll->isEmpty())
+        {
+            int32_t const prefillLen = runtime->getBaseModelPrefillLength();
+            int64_t const H = prefillEmbedsAll->getShape()[2];
+            int64_t const batchStride = static_cast<int64_t>(prefillLen) * H;
+
+            // Per-batch views into the [BS, prefillLen, H] tensors (must outlive omniRequests)
+            size_t const batchSize = response.outputIds.size();
+            std::vector<rt::Tensor> perBatchEmbedViews(batchSize);
+            std::vector<rt::Tensor> perBatchHiddenViews(batchSize);
+
+            std::vector<rt::Qwen3OmniTTSRuntime::OmniGenerationRequest> omniRequests;
+            for (size_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+            {
+                rt::Qwen3OmniTTSRuntime::OmniGenerationRequest omniReq;
+                if (batchIdx < thinkerInputTokenIds.size())
+                {
+                    omniReq.textTokenIds = thinkerInputTokenIds[batchIdx];
+                    omniReq.textTokenIds.insert(omniReq.textTokenIds.end(), response.outputIds[batchIdx].begin(),
+                        response.outputIds[batchIdx].end());
+                }
+                omniReq.talkerTemperature = args.talkerTemperature;
+                omniReq.talkerTopK = args.talkerTopK;
+                omniReq.talkerTopP = args.talkerTopP;
+                omniReq.repetitionPenalty = args.talkerRepetitionPenalty;
+
+                __half* embedBase = static_cast<__half*>(const_cast<void*>(prefillEmbedsAll->rawPointer()))
+                    + static_cast<int64_t>(batchIdx) * batchStride;
+                perBatchEmbedViews[batchIdx] = rt::Tensor(embedBase, rt::Coords{1, static_cast<int64_t>(prefillLen), H},
+                    rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+                omniReq.thinkerPrefillEmbeds = &perBatchEmbedViews[batchIdx];
+
+                if (hiddenStatesAll != nullptr)
+                {
+                    __half* hiddenBase = static_cast<__half*>(const_cast<void*>(hiddenStatesAll->rawPointer()))
+                        + static_cast<int64_t>(batchIdx) * batchStride;
+                    perBatchHiddenViews[batchIdx]
+                        = rt::Tensor(hiddenBase, rt::Coords{1, static_cast<int64_t>(prefillLen), H},
+                            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+                    omniReq.thinkerHiddenStates = &perBatchHiddenViews[batchIdx];
+                }
+
+                omniReq.prefillLength = batchIdx < thinkerInputTokenIds.size()
+                    ? static_cast<int32_t>(thinkerInputTokenIds[batchIdx].size())
+                    : 0;
+                omniRequests.push_back(std::move(omniReq));
+            }
+
+            rt::Qwen3OmniTTSRuntime::TalkerGenerationResponse talkerResp;
+            if (ttsRuntime->handleAudioGenerationFromThinker(omniRequests, talkerResp, stream))
+            {
+                for (size_t batchIdx = 0; batchIdx < talkerResp.batchRvqCodes.size(); ++batchIdx)
+                {
+                    vocodeAndSave(talkerResp.batchRvqCodes[batchIdx], batchIdx);
+                }
+            }
+            else
+            {
+                LOG_WARNING("Batched audio generation failed for request %zu", requestIdx);
+            }
+        }
+
+        if (e2eStart && e2eEnd && ttsRuntime)
+        {
+            CUDA_CHECK(cudaEventRecord(e2eEnd, stream));
+            CUDA_CHECK(cudaEventSynchronize(e2eEnd));
+
+            auto& latency = ttsRuntime->getMutableOmniLatencyMetrics();
+
+            float e2eMs = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&e2eMs, e2eStart, e2eEnd));
+            latency.endToEndMs = e2eMs;
+
+            auto const& ttfaEnd = ttsRuntime->getTtfaEndEvent();
+            if (ttfaEnd)
+            {
+                CUDA_CHECK(cudaEventSynchronize(ttfaEnd));
+                float ttfaMs = 0.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&ttfaMs, e2eStart, ttfaEnd));
+                latency.timeToFirstAudioCodeMs = ttfaMs;
+            }
+
+            if (ttfpaRecorded && ttfpaEvent)
+            {
+                CUDA_CHECK(cudaEventSynchronize(ttfpaEvent));
+                float ttfpaMs = 0.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&ttfpaMs, e2eStart, ttfpaEvent));
+                latency.timeToFirstPlayableAudioMs = ttfpaMs;
+            }
+            else
+            {
+                latency.timeToFirstPlayableAudioMs = e2eMs;
+            }
+
+            cudaEventDestroy(e2eStart);
+            cudaEventDestroy(e2eEnd);
+            if (ttfpaEvent)
+            {
+                cudaEventDestroy(ttfpaEvent);
+            }
+        }
 
         if (requestStatus)
         {
-            // Display inference output to console if --dumpOutput is enabled
             if (args.dumpOutput)
             {
                 for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
                 {
                     LOG_INFO("Response for request %zu batch %zu: %s", requestIdx, batchIdx,
                         response.outputTexts[batchIdx].c_str());
+                    if (batchIdx < audioOutputs.size() && audioOutputs[batchIdx].waveform
+                        && !audioOutputs[batchIdx].waveform->isEmpty())
+                    {
+                        auto const& shape = audioOutputs[batchIdx].waveform->getShape();
+                        int64_t samples = shape[shape.getNumDims() - 1];
+                        LOG_INFO("  Audio: %ld samples (%.2fs)", samples,
+                            static_cast<float>(samples) / audioOutputs[batchIdx].sampleRate);
+                    }
                 }
             }
         }
         else
         {
-            // Handle failed request - highlight failures
             hasFailedRequest = true;
             failedCount++;
             LOG_ERROR("*** FAILED *** Request %zu failed to process!", requestIdx);
@@ -580,6 +1003,11 @@ int main(int argc, char* argv[])
             outputGenerationProfile(profileOutput, runtime->getGenerationMetrics());
         }
         outputMultimodalProfile(profileOutput, multimodalMetrics);
+        if (ttsRuntime)
+        {
+            outputTalkerProfile(profileOutput, ttsRuntime->getMetrics());
+            outputOmniProfile(profileOutput, ttsRuntime->getOmniTalkerMetrics(), ttsRuntime->getOmniLatencyMetrics());
+        }
         outputMemoryProfile(profileOutput, memoryMonitor);
         profileOutput << "=====================================" << std::endl;
         LOG_INFO("%s", profileOutput.str().c_str());
@@ -603,9 +1031,19 @@ int main(int argc, char* argv[])
                 addJsonGenerationSummary(profileJson, runtime->getGenerationMetrics());
             }
             addJsonMultimodalSummary(profileJson, runtime->getMultimodalMetrics());
+            if (ttsRuntime)
+            {
+                addJsonTalkerSummary(profileJson, ttsRuntime->getMetrics());
+            }
 
             // Add detailed timing stages
             addJsonTimingStages(profileJson);
+
+            if (ttsRuntime)
+            {
+                addJsonOmniStageExtensions(
+                    profileJson, ttsRuntime->getOmniTalkerMetrics(), ttsRuntime->getOmniLatencyMetrics());
+            }
 
             // Add memory usage
             addJsonMemorySummary(profileJson, memoryMonitor);

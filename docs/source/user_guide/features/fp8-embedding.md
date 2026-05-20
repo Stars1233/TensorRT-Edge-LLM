@@ -15,12 +15,12 @@ FP8 embedding reduces memory usage by quantizing the embedding table from FP16 t
 
 ## Workflow
 
-### Checkpoint-Based Loader
-
 Export with `--fp8-embedding` to write the runtime embedding sidecar in FP8:
 
 ```bash
-export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+cd $EDGE_LLM_PATH
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 
 python -m llm_loader.export_all_cli \
   /path/to/Qwen3-8B \
@@ -30,24 +30,13 @@ python -m llm_loader.export_all_cli \
 
 This flag only changes `embedding.safetensors`; it does not change the ONNX graph or the checkpoint weights. The sidecar contains the FP8 embedding table plus `embedding_scale`.
 
-### Legacy Export Tools
-
-The legacy export CLI uses the underscore spelling:
-
-```bash
-tensorrt-edgellm-export-llm \
-  --model_dir Qwen/Qwen3-8B \
-  --output_dir onnx_models/qwen3-8b-fp8emb \
-  --fp8_embedding
-```
-
 ### Build Engine
 
 Build the TensorRT engine as usual. The build process automatically detects FP8 embedding from the safetensors metadata:
 
 ```bash
 ./build/examples/llm/llm_build \
-  --onnxDir onnx_models/qwen3-8b-fp8emb \
+  --onnxDir /tmp/qwen3_onnx_fp8emb/llm \
   --engineDir engines/qwen3-8b-fp8emb \
   --maxBatchSize=1
 ```
@@ -72,10 +61,12 @@ Run inference with the built engine. No special flags are needed:
 FP8 embedding can be combined with weight quantization for maximum memory savings:
 
 ```bash
-export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+cd $EDGE_LLM_PATH
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 
 # Step 1: Quantize weights to a checkpoint
-python -m experimental.quantization.cli llm \
+python -m experimental.quantization llm \
   --model_dir /path/to/Qwen3-8B \
   --output_dir /tmp/qwen3_nvfp4 \
   --quantization nvfp4
@@ -100,7 +91,7 @@ python -m llm_loader.export_all_cli \
 
 ### Quantization Process
 
-During export with `--fp8-embedding` in `llm_loader` or `--fp8_embedding` in the legacy export tools:
+During export with `--fp8-embedding` in `llm_loader`:
 1. The embedding table is divided into blocks of 128 elements along the hidden dimension
 2. For each block, the maximum absolute value is computed
 3. Quantization scale is computed: `scale = amax / FP8_E4M3_MAX` (where `FP8_E4M3_MAX = 448.0`)

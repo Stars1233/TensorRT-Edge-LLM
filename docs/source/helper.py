@@ -430,9 +430,7 @@ This section provides documentation for the TensorRT Edge-LLM C++ API.
 
 def generate_python_api_rst():
     """
-    Generate python_api.rst file for the tensorrt_edgellm package.
-    Since the top-level __init__.py exposes all necessary functions via __all__,
-    we only need to document the main module.
+    Generate python_api.rst for the current Python entry points.
     """
     # Get path relative to this helper file (docs/source/sphinx_helpers.py)
     source_dir = Path(__file__).parent
@@ -443,11 +441,40 @@ def generate_python_api_rst():
 
 This section provides documentation for the TensorRT Edge-LLM Python package.
 
-The ``tensorrt_edgellm`` package provides utilities for quantizing large language models 
-and exporting them to ONNX format for efficient inference on edge devices.
+New Python workflows use ``experimental.quantization`` for checkpoint
+quantization, ``llm_loader`` for ONNX export, and ``experimental.server`` for
+the experimental high-level API and OpenAI-compatible server.
 
-Main Module
------------
+Experimental Server
+-------------------
+
+.. automodule:: experimental.server
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Experimental Quantization
+-------------------------
+
+.. automodule:: experimental.quantization
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+LLM Loader
+----------
+
+.. automodule:: llm_loader
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Deprecated Export Package
+-------------------------
+
+The ``tensorrt_edgellm`` package contains deprecated Python export utilities that
+remain available in 0.7.1 for compatibility. New model enablement should target
+the experimental quantization and ``llm_loader`` workflow above.
 
 .. automodule:: tensorrt_edgellm
    :members:

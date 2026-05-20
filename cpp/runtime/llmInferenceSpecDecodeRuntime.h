@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "action/alpamayo1ActionRunner.h"
 #include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "multimodal/multimodalRunner.h"
@@ -102,6 +103,12 @@ struct SpecDecodeInferenceContext
     float topP{1.0f};        //!< Top-P (nucleus) sampling parameter
     int64_t topK{0};         //!< Top-K sampling parameter
 
+    // Thinker embedding output (Qwen3-Omni audio generation)
+    bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for Talker pipeline
+
+    //! Optional per-token callback invoked after each vanilla decode step
+    std::optional<TokenCallback> onTokenGenerated;
+
     /*!
      * @brief Initialize the context with given parameters
      * @param batchSize Active batch size
@@ -186,7 +193,8 @@ public:
      * @return True on success, false on failure
      * @throws std::runtime_error if an LLM or CUDA operation fails
      */
-    bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
+    bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream,
+        bool outputThinkerEmbeddings = false);
 
     /*!
      * @brief Generate and save system prompt KV cache (public API matching standard runtime signature)
@@ -198,6 +206,11 @@ public:
      */
     bool genAndSaveSystemPromptKVCache(
         std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream);
+
+    /*! \brief Set the random seed used when initializing the action diffusion noise trajectory
+     *  \param seed Random seed value; has no effect if no action runner is loaded
+     */
+    void setActionNoiseSeed(int32_t seed) noexcept;
 
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
@@ -225,6 +238,50 @@ public:
                              : metrics::MultimodalMetrics{};
     }
 
+    //! Get the embedding table (for Talker streaming pipeline)
+    rt::Tensor const& getEmbeddingTable() const
+    {
+        return mEmbedding.table;
+    }
+
+    //! @brief Get a base model hidden-states buffer for the requested layer index.
+    //!
+    //! Buffers are owned by the runtime and reused across requests. Layer 0 corresponds to
+    //! the post-multimodal input embeddings (backed up before the decode loop reshapes them);
+    //! other layer indices correspond to engine-output hidden states (e.g. acceptHiddenLayer
+    //! for the Qwen3-Omni Talker, or future MTP layers).
+    //!
+    //! Lifetime contract:
+    //!   - Buffers are sized to {maxRuntimeBatchSize, maxSupportedInputLength, hiddenSize}.
+    //!   - Contents are cleared (overwritten) at the start of each handleRequest() call and
+    //!     remain valid until the next handleRequest() begins. The buffer is reshaped to
+    //!     {activeBatchSize, prefillLength, hiddenSize} for the most recent request — use
+    //!     getBaseModelPrefillLength() to query the valid prefill length.
+    //!   - The caller is responsible for consuming the data within that window.
+    //!
+    //! @param layerIdx Layer index. 0 = input embeddings (post-multimodal); other indices are
+    //!                 model-specific (e.g. acceptHiddenLayer for Qwen3-Omni Talker).
+    //! @return Pointer to the buffer, or nullptr if no buffer is registered for that layer.
+    rt::Tensor const* getBaseModelHiddenStates(int32_t layerIdx) const noexcept
+    {
+        auto it = mHiddenStatesRegistry.find(layerIdx);
+        return it != mHiddenStatesRegistry.end() ? it->second : nullptr;
+    }
+
+    //! @brief Number of valid prefill tokens in the hidden-states buffers from the most
+    //! recent handleRequest() call. Returns 0 if no hidden-states output was requested.
+    int32_t getBaseModelPrefillLength() const noexcept
+    {
+        return mLastPrefillLength;
+    }
+
+    //! @brief Per-batch input token IDs from the most recent handleRequest() call.
+    //! Cleared at the start of each handleRequest(); valid until the next one begins.
+    std::vector<std::vector<int32_t>> const& getBaseModelInputTokenIds() const noexcept
+    {
+        return mLastInputTokenIds;
+    }
+
     //! @brief Check if draft model is loaded and spec-decode is available
     bool hasDraftModel() const noexcept
     {
@@ -243,11 +300,12 @@ private:
     LLMEngineRunnerConfig mBaseEngineConfig;            //!< Base engine configuration
     std::optional<EagleDraftEngineRunnerConfig> mDraftEngineConfig; //!< Draft engine configuration (nullopt = no draft)
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;         //!< Base model engine runner
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner; //!< Draft model engine runner (nullptr = no draft)
-    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};   //!< Vision multimodal runner (optional)
-    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};    //!< Audio multimodal runner (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;           //!< Tokenizer
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;            //!< Base model engine runner
+    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;    //!< Draft model engine runner (nullptr = no draft)
+    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};      //!< Vision multimodal runner (optional)
+    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
+    std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;              //!< Tokenizer
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
@@ -308,6 +366,16 @@ private:
 
     // [7] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
+
+    // [8] Base model hidden states portal (Qwen3-Omni audio generation, future MTP).
+    //     Buffers are pre-allocated to {maxBS, maxISL, H} and reshaped per request.
+    //     mHiddenStatesRegistry maps layer index → buffer; populated per handleRequest().
+    //     See getBaseModelHiddenStates() for the lifetime contract.
+    rt::Tensor mOutputHiddenStates{};  //!< Engine-output hidden states (layer N = acceptHiddenLayer)
+    rt::Tensor mPrefillEmbedsBackup{}; //!< Layer-0 input embeddings backup (post-multimodal)
+    std::unordered_map<int32_t, rt::Tensor const*> mHiddenStatesRegistry; //!< Per-request layer→buffer map
+    int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
+    std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
 
     //! @brief Restore recurrent/conv states from a cached system prompt.
     void restoreRecurrentStates(int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream);

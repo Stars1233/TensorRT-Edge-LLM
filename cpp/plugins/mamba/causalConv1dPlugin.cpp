@@ -45,8 +45,10 @@ constexpr int32_t kIN_CONV_STATE_IDX{3};
 constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{4};
 constexpr int32_t kOUT_IDX{0};
 constexpr int32_t kOUT_CONV_STATE_IDX{1};
+constexpr int32_t kOUT_INTERMEDIATE_CONV_STATES{2};
 constexpr int32_t kNUM_INPUTS{5};
-constexpr int32_t kNUM_OUTPUTS{2};
+constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
+constexpr int32_t kNUM_MTP_OPTIONAL_OUTPUTS{1};
 
 std::optional<int32_t> parsePluginIntField(std::string const& fieldName, PluginFieldCollection const* fc)
 {
@@ -81,12 +83,13 @@ REGISTER_TENSORRT_PLUGIN(CausalConv1dPluginCreator);
 // ---------------------------------------------------------------------------
 
 CausalConv1dPlugin::CausalConv1dPlugin(
-    std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups)
+    std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups, bool useMTP)
     : mLayerName(name)
     , mStride(stride)
     , mPadding(padding)
     , mDilation(dilation)
     , mGroups(groups)
+    , mUseMTP(useMTP)
 {
 }
 
@@ -101,6 +104,14 @@ CausalConv1dPlugin::CausalConv1dPlugin(std::string const& name, void const* data
     std::memcpy(&mDilation, d, sizeof(int32_t));
     d += sizeof(int32_t);
     std::memcpy(&mGroups, d, sizeof(int32_t));
+    d += sizeof(int32_t);
+    // mUseMTP was added later; tolerate older serialized data that is only 4 ints.
+    if (length >= 5 * sizeof(int32_t))
+    {
+        int32_t useMTPInt = 0;
+        std::memcpy(&useMTPInt, d, sizeof(int32_t));
+        mUseMTP = (useMTPInt != 0);
+    }
 }
 
 CausalConv1dPlugin::~CausalConv1dPlugin() {}
@@ -111,53 +122,62 @@ CausalConv1dPlugin::~CausalConv1dPlugin() {}
 
 IPluginV2DynamicExt* CausalConv1dPlugin::clone() const noexcept
 {
-    auto* plugin = new CausalConv1dPlugin(mLayerName, mStride, mPadding, mDilation, mGroups);
+    auto* plugin = new CausalConv1dPlugin(mLayerName, mStride, mPadding, mDilation, mGroups, mUseMTP);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
 
 int32_t CausalConv1dPlugin::getNbOutputs() const noexcept
 {
-    return kNUM_OUTPUTS;
+    return kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
 }
 
 DataType CausalConv1dPlugin::getOutputDataType(
     int32_t index, DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
-    // Both outputs (conv output and updated conv state) have the same type as x.
+    // All outputs (conv output, conv state, intermediate_conv_states) have the same type as x (FP16).
     (void) index;
     return inputTypes[kIN_X_IDX];
 }
 
 DimsExprs CausalConv1dPlugin::getOutputDimensions(
-    int32_t outputIndex, DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, IExprBuilder&) noexcept
+    int32_t outputIndex, DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, IExprBuilder& exprBuilder) noexcept
 {
     if (outputIndex == kOUT_IDX)
     {
-        // Output: same shape as x [batch, seq_len, dim].
+        // Output[0]: same shape as x [batch, seq_len, dim].
         return inputs[kIN_X_IDX];
     }
-    // Conv state output: same shape as conv_state input [batch, dim, kernel].
+    if (outputIndex == kOUT_INTERMEDIATE_CONV_STATES)
+    {
+        // Only reachable when mUseMTP is true (getNbOutputs() == 3).
+        DimsExprs out{};
+        // [batch, seq_len, dim, kernel_size]
+        out.nbDims = 4;
+        out.d[0] = inputs[kIN_X_IDX].d[0];          // batch
+        out.d[1] = inputs[kIN_X_IDX].d[1];          // seq_len (T)
+        out.d[2] = inputs[kIN_CONV_STATE_IDX].d[1]; // dim
+        out.d[3] = inputs[kIN_CONV_STATE_IDX].d[2]; // kernel_size
+        return out;
+    }
+    // Output[1]: conv state output — same shape as conv_state input [batch, dim, kernel].
     return inputs[kIN_CONV_STATE_IDX];
 }
 
 bool CausalConv1dPlugin::supportsFormatCombination(
     int32_t pos, PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
+    int32_t const expectedNbOutputs = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+    if (nbInputs != kNUM_INPUTS || nbOutputs != expectedNbOutputs)
         return false;
     auto const& desc = inOut[pos];
     if (desc.format != TensorFormat::kLINEAR)
         return false;
-    switch (pos)
-    {
-    case kIN_X_IDX:
-    case kIN_WEIGHT_IDX:
-    case kIN_BIAS_IDX:
-    case kIN_CONV_STATE_IDX: return desc.type == DataType::kHALF;
-    case kIN_CONTEXT_LENGTHS_IDX: return desc.type == DataType::kINT32;
-    default: return desc.type == inOut[kIN_X_IDX].type;
-    }
+    // INT32: context_lengths only
+    if (pos == kIN_CONTEXT_LENGTHS_IDX)
+        return desc.type == DataType::kINT32;
+    // Everything else (all inputs + all outputs): FP16
+    return desc.type == DataType::kHALF;
 }
 
 void CausalConv1dPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
@@ -208,9 +228,44 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
 
     void* convStateOut = outputs[kOUT_CONV_STATE_IDX];
 
+    // MTP mode activates only for short multi-token verification sequences (tree verify),
+    // not for normal prefill. Small prefills (seqLen <= kMTPMaxSeqLen) that happen to pass
+    // through this path pay a minor cost for intermediate state writes, but it is harmless.
+    // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
+    // from prefill when 1 < seqLen <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
+    // from the runtime instead of relying solely on seq_len range heuristics).
+    constexpr int32_t kMTPMaxSeqLen = 8;
+    bool const mtpActive = mUseMTP && (seqLen > 1) && (seqLen <= kMTPMaxSeqLen);
+
     namespace rt = trt_edgellm::rt;
 
-    if (seqLen > 1)
+    if (mtpActive)
+    {
+        // MTP DECODE path: process T draft tokens with per-step state checkpointing.
+        // Copy input conv_state -> output conv_state (MTP kernel updates in-place).
+        if (convStateOut != inputs[kIN_CONV_STATE_IDX])
+        {
+            size_t const stateBytes = static_cast<size_t>(batch) * dim * width * sizeof(half);
+            cudaMemcpyAsync(convStateOut, inputs[kIN_CONV_STATE_IDX], stateBytes, cudaMemcpyDeviceToDevice, stream);
+        }
+
+        auto mtpStateTensor = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
+        auto mtpNewColsTensor = rt::Tensor{
+            const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto mtpWeightTensor = rt::Tensor{const_cast<void*>(inputs[kIN_WEIGHT_IDX]),
+            rt::Coords{wDesc.dims.d[0], wDesc.dims.d[1], wDesc.dims.d[2]}, rt::DeviceType::kGPU, xDesc.type};
+        auto mtpBiasTensor
+            = rt::Tensor{const_cast<void*>(inputs[kIN_BIAS_IDX]), rt::Coords{dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto mtpOutTensor
+            = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto mtpIntermTensor = rt::Tensor{outputs[kOUT_INTERMEDIATE_CONV_STATES], rt::Coords{batch, seqLen, dim, width},
+            rt::DeviceType::kGPU, xDesc.type};
+
+        trt_edgellm::rt::OptionalInputTensor mtpBiasOpt = std::optional(std::cref(mtpBiasTensor));
+        mamba_ssm::invokeCausalConv1dDecodeMTP(mtpStateTensor, mtpNewColsTensor, mtpWeightTensor, mtpBiasOpt,
+            mtpOutTensor, mtpIntermTensor, seqLen, stream);
+    }
+    else if (seqLen > 1)
     {
         // PREFILL path
         int32_t const outSeqLen = static_cast<int32_t>(outDesc.dims.d[1]);
@@ -271,7 +326,7 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
 
 size_t CausalConv1dPlugin::getSerializationSize() const noexcept
 {
-    return 4 * sizeof(int32_t); // stride, padding, dilation, groups
+    return 5 * sizeof(int32_t); // stride, padding, dilation, groups, useMTP
 }
 
 void CausalConv1dPlugin::serialize(void* buffer) const noexcept
@@ -284,6 +339,9 @@ void CausalConv1dPlugin::serialize(void* buffer) const noexcept
     std::memcpy(d, &mDilation, sizeof(int32_t));
     d += sizeof(int32_t);
     std::memcpy(d, &mGroups, sizeof(int32_t));
+    d += sizeof(int32_t);
+    int32_t useMTPInt = mUseMTP ? 1 : 0;
+    std::memcpy(d, &useMTPInt, sizeof(int32_t));
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +393,7 @@ CausalConv1dPluginCreator::CausalConv1dPluginCreator()
     mPluginAttributes.emplace_back(PluginField("padding", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("dilation", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("groups", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("use_mtp", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }
@@ -372,7 +431,8 @@ IPluginV2* CausalConv1dPluginCreator::createPlugin(char const* name, PluginField
         int32_t const padding = parsePluginIntField("padding", fc).value_or(0);
         int32_t const dilation = parsePluginIntField("dilation", fc).value_or(1);
         int32_t const groups = parsePluginIntField("groups", fc).value_or(0);
-        auto* plugin = new CausalConv1dPlugin(name, stride, padding, dilation, groups);
+        bool const useMTP = parsePluginIntField("use_mtp", fc).value_or(0) != 0;
+        auto* plugin = new CausalConv1dPlugin(name, stride, padding, dilation, groups, useMTP);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

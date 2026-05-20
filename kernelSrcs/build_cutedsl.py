@@ -21,6 +21,7 @@ Kernel groups:
   ssd        — Mamba2 SSM chunk-scan prefill
   gemm       — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
   nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
+  nvfp4_fused_moe — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
 Usage (run from the repo root):
   python kernelSrcs/build_cutedsl.py                      # build all groups for this GPU
@@ -49,6 +50,7 @@ import concurrent.futures
 import importlib.metadata
 import importlib.util
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -76,7 +78,7 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn", "fmha", "nvfp4_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
+        group:         Logical group ("gdn", "fmha", "nvfp4_moe", "nvfp4_fused_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -104,6 +106,7 @@ class KernelVariant:
 #   ssd        — Mamba2 SSM chunk-scan prefill
 #   gemm       — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
 #   nvfp4_moe  — NvFP4 MoE FC1+FC2 grouped GEMM
+#   nvfp4_fused_moe — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 # ---------------------------------------------------------------------------
 KERNEL_VARIANTS = [
     # --- GDN group ---
@@ -127,6 +130,15 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="gdn_cutedsl/gdn_prefill_blackwell.py",
         script_args=["--export_only"],
+    ),
+    # MTP decode: multi-token speculative-decoding verification (Ampere SM80+).
+    # Only the cache variant is exported (per-step intermediate state checkpointing for rollback).
+    KernelVariant(
+        name="gdn_decode_mtp",
+        group="gdn",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="gdn_cutedsl/gdn_decode_mtp.py",
+        script_args=["--export_only", "--cache_only"],
     ),
     # --- SSD group (Mamba2 SSM chunk scan) ---
     # --- SSD SM80 variants (D×N combinations) ---
@@ -159,6 +171,11 @@ KERNEL_VARIANTS = [
         script_args=["--export_only", "--dim", "64", "--dstate", "64"],
     ),
     # --- SSD Blackwell variants ---
+    # Two has_init_states modes per (D, N): the default variant assumes the SSM state
+    # at chunk 0 is zero (fast path; covers all current Nemotron-H prefill calls). The
+    # `_init_states` variant accepts an optional user-provided initial hidden state at
+    # chunk 0, used when prefill carries SSM state across calls (continuous batching,
+    # multi-call prefill) or by the SsdCuteDslBlackwellChunkedPrefill unit test.
     KernelVariant(
         name="ssd_prefill_blackwell_d64_n128",
         group="ssd",
@@ -167,11 +184,31 @@ KERNEL_VARIANTS = [
         script_args=["--export_only", "--dim", "64", "--dstate", "128"],
     ),
     KernelVariant(
+        name="ssd_prefill_blackwell_d64_n128_init_states",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "128",
+                     "--has_init_states",
+                     "--file_name", "ssd_prefill_blackwell_d64_n128_init_states",
+                     "--function_prefix", "ssd_prefill_blackwell_d64_n128_init_states"],
+    ),
+    KernelVariant(
         name="ssd_prefill_blackwell_d64_n64",
         group="ssd",
         supported_sms=[100, 101, 110],
         script="ssd_cutedsl/ssd_prefill_blackwell.py",
         script_args=["--export_only", "--dim", "64", "--dstate", "64"],
+    ),
+    KernelVariant(
+        name="ssd_prefill_blackwell_d64_n64_init_states",
+        group="ssd",
+        supported_sms=[100, 101, 110],
+        script="ssd_cutedsl/ssd_prefill_blackwell.py",
+        script_args=["--export_only", "--dim", "64", "--dstate", "64",
+                     "--has_init_states",
+                     "--file_name", "ssd_prefill_blackwell_d64_n64_init_states",
+                     "--function_prefix", "ssd_prefill_blackwell_d64_n64_init_states"],
     ),
     # --- FMHA group ---
     KernelVariant(
@@ -363,6 +400,106 @@ KERNEL_VARIANTS = [
         script_args=["--mma_tiler_n", "256",
                      "--output_dtype", "fp16", "--export_only"],
     ),
+    # --- NvFP4 Fused MoE group (SM120/SM121 — Blackwell GeForce) ---
+    # Fused route/pack + FC1 + activation + quant + FC2 + scatter kernels.
+    # Decode backend: resident-grid barrier between route/pack and compute
+    #   phases; best for small routed working sets (num_tokens*top_k <= 640;
+    #   see CuteDslNvfp4MoeRunner::kDecodePrefillCutoverRoutedRows).
+    # Prefill backend: global task-queue driven producer/consumer overlap;
+    #   best for large routed working sets.
+    # NvFP4MoEPluginGeforce scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2}
+    # x {decode, prefill} x {n128 MMA N-tile} = 10 variants. Shape axes
+    # N / E / top_k are runtime (shape-polymorphic). The MMA N-tile and the
+    # hidden_size (K) are compile-time variant axes: CuteDslNvfp4MoeRunner
+    # currently dispatches n128 and requires hiddenSize == kSupportedHiddenSize.
+    # The K axis is compile-time
+    # because the Python-level ab_stage divisor loop in _setup_attributes
+    # (moe_{decode,prefill}_kernel.py) cannot be traced with a symbolic K.
+    # Decode backend, N-tile 128
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_identity_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "identity", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_silu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "silu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_swiglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "swiglu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_gelu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "gelu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_relu2_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "relu2", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+
+    # Prefill backend, N-tile 128
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_identity_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "identity", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_silu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "silu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_swiglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "swiglu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_gelu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "gelu", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_relu2_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "relu2", "--mma_tiler_n", "128",
+                     "--hidden_size", "2048", "--export_only"],
+    ),
+    # Prefill backend, N-tile 256 — DISABLED (same bug as decode n256).
+
     # =====================================================================
     # GEMM group — Talker MLP cuBLAS replacement
     #
@@ -375,7 +512,14 @@ KERNEL_VARIANTS = [
     #     M=384-640      → large_prefill (128×128×64) + unpredicated epilogue
     #     M>640          → medium_prefill (64×128×64)
     #
-    #   Blackwell DC (SM100-110): single variant, persistent+warp-spec+TMA
+    #   Blackwell DC (SM100-110):  tcgen05 + TMA store
+    #     M<=4*SMs                 → small  (64×128)  cluster=(1,2)
+    #     low-SM GPU AND M>=256    → 2-CTA  (256×256) cluster=(2,1)
+    #     else                     → default (128×128) cluster=(1,1)
+    #     (e.g. B100 144 SMs → small cap M<=576, no 2-CTA;
+    #      Thor 20 SMs → small cap M<=80, 2-CTA above M>=256;
+    #      see cuteDslGemmRunner sBlackwellSmallTileMaxM /
+    #          sBlackwell2ctaMinM)
     #
     #   BW GeForce (SM120-121):
     #     M<=64          → small (64×128×64) — persistent+warp-spec+TMA
@@ -508,26 +652,134 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # Blackwell DC GEMM tile variants:
+    #   "default"  tile=(128,128) cluster=(1,1) — wins for M >= 768 (large MM
+    #              has enough M-tiles to keep the GPU busy without sub-tiling)
+    #   "small"    tile=(64,128)  cluster=(1,2) — wins for M <= 512  (more
+    #              CTAs per wave -> better SM utilization on small/medium M;
+    #              cluster (1,2) multicasts B across 2 CTAs in N)
+    # See cuteDslGemmRunner::run() for the M threshold dispatch.
     KernelVariant(
         name="gemm_blackwell_fp16",
         group="gemm",
         supported_sms=[100, 101, 103, 110],
         script="gemm_cutedsl/gemm_blackwell.py",
-        script_args=["--mnk", "1024,2048,2048", "--export_only"],
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "128,128",
+            "--cluster_shape_mn", "1,1",
+            "--export_only",
+        ],
     ),
     KernelVariant(
         name="gemm_blackwell_bias_silu_fp16",
         group="gemm",
         supported_sms=[100, 101, 103, 110],
         script="gemm_cutedsl/gemm_blackwell.py",
-        script_args=["--mnk", "1024,2048,2048", "--fused_epilogue", "bias_silu", "--export_only"],
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "128,128",
+            "--cluster_shape_mn", "1,1",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
     ),
     KernelVariant(
         name="gemm_blackwell_bias_fp16",
         group="gemm",
         supported_sms=[100, 101, 103, 110],
         script="gemm_cutedsl/gemm_blackwell.py",
-        script_args=["--mnk", "1024,2048,2048", "--fused_epilogue", "bias", "--export_only"],
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "128,128",
+            "--cluster_shape_mn", "1,1",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_small_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_small_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_small_bias_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
+    ),
+    # 2-CTA variants (tile=256x256, cluster=(2,1)): paired CTAs share a
+    # 2x M tile per tcgen05.mma op. On low-SM-count GPUs (Thor 20 SMs)
+    # this beats the single-CTA default for M >= 256 by ~15-25%; on
+    # high-SM-count (B100 144 SMs) the single-CTA default already
+    # saturates compute so 2-CTA isn't dispatched.
+    KernelVariant(
+        name="gemm_blackwell_2cta_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "256,256",
+            "--cluster_shape_mn", "2,1",
+            "--use_2cta",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_2cta_bias_silu_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "256,256",
+            "--cluster_shape_mn", "2,1",
+            "--use_2cta",
+            "--fused_epilogue", "bias_silu",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
+        name="gemm_blackwell_2cta_bias_fp16",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "1024,2048,2048",
+            "--mma_tiler_mn", "256,256",
+            "--cluster_shape_mn", "2,1",
+            "--use_2cta",
+            "--fused_epilogue", "bias",
+            "--export_only",
+        ],
     ),
     # BW GeForce (SM120/121): warp-specialized, TMA, persistent tile scheduling.
     # Small tile for M<=64 — more CTAs on N1Auto's 20 SMs.
@@ -814,11 +1066,32 @@ def check_dependencies():
     return ver, lib_dir, cuda_ver
 
 
+def skip_sm121_fused_moe_for_all(variants, sm, kernels_arg):
+    """Skip SM121 fused MoE from ALL builds; it needs a manual CuTeDSL patch."""
+    if sm != 121 or kernels_arg.strip().upper() != "ALL":
+        return variants
+
+    skipped = [v for v in variants if v.group == "nvfp4_fused_moe"]
+    if not skipped:
+        return variants
+
+    print(
+        f"NOTE: Skipping {len(skipped)} SM121 nvfp4_fused_moe variant(s) "
+        "because this group requires the manual CuTeDSL SM121 source patch "
+        "documented in kernelSrcs/nvfp4_fused_moe_cutedsl/README.md."
+    )
+    print(
+        "      To build this group, apply that patch and run "
+        "--kernels nvfp4_fused_moe explicitly."
+    )
+    return [v for v in variants if v.group != "nvfp4_fused_moe"]
+
+
 # ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
 
-def _compile_one(variant, staging_dir, verbose):
+def _compile_one(variant, staging_dir, verbose, sm):
     """Invoke a kernel script to AOT-compile one variant into .o + .h.
 
     Returns (name, ok, elapsed_secs, error_msg).
@@ -829,8 +1102,16 @@ def _compile_one(variant, staging_dir, verbose):
             "--function_prefix", variant.name]
     cmd += variant.script_args
 
+    env = os.environ.copy()
+    if sm == 121 and variant.group == "nvfp4_fused_moe":
+        # Build a real SM121 image for DIGITS/GB10. SM120 cubins link, but
+        # fail at runtime on SM121 with cudaErrorNoKernelImageForDevice.
+        env.setdefault("CUTE_DSL_ARCH", "sm_121a")
+
     t0 = time.monotonic()
-    result = subprocess.run(cmd, cwd=str(_SCRIPT_DIR), capture_output=not verbose, text=True)
+    result = subprocess.run(
+        cmd, cwd=str(_SCRIPT_DIR), capture_output=not verbose, text=True, env=env
+    )
     elapsed = time.monotonic() - t0
 
     if result.returncode != 0:
@@ -839,11 +1120,16 @@ def _compile_one(variant, staging_dir, verbose):
     obj = staging_dir / f"{variant.name}.o"
     hdr = staging_dir / f"{variant.name}.h"
     if not obj.exists() or not hdr.exists():
-        return variant.name, False, elapsed, f"{obj.name} / {hdr.name} not found after successful exit"
+        # Some variants (e.g. gdn_decode_mtp --cache_only) produce artifacts with
+        # a suffix (e.g. gdn_decode_mtp_cache.o/.h).  Accept any .o + .h pair.
+        any_objs = list(staging_dir.glob("*.o"))
+        any_hdrs = list(staging_dir.glob("*.h"))
+        if not any_objs or not any_hdrs:
+            return variant.name, False, elapsed, f"{obj.name} / {hdr.name} not found after successful exit"
     return variant.name, True, elapsed, ""
 
 
-def compile_variants(variants, staging_dirs, jobs, verbose):
+def compile_variants(variants, staging_dirs, jobs, verbose, sm):
     """Compile all selected variants in parallel via a process pool.
 
     staging_dirs: dict mapping variant.name → Path of its dedicated staging dir.
@@ -853,7 +1139,7 @@ def compile_variants(variants, staging_dirs, jobs, verbose):
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
         futures = {
-            pool.submit(_compile_one, v, staging_dirs[v.name], verbose): v
+            pool.submit(_compile_one, v, staging_dirs[v.name], verbose, sm): v
             for v in variants
         }
         for future in concurrent.futures.as_completed(futures):
@@ -906,14 +1192,18 @@ def build(args):
         print("No variants selected — nothing to build.")
         return
 
-    groups_selected = sorted({v.group for v in variants})
-    print(f"Groups      : {groups_selected}")
-    print(f"Variants    : {[v.name for v in variants]}")
-
     # Check dependencies before cleaning — so a failed dep check doesn't
     # silently destroy a previously good build.
     print("\nChecking dependencies...")
     dsl_ver, lib_dir, cuda_ver = check_dependencies()
+    variants = skip_sm121_fused_moe_for_all(variants, sm, args.kernels)
+    if not variants:
+        print("No variants selected — nothing to build.")
+        return
+
+    groups_selected = sorted({v.group for v in variants})
+    print(f"Groups      : {groups_selected}")
+    print(f"Variants    : {[v.name for v in variants]}")
 
     if args.clean and output_dir.exists():
         shutil.rmtree(output_dir)
@@ -928,10 +1218,13 @@ def build(args):
             d.mkdir()
             staging_dirs[v.name] = d
 
-        compile_variants(variants, staging_dirs, args.jobs, args.verbose)
+        compile_variants(variants, staging_dirs, args.jobs, args.verbose, sm)
 
         # Collect all .o files from per-variant staging dirs.
-        kernel_obj_files = [staging_dirs[v.name] / f"{v.name}.o" for v in variants]
+        # Some variants (e.g. gdn_decode_mtp) produce multiple .o files.
+        kernel_obj_files = []
+        for v in variants:
+            kernel_obj_files.extend(sorted(staging_dirs[v.name].glob("*.o")))
 
         # Extract the DSL runtime static lib into a separate dir to avoid collisions.
         runtime = lib_dir / "libcuda_dialect_runtime_static.a"
@@ -955,20 +1248,27 @@ def build(args):
         )
         print(f"\n  Created {lib_path.name} ({lib_path.stat().st_size // 1024} KB)")
 
-        # Copy per-variant headers and write umbrella headers.
+        # Copy per-variant headers and write umbrella header.
+        # Some variants produce multiple .h files (e.g. gdn_decode_mtp + gdn_decode_mtp_cache).
         inc_dir = output_dir / "include"
         inc_dir.mkdir(exist_ok=True)
+        all_headers = []
         for v in variants:
-            shutil.copy2(staging_dirs[v.name] / f"{v.name}.h", inc_dir)
+            for hdr in sorted(staging_dirs[v.name].glob("*.h")):
+                shutil.copy2(hdr, inc_dir)
+                all_headers.append(hdr.name)
 
         # Per-group umbrella headers (e.g. cutedsl_nvfp4_moe_all.h).
         for group in groups_selected:
-            group_variants = [v for v in variants if v.group == group]
+            group_headers = []
+            for v in [vv for vv in variants if vv.group == group]:
+                for hdr in sorted(staging_dirs[v.name].glob("*.h")):
+                    group_headers.append(hdr.name)
             group_umbrella = inc_dir / f"cutedsl_{group}_all.h"
             group_umbrella.write_text(
                 "#pragma once\n"
                 f"// Auto-generated by build_cutedsl.py -- do not edit\n"
-                + "".join(f'#include "{v.name}.h"\n' for v in group_variants)
+                + "".join(f'#include "{h}"\n' for h in group_headers)
             )
 
         # Unified umbrella header (includes everything).
@@ -976,7 +1276,7 @@ def build(args):
         umbrella.write_text(
             "#pragma once\n"
             "// Auto-generated by build_cutedsl.py -- do not edit\n"
-            + "".join(f'#include "{v.name}.h"\n' for v in variants)
+            + "".join(f'#include "{h}"\n' for h in all_headers)
         )
 
         # Write build provenance + metadata for cmake consumption.
@@ -990,7 +1290,7 @@ def build(args):
                     "cutlass_dsl_version": dsl_ver,
                     "build_date": datetime.now(timezone.utc).isoformat(),
                     "groups": groups_selected,
-                    "variants": [v.name for v in variants],
+                    "variants": [o.stem for o in kernel_obj_files],
                 },
                 indent=2,
             )
@@ -1021,8 +1321,9 @@ def main():
     p.add_argument(
         "--kernels",
         default="ALL",
-        help="Which kernels to build: ALL (default), a group name (fmha | gdn | nvfp4_moe | ssd | gemm), "
-             "or a comma-separated list of group names (fmha,gdn,nvfp4_moe,ssd,gemm). "
+        help="Which kernels to build: ALL (default), a group name "
+             "(fmha | gdn | nvfp4_moe | nvfp4_fused_moe | ssd | gemm), "
+             "or a comma-separated list of group names. "
              "Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(

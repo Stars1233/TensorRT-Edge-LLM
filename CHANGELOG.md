@@ -1,6 +1,17 @@
 # Release Notes
 
+## 0.7.1
+- Added Qwen3.5 Multi-Token Prediction (MTP) support with performance improvements
+- Added Alpamayo-1 support
+- Added Qwen3-TTS streaming
+- Added `llm_loader` FP8 ViT support
+- Improved Mamba2 SSD prefill performance
+- Added v0.7.0 performance benchmark results
+- Migrated documentations and customization guides to `llm_loader`
+
 ## 0.7.0
+- Added `llm_loader` reduced-vocabulary export support
+- Added `llm_loader` static LoRA merge for merge -> quantize -> export workflows such as Phi-4-Multimodal
 - Added Qwen3.5 LLM/VLM support
 - Added Nemotron-Omni support
 - Added Nemotron-3-Nano-30B-A3B NVFP4 MoE support

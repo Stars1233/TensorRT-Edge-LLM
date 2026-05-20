@@ -79,7 +79,7 @@ ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow)
         info.chunkLengths[info.numChunks - 1] = remainder;
     }
 
-    info.maxChunkLength = *std::max_element(info.chunkLengths.begin(), info.chunkLengths.end());
+    info.maxChunkLength = std::max(*std::max_element(info.chunkLengths.begin(), info.chunkLengths.end()), chunkSize);
     return info;
 }
 

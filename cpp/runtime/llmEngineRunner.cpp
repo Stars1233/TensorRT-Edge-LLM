@@ -255,13 +255,23 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     DataType const recurrentStateType = (mConfig.numLinearAttnLayers > 0) ? getRecurrentStateType() : DataType::kHALF;
     DataType const convStateType = (mConfig.numLinearAttnLayers > 0) ? getConvStateType() : DataType::kHALF;
 
+    // MTP intermediate state seq_len: only allocated when the engine is an MTP base
+    // MTP kernels require maxVerifyTreeSize <= 8 (kMTPMaxSeqLen).
+    int32_t const maxIntermediateSeqLen
+        = (mConfig.mtpBase && mConfig.numLinearAttnLayers > 0) ? mConfig.maxVerifyTreeSize : 0;
+    if (maxIntermediateSeqLen > 8)
+    {
+        LOG_ERROR("MTP base model requires maxVerifyTreeSize <= 8, got %d", maxIntermediateSeqLen);
+        throw std::runtime_error("MTP maxVerifyTreeSize exceeds kernel limit (8)");
+    }
+
     // Build HybridCacheManager config from parsed per-layer configuration
     int32_t const numAttnLayers = static_cast<int32_t>(mConfig.kvLayerConfigs.size());
     rt::KVCacheManager::Config kvCacheConfig{
         numAttnLayers, mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.kvLayerConfigs, kvCacheType};
     rt::MambaCacheManager::Config mambaConfig{mConfig.numLinearAttnLayers, mConfig.maxSupportedBatchSize,
         mConfig.recurrentStateNumHeads, mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize, mConfig.convDim,
-        mConfig.convKernel, recurrentStateType, convStateType};
+        mConfig.convKernel, maxIntermediateSeqLen, recurrentStateType, convStateType};
     rt::HybridCacheManager::Config cacheManagerConfig{
         mConfig.layerTypes, kvCacheConfig, mambaConfig, mConfig.maxSupportedBatchSize};
     this->mCacheManager = rt::HybridCacheManager(cacheManagerConfig, stream);
@@ -350,14 +360,21 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     // Initialize dummy tensor memory to zero
     CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
 
-    // Allocate dummy output tensor for hidden_states for Eagle speculative decoding.
-    // TRT engine under this mode will produce output hidden states. we reserve this buffer to hold the data when
-    // conduct vanilla decoding. This will make runtime design cleaner.
-    if (mConfig.enableEagleSpecDecode)
+    // Allocate dummy output tensor for hidden_states when the engine has that output binding.
+    // This is needed for Eagle speculative decoding and Qwen3-Omni audio output (Thinker -> Talker).
+    // The dummy buffer is used during CUDA graph capture and vanilla decoding when the caller
+    // doesn't explicitly request hidden states output.
     {
-        int64_t const dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * mConfig.outputHiddenDim;
-        mDummyOutputTensor = rt::Tensor(
-            {dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyOutputTensor");
+        bool const engineHasHiddenStates = engineHasOutputTensor(mEngine.get(), binding_names::kOutputHiddenStates);
+        if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
+        {
+            int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;
+            int64_t dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * outputHiddenDim;
+            mDummyOutputTensor = rt::Tensor({dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+                "LLMEngineRunner::mDummyOutputTensor");
+            LOG_INFO("Allocated dummy hidden_states output buffer: %lld elements (engineHasHiddenStates=%d)",
+                dummyOutputSize, engineHasHiddenStates);
+        }
     }
 
     // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
@@ -589,11 +606,16 @@ bool LLMEngineRunner::initializeConfigFromJson(Json const& configJson) noexcept
             }
         }
 
-        // FIXME: Not a proper way to determine the output hidden dim.
-        // Hardcode output hidden_dim to 3 x model hidden_size which is default in eagle3.
+        // Determine output hidden dim based on model_type:
+        // - mtp_base: hidden_size (last layer output only)
+        // - eagle3_base (or unspecified): hidden_size * 3 (concatenates 3 layers)
         if (mConfig.enableEagleSpecDecode)
         {
-            mConfig.outputHiddenDim = configJson["hidden_size"].get<int32_t>() * 3;
+            int32_t const hiddenSize = configJson["hidden_size"].get<int32_t>();
+            std::string const modelType
+                = configJson.contains("model_type") ? configJson["model_type"].get<std::string>() : "";
+            mConfig.mtpBase = (modelType == "mtp_base");
+            mConfig.outputHiddenDim = mConfig.mtpBase ? hiddenSize : hiddenSize * 3;
 
             // maxVerifyTreeSize is only required when eagle_base is true
             if (!builderConfig.contains("max_verify_tree_size"))
@@ -1032,6 +1054,42 @@ bool LLMEngineRunner::bindConvStateToEngine(int32_t activeBatchSize)
     return status;
 }
 
+bool LLMEngineRunner::bindIntermediateRecurrentStateToEngine()
+{
+    auto& mambaCache = mCacheManager.getMambaCacheManager();
+    if (mConfig.numLinearAttnLayers == 0 || !mambaCache.hasIntermediateRecurrentStates())
+    {
+        return true;
+    }
+
+    bool status{true};
+    for (int32_t i = 0; i < mConfig.numLinearAttnLayers; ++i)
+    {
+        std::string const name = binding_names::formatIntermediateRecurrentStateName(i);
+        rt::Tensor& state = mambaCache.getIntermediateRecurrentState(i);
+        status &= mTRTExecutionContext->setTensorAddress(name.c_str(), state.rawPointer());
+    }
+    return status;
+}
+
+bool LLMEngineRunner::bindIntermediateConvStateToEngine()
+{
+    auto& mambaCache = mCacheManager.getMambaCacheManager();
+    if (mConfig.numLinearAttnLayers == 0 || !mambaCache.hasIntermediateConvStates())
+    {
+        return true;
+    }
+
+    bool status{true};
+    for (int32_t i = 0; i < mConfig.numLinearAttnLayers; ++i)
+    {
+        std::string const name = binding_names::formatIntermediateConvStateName(i);
+        rt::Tensor& state = mambaCache.getIntermediateConvState(i);
+        status &= mTRTExecutionContext->setTensorAddress(name.c_str(), state.rawPointer());
+    }
+    return status;
+}
+
 rt::Tensor& LLMEngineRunner::getRopeCosSinCacheTensor() noexcept
 {
     return mPosEncCosSinCache;
@@ -1047,20 +1105,23 @@ rt::HybridCacheManager& LLMEngineRunner::getCacheManager() noexcept
     return mCacheManager;
 }
 
-bool LLMEngineRunner::setLMHeadWeights(std::string const& name, rt::Tensor const& tensor)
+bool LLMEngineRunner::setLmHeadWeight(rt::Tensor const& lmHeadWeight)
 {
-    bool status = mTRTExecutionContext->setTensorAddress(name.c_str(), const_cast<void*>(tensor.rawPointer()));
+    constexpr char const* kLmHeadWeightName = "lm_head_weight";
+
+    bool status
+        = mTRTExecutionContext->setTensorAddress(kLmHeadWeightName, const_cast<void*>(lmHeadWeight.rawPointer()));
     if (!status)
     {
-        LOG_ERROR("setTensorAddress failed for '%s'", name.c_str());
+        LOG_ERROR("setTensorAddress failed for lm_head_weight");
         return false;
     }
 
-    bool shapeStatus = mTRTExecutionContext->setInputShape(name.c_str(), tensor.getShape().getTRTDims());
+    bool shapeStatus = mTRTExecutionContext->setInputShape(kLmHeadWeightName, lmHeadWeight.getShape().getTRTDims());
     if (!shapeStatus)
     {
         LOG_ERROR(
-            "setInputShape failed for '%s' with shape %s", name.c_str(), tensor.getShape().formatString().c_str());
+            "setInputShape failed for lm_head_weight with shape %s", lmHeadWeight.getShape().formatString().c_str());
         return false;
     }
 
@@ -1303,6 +1364,10 @@ bool LLMEngineRunner::executePrefillStep(rt::Tensor const& inputsEmbeds, rt::Ten
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindRecurrentStateToEngine(activeBatchSize);
 
+    // Bind MTP intermediate state outputs (needed even during prefill for TRT output address requirement)
+    setEngineIOStatus &= this->bindIntermediateRecurrentStateToEngine();
+    setEngineIOStatus &= this->bindIntermediateConvStateToEngine();
+
     if (!setEngineIOStatus)
     {
         LOG_ERROR("executePrefill(): Failed to bind engine input and output tensors.");
@@ -1428,6 +1493,8 @@ bool LLMEngineRunner::vanillaDecodingStepBindTensors(rt::Tensor const& inputsEmb
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindRecurrentStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindIntermediateRecurrentStateToEngine();
+    setEngineIOStatus &= this->bindIntermediateConvStateToEngine();
 
     // Bind deepstack_embeds to dummy tensors for Qwen3VL models during decoding
     if (mConfig.numDeepstackFeatures > 0)
@@ -1657,6 +1724,8 @@ bool LLMEngineRunner::eagleBaseTreeDecodingStepBindTensors(rt::Tensor const& bas
     setEngineIOStatus &= this->bindKVCacheToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindConvStateToEngine(activeBatchSize);
     setEngineIOStatus &= this->bindRecurrentStateToEngine(activeBatchSize);
+    setEngineIOStatus &= this->bindIntermediateRecurrentStateToEngine();
+    setEngineIOStatus &= this->bindIntermediateConvStateToEngine();
 
     // Bind packed attention mask for plugin-based attention
     setEngineIOStatus

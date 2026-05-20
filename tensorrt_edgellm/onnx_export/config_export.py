@@ -193,6 +193,12 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     if "laurel_rank" in config_dict:
         llm_config["laurel_rank"] = config_dict["laurel_rank"]
 
+    # Trajectory config for Alpamayo 1
+    if "num_traj_tokens" in config_dict:
+        llm_config["num_traj_tokens"] = config_dict["num_traj_tokens"]
+    if "traj_token_start" in config_dict:
+        llm_config["traj_token_start"] = config_dict["traj_token_start"]
+
     llm_config["model_type"] = "llm"
     return llm_config
 
@@ -560,11 +566,28 @@ def export_audio_config(config: Any) -> Dict[str, Any]:
     return config_dict
 
 
-def export_action_config(config: Any) -> Dict[str, Any]:
-    """Export action configuration without modification."""
+def export_action_config(config: Any,
+                         max_kv_cache_capacity: int) -> Dict[str, Any]:
+    """
+    Export action configuration with additional architecture parameters.
+
+    Args:
+        config: Model expert config (e.g., Qwen3VLTextModel config).
+        max_kv_cache_capacity: Maximum KV cache capacity (must match LLM engine).
+
+    Returns:
+        Dict[str, Any]: Configuration dictionary with action-specific fields.
+    """
     config_dict = config.to_dict()
+    rope_params = _select_rope_parameters(config_dict)
+    has_rope = ("rope_theta" in config_dict) or ("rope_theta" in rope_params)
+    if has_rope:
+        config_dict.update(_export_rope_config(config_dict))
     # Add TensorRT Edge-LLM version
     config_dict['edgellm_version'] = __version__
+    # Store max_kv_cache_capacity so the C++ builder and runtime can validate it
+    config_dict['max_kv_cache_capacity'] = max_kv_cache_capacity
+
     return config_dict
 
 

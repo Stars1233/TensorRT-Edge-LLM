@@ -2,17 +2,17 @@
 
 Decoupled quantization pipeline that produces **unified HuggingFace
 checkpoints** (safetensors + config) consumable by `llm_loader`.
-Runs in a clean venv — no `tensorrt_edgellm` dependency.
+Runs in a clean venv with the dependencies listed in `requirements.txt`.
 See `requirements.txt` for the full dependency list.
 
 ## Design
 
 ### Problem
 
-The existing quantization code lives inside `tensorrt_edgellm.quantization`
-and imports model-specific loaders, custom decoder layers, ONNX plugins, and
-TensorRT native ops.  This couples quantization (a GPU-only, PyTorch-only
-step) with the export pipeline, making the venv heavy and brittle.
+The old quantization path imported model-specific loaders, custom decoder
+layers, ONNX plugins, and TensorRT native ops. This coupled quantization
+(a GPU-only, PyTorch-only step) with the export pipeline, making the venv
+heavy and brittle.
 
 ### Solution
 
@@ -38,9 +38,8 @@ step) with the export pipeline, making the venv heavy and brittle.
 **Key decisions:**
 
 1. **Model loading** uses only `AutoModelForCausalLM` /
-   `AutoModelForImageTextToText`.  Model-specific workarounds
-   (Phi-4MM LoRA merge, NemotronH Mamba stub, GPTQ gate fixes) are
-   not yet implemented.
+   `AutoModelForImageTextToText`.  Required preprocessing, such as
+   Phi-4-Multimodal LoRA merge, should be run before this quantization step.
 
 2. **`models/` subfolder** holds standalone model implementations for
    architectures not available in HuggingFace `transformers`.  For
@@ -51,9 +50,9 @@ step) with the export pipeline, making the venv heavy and brittle.
    inference forward with KV-cache and GatherND belongs in the export
    layer.
 
-3. **Calibration** uses text data only (cnn_dailymail or a local
-   dataset).  Audio/visual calibration for Omni models is not yet
-   implemented.
+3. **Calibration** uses text data for LLM-only quantization and a multimodal
+   image-question dataset when `--visual_quantization fp8` is requested.
+   Audio calibration is not implemented.
 
 4. **Output** is always a unified HuggingFace checkpoint produced by
    `modelopt.torch.export.export_hf_checkpoint`.  This is the format
@@ -61,13 +60,13 @@ step) with the export pipeline, making the venv heavy and brittle.
 
 ### Supported quantization methods
 
-| Backbone        | LM-head         | KV-cache |
-|-----------------|-----------------|----------|
-| `fp8`           | `fp8`           | `fp8`    |
-| `int4_awq`      | `int4_awq`      | —        |
-| `nvfp4`         | `nvfp4`         | —        |
-| `mxfp8`         | `mxfp8`         | —        |
-| `int8_sq`       | —               | —        |
+| Backbone        | LM-head         | KV-cache | Visual tower |
+|-----------------|-----------------|----------|--------------|
+| `fp8`           | `fp8`           | `fp8`    | `fp8`        |
+| `int4_awq`      | `int4_awq`      | —        | —            |
+| `nvfp4`         | `nvfp4`         | —        | —            |
+| `mxfp8`         | `mxfp8`         | —        | —            |
+| `int8_sq`       | —               | —        | —            |
 
 Any backbone method can be combined with any lm_head method.  Examples:
 
@@ -81,7 +80,7 @@ Any backbone method can be combined with any lm_head method.  Examples:
 ### LLM quantization
 
 ```bash
-python -m experimental.quantization.cli llm \
+python -m experimental.quantization llm \
     --model_dir /path/to/Qwen3.5-0.8B \
     --output_dir /path/to/output \
     --quantization nvfp4 \
@@ -91,7 +90,7 @@ python -m experimental.quantization.cli llm \
 ### Eagle3 draft quantization
 
 ```bash
-python -m experimental.quantization.cli draft \
+python -m experimental.quantization draft \
     --base_model_dir /path/to/base_model \
     --draft_model_dir /path/to/eagle3_draft \
     --output_dir /path/to/output \
@@ -105,6 +104,7 @@ python -m experimental.quantization.cli draft \
 | `--quantization` | None | Backbone method |
 | `--lm_head_quantization` | None | LM-head method |
 | `--kv_cache_quantization` | None | KV-cache method (fp8) |
+| `--visual_quantization` | None | Visual tower method (fp8) |
 | `--dtype` | fp16 | Loading dtype |
 | `--device` | cuda | CUDA device |
 | `--dataset` | cnn_dailymail | Calibration dataset |
@@ -130,7 +130,7 @@ export pipeline.  The full workflow is:
 
 ```bash
 # 1. Quantize (this package — runs on any CUDA host)
-python -m experimental.quantization.cli llm \
+python -m experimental.quantization llm \
     --model_dir /data/Qwen3.5-0.8B \
     --output_dir /tmp/qwen35-nvfp4 \
     --quantization nvfp4 --lm_head_quantization nvfp4
@@ -144,4 +144,3 @@ Steps 3 (TRT engine build) and 4 (inference) run on the **edge device**
 using the C++ runtime.  See the
 [Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)
 for engine build and inference instructions.
-

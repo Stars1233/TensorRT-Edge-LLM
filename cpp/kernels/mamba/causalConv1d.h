@@ -73,4 +73,24 @@ void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor& convState, trt_edgellm::r
     trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
     cudaStream_t stream);
 
+/*!
+ * \brief MTP (multi-token) decode: process T draft tokens with per-step state checkpointing.
+ *
+ * For each draft token t in [0, T):
+ *   1. Shift conv_state left by 1, insert newCols[:, t, :]
+ *   2. Compute output = dot(conv_state, weight) + bias
+ *   3. Save intermediate conv_state to intermediateConvStates[:, t, :, :]
+ *
+ * convState:               [batch, dim, width]           FP16  (in-place updated to final state)
+ * newCols:                 [batch, T, dim]               FP16  (T draft token inputs)
+ * weight:                  [dim, 1, width]               FP16
+ * bias:                    [dim]                         FP16  (optional)
+ * out:                     [batch, T, dim]               FP16  (T outputs)
+ * intermediateConvStates:  [batch, T, dim, width]        FP16  (per-step state cache for rollback)
+ * T:                       number of draft tokens
+ */
+void invokeCausalConv1dDecodeMTP(trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCols,
+    trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
+    trt_edgellm::rt::Tensor& intermediateConvStates, int32_t T, cudaStream_t stream);
+
 } // namespace mamba_ssm

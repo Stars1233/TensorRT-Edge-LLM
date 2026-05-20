@@ -21,6 +21,7 @@
 
 #include "common/logger.h"
 
+#include <algorithm>
 #include <cuda_runtime.h>
 
 namespace trt_edgellm
@@ -29,6 +30,8 @@ namespace trt_edgellm
 // Static member initialization
 bool CuteDslGemmRunner::sLoaded = false;
 int32_t CuteDslGemmRunner::sActiveVariant = 0;
+int32_t CuteDslGemmRunner::sBlackwellSmallTileMaxM = 0;
+int32_t CuteDslGemmRunner::sBlackwell2ctaMinM = 0;
 std::mutex CuteDslGemmRunner::sMutex;
 
 #ifdef CUTE_DSL_GEMM_AMPERE_DECODE_ENABLED
@@ -63,6 +66,26 @@ gemm_blackwell_bias_silu_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwellBiasS
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_BIAS_ENABLED
 gemm_blackwell_bias_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwellBiasModule = {};
+#endif
+
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED
+gemm_blackwell_small_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwellSmallModule = {};
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED
+gemm_blackwell_small_bias_silu_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwellSmallBiasSiLUModule = {};
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
+gemm_blackwell_small_bias_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwellSmallBiasModule = {};
+#endif
+
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
+gemm_blackwell_2cta_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwell2ctaModule = {};
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED
+gemm_blackwell_2cta_bias_silu_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwell2ctaBiasSiLUModule = {};
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED
+gemm_blackwell_2cta_bias_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwell2ctaBiasModule = {};
 #endif
 
 #ifdef CUTE_DSL_GEMM_BLACKWELL_GEFORCE_ENABLED
@@ -168,9 +191,43 @@ bool CuteDslGemmRunner::loadKernelModule()
 #ifdef CUTE_DSL_GEMM_BLACKWELL_BIAS_ENABLED
         gemm_blackwell_bias_fp16_Kernel_Module_Load(&sBlackwellBiasModule);
 #endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED
+        gemm_blackwell_small_fp16_Kernel_Module_Load(&sBlackwellSmallModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED
+        gemm_blackwell_small_bias_silu_fp16_Kernel_Module_Load(&sBlackwellSmallBiasSiLUModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
+        gemm_blackwell_small_bias_fp16_Kernel_Module_Load(&sBlackwellSmallBiasModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
+        gemm_blackwell_2cta_fp16_Kernel_Module_Load(&sBlackwell2ctaModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED
+        gemm_blackwell_2cta_bias_silu_fp16_Kernel_Module_Load(&sBlackwell2ctaBiasSiLUModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED
+        gemm_blackwell_2cta_bias_fp16_Kernel_Module_Load(&sBlackwell2ctaBiasModule);
+#endif
+        // Pick small/default cutover from SM count. Each small CTA covers a
+        // 64x128 output sub-tile; default covers 128x128. Empirically, small
+        // wins while #CTAs / SM stays under ~3-4 waves; beyond that, the
+        // larger default tile amortizes MMA overhead better.
+        sBlackwellSmallTileMaxM = std::max(64, props.multiProcessorCount * 4);
+        // 2-CTA (256x256) tile beats the 1-CTA default on low-SM-count GPUs
+        // where each CTA needs more arithmetic intensity to fill SMs. Two
+        // gates: (a) M must clear sBlackwell2ctaMinM, and (b) for M between
+        // [MinM, 2*MinM) the 2-CTA tile only wins if N >= 2048 (otherwise
+        // the 256-wide N-tile is too granular and 1-CTA default tile wins).
+        // Disabled on B100/H100-class (high SM count -> default already
+        // saturates compute).
+        sBlackwell2ctaMinM = (props.multiProcessorCount <= 32) ? 256 : 0;
         sActiveVariant = static_cast<int32_t>(Variant::kBlackwell);
         sLoaded = true;
-        LOG_INFO("CuteDslGemmRunner: Blackwell GEMM module loaded for SM%d", smVersion);
+        LOG_INFO(
+            "CuteDslGemmRunner: Blackwell GEMM module loaded for SM%d (SMs=%d, "
+            "small_tile_max_M=%d, 2cta_min_M=%d)",
+            smVersion, props.multiProcessorCount, sBlackwellSmallTileMaxM, sBlackwell2ctaMinM);
         return true;
     }
 #endif
@@ -264,6 +321,24 @@ void CuteDslGemmRunner::unloadKernelModule()
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_BIAS_ENABLED
         gemm_blackwell_bias_fp16_Kernel_Module_Unload(&sBlackwellBiasModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED
+        gemm_blackwell_small_fp16_Kernel_Module_Unload(&sBlackwellSmallModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED
+        gemm_blackwell_small_bias_silu_fp16_Kernel_Module_Unload(&sBlackwellSmallBiasSiLUModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
+        gemm_blackwell_small_bias_fp16_Kernel_Module_Unload(&sBlackwellSmallBiasModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
+        gemm_blackwell_2cta_fp16_Kernel_Module_Unload(&sBlackwell2ctaModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED
+        gemm_blackwell_2cta_bias_silu_fp16_Kernel_Module_Unload(&sBlackwell2ctaBiasSiLUModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED
+        gemm_blackwell_2cta_bias_fp16_Kernel_Module_Unload(&sBlackwell2ctaBiasModule);
 #endif
     }
 #endif
@@ -445,6 +520,75 @@ bool CuteDslGemmRunner::run(
 #ifdef CUTE_DSL_GEMM_BLACKWELL_ENABLED
     case static_cast<int32_t>(Variant::kBlackwell):
     {
+        // Tile dispatch: small (64x128, cluster (1,2)) wins while there are
+        // few enough M-tiles to fit in a small number of waves; default
+        // (128x128, cluster (1,1)) wins once #CTAs >> #SMs. Threshold scales
+        // with SM count (sBlackwellSmallTileMaxM = max(64, 4 * SMs)) to cover
+        // both B100 (~144 SMs -> ~576) and Thor (~20 SMs -> 80).
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED
+        if (M <= sBlackwellSmallTileMaxM)
+        {
+            gemm_blackwell_small_fp16_Tensor_a_t tensorA{};
+            tensorA.data = const_cast<void*>(aPtr);
+            tensorA.dynamic_shapes[0] = M;
+            tensorA.dynamic_shapes[1] = K;
+            tensorA.dynamic_shapes[2] = 1;
+            tensorA.dynamic_strides[0] = K;
+            tensorA.dynamic_strides[1] = static_cast<int64_t>(M) * K;
+
+            gemm_blackwell_small_fp16_Tensor_b_t tensorB{};
+            tensorB.data = const_cast<void*>(bPtr);
+            tensorB.dynamic_shapes[0] = N;
+            tensorB.dynamic_shapes[1] = K;
+            tensorB.dynamic_shapes[2] = 1;
+            tensorB.dynamic_strides[0] = K;
+            tensorB.dynamic_strides[1] = static_cast<int64_t>(N) * K;
+
+            gemm_blackwell_small_fp16_Tensor_c_t tensorC{};
+            tensorC.data = cPtr;
+            tensorC.dynamic_shapes[0] = M;
+            tensorC.dynamic_shapes[1] = N;
+            tensorC.dynamic_shapes[2] = 1;
+            tensorC.dynamic_strides[0] = N;
+            tensorC.dynamic_strides[1] = static_cast<int64_t>(M) * N;
+
+            cute_dsl_gemm_blackwell_small_fp16_wrapper(&sBlackwellSmallModule, &tensorA, &tensorB, &tensorC, stream);
+            return true;
+        }
+#endif
+
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
+        if (sBlackwell2ctaMinM > 0 && M >= sBlackwell2ctaMinM && (M >= 2 * sBlackwell2ctaMinM || N >= 2048))
+        {
+            gemm_blackwell_2cta_fp16_Tensor_a_t tensorA{};
+            tensorA.data = const_cast<void*>(aPtr);
+            tensorA.dynamic_shapes[0] = M;
+            tensorA.dynamic_shapes[1] = K;
+            tensorA.dynamic_shapes[2] = 1;
+            tensorA.dynamic_strides[0] = K;
+            tensorA.dynamic_strides[1] = static_cast<int64_t>(M) * K;
+
+            gemm_blackwell_2cta_fp16_Tensor_b_t tensorB{};
+            tensorB.data = const_cast<void*>(bPtr);
+            tensorB.dynamic_shapes[0] = N;
+            tensorB.dynamic_shapes[1] = K;
+            tensorB.dynamic_shapes[2] = 1;
+            tensorB.dynamic_strides[0] = K;
+            tensorB.dynamic_strides[1] = static_cast<int64_t>(N) * K;
+
+            gemm_blackwell_2cta_fp16_Tensor_c_t tensorC{};
+            tensorC.data = cPtr;
+            tensorC.dynamic_shapes[0] = M;
+            tensorC.dynamic_shapes[1] = N;
+            tensorC.dynamic_shapes[2] = 1;
+            tensorC.dynamic_strides[0] = N;
+            tensorC.dynamic_strides[1] = static_cast<int64_t>(M) * N;
+
+            cute_dsl_gemm_blackwell_2cta_fp16_wrapper(&sBlackwell2ctaModule, &tensorA, &tensorB, &tensorC, stream);
+            return true;
+        }
+#endif
+
         gemm_blackwell_fp16_Tensor_a_t tensorA{};
         tensorA.data = const_cast<void*>(aPtr);
         tensorA.dynamic_shapes[0] = M;
@@ -638,6 +782,26 @@ bool CuteDslGemmRunner::runBiasSiLU(void const* aPtr, void const* bPtr, void* cP
 #ifdef CUTE_DSL_GEMM_BLACKWELL_BIAS_SILU_ENABLED
     if (sActiveVariant == static_cast<int32_t>(Variant::kBlackwell))
     {
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED
+        if (M <= sBlackwellSmallTileMaxM)
+        {
+            return dispatch3dFused<gemm_blackwell_small_bias_silu_fp16_Kernel_Module_t,
+                gemm_blackwell_small_bias_silu_fp16_Tensor_a_t, gemm_blackwell_small_bias_silu_fp16_Tensor_b_t,
+                gemm_blackwell_small_bias_silu_fp16_Tensor_c_t, gemm_blackwell_small_bias_silu_fp16_Tensor_mBias_t>(
+                sBlackwellSmallBiasSiLUModule, cute_dsl_gemm_blackwell_small_bias_silu_fp16_wrapper, aPtr, bPtr, cPtr,
+                biasPtr, M, N, K, stream);
+        }
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED
+        if (sBlackwell2ctaMinM > 0 && M >= sBlackwell2ctaMinM && (M >= 2 * sBlackwell2ctaMinM || N >= 2048))
+        {
+            return dispatch3dFused<gemm_blackwell_2cta_bias_silu_fp16_Kernel_Module_t,
+                gemm_blackwell_2cta_bias_silu_fp16_Tensor_a_t, gemm_blackwell_2cta_bias_silu_fp16_Tensor_b_t,
+                gemm_blackwell_2cta_bias_silu_fp16_Tensor_c_t, gemm_blackwell_2cta_bias_silu_fp16_Tensor_mBias_t>(
+                sBlackwell2ctaBiasSiLUModule, cute_dsl_gemm_blackwell_2cta_bias_silu_fp16_wrapper, aPtr, bPtr, cPtr,
+                biasPtr, M, N, K, stream);
+        }
+#endif
         return dispatch3dFused<gemm_blackwell_bias_silu_fp16_Kernel_Module_t, gemm_blackwell_bias_silu_fp16_Tensor_a_t,
             gemm_blackwell_bias_silu_fp16_Tensor_b_t, gemm_blackwell_bias_silu_fp16_Tensor_c_t,
             gemm_blackwell_bias_silu_fp16_Tensor_mBias_t>(sBlackwellBiasSiLUModule,
@@ -677,6 +841,26 @@ bool CuteDslGemmRunner::runBias(void const* aPtr, void const* bPtr, void* cPtr, 
 #ifdef CUTE_DSL_GEMM_BLACKWELL_BIAS_ENABLED
     if (sActiveVariant == static_cast<int32_t>(Variant::kBlackwell))
     {
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
+        if (M <= sBlackwellSmallTileMaxM)
+        {
+            return dispatch3dFused<gemm_blackwell_small_bias_fp16_Kernel_Module_t,
+                gemm_blackwell_small_bias_fp16_Tensor_a_t, gemm_blackwell_small_bias_fp16_Tensor_b_t,
+                gemm_blackwell_small_bias_fp16_Tensor_c_t, gemm_blackwell_small_bias_fp16_Tensor_mBias_t>(
+                sBlackwellSmallBiasModule, cute_dsl_gemm_blackwell_small_bias_fp16_wrapper, aPtr, bPtr, cPtr, biasPtr,
+                M, N, K, stream);
+        }
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED
+        if (sBlackwell2ctaMinM > 0 && M >= sBlackwell2ctaMinM && (M >= 2 * sBlackwell2ctaMinM || N >= 2048))
+        {
+            return dispatch3dFused<gemm_blackwell_2cta_bias_fp16_Kernel_Module_t,
+                gemm_blackwell_2cta_bias_fp16_Tensor_a_t, gemm_blackwell_2cta_bias_fp16_Tensor_b_t,
+                gemm_blackwell_2cta_bias_fp16_Tensor_c_t, gemm_blackwell_2cta_bias_fp16_Tensor_mBias_t>(
+                sBlackwell2ctaBiasModule, cute_dsl_gemm_blackwell_2cta_bias_fp16_wrapper, aPtr, bPtr, cPtr, biasPtr, M,
+                N, K, stream);
+        }
+#endif
         return dispatch3dFused<gemm_blackwell_bias_fp16_Kernel_Module_t, gemm_blackwell_bias_fp16_Tensor_a_t,
             gemm_blackwell_bias_fp16_Tensor_b_t, gemm_blackwell_bias_fp16_Tensor_c_t,
             gemm_blackwell_bias_fp16_Tensor_mBias_t>(sBlackwellBiasModule, cute_dsl_gemm_blackwell_bias_fp16_wrapper,

@@ -23,3 +23,5 @@ enough to run ModelOpt quantization and export a unified checkpoint.
 
 from .eagle3_draft import Eagle3DraftModel  # noqa: F401
 from .eagle3_draft import quantize_and_export_draft  # noqa: F401
+from .mtp_draft import MtpDraftModel  # noqa: F401
+from .mtp_draft import quantize_mtp_from_base  # noqa: F401

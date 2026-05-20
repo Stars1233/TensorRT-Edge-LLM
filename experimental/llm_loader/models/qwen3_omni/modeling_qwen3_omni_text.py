@@ -15,15 +15,22 @@
 """
 Qwen3-Omni LLM backbone (thinker).
 
-The Qwen3-Omni thinker is a standard Qwen3 transformer decoder. The default
-``AutoModel`` pipeline handles it automatically from ``config.json``.
-
-For export:
-    from llm_loader.model import AutoModel
-    from llm_loader.onnx.export import export_onnx
-    model = AutoModel.from_pretrained(model_dir)
-    export_onnx(model, output_path, model_dir=model_dir)
+The Qwen3-Omni thinker is a standard Qwen3 transformer decoder, but the TTS
+pipeline feeds the thinker's full-sequence last-layer normed hidden states
+into the Talker's input projection. This subclass enables the extra
+``hidden_states`` ONNX output so downstream tooling doesn't need to patch it
+in after the fact.
 """
-from ..default.modeling_default import CausalLM as Qwen3OmniLanguageModel
+from ..default.modeling_default import CausalLM
 
 __all__ = ["Qwen3OmniLanguageModel"]
+
+
+class Qwen3OmniLanguageModel(CausalLM):
+    """Qwen3-Omni thinker: standard Qwen3 decoder with ``hidden_states`` output.
+
+    The Talker consumes the thinker's full-sequence last-layer normed hidden
+    states; exposing them as a named ONNX output avoids a post-export patch.
+    """
+
+    emit_hidden_states = True

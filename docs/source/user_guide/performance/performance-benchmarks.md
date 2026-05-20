@@ -1,7 +1,6 @@
 # Performance Benchmarks
 
 > **Platform:** NVIDIA Jetson AGX Thor Developer Kit (Blackwell, SM110)
-> **SDK Version:** TensorRT Edge-LLM 0.4.0
 
 ## Definitions
 
@@ -15,6 +14,7 @@
 | **Speedup** | EAGLE generation throughput / vanilla generation throughput (same model, precision, batch size) |
 | **ViT time** | Total visual encoder processing time per inference run (ms) |
 | **ViT throughput** | Image tokens processed per second by the visual encoder (tok/s) |
+| **GPU memory** | Peak GPU memory usage during inference (MB) |
 
 ### Precision Key
 
@@ -23,11 +23,57 @@
 | FP16 | Half-precision float | All platforms |
 | FP8 | 8-bit float | SM89+ (Ada Lovelace and newer) |
 | INT4 AWQ | 4-bit integer (AWQ quantization) | All platforms |
+| INT4 GPTQ | 4-bit integer (GPTQ quantization) | All platforms |
 | NVFP4 | NVIDIA 4-bit float | SM100+ (Blackwell and newer) |
 
 ---
 
-## LLM — Vanilla Decoding
+## v0.7.0 Results
+
+> **SDK Version:** TensorRT Edge-LLM 0.7.0 &nbsp;|&nbsp; **TensorRT:** 10.13
+
+### LLM — Vanilla Decoding
+
+| Model | Precision | Batch | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | Generation (tok/s) | GPU Mem (MB) |
+|-------|-----------|:-----:|-------------:|:--------------:|----------------:|-------------------:|-------------:|
+| Qwen3-1.7B | NVFP4 | 1 | 13.9 | 370 | 26,683 | 170.4 | 1,453 |
+| Qwen3-1.7B | NVFP4 | 8 | 150.5 | 2,959 | 19,663 | 798.8 | 1,491 |
+| Qwen3-30B-A3B-GPTQ-Int4 | INT4 GPTQ | 1 | 125.3 | 370 | 2,951 | 81.3 | 15,938 |
+| Qwen3-30B-A3B-GPTQ-Int4 | INT4 GPTQ | 8 | 1,342.2 | 2,959 | 2,204 | 223.2 | 15,961 |
+| Nemotron-3-Nano-4B | NVFP4 | 1 | 126.8 | 383 | 3,018 | 65.4 | 3,647 |
+| Nemotron-3-Nano-4B | NVFP4 | 8 | 1,017.6 | 3,062 | 3,009 | 315.4 | 3,684 |
+
+### Vision Language Model — Vanilla Decoding
+
+| Model | LLM Prec | ViT Prec | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | Generation (tok/s) | GPU Mem (MB) |
+|-------|----------|----------|-------------:|:--------------:|----------------:|-------------------:|-------------:|
+| Qwen3.5-0.8B | NVFP4 | FP16 | 7.0 | 753 | 107,571 | 232.2 | 1,052 |
+| Qwen3.5-2B | NVFP4 | FP16 | 13.8 | 753 | 54,565 | 111.0 | 1,671 |
+| Qwen3.5-27B | NVFP4 | FP16 | 122.6 | 753 | 6,143 | 10.5 | 14,985 |
+| Nemotron-3-Nano-Omni-30B-A3B | NVFP4 | FP16 | 846.7 | 1,663 | 1,964 | 24.5 | 20,267 |
+
+### LLM — EAGLE Speculative Decoding
+
+#### Draft Models
+
+| Base Model | Draft Model | Source |
+|------------|-------------|--------|
+| Qwen3-1.7B | Qwen3-1.7B_eagle3 | [AngelSlim/Qwen3-1.7B_eagle3](https://huggingface.co/AngelSlim/Qwen3-1.7B_eagle3) |
+
+> **Note:** Both base and draft models are quantized to NVFP4.
+
+| Model | Base Prec | Draft Prec | Batch | Prefill (ms) | Prefill Tokens | Generation (tok/s) | Accept Rate | Speedup |
+|-------|-----------|------------|:-----:|-------------:|:--------------:|-------------------:|:-----------:|--------:|
+| Qwen3-1.7B | NVFP4 | NVFP4 | 1 | 14.5 | 370 | 312.4 | 3.75 | 1.83x |
+| Qwen3-1.7B | NVFP4 | NVFP4 | 8 | 153.5 | 2,959 | 828.8 | 3.73 | 1.04x |
+
+---
+
+## v0.4.0 Results
+
+> **SDK Version:** TensorRT Edge-LLM 0.4.0 &nbsp;|&nbsp; **TensorRT:** 10.13
+
+### LLM — Vanilla Decoding
 
 | Model | Precision | Batch | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | Generation (tok/s) |
 |-------|-----------|:-----:|-------------:|:--------------:|----------------:|-------------------:|
@@ -48,9 +94,7 @@
 | Qwen3-8B | NVFP4 | 1 | 32.8 | 366 | 11,159 | 53.7 |
 | Qwen3-8B | NVFP4 | 8 | 425.8 | 2927 | 6,874 | 372.2 |
 
----
-
-## Vision Language Model — Vanilla Decoding
+### Vision Language Model — Vanilla Decoding
 
 | Model | LLM Prec | ViT Prec | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | ViT Time (ms) | ViT Tok/Run | ViT (tok/s) | Generation (tok/s) |
 |-------|----------|----------|-------------:|:--------------:|----------------:|---------------:|:-----------:|------------:|-------------------:|
@@ -65,11 +109,9 @@
 
 > **Note:** ViT time = per-token ViT latency x image tokens per run. FP8 ViT reduces visual encoder time by ~17% compared to FP16 with negligible impact on generation throughput.
 
----
+### LLM — EAGLE Speculative Decoding
 
-## LLM — EAGLE Speculative Decoding
-
-### Draft Models
+#### Draft Models
 
 | Base Model | Draft Model | Source |
 |------------|-------------|--------|
@@ -91,11 +133,9 @@
 
 > **Note:** EAGLE speculative decoding provides the greatest speedup at BS=1 (latency-bound). At BS=8, base model compute is already well-utilized, limiting speculative acceleration. See [Speculative Decoding](../examples/speculative-decoding.md) for setup instructions.
 
----
+### Vision Language Model — EAGLE Speculative Decoding
 
-## Vision Language Model — EAGLE Speculative Decoding
-
-### Draft Models
+#### Draft Models
 
 | Base Model | Draft Model | Source |
 |------------|-------------|--------|
@@ -113,8 +153,20 @@
 
 ## Key Observations
 
+### v0.7.0
+
+- **MoE support:** Qwen3-30B-A3B-GPTQ-Int4 (MoE, 3B active params out of 30B) achieves 81.3 tok/s at BS=1 and 223.2 tok/s at BS=8 with INT4 GPTQ, demonstrating efficient sparse model inference on edge.
+- **Small model throughput:** Qwen3-1.7B with NVFP4 delivers 170.4 tok/s at BS=1 and 798.8 tok/s at BS=8, suitable for latency-sensitive edge applications.
+- **Qwen3.5 VLM family:** Ranges from 232.2 tok/s (0.8B) to 10.5 tok/s (27B), providing a scalable VLM option across memory and throughput budgets.
+- **Nemotron-3-Nano-Omni-30B-A3B:** The first audio+video multimodal model benchmarked, achieving 24.5 tok/s generation at 20 GB GPU memory.
+
+### v0.4.0
+
 - **NVFP4 delivers highest throughput**: NVFP4 achieves 1.1–2.3x higher generation throughput than INT4 AWQ, with substantially faster prefill (e.g., 31 ms vs 216 ms for Llama-3.1-8B at BS=1).
 - **EAGLE at BS=1 provides meaningful speedup**: 1.4–3.5x for LLMs, best for Llama-3.1-8B NVFP4 (3.45x). The draft model acceptance rate is high for Llama (~5.2 tokens/step) and moderate for Qwen3-8B (~4.3 tokens/step).
 - **EAGLE at BS=8 has limited benefit**: At high batch sizes, base model compute is already well-utilized. Speedup drops to <1x for INT4 AWQ and 1.2–1.6x for NVFP4.
 - **Qwen3-0.6B achieves the highest throughput**: 1562 tok/s at BS=8 with NVFP4 — a lightweight model well-suited for latency-sensitive edge applications.
-- All benchmarks use default TensorRT Edge-LLM inference settings. Production performance may vary with system-level tuning (power mode, memory configuration, thermal management).
+
+### General
+
+- All benchmarks use default TensorRT Edge-LLM inference settings on Jetson AGX Thor. Production performance may vary with system-level tuning (power mode, memory configuration, thermal management).

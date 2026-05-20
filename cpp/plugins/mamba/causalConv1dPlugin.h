@@ -30,7 +30,8 @@ namespace plugins
 class CausalConv1dPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-    CausalConv1dPlugin(std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups);
+    CausalConv1dPlugin(std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups,
+        bool useMTP = false);
     CausalConv1dPlugin(std::string const& name, void const* data, size_t length);
 
     CausalConv1dPlugin() = delete;
@@ -71,6 +72,7 @@ private:
     int32_t mPadding{0};
     int32_t mDilation{1};
     int32_t mGroups{0};
+    bool mUseMTP{false}; //!< Enable MTP output (intermediate_conv_states as 3rd output)
 };
 
 class CausalConv1dPluginCreator : public nvinfer1::IPluginCreator

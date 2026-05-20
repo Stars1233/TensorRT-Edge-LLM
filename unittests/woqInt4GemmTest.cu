@@ -126,3 +126,79 @@ TEST(WOQInt4GemmTest, accuracyGemm)
     TestInt4GroupwiseGemmAccuracy(64, 512, 512, 128);
     TestInt4GroupwiseGemmAccuracy(64, 640, 512, 128);
 }
+
+// Regression guard for the cudaFuncSetAttribute-during-stream-capture bug.
+// gemm_forward_cuda_new used to call cudaFuncSetAttribute on every invocation,
+// which is not capturable -- it invalidated any active stream capture and made
+// the next kernel launch return cudaErrorStreamCaptureInvalidated (901).  The
+// attribute is now set once via std::call_once during the first (out-of-capture)
+// call.  Iterates over a spread of representative shapes -- all hit the GEMM
+// path (M > kGemvMaxM and N % kGemmCtaN == 0).  Each iteration launches the
+// kernel inside cudaStreamBeginCapture/EndCapture and asserts the capture
+// completes, instantiates, and replays cleanly.
+TEST(WOQInt4GemmTest, streamCaptureSafe)
+{
+    struct Shape
+    {
+        int m;
+        int n;
+        int k;
+        char const* note;
+    };
+    Shape const shapes[] = {
+        {8, 128, 128, "minimal valid GEMM tile"},
+        {8, 2560, 5120, "Qwen3.5-4B attention/GDN proj (production)"},
+        {8, 9216, 2560, "Qwen3.5-4B MLP up/gate proj"},
+        {8, 2560, 9216, "Qwen3.5-4B MLP down proj"},
+        {120, 4096, 2560, "EAGLE-like large M (mxbs=2, vts=60)"},
+    };
+    int const group_size = 128;
+
+    for (auto const& s : shapes)
+    {
+        SCOPED_TRACE(testing::Message() << s.note << " (m=" << s.m << ", n=" << s.n << ", k=" << s.k << ")");
+        int const m = s.m;
+        int const n = s.n;
+        int const k = s.k;
+
+        cudaStream_t stream{nullptr};
+        CUDA_CHECK(cudaStreamCreate(&stream));
+
+        half *d_act{nullptr}, *d_scales{nullptr}, *d_out{nullptr};
+        int8_t* d_weight{nullptr};
+        CUDA_CHECK(cudaMallocAsync(&d_act, (size_t) m * k * sizeof(__half), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_weight, ((size_t) k * n / 2) * sizeof(int8_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_scales, (size_t) (k / group_size) * n * sizeof(__half), stream));
+        CUDA_CHECK(cudaMallocAsync(&d_out, (size_t) m * n * sizeof(__half), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_act, 0, (size_t) m * k * sizeof(__half), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_weight, 0, ((size_t) k * n / 2) * sizeof(int8_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(d_scales, 0, (size_t) (k / group_size) * n * sizeof(__half), stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Warmup outside capture -- triggers std::call_once / cudaFuncSetAttribute on first iteration.
+        trt_edgellm::kernel::gemm_forward_cuda_new(d_act, d_weight, d_scales, d_out, m, n, k, group_size, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Capture must not be invalidated by gemm_forward_cuda_new.
+        cudaGraph_t graph{};
+        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), cudaSuccess);
+        trt_edgellm::kernel::gemm_forward_cuda_new(d_act, d_weight, d_scales, d_out, m, n, k, group_size, stream);
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+        ASSERT_NE(graph, nullptr);
+
+        // Graph must instantiate and replay cleanly.
+        cudaGraphExec_t graphExec{};
+        ASSERT_EQ(cudaGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0), cudaSuccess);
+        ASSERT_EQ(cudaGraphLaunch(graphExec, stream), cudaSuccess);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        CUDA_CHECK(cudaGraphExecDestroy(graphExec));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        CUDA_CHECK(cudaFreeAsync(d_act, stream));
+        CUDA_CHECK(cudaFreeAsync(d_weight, stream));
+        CUDA_CHECK(cudaFreeAsync(d_scales, stream));
+        CUDA_CHECK(cudaFreeAsync(d_out, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
+}

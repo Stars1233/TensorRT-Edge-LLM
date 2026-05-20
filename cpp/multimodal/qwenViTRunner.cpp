@@ -119,6 +119,23 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
         return false;
     }
 
+    // Read mrope_interleaved from config. Fall back to model-type heuristic for older configs
+    // that lack this field (Qwen3-VL and Qwen3.5 always use interleaved MRoPE).
+    if (subConfig.contains("mrope_interleaved") && subConfig["mrope_interleaved"].is_boolean())
+    {
+        mConfig.mropeInterleaved = subConfig["mrope_interleaved"].get<bool>();
+    }
+    else if (ropeParams.contains("mrope_interleaved") && ropeParams["mrope_interleaved"].is_boolean())
+    {
+        mConfig.mropeInterleaved = ropeParams["mrope_interleaved"].get<bool>();
+    }
+    else
+    {
+        // Legacy fallback: Qwen3-VL and Qwen3.5 use interleaved MRoPE
+        mConfig.mropeInterleaved
+            = (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5);
+    }
+
     if (mModelType == multimodal::ModelType::QWEN2_5_VL)
     {
         mConfig.windowSize = jsonConfig["vision_config"]["window_size"].get<int64_t>();
@@ -318,23 +335,20 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
     int64_t channels = image.channels;
     unsigned char* imageData = image.data(); // In hwc order
 
-    if (height % (mConfig.patchSize * mConfig.mergeSize) != 0 || width % (mConfig.patchSize * mConfig.mergeSize) != 0)
-    {
-        throw std::runtime_error("Image height or width is not divisible by patchSize * mergeSize = "
+    ELLM_CHECK(
+        height % (mConfig.patchSize * mConfig.mergeSize) == 0 && width % (mConfig.patchSize * mConfig.mergeSize) == 0,
+        "Image height or width is not divisible by patchSize * mergeSize = "
             + std::to_string(mConfig.patchSize * mConfig.mergeSize) + " got height: " + std::to_string(height)
             + ", width: " + std::to_string(width));
-    }
 
     std::vector<int64_t> curGrid{1, (height / mConfig.patchSize), (width / mConfig.patchSize)};
     imageGridTHWs.emplace_back(curGrid);
     int64_t curSeqLength = (height / mConfig.patchSize) * (width / mConfig.patchSize);
     int64_t prevCuSeqlen = cuSeqlensData[cuSeqlensSize - 1];
-    if (prevCuSeqlen + curSeqLength > mConfig.maxHW || cuSeqlensSize > (mConfig.maxNumImages + 1))
-    {
-        throw std::runtime_error("cuSeqlens " + std::to_string(prevCuSeqlen + curSeqLength)
+    ELLM_CHECK(prevCuSeqlen + curSeqLength <= mConfig.maxHW && cuSeqlensSize <= (mConfig.maxNumImages + 1),
+        "cuSeqlens " + std::to_string(prevCuSeqlen + curSeqLength)
             + " exceeds the limitation, maxHW = " + std::to_string(mConfig.maxHW)
             + " or maxNumImages = " + std::to_string(mConfig.maxNumImages) + " of VIT engine.");
-    }
     imageTokenLengths.emplace_back(curSeqLength / mConfig.mergeSize / mConfig.mergeSize);
     maxSeqLen = std::max(maxSeqLen, curSeqLength);
 
@@ -370,8 +384,14 @@ std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
     int64_t const minPixels = mConfig.minImageTokensPerImage * factor * factor;
     int64_t const maxPixels = mConfig.maxImageTokensPerImage * factor * factor;
 
+    // Banker's rounding (round-half-to-even) to match Python's round() used by the HF reference.
     auto roundByFactor = [](int64_t value, int64_t factor) -> int64_t {
-        return std::round(static_cast<double>(value) / factor) * factor;
+        int64_t q = value / factor;
+        int64_t r = value - q * factor;
+        int64_t twoR = 2 * r;
+        if (twoR > factor || (twoR == factor && (q & 1)))
+            ++q;
+        return q * factor;
     };
     auto floorByFactor = [](int64_t value, int64_t factor) -> int64_t {
         return std::floor(static_cast<double>(value) / factor) * factor;
@@ -380,11 +400,9 @@ std::tuple<int64_t, int64_t> QwenViTRunner::getResizedImageSize(
         return std::ceil(static_cast<double>(value) / factor) * factor;
     };
 
-    if (std::max(height, width) / std::min(height, width) > maxRatio)
-    {
-        throw std::runtime_error("absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
+    ELLM_CHECK(std::max(height, width) / std::min(height, width) <= maxRatio,
+        "absolute aspect ratio must be smaller than " + std::to_string(maxRatio) + ", got "
             + std::to_string(std::max(height, width) / std::min(height, width)));
-    }
 
     int64_t hBar = std::max(factor, roundByFactor(height, factor));
     int64_t wBar = std::max(factor, roundByFactor(width, factor));
@@ -444,11 +462,9 @@ void QwenViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
         return;
     }
 
-    if (totalSeqLength < mConfig.minHW || totalSeqLength > mConfig.maxHW)
-    {
-        throw std::runtime_error("totalSeqLength " + std::to_string(totalSeqLength) + " exceeds the limitation, max = "
+    ELLM_CHECK(totalSeqLength >= mConfig.minHW && totalSeqLength <= mConfig.maxHW,
+        "totalSeqLength " + std::to_string(totalSeqLength) + " exceeds the limitation, max = "
             + std::to_string(mConfig.maxHW) + ", min = " + std::to_string(mConfig.minHW) + " of VIT engine.");
-    }
 
     // Reshape tensors
     int64_t totalImageTokens = totalSeqLength / (mConfig.mergeSize * mConfig.mergeSize);
@@ -520,6 +536,7 @@ void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const&
     int64_t totalImageIdx = 0;
     int64_t batchOffset = 0;
 
+    mMropeRopeDeltasPerBatch.clear();
     for (auto const& inputIds : batchInputIds)
     {
         auto start = inputIds.begin();
@@ -565,6 +582,10 @@ void QwenViTRunner::getMRopePositionIds(std::vector<std::vector<int32_t>> const&
             remainingStartPos = start - inputIds.begin();
         }
 
+        // MRoPE rope delta for this batch: maxMropePositionId + 1 - inputIdSize
+        int64_t const maxMropePositionId = startIdx + inputIds.size() - remainingStartPos - 1;
+        mMropeRopeDeltasPerBatch.push_back(maxMropePositionId + 1 - inputIds.size());
+
         // Remaining text part till maxPositionEmbeddings. Treat all generated tokens as text tokens.
         int64_t textLen = maxPositionEmbeddings - remainingStartPos;
         for (int64_t i = 0; i < 3; ++i)
@@ -607,7 +628,7 @@ void QwenViTRunner::generateMropeParams(std::vector<std::vector<int32_t>> const&
     // Initialize mrope cosSinCacheDevice
     check::check(
         ropeRotaryCosSinDevice.reshape({activeBatchSize, maxPositionEmbeddings, rotaryDim}), "Tensor reshape failed");
-    bool interleaved = (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5);
+    bool interleaved = mConfig.mropeInterleaved;
     kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
         mMropePositionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
         activeBatchSize, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW, stream);
@@ -664,12 +685,9 @@ void QwenViTRunner::getWindowIndex(
         windowIndexValue += T * llmGridH * llmGridW;
     }
 
-    if (windowIndexPos * (mConfig.mergeSize * mConfig.mergeSize) != curHW)
-    {
-        throw std::runtime_error(
-            "windowIndex size * (mergeSize * mergeSize) does not match curHW. Got windowIndex size: "
+    ELLM_CHECK(windowIndexPos * (mConfig.mergeSize * mConfig.mergeSize) == curHW,
+        "windowIndex size * (mergeSize * mergeSize) does not match curHW. Got windowIndex size: "
             + std::to_string(windowIndexPos) + ", curHW: " + std::to_string(curHW));
-    }
 
     // Copy cu_window_seqlens
     check::check(mCuWindowSeqlens.reshape({cuWindowSeqlensSize}), "Tensor reshape failed");

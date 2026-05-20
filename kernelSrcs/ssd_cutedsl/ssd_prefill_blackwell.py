@@ -40,6 +40,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.base_dsl.typing import Uint128
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 # setmaxregister_decrease/increase were introduced in cutlass-dsl 4.4.0,
@@ -65,6 +66,7 @@ class SSDKernel:
         has_init_states: bool,
         has_varlen: bool = False,
         has_z: bool = False,
+        padded_mode: bool = False,
         io_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         state_dtype: Type[cutlass.Numeric] = None,
         seq_idx_dtype: Type[cutlass.Numeric] = cutlass.Int32,
@@ -82,6 +84,12 @@ class SSDKernel:
         self.has_varlen: bool = has_varlen
         # has_z means epilog warp applies z gating: y *= z * sigmoid(z)
         self.has_z: bool = has_z
+        # padded_mode: input is padded [B, S, H, D] (Edge-LLM plugin contract).
+        # Each seq b's tokens occupy positions [b*S, b*S + cl[b]) within the
+        # super-batch view. Kernel uses valid_lens to clamp partial chunks at
+        # end-of-seq (no external zero-mask needed).
+        # When False, input is dense-packed [total_tokens, H, D] (flashinfer).
+        self.padded_mode: bool = padded_mode
         # d_has_hdim = True means D is (D, EH) shape and loaded by TMA
         # d_has_hdim = False means D is (1, EH) shape and loaded directly to register
         self.d_has_hdim: bool = d_has_hdim
@@ -408,6 +416,7 @@ class SSDKernel:
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         seq_chunk_cumsum: cute.Tensor,  # (num_seqs+1,) int32 (optional, varlen only)
+        valid_lens: cute.Tensor,  # (B,) int32 -- per-seq valid length (padded_mode only)
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
         max_active_clusters: cutlass.Constexpr,
@@ -694,6 +703,7 @@ class SSDKernel:
             chunk_indices,
             chunk_offsets,
             seq_chunk_cumsum,
+            valid_lens,
             num_logical_chunks,
             num_seqs,
             self.cluster_layout_vmnk,
@@ -751,6 +761,7 @@ class SSDKernel:
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 or None
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 or None
         seq_chunk_cumsum: cute.Tensor,  # (num_seqs+1,) int32 or None
+        valid_lens: cute.Tensor,  # (B,) int32 or None -- per-seq valid length (padded_mode only)
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
         cluster_layout_vmnk: cute.Layout,
@@ -1101,6 +1112,7 @@ class SSDKernel:
                 chunk_indices,
                 chunk_offsets,
                 seq_chunk_cumsum,
+                valid_lens,
                 num_logical_chunks,
             )
 
@@ -1130,6 +1142,7 @@ class SSDKernel:
                 chunk_indices,
                 chunk_offsets,
                 seq_chunk_cumsum,
+                valid_lens,
                 num_logical_chunks,
             )
 
@@ -1164,6 +1177,7 @@ class SSDKernel:
                 chunk_indices,
                 chunk_offsets,
                 seq_chunk_cumsum,
+                valid_lens,
                 num_logical_chunks,
             )
 
@@ -1220,6 +1234,7 @@ class SSDKernel:
         chunk_indices,
         chunk_offsets,
         seq_chunk_cumsum,
+        valid_lens,
         num_logical_chunks,
     ):
         # Make tiledCopy and partition smem/register tensor for smem load Bt
@@ -1479,6 +1494,9 @@ class SSDKernel:
                     chunk_indices,
                     chunk_offsets,
                     L,
+                    seq_id,
+                    first_chunk,
+                    valid_lens,
                 )
                 if cutlass.const_expr(self.has_varlen):
                     if chunk_size_limit < L:
@@ -1758,6 +1776,7 @@ class SSDKernel:
         chunk_indices,
         chunk_offsets,
         seq_chunk_cumsum,
+        valid_lens,
         num_logical_chunks,
     ):
         # (L, D, INPUT_STAGE)
@@ -1935,6 +1954,9 @@ class SSDKernel:
                     chunk_indices,
                     chunk_offsets,
                     L,
+                    seq_id,
+                    first_chunk,
+                    valid_lens,
                 )
 
                 # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
@@ -2209,6 +2231,7 @@ class SSDKernel:
         chunk_indices,
         chunk_offsets,
         seq_chunk_cumsum,
+        valid_lens,
         num_logical_chunks,
     ):
         # Make tmem fragment for INTRA1_ACC
@@ -2296,7 +2319,7 @@ class SSDKernel:
         )
 
         while work_tile.is_valid_tile:
-            _, _, _, _, first_chunk, C = self.resolve_varlen_tile_info(
+            _, _, _, seq_id, first_chunk, C = self.resolve_varlen_tile_info(
                 work_tile, seq_chunk_cumsum, C
             )
 
@@ -2340,6 +2363,9 @@ class SSDKernel:
                     chunk_indices,
                     chunk_offsets,
                     L,
+                    seq_id,
+                    first_chunk,
+                    valid_lens,
                 )
 
                 # Load Q from tmem
@@ -3865,13 +3891,21 @@ class SSDKernel:
 
     @cute.jit
     def compute_chunk_size_limit(
-        self, physical_chunk, chunk, num_logical_chunks, chunk_indices, chunk_offsets, L
+        self, physical_chunk, chunk, num_logical_chunks, chunk_indices, chunk_offsets, L,
+        seq_id, first_chunk_in_seq, valid_lens,
     ):
         """Compute how far into the physical chunk this logical chunk extends.
 
         Returns chunk_size_limit (= L when the logical chunk owns the full
-        physical chunk, < L when the next logical chunk shares the same
-        physical chunk).
+        physical chunk, < L when masked).
+
+        Two masking sources combined (both gated by has_varlen):
+        - flashinfer chunk-pack: next logical chunk shares this physical
+          chunk -> chunk_size_limit = chunk_offsets[next].
+        - padded_mode end-of-seq clamp (Edge-LLM plugin padded layout):
+          if this is seq's partial chunk, clamp to remaining valid tokens.
+          valid_lens / seq_id / first_chunk_in_seq are ignored when
+          padded_mode is False.
         """
         chunk_size_limit = L
         if cutlass.const_expr(self.has_varlen):
@@ -3879,6 +3913,15 @@ class SSDKernel:
                 next_chunk = chunk_indices[physical_chunk + 1]
                 if next_chunk == chunk:
                     chunk_size_limit = chunk_offsets[physical_chunk + 1]
+            if cutlass.const_expr(self.padded_mode):
+                local_chunk = physical_chunk - first_chunk_in_seq
+                chunk_start_in_seq = local_chunk * L
+                valid_in_chunk = valid_lens[seq_id] - chunk_start_in_seq
+                if valid_in_chunk < chunk_size_limit:
+                    if valid_in_chunk < 0:
+                        chunk_size_limit = cutlass.Int32(0)
+                    else:
+                        chunk_size_limit = valid_in_chunk
         return chunk_size_limit
 
     def pre_intra_tmem_load_and_partition_q(self, tIntra1, local_tidx):
@@ -3959,9 +4002,12 @@ class SSDKernel:
         tCrDeltaA_Col.store(tQrDeltaA_Col.load().to(self.acc_dtype))
         tCrDelta.store(tQrDelta.load().to(self.acc_dtype))
 
-        # SegSum
-        # fadd2 + fsel + fmul2/mufu + fmul2
+        # SegSum -- fused loop: each pair of register slots is processed
+        # end-to-end (sub - add, mask m<n, mul by exp2, mul by Q) so the
+        # tCompute live range stays short, reducing register pressure.
+        LOG2_E = cutlass.Float32(1.4426950408889634)
         for subtile_idx in cutlass.range(0, cute.size(tTR_rQ), 2, unroll_full=True):
+            # Step 1: tCompute = tCrDeltaA_Col - tCrDeltaA_Row
             (
                 tCompute[subtile_idx],
                 tCompute[subtile_idx + 1],
@@ -3969,13 +4015,16 @@ class SSDKernel:
                 (tCrDeltaA_Col[subtile_idx], tCrDeltaA_Col[subtile_idx + 1]),
                 (-tCrDeltaA_Row[subtile_idx], -tCrDeltaA_Row[subtile_idx + 1]),
             )
-        for subtile_idx in cutlass.range(cute.size(tTR_rQ), unroll_full=True):
-            m, n = tCoord[subtile_idx]
-            if m < n:
+
+            # Step 2: mask m < n entries to -inf
+            m0, n0 = tCoord[subtile_idx]
+            if m0 < n0:
                 tCompute[subtile_idx] = cutlass.Float32(-float("inf"))
-        LOG2_E = cutlass.Float32(1.4426950408889634)
-        for subtile_idx in cutlass.range(0, cute.size(tTR_rQ), 2, unroll_full=True):
-            # TODO: use math.exp directly
+            m1, n1 = tCoord[subtile_idx + 1]
+            if m1 < n1:
+                tCompute[subtile_idx + 1] = cutlass.Float32(-float("inf"))
+
+            # Step 3: tCompute = exp2(tCompute * LOG2_E) * tCrDelta
             tCompute_log2e = cute.arch.mul_packed_f32x2(
                 (tCompute[subtile_idx], tCompute[subtile_idx + 1]), (LOG2_E, LOG2_E)
             )
@@ -3989,6 +4038,8 @@ class SSDKernel:
                 ),
                 (tCrDelta[subtile_idx], tCrDelta[subtile_idx + 1]),
             )
+
+            # Step 4: tCompute *= tTR_rQ
             (
                 tCompute[subtile_idx],
                 tCompute[subtile_idx + 1],
@@ -4321,75 +4372,29 @@ AOT_NGROUPS, AOT_SEQLEN = 1, 128
 _compiled_cache = {}
 
 
-def _compile_ssd_blackwell_tvm(L, D, N, stream, gpu_arch="",
-                                has_d=True, has_z=False):
-    """Compile with TVM-FFI for Python JIT testing (permuted tensor views)."""
-    key = ("tvm", L, D, N, has_d, has_z)
-    if key in _compiled_cache:
-        return _compiled_cache[key]
-
-    kernel_obj = SSDKernel(
-        L=L, D=D, N=N,
-        has_d=has_d, d_has_hdim=False,
-        has_init_states=False, has_varlen=False, has_z=has_z,
-        io_dtype=cutlass.Float16, state_dtype=cutlass.Float16,
-    )
-    sym_C, sym_EH, sym_B, sym_G = (cute.sym_int() for _ in range(4))
-
-    x_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (D, L, sym_C, sym_EH, sym_B),
-        stride_order=(0, 2, 3, 1, 4), assumed_align=16)
-    cs_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (L, sym_C, sym_EH, sym_B),
-        stride_order=(0, 1, 2, 3), assumed_align=16)
-    dt_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (L, sym_C, sym_EH, sym_B),
-        stride_order=(0, 1, 2, 3), assumed_align=16)
-    b_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (L, N, sym_C, sym_G, sym_B),
-        stride_order=(2, 0, 3, 1, 4), assumed_align=16)
-    c_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (L, N, sym_C, sym_G, sym_B),
-        stride_order=(2, 0, 3, 1, 4), assumed_align=16)
-    y_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (L, D, sym_C, sym_EH, sym_B),
-        stride_order=(0, 2, 1, 3, 4), assumed_align=16)
-    fs_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (N, D, sym_EH, sym_B),
-        stride_order=(0, 1, 2, 3), assumed_align=16)
-    d_f = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float16, (1, sym_EH),
-        stride_order=(0, 1), assumed_align=16) if has_d else None
-
-    hw = cutlass.utils.HardwareInfo()
-    mac = hw.get_max_active_clusters(1)
-    opts = "--enable-tvm-ffi"
-    if gpu_arch:
-        opts += " --gpu-arch " + gpu_arch
-
-    compiled = cute.compile(kernel_obj,
-        x_f, cs_f, dt_f, b_f, c_f, y_f, None, fs_f, d_f, None,
-        None, None, None, None, cutlass.Int32(0), cutlass.Int32(0),
-        mac, stream, options=opts)
-    _compiled_cache[key] = compiled
-    return compiled
-
-
 def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
-                                stream, gpu_arch="", has_d=True, has_z=False):
+                                stream, gpu_arch="", has_d=True, has_z=False,
+                                has_init_states=False):
     """Compile for AOT C++ export (GDN-style: row-major placeholders).
 
-    Creates a @cute.jit wrapper that takes row-major inputs, builds permuted
-    CuTe tensor views, and calls the SSD kernel.
+    has_init_states=False (default): chunk 0 starts from a zero SSM state.
+    Faster path; covers all current Nemotron-H production prefill use cases
+    (single / batched / varlen, where the input state is implicit zero).
+
+    has_init_states=True: chunk 0 reads an optional user-provided initial
+    hidden state from the caller's `state` buffer. Used when prefill carries
+    an SSM state across calls (continuous batching / multi-call prefill) and
+    by the SsdCuteDslBlackwellChunkedPrefill unit test.
     """
-    key = ("aot", L, D, N, has_d, has_z)
+    key = ("aot", L, D, N, has_d, has_z, has_init_states)
     if key in _compiled_cache:
         return _compiled_cache[key]
 
     _kernel = SSDKernel(
         L=L, D=D, N=N,
         has_d=has_d, d_has_hdim=False,
-        has_init_states=False, has_varlen=False, has_z=has_z,
+        has_init_states=has_init_states, has_varlen=True, has_z=has_z,
+        padded_mode=True,
         io_dtype=cutlass.Float16, state_dtype=cutlass.Float16,
     )
 
@@ -4399,7 +4404,7 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
     def _cumsum_kernel(
         dt_in: cute.Tensor,       # [B, S, EH] fp16
         A: cute.Tensor,            # [EH] fp32
-        dt_bias: cute.Tensor,      # [EH] fp32
+        dt_bias: cute.Tensor,      # [EH] fp16
         dA_cumsum: cute.Tensor,    # [B, EH, C, L] fp32
         dt_proc: cute.Tensor,      # [B, EH, C, L] fp16
         seq_len: cutlass.Int32,
@@ -4421,92 +4426,156 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         # Write dt_proc
         dA_cumsum[b, h, c, tidx] = cutlass.Float32(A[h]) * dtv
         dt_proc[b, h, c, tidx] = cutlass.Float16(dtv)
-
-        # Sequential prefix sum (thread 0 only, L=128)
-        cute.arch.barrier()
-        if tidx == 0:
-            for i in range(1, L):
-                dA_cumsum[b, h, c, i] = dA_cumsum[b, h, c, i] + dA_cumsum[b, h, c, i - 1]
         cute.arch.barrier()
 
-    @cute.kernel
-    def _convert_d_kernel(
-        D_fp32: cute.Tensor,   # [EH] fp32
-        D_fp16: cute.Tensor,   # [EH] fp16
-    ):
-        """Convert D from fp32 to fp16."""
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = cutlass.Int32(bidx) * THREADS_UTIL + tidx
-        if idx < cute.size(D_fp32):
-            D_fp16[idx] = cutlass.Float16(D_fp32[idx])
+        # Parallel Hillis-Steele prefix scan over L=128 elements (log2(L) steps).
+        stride = 1
+        while stride < L:
+            val = cutlass.Float32(0.0)
+            if tidx >= stride:
+                val = dA_cumsum[b, h, c, tidx - stride]
+            cute.arch.barrier()
+            if tidx >= stride:
+                dA_cumsum[b, h, c, tidx] = dA_cumsum[b, h, c, tidx] + val
+            cute.arch.barrier()
+            stride = stride * 2
+
+    TRANSPOSE_THREADS = 256
+    VEC = 8                # 8 fp16 = 16 bytes = uint128 = b128 PTX instr
+    D_SPAD = D + 1         # break smem bank conflicts on column writes (phase 1)
 
     @cute.kernel
     def _transpose_y_kernel(
-        y_ws: cute.Tensor,     # [B, EH, D, C, L] fp16 — workspace (src)
-        output: cute.Tensor,   # [B, S, EH, D] fp16 — runtime output (dst)
+        y_ws: cute.Tensor,     # [B, EH, D, C, L] fp16 -- L stride 1
+        output: cute.Tensor,   # [B, S, EH, D] fp16 -- D stride 1
         seq_len: cutlass.Int32,
         nchunks: cutlass.Int32,
     ):
-        """Transpose y from [B,EH,D,C,L] to [B,S,EH,D] on GPU."""
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = cutlass.Int32(bidx) * THREADS_UTIL + tidx
-        n_eh = y_ws.layout.shape[1]
-        total = y_ws.layout.shape[0] * n_eh * D * nchunks * L
-        if idx < total:
-            l_ = idx % L
-            rem = idx // L
-            c_ = rem % nchunks
-            rem = rem // nchunks
-            d_ = rem % D
-            rem = rem // D
-            h_ = rem % n_eh
-            b_ = rem // n_eh
-            s_ = cutlass.Int32(c_) * L + l_
-            if s_ < seq_len:
-                output[b_, s_, h_, d_] = y_ws[b_, h_, d_, c_, l_]
+        """Smem-staged transpose y_ws[B,EH,D,C,L] -> output[B,S,EH,D].
 
-    @cute.kernel
-    def _copy_fstate_kernel(
-        fs_ws: cute.Tensor,    # [B, EH, D, N] fp16 — workspace (src)
-        state: cute.Tensor,    # [B, EH, D, N] fp32 — runtime output (dst)
-    ):
-        """Copy final state fp16 → fp32."""
+        sY is [L, D_SPAD] with D stride 1. Phase 2 is a direct b128 transfer
+        (smem D-contig -> gmem D-contig, no scratch). Phase 1's smem write is
+        strided along L so it routes through a per-thread uint128 scratch.
+
+        128-bit gmem ops use recast_ptr -> Uint128 to bypass cute.copy's
+        alignment validator: per-block offsets are runtime-multiples of
+        L*sizeof(fp16) = 256B so always 16B-aligned, but dynamic strides
+        prevent the validator from proving it statically.
+        """
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = cutlass.Int32(bidx) * THREADS_UTIL + tidx
-        total = cute.size(fs_ws)
-        if idx < total:
-            n_ = idx % N
-            rem = idx // N
-            d_ = rem % D
-            rem = rem // D
-            h_ = rem % fs_ws.layout.shape[1]
-            b_ = rem // fs_ws.layout.shape[1]
-            state[b_, h_, d_, n_] = cutlass.Float32(fs_ws[b_, h_, d_, n_])
+        c, eh, b = cute.arch.block_idx()
+
+        smem = cutlass.utils.SmemAllocator()
+        # sY: [L, D_SPAD] -- D innermost (D stride 1). Phase 2 vectorizes (smem
+        # D-contig -> gmem D-contig direct b128).
+        sY = smem.allocate_tensor(
+            cutlass.Float16,
+            cute.make_layout((L, D_SPAD), stride=(D_SPAD, 1)),
+            16,
+        )
+        # Per-thread 16-byte scratch: receives gmem b128 load, then is read
+        # back as 8 fp16 to write strided into sY in phase 1.
+        sScratch = smem.allocate_tensor(
+            cutlass.Float16,
+            cute.make_layout((TRANSPOSE_THREADS, VEC), stride=(VEC, 1)),
+            16,
+        )
+
+        # y_ws strides: (B_str, EH_str, DC_str, L=128 STATIC, 1 STATIC).
+        # All dynamic strides factor through L=128, so block_off is a multiple
+        # of L=128 fp16 = 256B -> 16B-aligned at runtime.
+        block_off = (b * y_ws.layout.stride[0]
+                     + eh * y_ws.layout.stride[1]
+                     + cutlass.Int32(c) * y_ws.layout.stride[3])
+        DC_str = y_ws.layout.stride[2]
+
+        out_B = output.layout.stride[0]
+        out_S = output.layout.stride[1]
+        out_EH = output.layout.stride[2]
+
+        # Per-thread scratch viewed as 1 uint128.
+        scratch_u128 = cute.make_tensor(
+            cute.recast_ptr(sScratch.iterator + tidx * VEC, dtype=Uint128),
+            cute.make_layout(1),
+        )
+
+        # ===== Phase 1: gmem y_ws -> sY [L, D_SPAD] (gmem L-contig, smem strided) =====
+        # Map: 16 thr d-base x 16 thr l-vec. 256 thr x 4 dd = 1024 vec = 64 d x 16 lv [x]
+        tidx_d = tidx // 16
+        tidx_lv = tidx % 16
+
+        for dd in cutlass.range(4, unroll_full=True):
+            d_idx = tidx_d * 4 + dd
+            l_base = tidx_lv * VEC
+
+            # 1x ld.global.b128 -> scratch (1x st.shared.b128)
+            gmem_off = block_off + d_idx * DC_str + l_base
+            gmem_u128_src = cute.make_tensor(
+                cute.recast_ptr(y_ws.iterator + gmem_off, dtype=Uint128),
+                cute.make_layout(1),
+            )
+            scratch_u128[0] = gmem_u128_src[0]
+
+            # 8x st.shared.b16 strided along L: sY[l_base+v, d_idx] steps
+            # by D_SPAD each v (D is stride 1, so iterating L is the strided axis).
+            for v in cutlass.range(VEC, unroll_full=True):
+                sY[l_base + v, d_idx] = sScratch[tidx, v]
+
+        cute.arch.barrier()
+
+        # ===== Phase 2: sY -> gmem output (BOTH D-contig -- direct b128) =====
+        # Map: 32 thr l x 8 thr d-vec. 256 thr x 4 ll = 1024 vec = 128 l x 8 dv [x]
+        tidx_l = tidx // 8
+        tidx_dv = tidx % 8
+
+        for ll in cutlass.range(4, unroll_full=True):
+            l_idx = tidx_l * 4 + ll
+            d_base = tidx_dv * VEC
+            s = cutlass.Int32(c) * L + l_idx
+
+            if s < seq_len:
+                # 1x ld.shared.b128: sY[l_idx, d_base..d_base+7] is contig (D stride 1).
+                smem_off_y = l_idx * D_SPAD + d_base
+                smem_u128_src = cute.make_tensor(
+                    cute.recast_ptr(sY.iterator + smem_off_y, dtype=Uint128),
+                    cute.make_layout(1),
+                )
+                # 1x st.global.b128: output[b, s, eh, d_base..d_base+7]
+                gmem_off_o = (b * out_B + s * out_S
+                              + eh * out_EH + d_base)
+                gmem_u128_dst = cute.make_tensor(
+                    cute.recast_ptr(output.iterator + gmem_off_o, dtype=Uint128),
+                    cute.make_layout(1),
+                )
+                gmem_u128_dst[0] = smem_u128_src[0]
 
     @cute.jit
     def ssd_blackwell_aot(
-        # Row-major inputs matching C++ data layout (same interface as SM80 kernel)
+        # Row-major inputs matching C++ data layout (plugin contract: fp16 x/B/C/D/state)
         x: cute.Tensor,              # [batch, seq_len, nheads, dim] fp16
         dt_in: cute.Tensor,          # [batch, seq_len, nheads] fp16 — raw dt
         A: cute.Tensor,              # [nheads] fp32
         B: cute.Tensor,              # [batch, seq_len, ngroups, dstate] fp16
         C: cute.Tensor,              # [batch, seq_len, ngroups, dstate] fp16
-        D_fp32: cute.Tensor,         # [nheads] fp32
-        dt_bias: cute.Tensor,        # [nheads] fp32
-        output: cute.Tensor,         # [batch, seq_len, nheads, dim] fp16
-        state: cute.Tensor,          # [batch, nheads, dim, dstate] fp32
+        Dvec: cute.Tensor,           # [nheads] fp16 (matches plugin kIN_D_IDX type)
+        dt_bias: cute.Tensor,        # [nheads] fp16 (matches plugin kIN_DT_BIAS_IDX type)
+        output: cute.Tensor,         # [batch, seq_len, nheads, dim] fp16 (final output)
+        state: cute.Tensor,          # [batch, nheads, dim, dstate] fp16 (matches plugin kIN_STATE_IDX type -- read init / write final in place)
         # Workspace buffers (pre-allocated by caller)
         dA_cumsum: cute.Tensor,      # [batch, nheads, nchunks, L] fp32
         dt_proc: cute.Tensor,        # [batch, nheads, nchunks, L] fp16
-        y_ws: cute.Tensor,           # [batch, nheads, dim, nchunks, L] fp16
-        fstate_ws: cute.Tensor,      # [batch, nheads, dim, dstate] fp16
-        D_fp16: cute.Tensor,         # [nheads] fp16
+        y_ws: cute.Tensor,           # [batch, nheads, dim, nchunks, L] fp16 (kernel's natural [B,EH,D,C,L] y layout -- transposed into output post-kernel)
+        # Varlen metadata (computed by caller from context_lengths)
+        seq_idx: cute.Tensor,        # [batch, seq_len] int32 (b if t<cl[b] else -1)
+        chunk_indices: cute.Tensor,  # [num_logical_chunks] int32
+        chunk_offsets: cute.Tensor,  # [num_logical_chunks] int32
+        seq_chunk_cumsum: cute.Tensor, # [num_seqs+1] int32 (prefix sum of ceil(cl[b]/L))
+        valid_lens: cute.Tensor,     # [batch] int32 -- context_lengths (padded_mode end-of-seq clamp)
         # Scalars
         seq_len_val: cutlass.Int32,
         nchunks_val: cutlass.Int32,
+        num_logical_chunks_val: cutlass.Int32,
+        num_seqs_val: cutlass.Int32,
         dt_softplus: cutlass.Constexpr[bool],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -4516,15 +4585,11 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         n_c = nchunks_val
         n_g = B.layout.shape[2]
 
-        # Step 1: Preprocessing — cumsum + dt conversion + D fp32→fp16
+        # Step 1: Preprocessing -- cumsum + dt conversion (only mandatory adapter,
+        # both Triton and flashinfer have an equivalent).
         _cumsum_kernel(dt_in, A, dt_bias, dA_cumsum, dt_proc, seq_len_val,
                        dt_softplus).launch(
             grid=(n_c, n_eh, n_batch), block=[L, 1, 1], smem=0, stream=stream)
-
-        n_eh_size = cute.size(D_fp32)
-        n_d_blocks = (n_eh_size + THREADS_UTIL - 1) // THREADS_UTIL
-        _convert_d_kernel(D_fp32, D_fp16).launch(
-            grid=(n_d_blocks, 1, 1), block=[THREADS_UTIL, 1, 1], smem=0, stream=stream)
 
         # Step 2: Create permuted tensor views for SSD kernel
         x_perm = cute.make_tensor(x.iterator, cute.make_layout(
@@ -4547,34 +4612,45 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
             (L, N, n_c, n_g, n_batch),
             stride=(n_g * N, 1, L * n_g * N, N, n_c * L * n_g * N)))
 
+        # y_perm aliases y_ws workspace ([B,EH,D,C,L] row-major; L stride 1 -- required
+        # by the kernel's smem swizzle / TMA descriptor). A post-kernel transpose
+        # (one launch, vectorized) maps y_ws[b,eh,d,c,l] -> output[b, c*L+l, eh, d]
+        # to satisfy the plugin's [B,S,EH,D] contract.
         y_perm = cute.make_tensor(y_ws.iterator, cute.make_layout(
             (L, D, n_c, n_eh, n_batch),
             stride=(1, n_c * L, L, D * n_c * L, n_eh * D * n_c * L)))
 
-        fs_perm = cute.make_tensor(fstate_ws.iterator, cute.make_layout(
-            (N, D, n_eh, n_batch),
+        # fstate aliases caller's state buffer ([B,EH,D,N] fp16 row-major) reshaped
+        # to (N,D,EH,B): kernel reads init at start, overwrites with final state in
+        # place. init_perm == fs_perm (same trick as SM80 path).
+        fs_perm = cute.make_tensor(state.iterator, cute.make_layout(
+            (N, D, n_eh, num_seqs_val),
             stride=(1, N, D * N, n_eh * D * N)))
+        init_perm = fs_perm
 
-        d_perm = cute.make_tensor(D_fp16.iterator, cute.make_layout(
+        d_perm = cute.make_tensor(Dvec.iterator, cute.make_layout(
             (1, n_eh), stride=(n_eh, 1)))
 
-        # Step 3: Launch main SSD kernel
+        # Step 3: Launch main SSD kernel (always-varlen, has_init_states, padded_mode).
+        # This is flashinfer's persistent kernel.
         _kernel(x_perm, cs_perm, dt_perm, b_perm, c_perm, y_perm,
-                None, fs_perm, d_perm, None,
-                None, None, None, None,
-                nchunks_val, cutlass.Int32(0), max_active_clusters, stream)
+                init_perm, fs_perm, d_perm, None,
+                seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum,
+                valid_lens,
+                num_logical_chunks_val, num_seqs_val, max_active_clusters, stream)
 
-        # Step 4: Transpose y: [B,EH,D,C,L] → [B,S,EH,D]
-        y_total = n_batch * n_eh * D * n_c * L
-        n_blocks_y = (y_total + THREADS_UTIL - 1) // THREADS_UTIL
+        # Step 4: Transpose y_ws[B,EH,D,C,L] -> output[B,S,EH,D]. Smem-staged
+        # with 128-bit gmem ld/st via recast_ptr -> Uint128 (bypasses cute.copy
+        # alignment validator since per-block offsets are runtime-aligned to
+        # L=128 fp16=256B but not statically provable on dynamic strides).
+        smem_bytes = cutlass.Int32(
+            L * D_SPAD * 2                  # sY: [L, D_SPAD] fp16
+            + TRANSPOSE_THREADS * VEC * 2   # sScratch: [TRANSPOSE_THREADS, VEC] fp16
+            + 256                           # alignment slack
+        )
         _transpose_y_kernel(y_ws, output, seq_len_val, n_c).launch(
-            grid=(n_blocks_y, 1, 1), block=[THREADS_UTIL, 1, 1], smem=0, stream=stream)
-
-        # Step 5: Copy fstate: fp16 → fp32
-        fs_total = n_batch * n_eh * D * N
-        n_blocks_fs = (fs_total + THREADS_UTIL - 1) // THREADS_UTIL
-        _copy_fstate_kernel(fstate_ws, state).launch(
-            grid=(n_blocks_fs, 1, 1), block=[THREADS_UTIL, 1, 1], smem=0, stream=stream)
+            grid=(n_c, n_eh, n_batch), block=[TRANSPOSE_THREADS, 1, 1],
+            smem=smem_bytes, stream=stream)
 
     # Create row-major CuPy placeholders (GDN pattern)
     from cutlass.cute.runtime import from_dlpack as _fdl
@@ -4589,65 +4665,114 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         return ct
 
     seq_len_ph = nchunks * L
-    # Primary inputs (same as SM80 kernel interface)
+    # Primary inputs (plugin contract: fp16 x/B/C/D/state, fp32 A/dt_bias)
     ph_x = _mark_nd(cp.zeros((batch, seq_len_ph, nheads, D), dtype=cp.float16), 3)
     ph_dt = _mark_nd(cp.zeros((batch, seq_len_ph, nheads), dtype=cp.float16), 2)
     ph_A = _fdl(cp.zeros((nheads,), dtype=cp.float32), assumed_align=16)
     ph_A = ph_A.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
     ph_B = _mark_nd(cp.zeros((batch, seq_len_ph, ngroups, N), dtype=cp.float16), 3)
     ph_C = _mark_nd(cp.zeros((batch, seq_len_ph, ngroups, N), dtype=cp.float16), 3)
-    ph_D32 = _fdl(cp.zeros((nheads,), dtype=cp.float32), assumed_align=16)
-    ph_D32 = ph_D32.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
-    ph_dtb = _fdl(cp.zeros((nheads,), dtype=cp.float32), assumed_align=16)
+    ph_Dvec = _fdl(cp.zeros((nheads,), dtype=cp.float16), assumed_align=16)
+    ph_Dvec = ph_Dvec.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+    ph_dtb = _fdl(cp.zeros((nheads,), dtype=cp.float16), assumed_align=16)
     ph_dtb = ph_dtb.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
     ph_out = _mark_nd(cp.zeros((batch, seq_len_ph, nheads, D), dtype=cp.float16), 3)
-    ph_state = _mark_nd(cp.zeros((batch, nheads, D, N), dtype=cp.float32), 2)
-    # Workspace buffers
+    ph_state = _mark_nd(cp.zeros((batch, nheads, D, N), dtype=cp.float16), 2)
+    # Workspace buffers: cumsum + dt_proc + y_ws (kernel's natural [B,EH,D,C,L] y layout).
     ph_cumsum = _mark_nd(cp.zeros((batch, nheads, nchunks, L), dtype=cp.float32), 3)
     ph_dtproc = _mark_nd(cp.zeros((batch, nheads, nchunks, L), dtype=cp.float16), 3)
     ph_y = _mark_nd(cp.zeros((batch, nheads, D, nchunks, L), dtype=cp.float16), 4)
-    ph_fs = _mark_nd(cp.zeros((batch, nheads, D, N), dtype=cp.float16), 2)
-    ph_D16 = _fdl(cp.zeros((nheads,), dtype=cp.float16), assumed_align=16)
-    ph_D16 = ph_D16.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+
+    # Varlen metadata placeholders (always-varlen AOT mode)
+    # Upper-bound logical chunks at batch * nchunks (one chunk per (batch, c) cell).
+    n_logical_chunks_max = batch * nchunks
+    ph_seq_idx = _mark_nd(cp.zeros((batch, seq_len_ph), dtype=cp.int32), 1)
+    ph_chunk_indices = _fdl(cp.zeros((n_logical_chunks_max,), dtype=cp.int32), assumed_align=16)
+    ph_chunk_indices = ph_chunk_indices.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+    ph_chunk_offsets = _fdl(cp.zeros((n_logical_chunks_max,), dtype=cp.int32), assumed_align=16)
+    ph_chunk_offsets = ph_chunk_offsets.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+    ph_seq_chunk_cumsum = _fdl(cp.zeros((batch + 1,), dtype=cp.int32), assumed_align=16)
+    ph_seq_chunk_cumsum = ph_seq_chunk_cumsum.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
+    ph_valid_lens = _fdl(cp.zeros((batch,), dtype=cp.int32), assumed_align=16)
+    ph_valid_lens = ph_valid_lens.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
 
     hw = cutlass.utils.HardwareInfo()
     mac = hw.get_max_active_clusters(1)
 
     compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
     compiled = cute.compile(ssd_blackwell_aot,
-        ph_x, ph_dt, ph_A, ph_B, ph_C, ph_D32, ph_dtb,
+        ph_x, ph_dt, ph_A, ph_B, ph_C, ph_Dvec, ph_dtb,
         ph_out, ph_state,
-        ph_cumsum, ph_dtproc, ph_y, ph_fs, ph_D16,
-        cutlass.Int32(0), cutlass.Int32(0), True, mac, stream,
+        ph_cumsum, ph_dtproc, ph_y,
+        ph_seq_idx, ph_chunk_indices, ph_chunk_offsets, ph_seq_chunk_cumsum,
+        ph_valid_lens,
+        cutlass.Int32(0), cutlass.Int32(0),
+        cutlass.Int32(0), cutlass.Int32(0),
+        True, mac, stream,
         **(dict(options=compile_opts) if compile_opts else {}))
     _compiled_cache[key] = compiled
     return compiled
 
 
-def _ssd_reference(x, dt, A, B, C, D, dt_bias, state, dt_softplus=True):
-    """NumPy serial reference: token-by-token SSM scan."""
+def _ssd_reference(x, dt, A, B, C, D, dt_bias, state, dt_softplus=True, context_lengths=None):
+    """NumPy reference: SSM scan, vectorized over (B, H, D, N), serial over t.
+
+    State update is sequential in t (depends on state[t-1]), so the t-loop stays serial;
+    everything else is numpy-broadcast. context_lengths (optional, [batch] int32): when
+    provided, tokens at t >= cl[b] are padding -- state unchanged, output zero -- matching
+    the kernel's padded_mode end-of-seq semantics.
+    """
     batch, seq_len, nheads, dim = x.shape
     _, _, ngroups, dstate = B.shape
     hpg = nheads // ngroups
-    output = np.zeros_like(x, dtype=np.float32)
-    state = state.copy().astype(np.float32)
-    for b_ in range(batch):
-        for t_ in range(seq_len):
-            for h_ in range(nheads):
-                g_ = h_ // hpg
-                dtv = float(dt[b_, t_, h_]) + float(dt_bias[h_])
-                if dt_softplus and dtv <= 20.0:
-                    dtv = np.log(1.0 + np.exp(dtv))
-                da = np.exp(float(A[h_]) * dtv)
-                for d_ in range(dim):
-                    xv = float(x[b_, t_, h_, d_])
-                    yv = float(D[h_]) * xv
-                    for ds_ in range(dstate):
-                        state[b_, h_, d_, ds_] = (
-                            da * state[b_, h_, d_, ds_]
-                            + dtv * float(B[b_, t_, g_, ds_]) * xv)
-                        yv += float(C[b_, t_, g_, ds_]) * state[b_, h_, d_, ds_]
-                    output[b_, t_, h_, d_] = yv
+
+    x32 = x.astype(np.float32)              # [B, S, H, D]
+    dt32 = dt.astype(np.float32)            # [B, S, H]
+    B32 = B.astype(np.float32)              # [B, S, G, N]
+    C32 = C.astype(np.float32)              # [B, S, G, N]
+    A32 = A.astype(np.float32)              # [H]
+    D32 = D.astype(np.float32)              # [H]
+    dtb32 = dt_bias.astype(np.float32)      # [H]
+    state = state.copy().astype(np.float32)  # [B, H, D, N]
+    output = np.zeros((batch, seq_len, nheads, dim), dtype=np.float32)
+
+    # Per-head group index.
+    g_idx = np.arange(nheads) // hpg        # [H]
+
+    if context_lengths is not None:
+        cl_arr = np.asarray(context_lengths, dtype=np.int32)
+    else:
+        cl_arr = np.full((batch,), seq_len, dtype=np.int32)
+
+    for t in range(seq_len):
+        # dtv: [B, H]
+        dtv = dt32[:, t, :] + dtb32[None, :]
+        if dt_softplus:
+            mask = dtv <= 20.0
+            dtv = np.where(mask, np.log1p(np.exp(np.where(mask, dtv, 0.0))), dtv)
+        # dA: [B, H]
+        dA = np.exp(A32[None, :] * dtv)
+
+        # Bt, Ct: [B, H, N]  via per-head group lookup
+        Bt = B32[:, t, g_idx, :]
+        Ct = C32[:, t, g_idx, :]
+
+        # Active mask: [B, 1, 1, 1] -- for varlen, batches past cl[b] don't update.
+        active = (cl_arr > t)[:, None, None, None]  # bool
+
+        # state update: state[b,h,d,n] = dA[b,h]*state + dtv[b,h] * Bt[b,h,n] * x[b,t,h,d]
+        # Shapes: dA[:,:,None,None] * state ([B,H,D,N]) -> [B,H,D,N]
+        # dtv[:,:,None,None] * Bt[:,:,None,:] * x[:,t,:,:,None] -> [B,H,D,N]
+        new_state = (dA[:, :, None, None] * state
+                     + dtv[:, :, None, None] * Bt[:, :, None, :] * x32[:, t, :, :, None])
+        # Only update batches with t < cl[b].
+        state = np.where(active, new_state, state)
+
+        # output[b,t,h,d] = (Ct[b,h,n] * state[b,h,d,n]).sum(n) + D[h] * x[b,t,h,d]
+        y = (Ct[:, :, None, :] * state).sum(axis=-1) + D32[None, :, None] * x32[:, t, :, :]
+        # Padding tokens: output = 0
+        output[:, t, :, :] = np.where(active[:, :, :, 0], y, 0.0)
+
     return output, state
 
 
@@ -4673,129 +4798,269 @@ def _cumsum_numpy(dt_np, A_np, dt_bias_np, nchunks, chunk_size, dt_softplus=True
 
 
 def run_test(n, nheads, dim, dstate, ngroups, seq_len,
-             warmup=3, iterations=10, gpu_arch=""):
-    """Compile, run, and verify the Blackwell SSD kernel."""
-    nchunks = seq_len // CHUNK_SIZE
+             warmup=3, iterations=10, gpu_arch="", cl_pattern=None):
+    """Compile, run, and verify the Blackwell SSD kernel.
+
+    Uses the same AOT compile path as production C++ (`_compile_ssd_blackwell_aot`)
+    with the C++ packed-view convention: input `[B, S, H, D]` is reinterpreted as
+    `[1, B*S, H, D]` (memory-identical, descriptor-only change), so the kernel's
+    flashinfer varlen path dispatches chunks across all sequences via the chunk
+    dim. fstate / state stay per-sequence (kernel uses seq_id from chunk_indices).
+
+    cl_pattern: optional comma-separated per-batch context_lengths
+        (e.g. "100,256,200,256" for n=4 mixed varlen). When None, uniform cl=seq_len.
+    """
+    # Ceil-div for seq_len % CHUNK_SIZE != 0; pad inputs to nchunks*CHUNK_SIZE so
+    # the kernel sees aligned chunks (extra positions are masked out via cl-clamp).
+    nchunks_per_seq = (seq_len + CHUNK_SIZE - 1) // CHUNK_SIZE
+    seq_len_padded = nchunks_per_seq * CHUNK_SIZE  # storage size; valid seq_len passed via cl
+    if cl_pattern is None:
+        cl_arr = [seq_len] * n
+        mode_str = "uniform"
+    else:
+        cl_arr = [int(x) for x in cl_pattern.split(",")]
+        assert len(cl_arr) == n, f"cl_pattern has {len(cl_arr)} entries, expected n={n}"
+        assert all(1 <= cl <= seq_len for cl in cl_arr), f"cl entries must be in [1, {seq_len}]"
+        mode_str = f"varlen(cl={cl_arr})"
     print(f"[ssd_blackwell] n={n} h={nheads} d={dim} ds={dstate} g={ngroups} "
-          f"s={seq_len} chunks={nchunks}")
+          f"s={seq_len} (padded={seq_len_padded}) chunks/seq={nchunks_per_seq} "
+          f"total_chunks={n * nchunks_per_seq} mode={mode_str}")
+
+    # Packed-view dims (must match C++ CALL_SSD_PREFILL_BLACKWELL packing)
+    total_seq = n * seq_len_padded
+    total_chunks = n * nchunks_per_seq
 
     np.random.seed(42)
-    x_np = np.random.randn(n, seq_len, nheads, dim).astype(np.float16)
-    dt_np = (np.random.rand(n, seq_len, nheads) * 0.5 + 0.1).astype(np.float16)
+    x_np = np.random.randn(n, seq_len_padded, nheads, dim).astype(np.float16)
+    dt_np = (np.random.rand(n, seq_len_padded, nheads) * 0.5 + 0.1).astype(np.float16)
     A_np = -(np.random.rand(nheads).astype(np.float32) * 0.5 + 0.5)
-    B_np = np.random.randn(n, seq_len, ngroups, dstate).astype(np.float16)
-    C_np = np.random.randn(n, seq_len, ngroups, dstate).astype(np.float16)
-    D_np = np.random.randn(nheads).astype(np.float32) * 0.1
-    dt_bias_np = np.random.randn(nheads).astype(np.float32) * 0.1
-    state_np = np.zeros((n, nheads, dim, dstate), dtype=np.float32)
+    B_np = np.random.randn(n, seq_len_padded, ngroups, dstate).astype(np.float16)
+    C_np = np.random.randn(n, seq_len_padded, ngroups, dstate).astype(np.float16)
+    D_np = (np.random.randn(nheads) * 0.1).astype(np.float16)  # plugin contract: fp16
+    dt_bias_np = (np.random.randn(nheads) * 0.1).astype(np.float16)  # plugin contract: fp16
+    state_np = np.zeros((n, nheads, dim, dstate), dtype=np.float16)  # fp16 contract
 
-    print("  NumPy reference...")
-    ref_out, _ = _ssd_reference(x_np, dt_np, A_np, B_np, C_np, D_np, dt_bias_np, state_np)
-
-    # Cumsum preprocessing (NumPy)
-    dA_cumsum_np, dt_proc_np = _cumsum_numpy(dt_np, A_np, dt_bias_np, nchunks, CHUNK_SIZE)
-    dt_proc_fp16 = dt_proc_np.astype(np.float16)
-
-    # GPU arrays in natural contiguous layout, then permute as VIEWS (strides only)
-    x_g = cp.array(x_np).reshape(n, nchunks, CHUNK_SIZE, nheads, dim)
-    x_perm = x_g.transpose(4, 2, 1, 3, 0)  # (D, L, C, EH, B) — view, D stride 1
-
-    delta_g = cp.array(dt_proc_fp16)  # (B, EH, C, L) contiguous
-    delta_perm = delta_g.transpose(3, 2, 1, 0)  # (L, C, EH, B)
-
-    cumsum_g = cp.array(dA_cumsum_np)  # (B, EH, C, L) fp32
-    cumsum_perm = cumsum_g.transpose(3, 2, 1, 0)  # (L, C, EH, B)
-
-    B_g = cp.array(B_np).reshape(n, nchunks, CHUNK_SIZE, ngroups, dstate)
-    b_perm = B_g.transpose(2, 4, 1, 3, 0)  # (L, N, C, G, B)
-
-    C_g = cp.array(C_np).reshape(n, nchunks, CHUNK_SIZE, ngroups, dstate)
-    c_perm = C_g.transpose(2, 4, 1, 3, 0)  # (L, N, C, G, B)
-
-    # y: allocate as (B, EH, D, C, L) then permute view to (L, D, C, EH, B)
-    y_g = cp.zeros((n, nheads, dim, nchunks, CHUNK_SIZE), dtype=cp.float16)
-    y_perm = y_g.transpose(4, 2, 3, 1, 0)  # (L, D, C, EH, B)
-
-    # fstate: (B, EH, D, N) -> (N, D, EH, B)
-    fstate_g = cp.zeros((n, nheads, dim, dstate), dtype=cp.float16)
-    fstate_perm = fstate_g.transpose(3, 2, 1, 0)
-
-    # D: (1, EH) — already contiguous
-    d_g = cp.array(D_np.astype(np.float16).reshape(1, nheads))
+    print("  NumPy reference (vectorized)...")
+    t_ref = time.time()
+    ref_out, _ = _ssd_reference(
+        x_np, dt_np, A_np, B_np, C_np, D_np, dt_bias_np, state_np,
+        context_lengths=cl_arr)
+    print(f"    Reference time: {time.time() - t_ref:.2f}s")
 
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
-    print("  Compiling Blackwell SSD kernel...")
+    print("  Compiling Blackwell SSD kernel (AOT path)...")
     t0 = time.time()
-    compiled = _compile_ssd_blackwell_tvm(CHUNK_SIZE, dim, dstate, stream,
-                                          gpu_arch=gpu_arch, has_d=True, has_z=False)
+    # Compile AOT JIT with packed-view shape (n_batch=1, total_chunks).
+    # Pass `batch=1, nchunks=total_chunks` to placeholder shapes -- at runtime we
+    # supply tensors of the same packed shape.
+    compiled = _compile_ssd_blackwell_aot(
+        CHUNK_SIZE, dim, dstate, nheads, ngroups,
+        batch=1, nchunks=total_chunks, stream=stream,
+        gpu_arch=gpu_arch, has_d=True, has_z=False)
     print(f"  Compilation: {time.time() - t0:.2f}s")
 
+    # Allocate row-major cupy arrays in C++ packed-view layout.
+    # Memory of `[n, seq_len_padded, ...]` is identical to `[1, n*seq_len_padded, ...]`
+    # -- only the descriptor changes -- so we just call cp.ascontiguousarray then reshape.
+    x_packed = cp.ascontiguousarray(cp.asarray(x_np)).reshape(1, total_seq, nheads, dim)
+    dt_packed = cp.ascontiguousarray(cp.asarray(dt_np)).reshape(1, total_seq, nheads)
+    A_g = cp.asarray(A_np)
+    B_packed = cp.ascontiguousarray(cp.asarray(B_np)).reshape(1, total_seq, ngroups, dstate)
+    C_packed = cp.ascontiguousarray(cp.asarray(C_np)).reshape(1, total_seq, ngroups, dstate)
+    D_g = cp.asarray(D_np)  # fp16
+    dt_bias_g = cp.asarray(dt_bias_np)
+    out_packed = cp.zeros((1, total_seq, nheads, dim), dtype=cp.float16)
+    # state stays per-seq (n, not 1); kernel uses seq_id from chunk_indices to index.
+    state_g = cp.asarray(state_np)  # [n, H, D, N] fp16 -- read init / write final in place
+
+    # Workspace buffers in packed view: outer dim = 1, total_chunks across all seqs.
+    cumsum_ws = cp.zeros((1, nheads, total_chunks, CHUNK_SIZE), dtype=cp.float32)
+    dt_proc_ws = cp.zeros((1, nheads, total_chunks, CHUNK_SIZE), dtype=cp.float16)
+    y_ws = cp.zeros((1, nheads, dim, total_chunks, CHUNK_SIZE), dtype=cp.float16)
+
+    # Varlen metadata -- same layout as cuteDslSSDRunner.cpp builds via
+    # buildSSDVarlenMetadata. seq_idx is [1, B*S] (flat super-batch) so the
+    # kernel's seq_idx[seq_id, t] read with seq_id=0 picks the b-tag at t.
+    seq_idx_np = np.zeros((n, seq_len_padded), dtype=np.int32)
+    for b in range(n):
+        seq_idx_np[b, :cl_arr[b]] = b
+        seq_idx_np[b, cl_arr[b]:] = -1
+    seq_idx_packed = seq_idx_np.reshape(1, total_seq)
+
+    # chunk_indices: prefix list of physical chunk ids that contain valid tokens.
+    # Each seq b contributes ceil(cl[b] / L) entries: chunk ids b*nchunks_per_seq..
+    # Trailing slack filled with sentinel -1.
+    chunk_indices_np = np.full((total_chunks,), -1, dtype=np.int32)
+    chunk_offsets_np = np.zeros((total_chunks,), dtype=np.int32)
+    cumsum_list = [0]
+    for b in range(n):
+        nc_b = (cl_arr[b] + CHUNK_SIZE - 1) // CHUNK_SIZE
+        for c in range(nc_b):
+            chunk_indices_np[cumsum_list[-1] + c] = b * nchunks_per_seq + c
+        cumsum_list.append(cumsum_list[-1] + nc_b)
+    seq_chunk_cumsum_np = np.array(cumsum_list, dtype=np.int32)
+
+    seq_idx_g = cp.asarray(seq_idx_packed)
+    chunk_indices_g = cp.asarray(chunk_indices_np)
+    chunk_offsets_g = cp.asarray(chunk_offsets_np)
+    seq_chunk_cumsum_g = cp.asarray(seq_chunk_cumsum_np)
+    valid_lens_g = cp.asarray(np.array(cl_arr, dtype=np.int32))
+
+    # Wrap with tvm-ffi-disabled from_dlpack: AOT path uses standard cute tensor
+    # marshalling (memref descriptors), not tvm-ffi. Mark layout/shape dynamic
+    # to mirror the AOT placeholder signature (GDN pattern, see _mark_4d_dynamic
+    # in gdn_prefill_blackwell.py).
     from cutlass.cute.runtime import from_dlpack
 
-    def wrap_tvm(arr):
-        return from_dlpack(arr, assumed_align=16, enable_tvm_ffi=True)
+    def _mark_nd_runtime(arr, n_dynamic):
+        ct = from_dlpack(arr, assumed_align=16)
+        ndim = len(arr.shape)
+        ct = ct.mark_layout_dynamic(leading_dim=ndim - 1)
+        so = tuple(range(ndim))
+        for m in range(n_dynamic):
+            ct = ct.mark_compact_shape_dynamic(mode=m, stride_order=so)
+        return ct
 
+    def _mark_1d_runtime(arr):
+        return (from_dlpack(arr, assumed_align=16)
+                .mark_compact_shape_dynamic(mode=0, stride_order=(0,)))
+
+    # num_logical_chunks is the *upper bound* (total_chunks); kernel handles
+    # trailing -1 sentinels in chunk_indices.
+    num_logical_chunks = total_chunks
+    num_seqs = n
+
+    # Match each tensor's dynamic-mode count to the AOT placeholder definition.
+    def _build_args():
+        return dict(
+            x=_mark_nd_runtime(x_packed, 3),
+            dt=_mark_nd_runtime(dt_packed, 2),
+            A=_mark_1d_runtime(A_g),
+            B=_mark_nd_runtime(B_packed, 3),
+            C=_mark_nd_runtime(C_packed, 3),
+            D=_mark_1d_runtime(D_g),
+            dt_bias=_mark_1d_runtime(dt_bias_g),
+            out=_mark_nd_runtime(out_packed, 3),
+            state=_mark_nd_runtime(state_g, 2),
+            cumsum=_mark_nd_runtime(cumsum_ws, 3),
+            dtproc=_mark_nd_runtime(dt_proc_ws, 3),
+            yws=_mark_nd_runtime(y_ws, 4),
+            si=_mark_nd_runtime(seq_idx_g, 1),
+            ci=_mark_1d_runtime(chunk_indices_g),
+            co=_mark_1d_runtime(chunk_offsets_g),
+            cs=_mark_1d_runtime(seq_chunk_cumsum_g),
+            vl=_mark_1d_runtime(valid_lens_g),
+        )
+
+    a = _build_args()
     print("  Running...")
     compiled(
-        wrap_tvm(x_perm), wrap_tvm(cumsum_perm), wrap_tvm(delta_perm),
-        wrap_tvm(b_perm), wrap_tvm(c_perm), wrap_tvm(y_perm),
-        None,  # init_states
-        wrap_tvm(fstate_perm),
-        wrap_tvm(d_g),
-        None,  # z
-        None, None, None, None,  # varlen
-        cutlass.Int32(nchunks), cutlass.Int32(0),
+        a["x"], a["dt"], a["A"], a["B"], a["C"],
+        a["D"], a["dt_bias"], a["out"], a["state"],
+        a["cumsum"], a["dtproc"], a["yws"],
+        a["si"], a["ci"], a["co"], a["cs"], a["vl"],
+        cutlass.Int32(total_seq), cutlass.Int32(total_chunks),
+        cutlass.Int32(num_logical_chunks), cutlass.Int32(num_seqs),
         stream,
     )
     cp.cuda.get_current_stream().synchronize()
 
-    # Verify: y_g is (B, EH, D, C, L) contiguous, reshape to (B, seqlen, EH, D)
-    y_result = y_g.get()  # (B, EH, D, C, L) — contiguous backing store
-    gpu_out = y_result.reshape(n, nheads, dim, seq_len).transpose(0, 3, 1, 2)
-    gpu_out = gpu_out.astype(np.float32)
+    # Output is [1, total_seq, H, D] -- reshape back to [n, S, H, D] for per-batch checks.
+    gpu_out = out_packed.get().reshape(n, seq_len_padded, nheads, dim).astype(np.float32)
 
-    max_diff = np.max(np.abs(gpu_out - ref_out))
-    ref_max = np.max(np.abs(ref_out))
-    rel_err = max_diff / (ref_max + 1e-8)
-    print(f"  Max diff: {max_diff:.6f}, Ref max: {ref_max:.6f}, Rel err: {rel_err:.6f}")
-    print(f"  {'PASSED' if rel_err < 0.05 else 'FAILED'}")
+    worst = 0.0
+    for b in range(n):
+        cl = cl_arr[b]
+        if cl == 0:
+            continue
+        diff = np.abs(gpu_out[b, :cl] - ref_out[b, :cl])
+        rmax = float(np.abs(ref_out[b, :cl]).max() + 1e-8)
+        worst = max(worst, float(diff.max() / rmax))
+    print(f"  Valid-region rel_err (max across batches): {worst:.6f}")
+    print(f"  {'PASSED' if worst < 0.05 else 'FAILED'}")
 
     if iterations > 0:
-        # Pre-wrap for benchmark loop
-        wx = wrap_tvm(x_perm); wcs = wrap_tvm(cumsum_perm)
-        wd = wrap_tvm(delta_perm); wb = wrap_tvm(b_perm)
-        wc = wrap_tvm(c_perm); wy = wrap_tvm(y_perm)
-        wf = wrap_tvm(fstate_perm); wD = wrap_tvm(d_g)
-        nc = cutlass.Int32(nchunks); ns = cutlass.Int32(0)
+        # Pre-wrap args ONCE outside the timed loop (apples-to-apples with the Triton
+        # bench, which doesn't re-wrap per call). Time via CUDA events.
+        s_seq = cutlass.Int32(total_seq); s_nc = cutlass.Int32(total_chunks)
+        s_nlc = cutlass.Int32(num_logical_chunks); s_ns = cutlass.Int32(num_seqs)
+        aa = _build_args()
+
+        def _call():
+            compiled(aa["x"], aa["dt"], aa["A"], aa["B"], aa["C"],
+                     aa["D"], aa["dt_bias"], aa["out"], aa["state"],
+                     aa["cumsum"], aa["dtproc"], aa["yws"],
+                     aa["si"], aa["ci"], aa["co"], aa["cs"], aa["vl"],
+                     s_seq, s_nc, s_nlc, s_ns, stream)
 
         for _ in range(warmup):
-            compiled(wx, wcs, wd, wb, wc, wy, None, wf, wD, None,
-                     None, None, None, None, nc, ns, stream)
+            _call()
         cp.cuda.get_current_stream().synchronize()
-        t0 = time.time()
-        for _ in range(iterations):
-            compiled(wx, wcs, wd, wb, wc, wy, None, wf, wD, None,
-                     None, None, None, None, nc, ns, stream)
+
+        starts = [cp.cuda.Event() for _ in range(iterations)]
+        ends = [cp.cuda.Event() for _ in range(iterations)]
+        for i in range(iterations):
+            starts[i].record()
+            _call()
+            ends[i].record()
         cp.cuda.get_current_stream().synchronize()
-        ms = (time.time() - t0) / iterations * 1000
-        print(f"  Avg latency: {ms:.3f} ms")
+        times = sorted(cp.cuda.get_elapsed_time(s, e) for s, e in zip(starts, ends))
+        ms = times[len(times) // 2]
+        print(f"  Median latency (CUDA events, no graph): {ms:.3f} ms")
+
+        # CUDA-graph timing: capture once, time replays. Matches flashinfer's
+        # `--cuda_graph` bench mode. Wrapper is graph-safe (no host syncs).
+        # Need a non-default stream for capture (legacy stream can't be captured).
+        graph_stream = cp.cuda.Stream(non_blocking=True)
+        graph_cu = cuda.CUstream(graph_stream.ptr)
+
+        def _call_on(s):
+            compiled(aa["x"], aa["dt"], aa["A"], aa["B"], aa["C"],
+                     aa["D"], aa["dt_bias"], aa["out"], aa["state"],
+                     aa["cumsum"], aa["dtproc"], aa["yws"],
+                     aa["si"], aa["ci"], aa["co"], aa["cs"], aa["vl"],
+                     s_seq, s_nc, s_nlc, s_ns, s)
+
+        with graph_stream:
+            for _ in range(3):
+                _call_on(graph_cu)
+            graph_stream.synchronize()
+            graph_stream.begin_capture()
+            _call_on(graph_cu)
+            graph = graph_stream.end_capture()
+            graph.upload()
+            for _ in range(warmup):
+                graph.launch()
+            graph_stream.synchronize()
+            g_starts = [cp.cuda.Event() for _ in range(iterations)]
+            g_ends = [cp.cuda.Event() for _ in range(iterations)]
+            for i in range(iterations):
+                g_starts[i].record()
+                graph.launch()
+                g_ends[i].record()
+            graph_stream.synchronize()
+        g_times = sorted(cp.cuda.get_elapsed_time(s, e) for s, e in zip(g_starts, g_ends))
+        g_ms = g_times[len(g_times) // 2]
+        print(f"  Median latency (CUDA events, CUDA graph): {g_ms:.3f} ms")
 
 
 def export_ssd_prefill_blackwell(output_dir, file_name, function_prefix, gpu_arch="",
-                                  dim=None, dstate=None):
+                                  dim=None, dstate=None, has_init_states=False):
     """AOT compile and export the Blackwell SSD prefill kernel."""
     aot_dim = dim if dim is not None else AOT_DIM
     aot_dstate = dstate if dstate is not None else AOT_DSTATE
     cp.cuda.Device(0).use()
     _ = cp.zeros(1)
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
-    print(f"[ssd_prefill_blackwell] AOT compile D={aot_dim} N={aot_dstate} gpu_arch={gpu_arch or 'auto'}")
+    print(f"[ssd_prefill_blackwell] AOT compile D={aot_dim} N={aot_dstate} "
+          f"has_init_states={has_init_states} gpu_arch={gpu_arch or 'auto'}")
     t0 = time.time()
     nchunks = AOT_SEQLEN // CHUNK_SIZE
     compiled = _compile_ssd_blackwell_aot(
         CHUNK_SIZE, aot_dim, aot_dstate, AOT_NHEADS, AOT_NGROUPS,
-        AOT_N, nchunks, stream, gpu_arch=gpu_arch)
+        AOT_N, nchunks, stream, gpu_arch=gpu_arch,
+        has_init_states=has_init_states)
     print(f"[ssd_prefill_blackwell] Compilation: {time.time() - t0:.2f}s")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -4827,13 +5092,22 @@ if __name__ == "__main__":
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iterations", type=int, default=50)
     p.add_argument("--gpu_arch", type=str, default="")
+    p.add_argument("--cl", type=str, default=None,
+                   help="Comma-separated per-batch context_lengths "
+                        "(e.g. '100,256,200,256' for n=4 mixed varlen). "
+                        "Default uniform cl=seq_len.")
+    p.add_argument("--has_init_states", action="store_true",
+                   help="Compile the variant that reads a user-provided initial hidden "
+                        "state at chunk 0. Default off (zero state at chunk 0).")
     args = p.parse_args(_saved_argv[1:] if _saved_argv else [])
 
     if args.export_only:
         export_ssd_prefill_blackwell(
             output_dir=args.output_dir, file_name=args.file_name,
             function_prefix=args.function_prefix, gpu_arch=args.gpu_arch,
-            dim=args.dim, dstate=args.dstate)
+            dim=args.dim, dstate=args.dstate,
+            has_init_states=args.has_init_states)
     else:
         run_test(args.n, args.nheads, args.dim, args.dstate, args.ngroups,
-                 args.seq_len, args.warmup, args.iterations, args.gpu_arch)
+                 args.seq_len, args.warmup, args.iterations, args.gpu_arch,
+                 cl_pattern=args.cl)

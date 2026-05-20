@@ -68,7 +68,7 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
-                 "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
+                 "[--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -85,13 +85,11 @@ void printUsage(char const* programName)
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
     std::cerr << "  --maxLoraRank             Maximum LoRA rank for dynamic LoRA adaptation. Default = 0 (no LoRA)"
               << std::endl;
-    std::cerr << "  --eagleDraft              Enable Eagle draft mode" << std::endl;
-    std::cerr << "  --eagleBase               Enable Eagle base mode" << std::endl;
-    std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens passed into Eagle base model for tree "
-                 "verification. Default = 60"
+    std::cerr << "  --specDraft               Build as speculative decoding draft model (EAGLE/MTP)" << std::endl;
+    std::cerr << "  --specBase                Build as speculative decoding base model (EAGLE/MTP)" << std::endl;
+    std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens for base model tree verification. Default = 60"
               << std::endl;
-    std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens passed into Eagle draft model for draft "
-                 "generation. Default = 60"
+    std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens for draft model generation. Default = 60"
               << std::endl;
     std::cerr << "  --profilingDetailed       Enable detailed profiling verbosity to include ONNX op names "
                  "in layer info. Use for DLSim analysis."
@@ -109,8 +107,10 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
-        {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
-        {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
+        {"specDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
+        {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT}, // deprecated alias
+        {"specBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
+        {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE}, // deprecated alias
         {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
         {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
         {"profilingDetailed", no_argument, 0, LLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};

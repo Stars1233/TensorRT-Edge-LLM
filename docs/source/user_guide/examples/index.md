@@ -27,4 +27,5 @@ End-to-end workflows demonstrating TensorRT Edge-LLM capabilities across differe
 - **[ASR (Automatic Speech Recognition)](asr.md)** - Speech-to-text with Qwen3-ASR models
 - **[MoE (Mixture of Experts)](moe.md)** - Mixture of Experts model deployment
 - **[TTS (Text-to-Speech)](tts.md)** - Text-to-speech synthesis workflows
+- **[Alpamayo-R1-10B (VLA)](vla.md)** - Vision-language-action workflow with image, text, trajectory history, and action prediction
 - **[Experimental High-Level Python API and Server](experimental-server.md)** - vLLM-style API and OpenAI-compatible server with spec-decode support

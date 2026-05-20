@@ -102,6 +102,9 @@ class TalkerCausalLM(CausalLM):
         # Select last token hidden states via GatherND
         last_hidden = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
         logits = self.lm_head(last_hidden).to(torch.float32)
+        # Talker's ``hidden_states`` output is the post-norm final layer
+        # output — matches the reference tensorrt_edgellm export, which the
+        # CodePredictor's residual path was trained to consume.
         return logits, hidden_states, present_key_values
 
     def onnx_export_spec(self) -> OnnxSpec:

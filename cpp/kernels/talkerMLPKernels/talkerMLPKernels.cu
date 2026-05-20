@@ -446,7 +446,8 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 //!   5:          ttsPad + embTable[codecThinkEosId]
 //!   6:          ttsPad + embTable[speakerId]
 //!   7:          ttsBos + embTable[codecPadId]
-//!   8..8+N-1:   projected[3+i] + embTable[codecPadId]  (i = rowIdx-8)
+//!   8..8+N-2:   projected[3+i] + embTable[codecPadId]  (i = rowIdx-8)
+//!   8+N-1:      projected[3+N-1] + embTable[codecBosId]  (last text row = start-of-generation)
 //!   8+N:        ttsEos + embTable[codecPadId]
 //!   8+N+1:      ttsPad + embTable[codecBosId]
 template <int32_t VEC_SIZE = 8>
@@ -496,10 +497,14 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
     }
     else if (rowIdx < kFixedPrefixLen + textLen)
     {
-        // Text token rows: projected[3 + (rowIdx-8)] + embTable[codecPadId]
+        // Text token rows: projected[3 + (rowIdx-8)] + embTable[codec]
+        // Last text row uses codecBosId (start-of-generation marker);
+        // all preceding text rows use codecPadId. Matches PyTorch reference:
+        //   assistant_codec_hidden = [zeros(3), no-think, thinkBos, thinkEos, speaker, codecPad, codecBos]
         int32_t const textIdx = rowIdx - kFixedPrefixLen;
         srcA = projected + static_cast<int64_t>(3 + textIdx) * hiddenDim;
-        srcB = embTable + static_cast<int64_t>(codecPadId) * hiddenDim;
+        int32_t const codecId = (rowIdx == kFixedPrefixLen + textLen - 1) ? codecBosId : codecPadId;
+        srcB = embTable + static_cast<int64_t>(codecId) * hiddenDim;
     }
     else if (rowIdx == kFixedPrefixLen + textLen)
     {
@@ -564,12 +569,13 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
 
 //! Fused residual connection kernel
 //!
-//! Computes: output[j] = embed0[code0,j] + embed15[code15,j] + addend[j] + sum_{k=1}^{14}(codecHiddens[k,j])
-//! Single block of (hiddenDim/VEC_SIZE) threads; FP32 accumulators for precision.
+//! Computes: output[j] = embed0[code0,j] + embedLast[codeLast,j] + addend[j] +
+//! sum_{k=1}^{numInnerRows}(codecHiddens[k,j]) Single block of (hiddenDim/VEC_SIZE) threads; FP32 accumulators for
+//! precision.
 template <int32_t VEC_SIZE = 8>
 __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, half const* __restrict__ embTable0,
-    half const* __restrict__ embTable15, int32_t code0, int32_t code15, half const* __restrict__ addend,
-    int32_t hiddenDim, half* __restrict__ output)
+    half const* __restrict__ embTableLast, int32_t code0, int32_t codeLast, half const* __restrict__ addend,
+    int32_t hiddenDim, int32_t numInnerRows, half* __restrict__ output)
 {
     using vec_t = uint4;
     int32_t const vecIdx = static_cast<int32_t>(threadIdx.x);
@@ -591,9 +597,9 @@ __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, 
             acc[i] = __half2float(p[i]);
         }
     }
-    // embed(code15) from CodePredictor embedding table
+    // embed(codeLast) from CodePredictor embedding table
     {
-        vec_t v = reinterpret_cast<vec_t const*>(embTable15 + static_cast<int64_t>(code15) * hiddenDim)[vecIdx];
+        vec_t v = reinterpret_cast<vec_t const*>(embTableLast + static_cast<int64_t>(codeLast) * hiddenDim)[vecIdx];
         half const* p = reinterpret_cast<half const*>(&v);
 #pragma unroll
         for (int32_t i = 0; i < VEC_SIZE; ++i)
@@ -611,8 +617,8 @@ __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, 
             acc[i] += __half2float(p[i]);
         }
     }
-    // sum codecHiddens rows 1..14 (row 0 and 15 replaced by direct embedding lookups above)
-    for (int32_t k = 1; k <= 14; ++k)
+    // sum codecHiddens rows 1..numInnerRows (row 0 and last replaced by direct embedding lookups above)
+    for (int32_t k = 1; k <= numInnerRows; ++k)
     {
         vec_t v = reinterpret_cast<vec_t const*>(codecHiddens + static_cast<int64_t>(k) * hiddenDim)[vecIdx];
         half const* p = reinterpret_cast<half const*>(&v);
@@ -634,18 +640,23 @@ __global__ void residualConnectionKernel(half const* __restrict__ codecHiddens, 
     reinterpret_cast<vec_t*>(output)[vecIdx] = result;
 }
 
-void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0, rt::Tensor const& embTable15,
-    int32_t code0, int32_t code15, half const* addend, rt::Tensor& output, cudaStream_t stream)
+void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0,
+    rt::Tensor const& embTableLast, int32_t code0, int32_t codeLast, half const* addend, rt::Tensor& output,
+    cudaStream_t stream)
 {
     int32_t const hiddenDim = static_cast<int32_t>(embTable0.getShape()[1]);
     constexpr int32_t kVecSize = 8;
     int32_t const numVecs = hiddenDim / kVecSize;
 
-    // codecHiddens has shape [1, 16, H]: skip leading batch dim
+    // codecHiddens has shape [1, numCodesPerFrame, H]: skip leading batch dim
+    // numInnerRows = total rows - 2 (excluding first and last which use direct embedding lookup)
+    int32_t const numCodesPerFrame = static_cast<int32_t>(codecHiddens.getShape()[1]);
+    int32_t const numInnerRows = numCodesPerFrame - 2;
     half const* codecPtr = codecHiddens.dataPointer<half>();
 
     residualConnectionKernel<kVecSize><<<1, numVecs, 0, stream>>>(codecPtr, embTable0.dataPointer<half>(),
-        embTable15.dataPointer<half>(), code0, code15, addend, hiddenDim, static_cast<half*>(output.rawPointer()));
+        embTableLast.dataPointer<half>(), code0, codeLast, addend, hiddenDim, numInnerRows,
+        static_cast<half*>(output.rawPointer()));
     CUDA_CHECK(cudaPeekAtLastError());
 }
 

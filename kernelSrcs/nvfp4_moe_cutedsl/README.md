@@ -20,12 +20,13 @@ Run on a machine with a **Blackwell or Thor GPU** (SM100, SM101/SM110) and CUDA 
 python3 -m venv build_kernel_venv
 source build_kernel_venv/bin/activate
 
-pip install nvidia-cutlass-dsl==4.4.1
-
-# Pick the cupy variant that matches your CUDA version:
-pip install cupy-cuda12x==12.3.0  # CUDA 12.x
+# Pick cuda-python and cupy variant that matches your CUDA version
+# before installing `nvidia-cutlass-dsl`:
+pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
-pip install cupy-cuda13x==13.6.0  # CUDA 13.x
+pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
+
+pip install nvidia-cutlass-dsl==4.4.1
 ```
 
 **2. Compile all kernel variants into a static library**
@@ -116,6 +117,7 @@ python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_100 [--clea
 | Dependency | Version | Notes |
 |---|---|---|
 | `nvidia-cutlass-dsl` | 4.4.1 | |
+| `cuda-python` | 12.8.* for CUDA 12.x | Install before `nvidia-cutlass-dsl`; use the CUDA 13.x resolved version for CUDA 13.x |
 | `cupy-cuda12x` | 12.3.0 | CUDA 12.x |
 | `cupy-cuda13x` | 13.6.0 | CUDA 13.x |
 

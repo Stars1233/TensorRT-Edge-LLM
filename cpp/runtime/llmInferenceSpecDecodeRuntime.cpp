@@ -28,6 +28,7 @@
 #include "kernels/speculative/eagleAcceptKernels.h"
 #include "kernels/speculative/eagleUtilKernels.h"
 #include "multimodal/multimodalRunner.h"
+#include "multimodal/qwenViTRunner.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/hybridCacheManager.h"
@@ -196,10 +197,8 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         LOG_INFO("Runtime batch size set to: %d (vanilla mode, base engine max)", mMaxRuntimeBatchSize);
     }
 
-    if (mBaseEngineConfig.numDeepstackFeatures > 0 && multimodalEngineDir.empty())
-    {
-        throw std::runtime_error("--multimodalEngineDir is required for VLM engine.");
-    }
+    ELLM_CHECK(mBaseEngineConfig.numDeepstackFeatures <= 0 || !multimodalEngineDir.empty(),
+        "--multimodalEngineDir is required for VLM engine.");
 
     // Allocate runtime tensors till max supported size.
     bool const hasDraft = (mDraftEngineRunner != nullptr);
@@ -225,13 +224,19 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         "runtime",
         effectiveMaxTreeSize, maxSamplingSize, draftFullTableLength);
 
-    // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage
+    // Reserve enough workspace for sampling, accounting for batch dimension in draft proposal stage.
+    // Always include vanilla sampling workspace size because per-request disable_spec_decode
+    // can fall back to topK/topP sampling even when draft is loaded.
+    int32_t const vanillaSamplingWorkspaceSize
+        = static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize,
+            SamplingParams(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1.0f, 0, 0.9f)));
     int32_t const maxSamplingWorkspaceSize = hasDraft
-        ? std::max(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1),
-              getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * effectiveDraftTopK,
-                  mDraftEngineConfig->draftModelVocabSize, effectiveDraftTopK))
-        : static_cast<int32_t>(getTopKtopPSamplingWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize,
-              SamplingParams(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1.0f, 0, 0.9f)));
+        ? std::max({vanillaSamplingWorkspaceSize,
+              static_cast<int32_t>(
+                  getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize, mBaseEngineConfig.outputVocabSize, 1)),
+              static_cast<int32_t>(getSelectAllTopKWorkspaceSize(mMaxRuntimeBatchSize * effectiveDraftTopK,
+                  mDraftEngineConfig->draftModelVocabSize, effectiveDraftTopK))})
+        : vanillaSamplingWorkspaceSize;
 
     try
     {
@@ -255,6 +260,9 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
                 mBaseEngineConfig.numDeepstackFeatures, mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength,
                 mBaseEngineConfig.hiddenSize);
         }
+        mOutputHiddenStates = rt::Tensor(
+            {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
+            rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mOutputHiddenStates");
         mContextLengthsInput = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
             "LLMInferenceSpecDecodeRuntime::mContextLengthsInput");
         // Allocate mLogitsOutput with max capacity to support both draft (smaller vocab) and base (larger vocab)
@@ -347,22 +355,31 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     }
     LOG_INFO("Runtime tensors successfully allocated.");
 
-    // Load conversion table from draft model vocab to base model vocab (draft-only).
+    // Load conversion table from draft model vocab to base model vocab.
+    // MTP draft shares vocab with base (no d2t mapping needed); fill with zeros (identity).
     if (hasDraft)
     {
-        std::vector<rt::Tensor> d2tTensors;
-        if (!safetensors::loadSafetensors(std::filesystem::path(engineDir) / "d2t.safetensors", d2tTensors, stream))
+        std::filesystem::path const d2tPath = std::filesystem::path(engineDir) / "d2t.safetensors";
+        if (std::filesystem::exists(d2tPath))
         {
-            LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
-            throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir);
+            std::vector<rt::Tensor> d2tTensors;
+            if (!safetensors::loadSafetensors(d2tPath, d2tTensors, stream))
+            {
+                LOG_ERROR("Failed to load d2t.safetensors from model directory: %s", engineDir.c_str());
+                throw std::runtime_error("Failed to load d2t.safetensors from model directory: " + engineDir);
+            }
+            check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
+            check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
+            check::check(d2tTensors[0].getShape()[0] == mDraftEngineConfig->draftModelVocabSize,
+                "d2t tensor length should match draft vocab size");
+            mDraftVocabMappingTable = std::move(d2tTensors[0]);
         }
-
-        // Check we have exactly one tensor and use it
-        check::check(d2tTensors.size() == 1, "d2t.safetensors should contain exactly one tensor");
-        check::check(d2tTensors[0].getShape().getNumDims() == 1, "d2t tensor should be 1D");
-        check::check(d2tTensors[0].getShape()[0] == mDraftEngineConfig->draftModelVocabSize,
-            "d2t tensor length should match draft vocab size");
-        mDraftVocabMappingTable = std::move(d2tTensors[0]);
+        else
+        {
+            LOG_INFO("d2t.safetensors not found (MTP draft shares vocab with base), using identity mapping.");
+            CUDA_CHECK(cudaMemsetAsync(
+                mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
+        }
     }
 
     // Optional: Load vocabulary mapping table if base model uses reduced vocabulary
@@ -431,9 +448,32 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
         }
 
         // At least one multimodal runner must be available
-        if (!mAudioRunner && !mVisionRunner)
+        ELLM_CHECK(mAudioRunner || mVisionRunner, "No valid multimodal engine found in " + multimodalEngineDir);
+
+        // Try to load action expert from multimodalEngineDir/action
+        try
         {
-            throw std::runtime_error("No valid multimodal engine found in " + multimodalEngineDir);
+            std::string actionDir = multimodalEngineDir + "/action";
+            LOG_INFO("Attempting to load Action runner from %s", actionDir.c_str());
+            mActionRunner = std::make_unique<Alpamayo1ActionRunner>(
+                actionDir, stream, mBaseEngineRunner->getCacheManager().getKVCacheManager().getConfig());
+            LOG_INFO("Alpamayo 1 action expert loaded.");
+        }
+        catch (std::exception const& e)
+        {
+            LOG_INFO("Failed to load Action runner from %s: %s", (multimodalEngineDir + "/action").c_str(), e.what());
+        }
+
+        // Validate that the action engine's max KV cache capacity matches the LLM engine's.
+        if (mActionRunner)
+        {
+            int32_t const actionMaxKVCacheCapacity = mActionRunner->getMaxKVCacheCapacity();
+            int32_t const llmMaxKVCacheCapacity = mBaseEngineConfig.maxKVCacheCapacity;
+            ELLM_CHECK(actionMaxKVCacheCapacity == llmMaxKVCacheCapacity,
+                format::fmtstr(
+                    "Action engine max_kv_cache_capacity (%d) does not match LLM engine max_kv_cache_capacity (%d). "
+                    "Re-export and rebuild the action engine with --max_kv_cache_capacity=%d to match the LLM engine.",
+                    actionMaxKVCacheCapacity, llmMaxKVCacheCapacity, llmMaxKVCacheCapacity));
         }
     }
 
@@ -444,8 +484,9 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     int64_t const draftContextMemorySize = mDraftEngineRunner ? mDraftEngineRunner->getRequiredContextMemorySize() : 0;
     int64_t const visionContextMemorySize = mVisionRunner ? mVisionRunner->getRequiredContextMemorySize() : 0;
     int64_t const audioContextMemorySize = mAudioRunner ? mAudioRunner->getRequiredContextMemorySize() : 0;
-    int64_t const sharedContextMemorySize
-        = std::max({baseContextMemorySize, draftContextMemorySize, visionContextMemorySize, audioContextMemorySize});
+    int64_t const actionContextMemorySize = mActionRunner ? mActionRunner->getRequiredContextMemorySize() : 0;
+    int64_t const sharedContextMemorySize = std::max({baseContextMemorySize, draftContextMemorySize,
+        visionContextMemorySize, audioContextMemorySize, actionContextMemorySize});
     mSharedExecContextMemory = rt::Tensor({sharedContextMemorySize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "LLMInferenceSpecDecodeRuntime::mSharedExecContextMemory");
     mBaseEngineRunner->setContextMemory(mSharedExecContextMemory);
@@ -461,17 +502,35 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
     {
         mAudioRunner->setContextMemory(mSharedExecContextMemory);
     }
+    if (mActionRunner)
+    {
+        mActionRunner->setContextMemory(mSharedExecContextMemory);
+    }
     LOG_INFO(
         "Setup shared execution context memory: %zu bytes (base requires: %zu, draft requires: %zu, vision requires: "
-        "%zu, audio requires: %zu)",
+        "%zu, audio requires: %zu, action requires: %zu)",
         static_cast<size_t>(sharedContextMemorySize), static_cast<size_t>(baseContextMemorySize),
         static_cast<size_t>(draftContextMemorySize), static_cast<size_t>(visionContextMemorySize),
-        static_cast<size_t>(audioContextMemorySize));
+        static_cast<size_t>(audioContextMemorySize), static_cast<size_t>(actionContextMemorySize));
 }
 
-bool LLMInferenceSpecDecodeRuntime::handleRequest(
-    LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream)
+void LLMInferenceSpecDecodeRuntime::setActionNoiseSeed(int32_t seed) noexcept
 {
+    if (mActionRunner)
+    {
+        mActionRunner->setNoiseSeed(seed);
+    }
+}
+
+bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response,
+    cudaStream_t stream, bool outputThinkerEmbeddings)
+{
+    // Clear per-request portal state. Buffers themselves stay allocated and are
+    // reshaped/overwritten when populated below — see getBaseModelHiddenStates() contract.
+    mHiddenStatesRegistry.clear();
+    mLastPrefillLength = 0;
+    mLastInputTokenIds.clear();
+
     int32_t const activeBatchSize = static_cast<int32_t>(request.requests.size());
     bool const enableSpecDecode = (mDraftEngineRunner != nullptr) && !request.disableSpecDecode;
     std::string const& loraWeightsName = request.loraWeightsName;
@@ -508,7 +567,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     SpecDecodeInferenceContext context;
     context.initialize(
         activeBatchSize, maxGenerateLength, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName, stream);
-    bool const supportsMultimodalInput = (mAudioRunner != nullptr) || (mVisionRunner != nullptr);
+    bool const supportsMultimodalInput
+        = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
 
     if (supportsMultimodalInput)
     {
@@ -536,6 +596,8 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     context.temperature = enableSpecDecode ? 1.0f : request.temperature;
     context.topP = enableSpecDecode ? 1.0f : request.topP;
     context.topK = enableSpecDecode ? 0 : request.topK;
+    context.outputThinkerEmbeddings = outputThinkerEmbeddings;
+    context.onTokenGenerated = request.onTokenGenerated;
 
     // The spec-decode path needs extra KV reserve for draft tokens during verification.
     constexpr int32_t kDRAFT_KVCACHE_RESERVE_LENGTH{100};
@@ -620,6 +682,40 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return false;
     }
 
+    // Populate the base-model hidden-states portal so consumers (Qwen3-Omni Talker via
+    // streaming callback or post-handleRequest sequential consumer) can fetch the buffers
+    // by layer index. See getBaseModelHiddenStates() / getBaseModelInputTokenIds() for the
+    // lifetime contract.
+    int32_t prefillSequenceLength = 0;
+    if (outputThinkerEmbeddings)
+    {
+        prefillSequenceLength
+            = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
+
+        // Layer 0: back up post-multimodal input embeddings before the decode loop reshapes
+        // mInputsEmbeds to {BS,1,H} (scrambling the contiguous {BS,prefillLen,H} layout).
+        // Buffer is allocated once at maxISL and reshaped per request — see
+        // getBaseModelHiddenStates() lifetime contract.
+        if (mPrefillEmbedsBackup.isEmpty())
+        {
+            mPrefillEmbedsBackup = rt::Tensor(
+                {mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength, mBaseEngineConfig.hiddenSize},
+                rt::DeviceType::kGPU, DataType::kHALF, "LLMInferenceSpecDecodeRuntime::mPrefillEmbedsBackup");
+        }
+        check::check(
+            mPrefillEmbedsBackup.reshape({activeBatchSize, prefillSequenceLength, mBaseEngineConfig.hiddenSize}),
+            "Tensor reshape failed");
+        size_t const prefillBytes = static_cast<size_t>(activeBatchSize) * prefillSequenceLength
+            * mBaseEngineConfig.hiddenSize * sizeof(__half);
+        CUDA_CHECK(cudaMemcpyAsync(mPrefillEmbedsBackup.rawPointer(), mInputsEmbeds.rawPointer(), prefillBytes,
+            cudaMemcpyDeviceToDevice, stream));
+
+        mLastPrefillLength = prefillSequenceLength;
+        mLastInputTokenIds = context.rawBatchedInputIds;
+        mHiddenStatesRegistry[0] = &mPrefillEmbedsBackup;
+        // Layer N (acceptHiddenLayer) is registered after the engine-output reshape below.
+    }
+
     // Lambda to check if all batches are finished
     auto checkAllFinished = [&]() {
         // Check if all batches have been evicted
@@ -637,6 +733,13 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         return true;
     };
 
+    // Used for Alpamayo 1
+    int32_t trajFutureStartId = 0;
+    if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+    {
+        trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
+    }
+
     // Lambda to update finish states based on EOS and max_length. Latches
     // terminalReason atomically with the state flip — the !finishedStates guard
     // keeps first-writer-wins semantics relative to applyCancellationToFinishStates.
@@ -648,16 +751,33 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
                 continue; // Respect first-writer-wins (cancel may have fired).
             }
             auto& s = context.slotStreams[i];
-            // Check EOS
-            if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+            if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
             {
-                context.finishedStates[i] = 1;
-                if (s.channel)
+                if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
+                    && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
                 {
-                    s.terminalReason = FinishReason::kEndId;
+                    context.finishedStates[i] = 1;
+                    if (s.channel)
+                    {
+                        s.terminalReason = FinishReason::kEndId;
+                    }
+                    LOG_DEBUG("Batch %d finished, reason: traj_future_start", i);
+                    continue;
                 }
-                LOG_DEBUG("Batch %d finished, reason: EOS", i);
-                continue;
+            }
+            else
+            {
+                // Check EOS
+                if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+                {
+                    context.finishedStates[i] = 1;
+                    if (s.channel)
+                    {
+                        s.terminalReason = FinishReason::kEndId;
+                    }
+                    LOG_DEBUG("Batch %d finished, reason: EOS", i);
+                    continue;
+                }
             }
             // Check max length
             if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
@@ -794,8 +914,10 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
     // Maintain original batch order using original batch indices
     response.outputIds.clear();
     response.outputTexts.clear();
+    response.outputTrajectories.clear();
     response.outputIds.resize(context.completedBatches.size());
     response.outputTexts.resize(context.completedBatches.size());
+    response.outputTrajectories.resize(context.completedBatches.size());
 
     // Add outputs from completed batches (using saved original indices)
     for (auto const& [originalIdx, batchResult] : context.completedBatches)
@@ -824,6 +946,56 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(
         response.outputTexts[originalIdx] = mTokenizer->decode(response.outputIds[originalIdx], true);
     }
 
+    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
+        [](auto const& req) { return req.pastTrajectory.has_value(); });
+    // If action engine is loaded, run one batched trajectory sample and fill output for all batch items.
+    if (hasTrajectoryHistory && mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+    {
+        if (!mVisionRunner)
+        {
+            LOG_ERROR("Alpamayo1ActionRunner requires a vision runner (e.g. QwenViTRunner) for MRoPE rope deltas.");
+            return false;
+        }
+
+        multimodal::ModelType const visionType = mVisionRunner->getModelType();
+        bool const isQwen3ViT = visionType == multimodal::ModelType::QWEN3_VL;
+        if (!isQwen3ViT)
+        {
+            LOG_ERROR(
+                "Alpamayo1ActionRunner requires a Qwen3-VL vision runner but a different vision runner is loaded.");
+            return false;
+        }
+        // MultimodalRunner::create() uses QwenViTRunner only for Qwen3-VL.
+        auto* qwenVision = static_cast<rt::QwenViTRunner*>(mVisionRunner.get());
+        std::vector<int64_t> const& ropeDeltas = qwenVision->getMropeRopeDeltasPerBatch();
+        rt::HybridCacheManager& kvcache = mBaseEngineRunner->getCacheManager();
+        std::vector<std::vector<rt::FutureTrajectoryPoint>> trajectories
+            = mActionRunner->sampleTrajectory(stream, activeBatchSize, kvcache, ropeDeltas);
+        if (trajectories.size() != static_cast<size_t>(activeBatchSize))
+        {
+            LOG_ERROR("Alpamayo1ActionRunner trajectory sampling failed.");
+            return false;
+        }
+        for (size_t i = 0; i < trajectories.size() && i < static_cast<size_t>(activeBatchSize); ++i)
+        {
+            if (!trajectories[i].empty())
+            {
+                response.outputTrajectories[i] = std::move(trajectories[i]);
+            }
+        }
+    }
+
+    // Reshape engine-output hidden states to the actual prefill size and register layer N
+    // (acceptHiddenLayer) in the portal. mOutputHiddenStates / mPrefillEmbedsBackup are
+    // owned by the runtime; consumers fetch them via getBaseModelHiddenStates().
+    if (outputThinkerEmbeddings)
+    {
+        check::check(
+            mOutputHiddenStates.reshape({activeBatchSize, prefillSequenceLength, mBaseEngineConfig.hiddenSize}),
+            "Tensor reshape failed");
+        mHiddenStatesRegistry[request.acceptHiddenLayer] = &mOutputHiddenStates;
+    }
+
     return true;
 }
 
@@ -834,6 +1006,8 @@ bool LLMInferenceSpecDecodeRuntime::validateRequestConfig(LLMGenerationRequest c
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.audioBuffers.empty(); });
     bool const hasVision = std::any_of(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
+    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
+        [](auto const& req) { return req.pastTrajectory.has_value(); });
 
     if (activeBatchSize == 0)
     {
@@ -865,6 +1039,11 @@ bool LLMInferenceSpecDecodeRuntime::validateRequestConfig(LLMGenerationRequest c
         LOG_ERROR("Request contains vision input, but this runtime does not have a vision runner.");
         return false;
     }
+    if (hasTrajectoryHistory && !mActionRunner)
+    {
+        LOG_ERROR("Request contains trajectory history input, but this runtime does not have an action runner.");
+        return false;
+    }
 
     return true;
 }
@@ -877,6 +1056,8 @@ bool LLMInferenceSpecDecodeRuntime::multiModalRuntimePreprocess(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.audioBuffers.empty(); });
     bool const hasVision = std::any_of(
         request.requests.begin(), request.requests.end(), [](auto const& req) { return !req.imageBuffers.empty(); });
+    bool const hasTrajectoryHistory = std::any_of(request.requests.begin(), request.requests.end(),
+        [](auto const& req) { return req.pastTrajectory.has_value(); });
 
     // Clear request-scoped multimodal state up front so previous requests cannot leak through reused runtime members.
     context.visualEmbeddings = std::nullopt;
@@ -923,6 +1104,18 @@ bool LLMInferenceSpecDecodeRuntime::multiModalRuntimePreprocess(
         if (!mVisionRunner->infer(stream))
         {
             LOG_ERROR("Vision inference failed. This request cannot be handled.");
+            return false;
+        }
+    }
+
+    // Process action inputs (if present)
+    if (hasTrajectoryHistory && mActionRunner)
+    {
+        LOG_INFO("Processing trajectory history inputs");
+        if (!mActionRunner->preprocess(request, batchedInputIds, mTokenizer.get()))
+        {
+            LOG_ERROR(
+                "LLMInferenceRuntime(): Trajectory history preprocessing failed. This request cannot be handled.");
             return false;
         }
     }
@@ -1005,6 +1198,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     int32_t* hostPackedTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
 
     // Use actual prompt length (not padded length) for context_lengths to ensure we select the last real token
+    // Clear the entire pinned buffer first so trailing pad slots from prior batches don't leak into the
+    // multimodal-indices walk, which scans all inputIdsLength positions per row, not just up to context_length.
+    std::fill(hostPackedTokenIdsData, hostPackedTokenIdsData + activeBatchSize * inputIdsLength, 0);
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         ctxLenData[i]
@@ -1063,7 +1259,7 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
     }
     else
     {
-        // Standard embedding lookup
+        // Standard embedding lookup (pure text)
         kernel::embeddingLookup(
             mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(), mInputsEmbeds, context.stream);
     }
@@ -1111,9 +1307,19 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         }
     }
 
-    // Only request hidden states output when draft model needs them
-    rt::OptionalOutputTensor hiddenStatesOutput
-        = hasDraftModel() ? rt::OptionalOutputTensor{std::ref(mBaseHiddenStatesOutput)} : std::nullopt;
+    // Request hidden states output when draft model needs them or for Thinker embedding capture
+    rt::OptionalOutputTensor hiddenStatesOutput{std::nullopt};
+    if (hasDraftModel())
+    {
+        hiddenStatesOutput = std::ref(mBaseHiddenStatesOutput);
+    }
+    else if (context.outputThinkerEmbeddings)
+    {
+        int64_t const prefillSeqLen = mInputsEmbeds.getShape()[1];
+        check::check(mOutputHiddenStates.reshape({activeBatchSize, prefillSeqLen, mBaseEngineConfig.hiddenSize}),
+            "Tensor reshape failed");
+        hiddenStatesOutput = std::ref(mOutputHiddenStates);
+    }
     bool const prefillSuccess = mBaseEngineRunner->executePrefillStep(
         mInputsEmbeds, mContextLengthsInput, deepstackEmbeds, mLogitsOutput, hiddenStatesOutput, context.stream);
     if (!prefillSuccess)
@@ -1156,6 +1362,16 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelPrefill(SpecDecodeInferenceConte
         {
             context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
             context.currentGenerateLengths[i] += 1;
+
+            // Fire the per-token callback for the prefill-sampled token. runVanillaDecoding
+            // dispatches the callback for every decode token, so emitting here keeps the sequence
+            // complete for streaming consumers (e.g. the Qwen3-Omni Thinker-Talker pipeline).
+            if (context.onTokenGenerated.has_value())
+            {
+                bool const isFinished = context.finishedStates[i] != 0;
+                TokenCallbackInfo info{hostSelectedTokenIdsData[i], i, context.generationRound, isFinished};
+                context.onTokenGenerated.value()(info);
+            }
         }
     }
 
@@ -1433,6 +1649,10 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
 
     int32_t const activeBatchSize = context.activeBatchSize;
 
+    // Cache sub-manager references used throughout this function.
+    auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
+    auto& mambaCacheManager = baseCacheManager.getMambaCacheManager();
+
     // This function will consume idsInput and draftTreeMask. Use base model to verify the draft tree.
     // We need to collect the logits and hidden states (for further drafting step).
     check::check(
@@ -1457,6 +1677,10 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     check::check(mLogitsOutput.reshape({selectTokenSize, mBaseEngineConfig.outputVocabSize}), "Tensor reshape failed");
     check::check(
         mBaseHiddenStatesOutput.reshape({selectTokenSize, mBaseEngineConfig.outputHiddenDim}), "Tensor reshape failed");
+
+    // Reshape MTP intermediate state outputs to match actual runtime dimensions.
+    // TRT writes these contiguously as [activeBatchSize, verifyTreeSize, ...].
+    mambaCacheManager.reshapeIntermediateStates(activeBatchSize, mDraftingConfig->verifyTreeSize);
 
     bool const verifySuccess = mBaseEngineRunner->executeEagleBaseTreeDecodingStep(
         mInputsEmbeds, mDraftTreeMask, mLogitsOutput, mBaseHiddenStatesOutput, context.stream);
@@ -1484,7 +1708,6 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     // Inplace update the KVCache and input hidden states from the accepted token indices.
     // Also commit KVCache to reflect the latest KVCache length (We can only do this after knowing how many tokens are
     // accepted).
-    auto& baseCacheManager = mBaseEngineRunner->getCacheManager();
     rt::Tensor const& kvCacheLengths = baseCacheManager.getKVCacheLengths();
 
     // The EAGLE base verify is per-head-dim-group batched: one launch per group covers
@@ -1516,6 +1739,9 @@ bool LLMInferenceSpecDecodeRuntime::runBaseModelVerification(SpecDecodeInference
     kernel::eagleBaseAssembleHiddenState(mAcceptedTokenIndices, mAcceptLength, mBaseHiddenStatesOutput, context.stream);
 
     baseCacheManager.commitSequenceLength(mAcceptLength, context.stream);
+
+    // MTP: roll back recurrent/conv states to last accepted step. No-op when MTP is disabled.
+    mambaCacheManager.scatterMtpStates(mAcceptLength, context.stream);
 
     // Reshape to reflect the compacted layout [batch, maxAcceptDepth, hiddenDim]
     check::check(mBaseHiddenStatesOutput.reshape({activeBatchSize, maxAcceptDepth, mBaseEngineConfig.outputHiddenDim}),
@@ -1631,6 +1857,13 @@ bool LLMInferenceSpecDecodeRuntime::runVanillaDecoding(SpecDecodeInferenceContex
     {
         context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
         context.currentGenerateLengths[i] += 1;
+
+        if (context.onTokenGenerated.has_value())
+        {
+            bool const isFinished = context.finishedStates[i] != 0;
+            TokenCallbackInfo info{hostSelectedTokenIdsData[i], i, context.generationRound, isFinished};
+            context.onTokenGenerated.value()(info);
+        }
     }
 
     return true;

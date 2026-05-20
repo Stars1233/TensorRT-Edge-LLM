@@ -25,6 +25,7 @@
 #endif
 #include "plugins/utils/pluginUtils.h"
 
+#include "common/checkMacros.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -293,16 +294,17 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
         int32_t const seqLen = static_cast<int32_t>(xDesc.dims.d[1]);
 
 #ifdef CUTE_DSL_SSD_ENABLED
-        // CuTe DSL path: chunked SSD prefill (requires seq_len >= 128, multiple of chunk_size).
-        // Falls back to serial scan when context_lengths indicates variable-length sequences,
-        // since the CuTe DSL kernel always processes the full seq_len without per-batch masking.
+        // CuTe DSL path: chunked SSD prefill, requires seq_len >= 128.
         bool usedCuteDsl = false;
         {
             int32_t const smVersion = getSMVersion();
-            bool const hasContextLengths = (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX] != nullptr);
-            if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128
-                && !hasContextLengths)
+            if (trt_edgellm::CuteDslSSDRunner::canImplement(mDim, mDstate, smVersion) && seqLen >= 128)
             {
+                if (!trt_edgellm::CuteDslSSDRunner::loadKernelModules())
+                {
+                    LOG_ERROR("Failed to load CuTe DSL SSD kernel modules");
+                    return -1;
+                }
                 trt_edgellm::CuteDslSSDRunner runner;
                 trt_edgellm::SSDParams ssdParams{};
                 ssdParams.x = const_cast<void*>(inputs[kIN_X_IDX]);
@@ -326,6 +328,10 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
                 ssdParams.dt_softplus = dt_softplus;
                 ssdParams.has_D = (inputs[kIN_D_IDX] != nullptr);
                 ssdParams.has_z = false;
+                ssdParams.context_lengths = inputs[kIN_CONTEXT_LENGTHS_IDX];
+                // Fresh-prefill contract: state arrives zeroed. Chunked prefill needs a
+                // builder attribute to flip this on per-call.
+                ssdParams.has_init_states = false;
                 int const rc = runner.run(ssdParams, stream);
                 if (rc != 0)
                 {
@@ -339,6 +345,8 @@ int32_t MambaPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
 #endif
         {
             // Only use context_lengths for actual prefill (seqLen > 1).
+            // During decode, x is 4D with seqLen=1 but context_lengths holds the
+            // cumulative length which would cause an out-of-bounds scan.
             rt::OptionalInputTensor contextLengthsOpt = std::nullopt;
             std::optional<rt::Tensor> clTensorOpt;
             if (seqLen > 1 && inputs[kIN_CONTEXT_LENGTHS_IDX])
@@ -449,13 +457,10 @@ IPluginV3* MambaPluginCreator::createPlugin(
             // chunk_size: Mamba2 prefill uses a chunked parallel scan when > 1.
             //   TODO: implement mamba_chunk_scan_combined kernel for chunk_size > 1.
             std::optional<int32_t> chunkSize = parsePluginScalarField<int32_t>("chunk_size", fc);
-            if (chunkSize.has_value() && chunkSize.value() > 1)
-            {
-                throw std::runtime_error(
-                    "update_ssm_state: chunk_size > 1 is not supported. "
-                    "Only single-step kernel with seq_len loop is implemented. "
-                    "Parallel chunked scan requires a mamba_chunk_scan_combined kernel.");
-            }
+            ELLM_CHECK(!chunkSize.has_value() || chunkSize.value() <= 1,
+                "update_ssm_state: chunk_size > 1 is not supported. "
+                "Only single-step kernel with seq_len loop is implemented. "
+                "Parallel chunked scan requires a mamba_chunk_scan_combined kernel.");
             // time_step_limit: (0.0, inf) is a no-op. Non-trivial clamping not yet in kernel.
             //   TODO: add dt clamping support to the selectiveStateUpdate kernel.
             for (int32_t i = 0; i < fc->nbFields; ++i)
@@ -465,13 +470,10 @@ IPluginV3* MambaPluginCreator::createPlugin(
                 {
                     auto const* limits = static_cast<float const*>(f.data);
                     bool const isNoop = (limits[0] == 0.f && std::isinf(limits[1]) && limits[1] > 0.f);
-                    if (!isNoop)
-                    {
-                        throw std::runtime_error(
-                            "update_ssm_state: non-trivial time_step_limit is not supported. "
-                            "Only the no-op default (0.0, inf) is currently handled. "
-                            "Non-trivial dt clamping requires kernel changes.");
-                    }
+                    ELLM_CHECK(isNoop,
+                        "update_ssm_state: non-trivial time_step_limit is not supported. "
+                        "Only the no-op default (0.0, inf) is currently handled. "
+                        "Non-trivial dt clamping requires kernel changes.");
                 }
             }
         }

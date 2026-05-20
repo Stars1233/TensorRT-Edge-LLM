@@ -43,16 +43,17 @@ namespace trt_edgellm
 /// Device pointers and dimensions for the SSD (Mamba2 SSM scan) kernel.
 struct SSDParams
 {
-    void* x{};       ///< [batch, seq_len, nheads, dim]        input features (fp16)
-    void* dt{};      ///< [batch, seq_len, nheads]             delta/timestep (fp16)
-    void* A{};       ///< [nheads]                             state decay (fp32, negative)
-    void* B{};       ///< [batch, seq_len, ngroups, dstate]    input projection (fp16)
-    void* C{};       ///< [batch, seq_len, ngroups, dstate]    output projection (fp16)
-    void* D{};       ///< [nheads]                             skip connection (fp32, nullable)
-    void* dt_bias{}; ///< [nheads]                             dt bias (fp32, nullable)
-    void* z{};       ///< [batch, seq_len, nheads, dim]        gating (fp16, nullable)
-    void* state{};   ///< [batch, nheads, dim, dstate]         SSM state in/out (fp32)
-    void* output{};  ///< [batch, seq_len, nheads, dim]        output (fp16)
+    void* x{};                     ///< [batch, seq_len, nheads, dim]        input features (fp16)
+    void* dt{};                    ///< [batch, seq_len, nheads]             delta/timestep (fp16)
+    void* A{};                     ///< [nheads]                             state decay (fp32, negative)
+    void* B{};                     ///< [batch, seq_len, ngroups, dstate]    input projection (fp16)
+    void* C{};                     ///< [batch, seq_len, ngroups, dstate]    output projection (fp16)
+    void* D{};                     ///< [nheads]                             skip connection (fp16, nullable)
+    void* dt_bias{};               ///< [nheads]                             dt bias (fp16, nullable)
+    void* z{};                     ///< [batch, seq_len, nheads, dim]        gating (fp16, nullable)
+    void* state{};                 ///< [batch, nheads, dim, dstate]         SSM state in/out (fp16)
+    void* output{};                ///< [batch, seq_len, nheads, dim]        output (fp16)
+    void const* context_lengths{}; ///< [batch] int32 actual length per batch (nullptr = uniform = seq_len for all)
 
     int32_t batch{};
     int32_t seq_len{};
@@ -65,6 +66,8 @@ struct SSDParams
     bool dt_softplus{false};
     bool has_D{false};
     bool has_z{false};
+    /// Caller provides an initial hidden state at chunk 0 (false = zero-state, faster).
+    bool has_init_states{false};
 
     void* workspace{}; ///< Pre-allocated workspace for intermediate buffers
 };
@@ -107,8 +110,11 @@ private:
     static ssd_prefill_d128_n64_Kernel_Module_t sD128N64Module;
     static ssd_prefill_d64_n64_Kernel_Module_t sD64N64Module;
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
+    // Two has_init_states variants per (D, N); runner dispatches on params.has_init_states.
     static ssd_prefill_blackwell_d64_n128_Kernel_Module_t sBlackwellD64N128Module;
+    static ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t sBlackwellD64N128InitStatesModule;
     static ssd_prefill_blackwell_d64_n64_Kernel_Module_t sBlackwellD64N64Module;
+    static ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t sBlackwellD64N64InitStatesModule;
 #endif
     static bool sLoaded;
 };

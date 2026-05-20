@@ -31,13 +31,13 @@ def check_accuracy_with_dataset(output_json_file,
                                 logger=None):
     """
     Calculate accuracy/rouge score based on dataset type using the accuracy scripts.
-    
+
     Args:
         output_json_file: Path to the output JSON file.
         reference_json_file: Path to the reference JSON file.
         test_case_name: Name of the test case to determine which metric to use.
         logger: Optional logger for command execution.
-        
+
     Returns:
         Dictionary with metric results and metadata.
     """
@@ -54,8 +54,13 @@ def check_accuracy_with_dataset(output_json_file,
         "mmmu_pro_vision"
     ]
 
-    # Other datasets to be handled later
-    OTHER_DATASETS = ["mtbench", "coco", "aime", "humaneval", "math500"]
+    # Datasets that use WER (Word Error Rate) for ASR / LibriSpeech
+    WER_DATASETS = ["librispeech_clean_test", "asr_basic"]
+
+    # Other datasets to be handled later (TTS output is audio, not text — skip accuracy)
+    OTHER_DATASETS = [
+        "mtbench", "coco", "aime", "humaneval", "math500", "tts_basic"
+    ]
 
     # Dataset-specific thresholds for ROUGE scores (rouge1, rougeL). Current thresholds are set to 25% for ROUGE-1 and 20% for ROUGE-L.
     ROUGE_THRESHOLDS = {
@@ -77,6 +82,12 @@ def check_accuracy_with_dataset(output_json_file,
         "mmmu_pro_4": 0.30,  # MMMU Pro with 4 options
         "mmmu_pro_10": 0.12,  # MMMU Pro with 10 options - harder
         "mmmu_pro_vision": 0.12,  # MMMU Pro vision tasks
+    }
+
+    # WER threshold (%). Lower is better; pass if WER <= threshold.
+    WER_THRESHOLDS = {
+        "librispeech_clean_test": 25.0,
+        "asr_basic": 25.0,
     }
 
     # Load the output JSON to get prediction count
@@ -214,6 +225,45 @@ def check_accuracy_with_dataset(output_json_file,
 
         except Exception as e:
             raise RuntimeError(f"Failed to run correctness script: {str(e)}")
+
+    elif test_case_name in WER_DATASETS:
+        # Use WER script for LibriSpeech ASR evaluation
+        wer_script = 'examples/accuracy/scripts/calculate_wer_score.py'
+        try:
+            cmd = [
+                'python3', wer_script, '--predictions_file', output_json_file,
+                '--dataset_file', reference_json_file
+            ]
+            cmd_result = run_command(cmd,
+                                     remote_config=None,
+                                     timeout=600,
+                                     logger=logger)
+
+            if not cmd_result['success']:
+                raise RuntimeError(
+                    f"WER calculation failed: {cmd_result.get('error', 'Unknown error')}"
+                )
+
+            output = cmd_result['output']
+            wer_match = re.search(r'WER:\s+([\d.]+)\s*%', output)
+            if not wer_match:
+                raise RuntimeError(
+                    f"Could not parse WER from output: {output}")
+
+            wer_pct = float(wer_match.group(1))
+            result['wer'] = wer_pct
+            result['metric_type'] = 'wer'
+
+            wer_threshold = WER_THRESHOLDS.get(test_case_name, 25.0)
+            if wer_pct > wer_threshold:
+                result['threshold_failure'] = "\n".join([
+                    f"WER above threshold for {test_case_name}",
+                    f"WER: {wer_pct:.2f}% (max allowed: {wer_threshold}%)",
+                    f"Number of predictions: {num_predictions}"
+                ])
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to run WER script: {str(e)}")
 
     elif test_case_name in OTHER_DATASETS:
         # Skip validation for these datasets

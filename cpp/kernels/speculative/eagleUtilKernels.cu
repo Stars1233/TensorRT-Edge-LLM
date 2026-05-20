@@ -1000,7 +1000,7 @@ __global__ void eagleBaseCommitKVCacheBatchedKernel(int32_t const* __restrict__ 
     int32_t const* __restrict__ acceptLengths, int32_t const* __restrict__ kvCacheLengths,
     KVLayerInfo const* __restrict__ layerInfos, int32_t const activeBatchSize, int32_t const maxDepth)
 {
-    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128, "Only HEAD_DIM = 64 or 128 are supported");
+    static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256, "Only HEAD_DIM = 64, 128 or 256 are supported");
     DVec<KV_T> tempBuffer[MAX_PATH];
 
     // Per-layer batched commit. One launch covers all layers in a head-dim group.
@@ -1203,9 +1203,26 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
 #endif
         }
         break;
+    case 256:
+        if (kvCacheType == DataType::kHALF)
+        {
+            eagleBaseCommitKVCacheBatchedKernel<256, MAX_PATH, half><<<gridDim1, blockDim1, 0, stream>>>(
+                acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr, deviceLayerInfos, activeBatchSize, maxDepth);
+        }
+        else
+        {
+#if SUPPORTS_FP8
+            eagleBaseCommitKVCacheBatchedKernel<256, MAX_PATH, __nv_fp8_e4m3><<<gridDim1, blockDim1, 0, stream>>>(
+                acceptedIndicesPtr, acceptLengthsPtr, kvCacheLengthsPtr, deviceLayerInfos, activeBatchSize, maxDepth);
+#else
+            throw std::runtime_error("FP8 KV cache requested but CUDA_VERSION < 11080 (cuda_fp8.h unavailable).");
+#endif
+        }
+        break;
     default:
         throw std::runtime_error(
-            "Only HEAD_DIM = 64 or 128 are supported by eagleBaseCommitKVCache, current HEAD_DIM = "
+            "Only HEAD_DIM = 64, 128 or 256 are supported by eagleBaseCommitKVCacheAndAssembleHiddenState, current "
+            "HEAD_DIM = "
             + std::to_string(headDim));
     }
     CUDA_CHECK(cudaGetLastError());

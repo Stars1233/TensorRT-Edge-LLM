@@ -51,11 +51,16 @@ struct GDNParams
     void* A_log{};
     void* dt_bias{};
     void* h0_source{};
-    void* context_lengths{}; ///< [N] int32 — valid length per batch (decode / sequential prefill)
+    void* context_lengths{}; ///< [N] int32 — valid length per batch (decode / prefill; unused in MTP)
     void* cu_seqlens{};      ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
     void* h0_scratch{};      ///< [N, hv, k, v] f32 — pre-allocated scratch for h0_out (Blackwell prefill);
                              ///<   must be provided by caller (e.g. plugin workspace).
     void* o{};
+
+    // MTP (multi-token) decode fields — used only when use_mtp == true.
+    void* intermediate_states{}; ///< [N, seq_len, HV, K, V] FP32 — per-step h cache for rollback.
+                                 ///<   Must be non-null when use_mtp == true.
+    bool use_mtp{false};         ///< true → MTP decode path (any seq_len).
 
     int32_t n{};
     int32_t seq_len{};
@@ -66,7 +71,17 @@ struct GDNParams
     int32_t smVersion{}; // GPU SM version for dispatch (e.g. 87, 110)
 };
 
-/** Loads AOT .o, fills tensor structs from GDNParams, calls generated wrapper. */
+/** Loads AOT .o, fills tensor structs from GDNParams, calls generated wrapper.
+ *
+ *  Dispatch table (evaluated in order):
+ *    use_mtp == true              → runDecodeMTP()       (MTP: any seq_len)
+ *    seq_len == 1                 → runDecode()          (single-token decode)
+ *    seq_len > 1 && SM >= 100     → runPrefillBlackwell() (Blackwell prefill)
+ *    seq_len > 1                  → runPrefill()          (sequential prefill)
+ *
+ *  MTP note: all batch items process seq_len (T) draft tokens uniformly.
+ *  context_lengths is not used in MTP mode.
+ */
 class CuteDslGDNRunner
 {
 public:
@@ -80,19 +95,21 @@ public:
     static bool loadKernelModules();
     static void unloadKernelModules();
 
-    /** Run GDN: decode when params.seq_len == 1, else prefill (Blackwell or sequential). */
+    /** Run GDN kernel. See class-level dispatch table. */
     int run(GDNParams const& params, cudaStream_t stream);
 
 private:
     int runDecode(GDNParams const& params, cudaStream_t stream);
     int runPrefill(GDNParams const& params, cudaStream_t stream);
     int runPrefillBlackwell(GDNParams const& params, cudaStream_t stream);
+    int runDecodeMTP(GDNParams const& params, cudaStream_t stream);
 
     static gdn_decode_Kernel_Module_t sDecodeModule;
     static gdn_prefill_Kernel_Module_t sPrefillModule;
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
     static gdn_prefill_blackwell_Kernel_Module_t sBlackwellPrefillModule;
 #endif
+    static gdn_decode_mtp_cache_Kernel_Module_t sMTPDecodeCacheModule;
     static bool sLoaded;
 };
 

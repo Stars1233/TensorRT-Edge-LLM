@@ -51,7 +51,14 @@ inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tr
 inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";       //!< Eagle base verification stage
 inline std::string const kCODE2WAV = "code2wav";                                     //!< Code2Wav vocoder stage
 inline std::string const kTALKER_GENERATION = "talker_generation";                   //!< Talker audio frame generation
-inline std::string const kCODE_PREDICTOR = "code_predictor"; //!< CodePredictor RVQ code generation
+inline std::string const kCODE_PREDICTOR
+    = "code_predictor"; //!< CodePredictor RVQ code generation (legacy aggregate; superseded by
+                        //!< kCODEPREDICTOR_PREFILL/kCODEPREDICTOR_GENERATION)
+inline std::string const kCODEPREDICTOR_PREFILL = "codepredictor_prefill"; //!< CodePredictor prefill (per-frame)
+inline std::string const kCODEPREDICTOR_GENERATION
+    = "codepredictor_generation";                                //!< CodePredictor generation loop (per-frame)
+inline std::string const kTALKER_PREFILL = "talker_prefill";     //!< Talker prefill stage (single-shot)
+inline std::string const kACTION_INFERENCE = "action_inference"; //!< Action head trajectory sampling stage
 } // namespace StageNames
 
 /*!
@@ -181,6 +188,56 @@ public:
         totalIterations += iterations;
         totalGeneratedTokens += generatedTokens;
     }
+};
+
+/*!
+ * @brief Omni Talker pipeline metrics
+ *
+ * Tracks audio frame generation, RVQ codes, prefill time, and exit reason.
+ */
+class OmniTalkerMetrics : public BaseMetrics
+{
+public:
+    int64_t totalFrames{0};      //!< Total audio frames generated (each frame = numCodesPerFrame RVQ codes)
+    int64_t totalRvqCodes{0};    //!< Total RVQ codes generated (frames * codesPerFrame)
+    float prefillGpuTimeMs{0};   //!< Talker prefill GPU time in milliseconds
+    int32_t prefillSeqLength{0}; //!< Talker prefill input sequence length
+    std::string exitReason;      //!< "eos" or "max_length"
+    bool isStreaming{false};     //!< Whether streaming mode was used
+
+    void recordRun(int64_t frames, int64_t rvqCodes, float prefillMs, int32_t prefillSeqLen, std::string const& exit,
+        bool streaming) noexcept
+    {
+        if (!getProfilingEnabled())
+        {
+            return;
+        }
+        totalRuns++;
+        totalFrames += frames;
+        totalRvqCodes += rvqCodes;
+        prefillGpuTimeMs = prefillMs;
+        prefillSeqLength = prefillSeqLen;
+        exitReason = exit;
+        isStreaming = streaming;
+    }
+};
+
+/*!
+ * @brief Omni audio latency metrics
+ *
+ * Tracks time to first audio code (TTFA), real-time factor (RTF), and audio output info.
+ * Time to first playable audio (TTFPA) is derived at JSON output time from
+ * talker_generation + code2wav stage times.
+ */
+struct OmniLatencyMetrics
+{
+    float timeToFirstAudioCodeMs{0};     //!< Request start to first codec token sampled (includes Thinker)
+    float timeToFirstPlayableAudioMs{0}; //!< Request start to first playable audio chunk complete
+    float endToEndMs{0};                 //!< Request start to all audio output complete
+    float realTimeFactor{0};             //!< audio_duration / talker_generation_time (< 1.0 = faster than real-time)
+    float audioDurationSeconds{0};       //!< Total audio output duration in seconds
+    int64_t audioSamples{0};             //!< Total audio output samples
+    int32_t sampleRate{24000};           //!< Audio sample rate
 };
 
 } // namespace metrics

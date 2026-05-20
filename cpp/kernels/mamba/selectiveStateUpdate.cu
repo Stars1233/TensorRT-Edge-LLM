@@ -31,6 +31,7 @@
 #include "selectiveStateUpdate.h"
 
 #include "common.cuh"
+#include "common/checkMacros.h"
 #include "conversion.cuh"
 
 #include <cuda_bf16.h>
@@ -421,10 +422,10 @@ struct SsmKernelLauncher
         using load_state_t = PackedAligned<state_t, stateLoadSize>;
 
         auto const stateAlign = std::to_string(sizeof(load_state_t));
-        if (reinterpret_cast<uintptr_t>(params.state) % sizeof(load_state_t) != 0)
-            throw std::runtime_error("state pointer must be aligned to " + stateAlign + " bytes");
-        if ((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) != 0)
-            throw std::runtime_error("state head stride must be aligned to " + stateAlign + " bytes");
+        ELLM_CHECK(reinterpret_cast<uintptr_t>(params.state) % sizeof(load_state_t) == 0,
+            "state pointer must be aligned to " + stateAlign + " bytes");
+        ELLM_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
+            "state head stride must be aligned to " + stateAlign + " bytes");
 
         constexpr int numWarps = 4;
         dim3 block(kWARP_SIZE, numWarps);

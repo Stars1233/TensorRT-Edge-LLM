@@ -113,6 +113,35 @@ bool ActionBuilder::parseConfig()
     std::string modelVersion = mModelConfig.value(binding_names::kEdgellmVersion, "");
     version::checkVersion(modelVersion);
 
+    // Read model architecture parameters
+    if (!mModelConfig.contains("num_hidden_layers"))
+    {
+        LOG_ERROR("num_hidden_layers not found in config.json");
+        return false;
+    }
+    mNumLayers = mModelConfig["num_hidden_layers"].get<int32_t>();
+
+    if (!mModelConfig.contains("num_key_value_heads"))
+    {
+        LOG_ERROR("num_key_value_heads not found in config.json");
+        return false;
+    }
+    mNumHeads = mModelConfig["num_key_value_heads"].get<int32_t>();
+
+    if (!mModelConfig.contains("head_dim"))
+    {
+        LOG_ERROR("head_dim not found in config.json");
+        return false;
+    }
+    mHeadDim = mModelConfig["head_dim"].get<int32_t>();
+
+    if (!mModelConfig.contains("n_diffusion_tokens"))
+    {
+        LOG_ERROR("n_diffusion_tokens not found in config.json");
+        return false;
+    }
+    mNumDiffusionTokens = mModelConfig["n_diffusion_tokens"].get<int32_t>();
+
     return true;
 }
 
@@ -120,17 +149,62 @@ bool ActionBuilder::setupActionOptimizationProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
     auto* profile = builder.createOptimizationProfile();
+    bool result = true;
 
-    bool setShapeValuesStatus{true};
-    setShapeValuesStatus
-        &= profile->setShapeValues("seq_length", nvinfer1::OptProfileSelector::kMIN, &mBuilderConfig.minSeqLen, 1);
-    setShapeValuesStatus
-        &= profile->setShapeValues("seq_length", nvinfer1::OptProfileSelector::kOPT, &mBuilderConfig.optSeqLen, 1);
-    setShapeValuesStatus
-        &= profile->setShapeValues("seq_length", nvinfer1::OptProfileSelector::kMAX, &mBuilderConfig.maxSeqLen, 1);
-    if (!setShapeValuesStatus)
+    // kvcache_start_index: [batch] — one past-KV length per batch row
+    result &= setOptimizationProfile(profile, binding_names::kKVCacheStartIndex, createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+
+    // noise_trajectory: [batch, num_waypoints, 2]
+    result &= setOptimizationProfile(profile, binding_names::kNoiseTrajectory, createDims({1, mNumDiffusionTokens, 2}),
+        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, 2}),
+        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, 2}));
+
+    // rope_rotary_cos_sin: [batch, num_diffusion_tokens, head_dim]
+    result
+        &= setOptimizationProfile(profile, binding_names::kRopeCosSin, createDims({1, mNumDiffusionTokens, mHeadDim}),
+            createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, mHeadDim}),
+            createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens, mHeadDim}));
+
+    // attention_pos_id: [batch, num_diffusion_tokens]
+    result &= setOptimizationProfile(profile, binding_names::kAttentionPosId, createDims({1, mNumDiffusionTokens}),
+        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens}),
+        createDims({mBuilderConfig.maxBatchSize, mNumDiffusionTokens}));
+
+    // k_cache, v_cache: [batch, num_heads, max_capacity, head_dim]
+    int32_t maxKVCacheCapacity = 0;
+    std::string const kCache0Name = binding_names::formatKCacheName(0, true);
+    for (int32_t i = 0; i < network.getNbInputs(); ++i)
     {
-        LOG_ERROR("Failed to set optimization profile for input \"seq_length\"");
+        auto* input = network.getInput(i);
+        if (input->getName() == kCache0Name)
+        {
+            maxKVCacheCapacity = input->getDimensions().d[2];
+        }
+    }
+    if (maxKVCacheCapacity == 0)
+    {
+        LOG_ERROR("Cannot infer maxKVCacheCapacity. Do you have proper k_cache and v_cache inputs in ONNX?");
+        return false;
+    }
+
+    mBuilderConfig.maxKVCacheCapacity = maxKVCacheCapacity;
+
+    nvinfer1::Dims minCacheDims = createDims({1, mNumHeads, maxKVCacheCapacity, mHeadDim});
+    nvinfer1::Dims optCacheDims = createDims({mBuilderConfig.maxBatchSize, mNumHeads, maxKVCacheCapacity, mHeadDim});
+    nvinfer1::Dims maxCacheDims = createDims({mBuilderConfig.maxBatchSize, mNumHeads, maxKVCacheCapacity, mHeadDim});
+
+    for (int32_t i = 0; i < mNumLayers; ++i)
+    {
+        result &= setOptimizationProfile(
+            profile, binding_names::formatKCacheName(i, true).c_str(), minCacheDims, optCacheDims, maxCacheDims);
+        result &= setOptimizationProfile(
+            profile, binding_names::formatVCacheName(i, true).c_str(), minCacheDims, optCacheDims, maxCacheDims);
+    }
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup action optimization profile");
         return false;
     }
 

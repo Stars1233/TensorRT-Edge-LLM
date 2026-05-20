@@ -21,6 +21,7 @@
 #include <forward_list>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <regex>
 #include <string>
 #include <unordered_map>
@@ -226,6 +227,16 @@ public:
         return mUnkId;
     }
 
+    /*!
+     * @brief Get token ID by token string
+     * @param token Token string to look up
+     * @return Token ID, or -1 if not found
+     */
+    Rank getTokenId(std::string const& token) const noexcept
+    {
+        return mTokenEncoder ? mTokenEncoder->getTokenRank(token) : -1;
+    }
+
     /**
      * @brief Check if tokenizer is properly initialized
      * @return true if initialized, false otherwise
@@ -252,6 +263,14 @@ public:
     bool applyChatTemplate(rt::LLMGenerationRequest::Request const& request,
         rt::LLMGenerationRequest::FormattedRequest& formattedRequest, bool applyChatTemplate = true,
         bool addGenerationPrompt = true, bool enableThinking = false) const;
+
+    /*!
+     * @brief Special token string → id map (e.g. Alpamayo trajectory placeholder expansion).
+     */
+    TokenToRanks const& getSpecialTokensEncoder() const noexcept
+    {
+        return mSpecialTokensEncoder;
+    }
 
     /**
      * @brief Get default system prompt from chat template

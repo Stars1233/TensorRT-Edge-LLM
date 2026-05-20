@@ -145,11 +145,14 @@ def compute_wer_single(hypothesis: str, reference: str,
 
 def load_whisper(device: str = "cuda"):
     """Load Whisper-large-v3 for English ASR."""
+    import torch
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     model_id = "openai/whisper-large-v3"
     processor = WhisperProcessor.from_pretrained(model_id)
-    model = WhisperForConditionalGeneration.from_pretrained(model_id)
+    dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    model = WhisperForConditionalGeneration.from_pretrained(model_id,
+                                                            torch_dtype=dtype)
     model = model.to(device)
     model.eval()
     return processor, model
@@ -190,7 +193,9 @@ def transcribe_en_batch(audio_paths: list,
         inputs = processor(wavs,
                            sampling_rate=16000,
                            return_tensors="pt",
-                           padding=True).input_features.to(device)
+                           padding=True).input_features
+        dtype = next(model.parameters()).dtype
+        inputs = inputs.to(device=device, dtype=dtype)
 
         with torch.no_grad():
             predicted_ids = model.generate(
@@ -386,6 +391,11 @@ def find_audio_file(audio_dir: str, request_idx: int,
     path = os.path.join(audio_dir, filename)
     if os.path.exists(path):
         return path
+    if batch_idx == 0:
+        filename = f"audio_req{request_idx}.wav"
+        path = os.path.join(audio_dir, filename)
+        if os.path.exists(path):
+            return path
     return None
 
 

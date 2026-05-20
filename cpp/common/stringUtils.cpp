@@ -17,6 +17,7 @@
 
 #include "stringUtils.h"
 
+#include "common/checkMacros.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -50,10 +51,7 @@ std::string vformat(char const* fmt, va_list args)
     std::string stringBuf(size + 1, char{});
     auto const size2 = std::vsnprintf(&stringBuf[0], size + 1, fmt, args);
 
-    if (size2 != size)
-    {
-        throw std::runtime_error(std::string(std::strerror(errno)));
-    }
+    ELLM_CHECK(size2 == size, std::string(std::strerror(errno)));
     stringBuf.resize(size);
 
     return stringBuf;

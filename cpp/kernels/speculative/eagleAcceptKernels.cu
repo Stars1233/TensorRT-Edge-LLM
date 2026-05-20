@@ -61,10 +61,7 @@ struct EagleAcceptWorkspace
     void setupWorkspace(void* workspace, size_t workspaceSize, int32_t batchSize, int32_t numTokens)
     {
         // Check that workspace is aligned to 256 bytes for optimal GPU memory access
-        if (reinterpret_cast<uintptr_t>(workspace) % 256 != 0)
-        {
-            throw std::runtime_error("Workspace must be aligned to 256 bytes");
-        }
+        ELLM_CHECK(reinterpret_cast<uintptr_t>(workspace) % 256 == 0, "Workspace must be aligned to 256 bytes");
 
         ptr = workspace;
         size = workspaceSize;
@@ -78,11 +75,9 @@ struct EagleAcceptWorkspace
         offset += top1TokensSize;
 
         // Validate workspace size
-        if (offset > workspaceSize)
-        {
-            throw std::runtime_error("Eagle workspace size too small. Required: " + std::to_string(offset)
+        ELLM_CHECK(offset <= workspaceSize,
+            "Eagle workspace size too small. Required: " + std::to_string(offset)
                 + ", provided: " + std::to_string(workspaceSize));
-        }
     }
 };
 
@@ -407,11 +402,9 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
 
     // Validate workspace size
     size_t requiredWorkspaceSize = getEagleAcceptWorkspaceSize(batchSize, numTokens);
-    if (workspaceSize < requiredWorkspaceSize)
-    {
-        throw std::runtime_error("Eagle workspace size too small. Required: " + std::to_string(requiredWorkspaceSize)
+    ELLM_CHECK(workspaceSize >= requiredWorkspaceSize,
+        "Eagle workspace size too small. Required: " + std::to_string(requiredWorkspaceSize)
             + ", provided: " + std::to_string(workspaceSize));
-    }
 
     // Launch kernel
     launchEagleAcceptKernel(logitsPtr, tokenIdsPtr, attentionMaskPtr, acceptedTokenIdsPtr, acceptedLogitsIndicesPtr,

@@ -1,6 +1,6 @@
 # Quantization
 
-Use `experimental.quantization` when you start from an FP16 checkpoint and need to create a unified quantized checkpoint for `llm_loader`.
+Use `experimental.quantization` when you start from an FP16/BF16 checkpoint and need to create a unified quantized checkpoint for `llm_loader`.
 
 The quantization CLI writes a unified HuggingFace-style checkpoint directory that `llm_loader` can export directly.
 
@@ -8,61 +8,68 @@ Skip this step when you already have a supported pre-quantized HuggingFace check
 
 ## Setup
 
+Install `experimental/quantization/requirements.txt` from the Installation Guide before running the quantization CLI.
+
 ```bash
-export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
-python -m experimental.quantization.cli --help
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+cd $EDGE_LLM_PATH
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+python -m experimental.quantization --help
 ```
 
 ## Quantize An LLM
 
 ```bash
-python -m experimental.quantization.cli llm \
-  --model_dir /path/to/Qwen3.5-0.8B \
-  --output_dir /tmp/qwen35_nvfp4 \
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-0.6B \
+  --output_dir /tmp/qwen3_0_6b_nvfp4 \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 ```
 
+The output directory is a HuggingFace-style checkpoint that `llm_loader` can export directly. See [Quick Start Guide](../getting_started/quick-start-guide.md) for the full export-build-inference workflow.
+
 ## Enable FP8 KV Cache
 
 ```bash
-python -m experimental.quantization.cli llm \
-  --model_dir /path/to/Qwen3-8B \
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-8B \
   --output_dir /tmp/qwen3_nvfp4_fp8kv \
   --quantization nvfp4 \
   --kv_cache_quantization fp8
 ```
 
-When this checkpoint is exported with `llm_loader`, FP8 KV cache is detected from the checkpoint metadata automatically.
+When this checkpoint is exported with `llm_loader`, FP8 KV cache is detected from the checkpoint metadata automatically. See [FP8 KV Cache](FP8KV.md) for details on FP8 KV cache behavior and platform requirements.
+
+## Quantize A Visual Tower To FP8
+
+For supported VLM checkpoints, the standalone quantizer can also calibrate the
+visual tower to FP8. Use a multimodal calibration dataset so the visual path sees
+real image activations:
+
+```bash
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-VL-2B-Instruct \
+  --output_dir /tmp/qwen3_vl_fp8_visual \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4 \
+  --visual_quantization fp8 \
+  --dataset lmms-lab/MMMU
+```
 
 ## Quantize An EAGLE3 Draft
 
 ```bash
-python -m experimental.quantization.cli draft \
+python -m experimental.quantization draft \
   --base_model_dir /path/to/base_model \
   --draft_model_dir /path/to/eagle3_draft \
   --output_dir /tmp/eagle3_draft_fp8 \
   --quantization fp8
 ```
 
-## Export The Quantized Checkpoint
+## Quantize Embedding Table To FP8
 
-```bash
-python -m llm_loader.export_all_cli \
-  /tmp/qwen35_nvfp4 \
-  /tmp/qwen35_onnx
-```
-
-To also store the runtime embedding table in FP8:
-
-```bash
-python -m llm_loader.export_all_cli \
-  /tmp/qwen35_nvfp4 \
-  /tmp/qwen35_onnx \
-  --fp8-embedding
-```
-
-Build engines and run inference with the normal C++ tools. See [Quick Start Guide](../getting_started/quick-start-guide.md).
+FP8 embedding quantization is applied at export time via `llm_loader`, not during the quantization step. Pass `--fp8-embedding` when exporting the quantized checkpoint. See [FP8 Embedding](fp8-embedding.md) for details and usage examples.
 
 ## Supported Methods
 
@@ -71,9 +78,10 @@ Build engines and run inference with the normal C++ tools. See [Quick Start Guid
 | Backbone | `fp8`, `int4_awq`, `nvfp4`, `mxfp8`, `int8_sq` |
 | LM head | `fp8`, `int4_awq`, `nvfp4`, `mxfp8` |
 | KV cache | `fp8` |
+| Visual tower | `fp8` |
 
 ## Notes
 
 - The package writes unified checkpoints only. It does not export ONNX or build TensorRT engines.
-- Audio and visual calibration are not implemented.
+- Audio calibration is not implemented.
 - GPTQ checkpoints are loaded as pre-quantized checkpoints; this package does not create GPTQ models.

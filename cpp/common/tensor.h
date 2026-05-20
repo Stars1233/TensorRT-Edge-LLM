@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "common/checkMacros.h"
 #include "cudaMacros.h"
 #include <NvInferRuntime.h>
 #include <algorithm>
@@ -138,10 +139,7 @@ public:
     Coords(IT begin, IT end)
         : mNumDims(std::distance(begin, end))
     {
-        if (mNumDims > kMAX_DIMS)
-        {
-            throw std::runtime_error("Coords: number of dimensions out of range");
-        }
+        ELLM_CHECK(mNumDims <= kMAX_DIMS, "Coords: number of dimensions out of range");
         std::copy(begin, end, mDims.begin());
     }
 

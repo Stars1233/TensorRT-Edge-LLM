@@ -264,6 +264,24 @@ private:
     bool setupConvStateProfiles(
         nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
 
+    //! Set up optimization profiles for MTP intermediate recurrent state output tensors.
+    //! These are per-step checkpoints of GDN recurrent states during tree verification.
+    //! Only needed when model_type is "mtp_base".
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupIntermediateRecurrentStateProfiles(
+        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+
+    //! Set up optimization profiles for MTP intermediate conv state output tensors.
+    //! These are per-step checkpoints of conv1d states during tree verification.
+    //! Only needed when model_type is "mtp_base".
+    //! @param contextProfile Optimization profile for context processing
+    //! @param generationProfile Optimization profile for generation processing
+    //! @return true if setup was successful, false otherwise
+    bool setupIntermediateConvStateProfiles(
+        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config
     //! and builder configuration parameters.

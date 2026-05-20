@@ -20,6 +20,7 @@
 #include "cuteDslSSDRunner.h"
 
 #include "common/logger.h"
+#include "ssdVarlenMetadata.h"
 
 #include <algorithm>
 #include <cmath>
@@ -34,7 +35,9 @@ ssd_prefill_d128_n64_Kernel_Module_t CuteDslSSDRunner::sD128N64Module = {};
 ssd_prefill_d64_n64_Kernel_Module_t CuteDslSSDRunner::sD64N64Module = {};
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
 ssd_prefill_blackwell_d64_n128_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N128Module = {};
+ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N128InitStatesModule = {};
 ssd_prefill_blackwell_d64_n64_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N64Module = {};
+ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N64InitStatesModule = {};
 #endif
 bool CuteDslSSDRunner::sLoaded = false;
 
@@ -108,8 +111,10 @@ bool CuteDslSSDRunner::loadKernelModules()
         ssd_prefill_d64_n64_Kernel_Module_Load(&sD64N64Module);
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
         ssd_prefill_blackwell_d64_n128_Kernel_Module_Load(&sBlackwellD64N128Module);
+        ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Load(&sBlackwellD64N128InitStatesModule);
         ssd_prefill_blackwell_d64_n64_Kernel_Module_Load(&sBlackwellD64N64Module);
-        LOG_DEBUG("CuTe DSL SSD kernel modules (4 SM80 + 2 Blackwell) loaded");
+        ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_Load(&sBlackwellD64N64InitStatesModule);
+        LOG_DEBUG("CuTe DSL SSD kernel modules (4 SM80 + 4 Blackwell) loaded");
 #else
         LOG_DEBUG("CuTe DSL SSD kernel modules (4 SM80 variants) loaded");
 #endif
@@ -134,7 +139,9 @@ void CuteDslSSDRunner::unloadKernelModules()
         ssd_prefill_d64_n64_Kernel_Module_Unload(&sD64N64Module);
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
         ssd_prefill_blackwell_d64_n128_Kernel_Module_Unload(&sBlackwellD64N128Module);
+        ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Unload(&sBlackwellD64N128InitStatesModule);
         ssd_prefill_blackwell_d64_n64_Kernel_Module_Unload(&sBlackwellD64N64Module);
+        ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_Unload(&sBlackwellD64N64InitStatesModule);
 #endif
         sLoaded = false;
     }
@@ -200,6 +207,10 @@ int CuteDslSSDRunner::run(SSDParams const& params, cudaStream_t stream)
         PREFIX##_Tensor_final_states_t finalStatesTensor{};                                                            \
         SET_4D_TENSOR(finalStatesTensor, params.state, n, nheads, dim, dstate);                                        \
                                                                                                                        \
+        /* init_states aliases params.state: kernel reads init at chunk 0, overwrites with final. */                   \
+        PREFIX##_Tensor_init_states_t initStatesTensor{};                                                              \
+        SET_4D_TENSOR(initStatesTensor, params.state, n, nheads, dim, dstate);                                         \
+                                                                                                                       \
         void* ws = params.workspace;                                                                                   \
         size_t offset = 0;                                                                                             \
                                                                                                                        \
@@ -226,12 +237,27 @@ int CuteDslSSDRunner::run(SSDParams const& params, cudaStream_t stream)
         SET_5D_TENSOR(cbTensor, static_cast<char*>(ws) + offset, n, nchunks, ngroups, 128, 128);                       \
         offset += cbBytes;                                                                                             \
                                                                                                                        \
+        /* Memset must precede cl synth: same-stream memset would clobber the just-filled cl[]. */                     \
         cudaMemsetAsync(ws, 0, offset, stream);                                                                        \
                                                                                                                        \
+        /* Synth cl[b] = seq_len when caller passes null (kernel always reads context_lengths). */                     \
+        int32_t const* clPtr = reinterpret_cast<int32_t const*>(params.context_lengths);                               \
+        if (clPtr == nullptr)                                                                                          \
+        {                                                                                                              \
+            size_t clBytes = static_cast<size_t>(n) * sizeof(int32_t);                                                 \
+            int32_t* dCl = reinterpret_cast<int32_t*>(static_cast<char*>(ws) + offset);                                \
+            offset += clBytes;                                                                                         \
+            ::trt_edgellm::mamba::fillUniformValidLens(dCl, n, seq_len, stream);                                       \
+            clPtr = dCl;                                                                                               \
+        }                                                                                                              \
+        PREFIX##_Tensor_context_lengths_t clTensor{};                                                                  \
+        clTensor.data = const_cast<int32_t*>(clPtr);                                                                   \
+        clTensor.dynamic_shapes[0] = n;                                                                                \
+                                                                                                                       \
         return cute_dsl_##PREFIX##_wrapper(&(MODULE), &xTensor, &dtTensor, &aTensor, &bTensor, &cTensor, &dTensor,     \
-            &dtBiasTensor, &zTensor, &outputTensor, &finalStatesTensor, &dACumsumTensor, &dtProcTensor,                \
-            &statesTensor, &prevStatesTensor, &cbTensor, seq_len, nchunks, n, nheads, nheads_ngroups_ratio,            \
-            ngroups, stream);                                                                                          \
+            &dtBiasTensor, &zTensor, &outputTensor, &finalStatesTensor, &initStatesTensor,                             \
+            &dACumsumTensor, &dtProcTensor, &statesTensor, &prevStatesTensor, &cbTensor, &clTensor,                    \
+            nchunks, n, nheads, nheads_ngroups_ratio, ngroups, stream);                                                \
     } while (0)
 // clang-format on
 
@@ -240,6 +266,13 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
     if (!sLoaded)
     {
         LOG_ERROR("CuTe DSL SSD prefill kernel module not loaded.");
+        return -1;
+    }
+    // buildSSDVarlenMetadata launches a single-block kernel; batch must fit one CTA's
+    // 1024-thread cap. Production Nemotron-H workloads use batch <= 8.
+    if (params.batch > 1024)
+    {
+        LOG_ERROR("CuTe DSL SSD prefill: batch=%d exceeds supported maximum (1024)", params.batch);
         return -1;
     }
 
@@ -278,35 +311,41 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
 
 // Macro to fill tensor structs and call the Blackwell wrapper for a given variant prefix.
-// All Blackwell D=64 variants share the same struct layout — only the type name prefix differs.
+// All Blackwell D=64 variants share the same struct layout: only the type name prefix differs.
 // Relies on local variables: params, n, seq_len, nheads, dim, dstate, ngroups, nchunks, stream.
+// Plugin contract is padded [B,S,...]+context_lengths; runner reshapes to [1,B*S,...] via
+// stride change (zero data movement), passes context_lengths as valid_lens for end-of-seq clamp.
 // clang-format off
 #define CALL_SSD_PREFILL_BLACKWELL(PREFIX, MODULE)                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
+        /* Reshape padded [B,T,...] to [1,B*T,...] (zero data movement); kernel hardcodes b_idx=0. */                  \
+        int32_t const total_seq = n * seq_len;                                                                         \
+        int32_t const total_chunks = n * nchunks;                                                                      \
+                                                                                                                       \
         PREFIX##_Tensor_x_t xTensor{};                                                                                 \
-        SET_4D_TENSOR(xTensor, params.x, n, seq_len, nheads, dim);                                                     \
+        SET_4D_TENSOR(xTensor, params.x, 1, total_seq, nheads, dim);                                                   \
                                                                                                                        \
         PREFIX##_Tensor_dt_in_t dtTensor{};                                                                            \
-        SET_3D_TENSOR(dtTensor, params.dt, n, seq_len, nheads);                                                        \
+        SET_3D_TENSOR(dtTensor, params.dt, 1, total_seq, nheads);                                                      \
                                                                                                                        \
         PREFIX##_Tensor_A_t aTensor{};                                                                                 \
         SET_1D_TENSOR(aTensor, params.A, nheads);                                                                      \
                                                                                                                        \
         PREFIX##_Tensor_B_t bTensor{};                                                                                 \
-        SET_4D_TENSOR(bTensor, params.B, n, seq_len, ngroups, dstate);                                                 \
+        SET_4D_TENSOR(bTensor, params.B, 1, total_seq, ngroups, dstate);                                               \
                                                                                                                        \
         PREFIX##_Tensor_C_t cTensor{};                                                                                 \
-        SET_4D_TENSOR(cTensor, params.C, n, seq_len, ngroups, dstate);                                                 \
+        SET_4D_TENSOR(cTensor, params.C, 1, total_seq, ngroups, dstate);                                               \
                                                                                                                        \
-        PREFIX##_Tensor_D_fp32_t dTensor{};                                                                            \
+        PREFIX##_Tensor_Dvec_t dTensor{};                                                                              \
         SET_1D_TENSOR(dTensor, params.D, nheads);                                                                      \
                                                                                                                        \
         PREFIX##_Tensor_dt_bias_t dtBiasTensor{};                                                                      \
         SET_1D_TENSOR(dtBiasTensor, params.dt_bias, nheads);                                                           \
                                                                                                                        \
         PREFIX##_Tensor_output_t outputTensor{};                                                                       \
-        SET_4D_TENSOR(outputTensor, params.output, n, seq_len, nheads, dim);                                           \
+        SET_4D_TENSOR(outputTensor, params.output, 1, total_seq, nheads, dim);                                         \
                                                                                                                        \
         PREFIX##_Tensor_state_t stateTensor{};                                                                         \
         SET_4D_TENSOR(stateTensor, params.state, n, nheads, dim, dstate);                                              \
@@ -314,37 +353,86 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
         void* ws = params.workspace;                                                                                   \
         size_t offset = 0;                                                                                             \
                                                                                                                        \
-        size_t cumsumBytes = static_cast<size_t>(n) * nheads * nchunks * 128 * sizeof(float);                          \
+        size_t cumsumBytes = static_cast<size_t>(1) * nheads * total_chunks * 128 * sizeof(float);                     \
         PREFIX##_Tensor_dA_cumsum_t cumsumTensor{};                                                                    \
-        SET_4D_TENSOR(cumsumTensor, static_cast<char*>(ws) + offset, n, nheads, nchunks, 128);                         \
+        SET_4D_TENSOR(cumsumTensor, static_cast<char*>(ws) + offset, 1, nheads, total_chunks, 128);                    \
         offset += cumsumBytes;                                                                                         \
                                                                                                                        \
-        size_t dtProcBytes = static_cast<size_t>(n) * nheads * nchunks * 128 * sizeof(__half);                         \
+        size_t dtProcBytes = static_cast<size_t>(1) * nheads * total_chunks * 128 * sizeof(__half);                    \
         PREFIX##_Tensor_dt_proc_t dtProcTensor{};                                                                      \
-        SET_4D_TENSOR(dtProcTensor, static_cast<char*>(ws) + offset, n, nheads, nchunks, 128);                         \
+        SET_4D_TENSOR(dtProcTensor, static_cast<char*>(ws) + offset, 1, nheads, total_chunks, 128);                    \
         offset += dtProcBytes;                                                                                         \
                                                                                                                        \
-        size_t yBytes = static_cast<size_t>(n) * nheads * dim * nchunks * 128 * sizeof(__half);                        \
+        /* y_ws layout [B,EH,D,C,L] with L stride 1: TMA descriptor / smem swizzle constraint. */                      \
+        size_t yBytes = static_cast<size_t>(1) * nheads * dim * total_chunks * 128 * sizeof(__half);                   \
         PREFIX##_Tensor_y_ws_t yTensor{};                                                                              \
-        SET_5D_TENSOR(yTensor, static_cast<char*>(ws) + offset, n, nheads, dim, nchunks, 128);                         \
+        SET_5D_TENSOR(yTensor, static_cast<char*>(ws) + offset, 1, nheads, dim, total_chunks, 128);                    \
         offset += yBytes;                                                                                              \
                                                                                                                        \
-        size_t fstateBytes = static_cast<size_t>(n) * nheads * dim * dstate * sizeof(__half);                          \
-        PREFIX##_Tensor_fstate_ws_t fstateTensor{};                                                                    \
-        SET_4D_TENSOR(fstateTensor, static_cast<char*>(ws) + offset, n, nheads, dim, dstate);                          \
-        offset += fstateBytes;                                                                                         \
+        /* Varlen metadata (always-varlen at AOT: uniform batch synthesizes degenerate metadata). */                   \
+        size_t seqIdxBytes = static_cast<size_t>(n) * seq_len * sizeof(int32_t);                                       \
+        int32_t* dSeqIdx = reinterpret_cast<int32_t*>(static_cast<char*>(ws) + offset);                                \
+        offset += seqIdxBytes;                                                                                         \
                                                                                                                        \
-        size_t dFp16Bytes = static_cast<size_t>(nheads) * sizeof(__half);                                              \
-        PREFIX##_Tensor_D_fp16_t dFp16Tensor{};                                                                        \
-        SET_1D_TENSOR(dFp16Tensor, static_cast<char*>(ws) + offset, nheads);                                           \
-        offset += dFp16Bytes;                                                                                          \
+        size_t chunkBytes = static_cast<size_t>(n) * nchunks * sizeof(int32_t);                                        \
+        int32_t* dChunkIndices = reinterpret_cast<int32_t*>(static_cast<char*>(ws) + offset);                          \
+        offset += chunkBytes;                                                                                          \
+        int32_t* dChunkOffsets = reinterpret_cast<int32_t*>(static_cast<char*>(ws) + offset);                          \
+        offset += chunkBytes;                                                                                          \
+                                                                                                                       \
+        size_t cumsumChunkBytes = static_cast<size_t>(n + 1) * sizeof(int32_t);                                        \
+        int32_t* dSeqChunkCumsum = reinterpret_cast<int32_t*>(static_cast<char*>(ws) + offset);                        \
+        offset += cumsumChunkBytes;                                                                                    \
                                                                                                                        \
         cudaMemsetAsync(ws, 0, offset, stream);                                                                        \
                                                                                                                        \
+        /* Build metadata fully on-device: CUDA-graph-compatible, no D2H sync. */                                      \
+        int32_t const numLogicalChunks = n * nchunks;                                                                  \
+        int32_t const numSeqs = n;                                                                                     \
+        ::trt_edgellm::mamba::buildSSDVarlenMetadata(                                                                  \
+            dSeqIdx, dChunkIndices, dChunkOffsets, dSeqChunkCumsum,                                                    \
+            reinterpret_cast<int32_t const*>(params.context_lengths),                                                  \
+            n, seq_len, 128, stream);                                                                                  \
+                                                                                                                       \
+        PREFIX##_Tensor_seq_idx_t seqIdxTensor{};                                                                      \
+        seqIdxTensor.data = dSeqIdx;                                                                                   \
+        seqIdxTensor.dynamic_shapes[0] = n;                                                                            \
+        seqIdxTensor.dynamic_shapes[1] = seq_len;                                                                      \
+        seqIdxTensor.dynamic_strides[0] = seq_len;                                                                     \
+                                                                                                                       \
+        PREFIX##_Tensor_chunk_indices_t chunkIndicesTensor{};                                                          \
+        chunkIndicesTensor.data = dChunkIndices;                                                                       \
+        chunkIndicesTensor.dynamic_shapes[0] = numLogicalChunks;                                                       \
+                                                                                                                       \
+        PREFIX##_Tensor_chunk_offsets_t chunkOffsetsTensor{};                                                          \
+        chunkOffsetsTensor.data = dChunkOffsets;                                                                       \
+        chunkOffsetsTensor.dynamic_shapes[0] = numLogicalChunks;                                                       \
+                                                                                                                       \
+        PREFIX##_Tensor_seq_chunk_cumsum_t seqChunkCumsumTensor{};                                                     \
+        seqChunkCumsumTensor.data = dSeqChunkCumsum;                                                                   \
+        seqChunkCumsumTensor.dynamic_shapes[0] = numSeqs + 1;                                                          \
+                                                                                                                       \
+        /* Synth valid_lens[b] = seq_len when caller passes null (kernel always reads context_lengths). */             \
+        int32_t const* validLensPtr = reinterpret_cast<int32_t const*>(params.context_lengths);                        \
+        int32_t* dValidLensSynth = nullptr;                                                                            \
+        if (validLensPtr == nullptr)                                                                                   \
+        {                                                                                                              \
+            size_t validLensBytes = static_cast<size_t>(n) * sizeof(int32_t);                                          \
+            dValidLensSynth = reinterpret_cast<int32_t*>(static_cast<char*>(ws) + offset);                             \
+            offset += validLensBytes;                                                                                  \
+            ::trt_edgellm::mamba::fillUniformValidLens(dValidLensSynth, n, seq_len, stream);                           \
+            validLensPtr = dValidLensSynth;                                                                            \
+        }                                                                                                              \
+        PREFIX##_Tensor_valid_lens_t validLensTensor{};                                                                \
+        validLensTensor.data = const_cast<int32_t*>(validLensPtr);                                                     \
+        validLensTensor.dynamic_shapes[0] = n;                                                                         \
+                                                                                                                       \
         return cute_dsl_##PREFIX##_wrapper(&(MODULE), &xTensor, &dtTensor, &aTensor, &bTensor, &cTensor, &dTensor,     \
             &dtBiasTensor, &outputTensor, &stateTensor,                                                                \
-            &cumsumTensor, &dtProcTensor, &yTensor, &fstateTensor, &dFp16Tensor,                                       \
-            seq_len, nchunks, stream);                                                                                 \
+            &cumsumTensor, &dtProcTensor, &yTensor,                                                                    \
+            &seqIdxTensor, &chunkIndicesTensor, &chunkOffsetsTensor, &seqChunkCumsumTensor,                            \
+            &validLensTensor,                                                                                          \
+            total_seq, total_chunks, numLogicalChunks, numSeqs, stream);                                               \
     } while (0)
 // clang-format on
 
@@ -353,6 +441,11 @@ int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t 
     if (!sLoaded)
     {
         LOG_ERROR("CuTe DSL SSD Blackwell prefill kernel module not loaded.");
+        return -1;
+    }
+    if (params.batch > 1024)
+    {
+        LOG_ERROR("CuTe DSL SSD Blackwell prefill: batch=%d exceeds supported maximum (1024)", params.batch);
         return -1;
     }
 
@@ -364,13 +457,20 @@ int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t 
     int32_t const ngroups = params.ngroups;
     int32_t const nchunks = (seq_len + 127) / 128;
 
+    // Dispatch on (dstate, has_init_states).
     if (dstate == 128)
     {
-        CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128, sBlackwellD64N128Module);
+        if (params.has_init_states)
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128_init_states, sBlackwellD64N128InitStatesModule);
+        else
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128, sBlackwellD64N128Module);
     }
     else if (dstate == 64)
     {
-        CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64, sBlackwellD64N64Module);
+        if (params.has_init_states)
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64_init_states, sBlackwellD64N64InitStatesModule);
+        else
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64, sBlackwellD64N64Module);
     }
 
     LOG_ERROR("CuTe DSL SSD Blackwell prefill: unsupported dstate=%d", dstate);
@@ -391,15 +491,19 @@ size_t CuteDslSSDRunner::getWorkspaceSize(
     size += static_cast<size_t>(batch) * nchunks * nheads * dim * dstate * sizeof(float); // states
     size += static_cast<size_t>(batch) * nchunks * nheads * dim * dstate * sizeof(float); // prev_states
     size += static_cast<size_t>(batch) * nchunks * ngroups * 128 * 128 * sizeof(float);   // CB
+    size += static_cast<size_t>(batch) * sizeof(int32_t); // cl synth fallback when context_lengths is null
 
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
-    // Blackwell workspace: cumsum_delta(fp32) + delta(fp16) + y(fp16) + fstate(fp16)
+    // y_ws holds [B,EH,D,C,L] (L innermost: smem swizzle constraint); transposed post-kernel.
     size_t bwSize = 0;
     bwSize += static_cast<size_t>(batch) * nheads * nchunks * 128 * sizeof(float);        // cumsum_delta
     bwSize += static_cast<size_t>(batch) * nheads * nchunks * 128 * sizeof(__half);       // delta
-    bwSize += static_cast<size_t>(batch) * nheads * dim * nchunks * 128 * sizeof(__half); // y
-    bwSize += static_cast<size_t>(batch) * nheads * dim * dstate * sizeof(__half);        // fstate
-    bwSize += static_cast<size_t>(nheads) * sizeof(__half);                               // D fp16
+    bwSize += static_cast<size_t>(batch) * nheads * dim * nchunks * 128 * sizeof(__half); // y_ws
+    bwSize += static_cast<size_t>(batch) * seqLen * sizeof(int32_t);                      // seq_idx
+    bwSize += static_cast<size_t>(batch) * nchunks * sizeof(int32_t);                     // chunk_indices
+    bwSize += static_cast<size_t>(batch) * nchunks * sizeof(int32_t);                     // chunk_offsets
+    bwSize += static_cast<size_t>(batch + 1) * sizeof(int32_t);                           // seq_chunk_cumsum
+    bwSize += static_cast<size_t>(batch) * sizeof(int32_t); // valid_lens (synth fallback when context_lengths is null)
     size = std::max(size, bwSize);
 #endif
     return size;

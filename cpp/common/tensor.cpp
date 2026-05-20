@@ -19,6 +19,7 @@
 #include "checkMacros.h"
 #include "logger.h"
 
+#include "common/checkMacros.h"
 #include <sstream>
 
 using namespace nvinfer1;
@@ -142,10 +143,7 @@ std::string Coords::formatString() const
 
 Tensor::Tensor(Coords const& shape, DeviceType deviceType, nvinfer1::DataType dataType, std::string const& name)
 {
-    if (shape.volume() == 0)
-    {
-        throw std::runtime_error("Construction of Tensor object with zero volume is prohibited");
-    }
+    ELLM_CHECK(shape.volume() > 0, "Construction of Tensor object with zero volume is prohibited");
 #if NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 8
     if (dataType == DataType::kINT4 || dataType == DataType::kFP4)
 #else

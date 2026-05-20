@@ -23,6 +23,7 @@
 
 #include "NvFP4MoEContiguousGemmRunner.h"
 
+#include "common/checkMacros.h"
 #include <stdexcept>
 #include <string>
 
@@ -109,17 +110,10 @@ void NvFP4MoEContiguousGemmRunner::run(void const* gatheredFP4, void const* weig
     cudaStream_t stream)
 {
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-    if (!sLoaded)
-    {
-        throw std::runtime_error("NvFP4MoEContiguousGemmRunner: kernel modules not loaded");
-    }
+    ELLM_CHECK(sLoaded, "kernel modules not loaded");
 
     int32_t const tactic = selectTactic(mN, mK);
-    if (tactic == 0)
-    {
-        throw std::runtime_error(
-            "NvFP4MoEContiguousGemmRunner: no valid tactic for N=" + std::to_string(mN) + " K=" + std::to_string(mK));
-    }
+    ELLM_CHECK(tactic > 0, "no valid tactic for N=" + std::to_string(mN) + " K=" + std::to_string(mK));
 
     bool const isSwiglu = (mActivation == Activation::kSwiglu);
     int64_t const n = static_cast<int64_t>(mN);

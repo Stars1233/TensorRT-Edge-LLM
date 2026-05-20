@@ -110,10 +110,8 @@ def get_audio_calib_dataloader(model,
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
 
-        mel = torch.from_numpy(
-            extract_mel_spectrogram(audio,
-                                    sample_rate=sr,
-                                    feature_size=num_mel_bins))
+        mel_np, _ = extract_mel_spectrogram(audio, sample_rate=sr)
+        mel = torch.from_numpy(mel_np)
         _, T = mel.shape
 
         num_chunks = min(max(1, T // chunk_length), max_chunks)

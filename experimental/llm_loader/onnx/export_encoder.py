@@ -26,12 +26,14 @@ Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - InternVL3        (model_type ``internvl_chat``)
     - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
-    - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2``)
+    - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2`` or
+      ``NemotronH_Nano_Omni_Reasoning_V3``)
 
 Audio encoders — I/O spec defined internally or via ``model.get_onnx_export_args``:
     - Qwen3-ASR    (model_type ``qwen3_asr``)
     - Qwen3-Omni   (model_type ``qwen3_omni``, ``qwen3_omni_thinker``)
-    - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2``)
+    - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2`` or
+      ``NemotronH_Nano_Omni_Reasoning_V3``)
 
 Note: Qwen3-TTS has NO audio encoder.  Its Talker/CodePredictor are LLM
 decoders exported via the standard LLM pipeline.
@@ -42,23 +44,35 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
 from .dynamo_translations import build_custom_translation_table
-from .export import _OPSET_VERSION, _permissive_inline_opset
+from .export import (_OPSET_VERSION, _fix_initializer_dtypes,
+                     _fix_nvfp4_weight_dtype, _permissive_inline_opset,
+                     _strip_onnxscript_internal_attrs)
+
+if TYPE_CHECKING:
+    from ..config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "export_visual_onnx",
     "export_audio_onnx",
+    "export_action_onnx",
 ]
 
 # ---------------------------------------------------------------------------
 # Visual encoder registry
 # ---------------------------------------------------------------------------
+
+_NEMOTRON_OMNI_MODEL_TYPES: frozenset[str] = frozenset([
+    "NemotronH_Nano_VL_V2",
+    "NemotronH_Nano_Omni_Reasoning_V3",
+])
 
 # Maps model_type → internal family name
 _VISUAL_REGISTRY: dict[str, str] = {
@@ -71,6 +85,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
+    "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
 }
 
 # Maps family → dotted module path inside llm_loader
@@ -110,7 +125,7 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
-    "NemotronH_Nano_VL_V2",
+    *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
 
@@ -136,7 +151,8 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if model_type in ("internvl", "internvl_chat", "NemotronH_Nano_VL_V2"):
+    if (model_type in ("internvl", "internvl_chat")
+            or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
         # InternVL / Nemotron-Omni need the full config (vision + text + downsample_ratio)
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
@@ -203,21 +219,25 @@ def export_visual_onnx(
     weights: dict,
     config: dict,
     model_type: str,
+    model_config: "ModelConfig",
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
 ) -> None:
     """Export a from-scratch visual encoder to ONNX.
 
     Args:
-        model_dir:   Source checkpoint directory (for reference; weights already
-                     loaded by the caller).
-        output_path: Destination ``.onnx`` file path.
-        weights:     Flat ``{key: tensor}`` dict loaded from safetensors.
-        config:      Full model ``config.json`` dict.
-        model_type:  Value of ``config.json["model_type"]``.
-        dtype:       Weight dtype (default ``float16``).
-        device:      CUDA device string for tracing (default ``"cuda"``).
+        model_dir:    Source checkpoint directory (for reference; weights
+                      already loaded by the caller).
+        output_path:  Destination ``.onnx`` file path.
+        weights:      Flat ``{key: tensor}`` dict loaded from safetensors.
+        config:       Full model ``config.json`` dict.
+        model_type:   Value of ``config.json["model_type"]``.
+        model_config: Top-level ``ModelConfig``.  All family ``build_fn``s
+                      accept it and dispatch their linear layers through
+                      ``make_linear``; an FP16 checkpoint produces
+                      ``FP16Linear`` everywhere.
+        dtype:        Weight dtype (default ``float16``).
     """
+    device = "cpu"
     if model_type not in _VISUAL_REGISTRY:
         raise ValueError(f"Unsupported visual model_type {model_type!r}. "
                          f"Supported: {sorted(_VISUAL_REGISTRY)}")
@@ -227,16 +247,21 @@ def export_visual_onnx(
     vcfg = _get_visual_config(model_type, config)
 
     # Build the from-scratch model.
-    # Use a package-relative import so this works regardless of whether
-    # experimental/ is on sys.path (importlib.import_module with an absolute
-    # "llm_loader.*" name fails when the package was loaded via sys.path on
-    # the experimental/ directory rather than installed).
-    _pkg_root = __package__.split(".")[0]  # "llm_loader"
-    _rel = "." + _VISUAL_FAMILY_MODULE[family][len(_pkg_root):]
+    # Use a package-relative import so this works regardless of whether the
+    # package is loaded as ``llm_loader.*`` (top-level on sys.path) or
+    # ``experimental.llm_loader.*`` (when experimental/ is the package root).
+    # ``_VISUAL_FAMILY_MODULE`` entries are written as ``llm_loader.<sub>``;
+    # strip that fixed prefix and prepend ``..`` so the relative import lands
+    # on the sibling-of-onnx ``models.<family>.*`` either way.
+    _PKG_ROOT = "llm_loader"
+    _rel = "." + _VISUAL_FAMILY_MODULE[family][len(_PKG_ROOT):]
     mod = importlib.import_module(_rel, package=__package__)
     build_fn = getattr(mod, _VISUAL_FAMILY_BUILD_FN[family])
     logger.info("Building %s visual model ...", family)
-    visual_model: nn.Module = build_fn(vcfg, weights, dtype)
+    visual_model: nn.Module = build_fn(vcfg,
+                                       weights,
+                                       model_config=model_config,
+                                       dtype=dtype)
     visual_model = visual_model.to(device)
     visual_model.eval()
 
@@ -246,6 +271,24 @@ def export_visual_onnx(
 
     _run_dynamo_export(visual_model, args, output_path, input_names,
                        output_names, dynamic_shapes)
+
+    # TRT-compat post-processing for quantized weights — same passes the LLM
+    # path runs in ``export.py``.  Without these, NVFP4 weights stay as INT8
+    # initializers and TRT's DequantizeLinear can't expand the packed dim.
+    if model_config is not None:
+        nvfp4 = model_config.quant.uses_nvfp4_weights
+        mxfp8 = model_config.quant.uses_mxfp8_weights
+        if nvfp4:
+            _fix_nvfp4_weight_dtype(output_path)
+        if mxfp8:
+            _strip_onnxscript_internal_attrs(output_path)
+        if nvfp4 or mxfp8:
+            # Visual graphs legitimately keep FP32 constants from in-body
+            # ``.float()`` casts (RMSNorm computes in FP32); skip the FP32→FP16
+            # downgrade that the LLM path uses for tied-lm_head BF16 fixup.
+            _fix_initializer_dtypes(output_path,
+                                    dedup_dql_scales=True,
+                                    cast_fp32_weights_to_fp16=False)
 
     # Phi-4mm sidecar tensors (GN projection weights)
     if family == "phi4mm":
@@ -314,7 +357,6 @@ def export_audio_onnx(
     config: dict,
     model_type: str,
     dtype: torch.dtype = torch.float16,
-    device: str = "cuda",
 ) -> None:
     """Export a from-scratch audio encoder to ONNX.
 
@@ -325,14 +367,14 @@ def export_audio_onnx(
         config:      Full ``config.json`` dict.
         model_type:  Value of ``config.json["model_type"]``.
         dtype:       Weight dtype (default ``float16``).
-        device:      CUDA device for tracing (default ``"cuda"``).
     """
+    device = "cpu"
     if model_type not in _AUDIO_MODEL_TYPES:
         raise ValueError(f"Unsupported audio model_type {model_type!r}. "
                          f"Supported: {sorted(_AUDIO_MODEL_TYPES)}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    if model_type == "NemotronH_Nano_VL_V2":
+    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")
@@ -359,3 +401,76 @@ def export_audio_onnx(
 
     _run_dynamo_export(audio_model, args, output_path, input_names,
                        output_names, dynamic_shapes)
+
+
+# ---------------------------------------------------------------------------
+# Action expert export (Alpamayo)
+# ---------------------------------------------------------------------------
+
+
+def export_action_onnx(
+    output_path: str,
+    weights: dict,
+    config: "ActionConfig",
+    max_kv_cache_capacity: int,
+    dtype: torch.dtype = torch.float16,
+) -> None:
+    """Export Alpamayo action expert (one flow-matching step) to ONNX.
+
+    Args:
+        output_path: Destination ``.onnx`` file path.
+        weights:     Flat ``{key: tensor}`` dict from safetensors (must include
+                     ``expert.*``, ``action_in_proj.*``, ``action_out_proj.*``).
+        config:      :class:`~config.ActionConfig` with expert hyperparameters.
+        max_kv_cache_capacity: Fixed KV cache capacity (must match LLM engine).
+        dtype:       Weight dtype (default ``float16``).
+    """
+    device = "cpu"
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    from ..models.alpamayo.modeling_alpamayo_action import \
+        build_alpamayo_1_action
+    logger.info("Building Alpamayo action expert ...")
+    model = build_alpamayo_1_action(config, weights, dtype)
+    model = model.to(device)
+    model.eval()
+
+    args, input_names, output_names, dynamic_shapes = (
+        model.get_onnx_export_args(max_kv_cache_capacity, device))
+
+    _run_dynamo_export(model, args, output_path, input_names, output_names,
+                       dynamic_shapes)
+
+
+def write_action_config(config: "ActionConfig", max_kv_cache_capacity: int,
+                        out_dir: str) -> None:
+    """Write the action config.json for the C++ runtime."""
+    import json
+    os.makedirs(out_dir, exist_ok=True)
+    rope_scaling = {
+        "mrope_section": config.mrope_section,
+        "mrope_interleaved": config.mrope_interleaved,
+        "rope_type": "mrope",
+        "type": "mrope",
+    }
+    cfg_out = {
+        "rope_theta": config.rope_theta,
+        "rope_scaling": rope_scaling,
+        "num_hidden_layers": config.num_hidden_layers,
+        "num_attention_heads": config.num_attention_heads,
+        "num_key_value_heads": config.num_key_value_heads,
+        "head_dim": config.head_dim,
+        "hidden_size": config.hidden_size,
+        "intermediate_size": config.intermediate_size,
+        "rms_norm_eps": config.rms_norm_eps,
+        "num_traj_tokens": config.num_traj_tokens,
+        "traj_token_start": config.traj_token_start,
+        "n_diffusion_tokens": config.n_diffusion_tokens,
+        "builder_config": {
+            "max_kv_cache_capacity": max_kv_cache_capacity,
+        },
+    }
+    path = os.path.join(out_dir, "config.json")
+    with open(path, "w") as f:
+        json.dump(cfg_out, f, indent=2)
+    logger.info("Wrote action config.json: %s", path)

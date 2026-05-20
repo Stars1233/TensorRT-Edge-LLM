@@ -76,7 +76,7 @@ elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-orin")
       CACHE STRING "CUDA toolkit dir")
 elseif("${EMBEDDED_TARGET}" STREQUAL "gb10")
   set_ifndef(CUDA_CTK_VERSION 13.0)
-  set(CMAKE_CUDA_ARCHITECTURES 121)
+  set(CMAKE_CUDA_ARCHITECTURES 121a)
   set(CUDA_DIR
       /usr/local/cuda/targets/sbsa-linux
       CACHE STRING "CUDA toolkit dir")

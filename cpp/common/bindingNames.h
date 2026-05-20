@@ -147,6 +147,40 @@ inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
 
 /*! @} */
 
+/*! @name Alpamayo 1 action head input/output bindings
+ * @{
+ */
+
+/*!
+ * @brief Noise trajectory input for one denoising step
+ *
+ * Shape: [batch_size, num_waypoints, 2] (FLOAT32)
+ */
+inline constexpr char const* kNoiseTrajectory = "noise_trajectory";
+
+/*!
+ * @brief Denoising time step t0 (start)
+ *
+ * Shape: [1] (FLOAT32)
+ */
+inline constexpr char const* kTimeStepsT0 = "time_steps_t0";
+
+/*!
+ * @brief Denoising time step t1 (end)
+ *
+ * Shape: [1] (FLOAT32)
+ */
+inline constexpr char const* kTimeStepsT1 = "time_steps_t1";
+
+/*!
+ * @brief Denoised trajectory output from one denoising step
+ *
+ * Shape: [batch_size, num_waypoints, 2] (FLOAT32)
+ */
+inline constexpr char const* kDenoisedTrajectory = "denoised_trajectory";
+
+/*! @} */
+
 /*! @name Recurrent State Bindings (Mamba / GDN / linear-attention layers)
  * @{
  */
@@ -182,6 +216,22 @@ inline constexpr char const* kConvStateTemplate = "conv_state";
  * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
  */
 inline constexpr char const* kPresentConvStateTemplate = "present_conv_state";
+
+/*!
+ * @brief Intermediate conv state output template for MTP speculative decoding
+ *
+ * Template: "intermediate_conv_state_{recurrent_layer_idx}"
+ * Shape: [batch_size, seq_len, conv_dim, conv_kernel_size] (FLOAT16)
+ */
+inline constexpr char const* kIntermediateConvStateTemplate = "intermediate_conv_state";
+
+/*!
+ * @brief Intermediate recurrent state output template for MTP speculative decoding
+ *
+ * Template: "intermediate_recurrent_state_{recurrent_layer_idx}"
+ * Shape: [batch_size, seq_len, recurrentNumHeads, recurrentHeadDim, recurrentStateSize] (FLOAT32)
+ */
+inline constexpr char const* kIntermediateRecurrentStateTemplate = "intermediate_recurrent_state";
 
 /*! @} */
 
@@ -493,6 +543,10 @@ inline std::string formatRecurrentStateName(int32_t recurrentLayerIdx, bool isPa
  */
 inline bool isRecurrentStateBinding(std::string const& bindingName)
 {
+    if (bindingName.find(kIntermediateRecurrentStateTemplate) != std::string::npos)
+    {
+        return false;
+    }
     return bindingName.find(kRecurrentStateTemplate) != std::string::npos
         || bindingName.find(kPresentRecurrentStateTemplate) != std::string::npos;
 }
@@ -518,8 +572,34 @@ inline std::string formatConvStateName(int32_t recurrentLayerIdx, bool isPast = 
  */
 inline bool isConvStateBinding(std::string const& bindingName)
 {
+    if (bindingName.find(kIntermediateConvStateTemplate) != std::string::npos)
+    {
+        return false;
+    }
     return bindingName.find(kConvStateTemplate) != std::string::npos
         || bindingName.find(kPresentConvStateTemplate) != std::string::npos;
+}
+
+/*!
+ * @brief Format intermediate recurrent state binding name for MTP
+ *
+ * @param recurrentLayerIdx The recurrent layer index (0-based)
+ * @return Formatted binding name like "intermediate_recurrent_state_0"
+ */
+inline std::string formatIntermediateRecurrentStateName(int32_t recurrentLayerIdx)
+{
+    return std::string(kIntermediateRecurrentStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
+}
+
+/*!
+ * @brief Format intermediate conv state binding name for MTP
+ *
+ * @param recurrentLayerIdx The recurrent layer index (0-based)
+ * @return Formatted binding name like "intermediate_conv_state_0"
+ */
+inline std::string formatIntermediateConvStateName(int32_t recurrentLayerIdx)
+{
+    return std::string(kIntermediateConvStateTemplate) + "_" + std::to_string(recurrentLayerIdx);
 }
 
 /*!

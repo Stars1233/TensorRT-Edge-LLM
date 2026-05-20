@@ -103,7 +103,8 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 //!   [5]:          ttsPadEmbed + talkerEmbTable[codecThinkEosId]
 //!   [6]:          ttsPadEmbed + talkerEmbTable[speakerId]
 //!   [7]:          ttsBosEmbed + talkerEmbTable[codecPadId]
-//!   [8..8+N-1]:   projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
+//!   [8..8+N-2]:   projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
+//!   [8+N-1]:      projected[3+N-1] + talkerEmbTable[codecBosId]  (last text = start-of-generation)
 //!   [8+N]:        ttsEosEmbed + talkerEmbTable[codecPadId]
 //!   [8+N+1]:      ttsPadEmbed + talkerEmbTable[codecBosId]
 //!
@@ -122,18 +123,20 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
 
 //! \brief Fused residual connection for TTS decode input
 //!
-//! Computes: output = embed0[code0] + embed15[code15] + addend + sum(codecHiddens[1..14])
+//! Computes: output = embed0[code0] + embedLast[codeLast] + addend + sum(codecHiddens[1..N-1])
+//! where N = numCodesPerFrame (inferred from codecHiddens shape).
 //! Eliminates 7 separate dispatches (2x H→D, 2x embLookup, 2x D→D, sumReduce) in one kernel.
 //!
-//! \param codecHiddens   [1, 16, H] buffer — rows 1-14 pre-filled by CodePredictor (FP16)
+//! \param codecHiddens   [1, numCodesPerFrame, H] buffer — inner rows pre-filled by CodePredictor (FP16)
 //! \param embTable0      Talker embedding table [vocabSize, H] (FP16) — for embed(code0)
-//! \param embTable15     CodePredictor embedding table[-1] [vocabSize, H] (FP16) — for embed(code15)
-//! \param code0/code15   Token IDs passed as scalars (no H→D upload needed)
+//! \param embTableLast   CodePredictor embedding table[-1] [vocabSize, H] (FP16) — for embed(codeLast)
+//! \param code0/codeLast Token IDs passed as scalars (no H→D upload needed)
 //! \param addend         Row pointer [H] — trailing_text_hidden[generationStep] or tts_pad_embed (FP16)
 //! \param output         Output tensor [1, 1, H] (FP16)
 //! \param stream         CUDA stream
-void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0, rt::Tensor const& embTable15,
-    int32_t code0, int32_t code15, half const* addend, rt::Tensor& output, cudaStream_t stream);
+void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& embTable0,
+    rt::Tensor const& embTableLast, int32_t code0, int32_t codeLast, half const* addend, rt::Tensor& output,
+    cudaStream_t stream);
 
 //! \brief Adjust Talker logits: suppress special tokens and apply repetition penalty.
 //!

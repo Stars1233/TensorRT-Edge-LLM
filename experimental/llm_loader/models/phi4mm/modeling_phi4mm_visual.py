@@ -42,10 +42,16 @@ state (layer index 25 out of 27) is extracted before ``post_layernorm``.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..linear import make_linear
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Embeddings
@@ -102,16 +108,40 @@ class Phi4MMVisionAttention(nn.Module):
         out_proj.weight / out_proj.bias
     """
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
         self.hidden_size = hidden_size
-        self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.q_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.q_proj" if name_prefix else "")
+        self.k_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.k_proj" if name_prefix else "")
+        self.v_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.v_proj" if name_prefix else "")
+        self.out_proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.out_proj" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         N, S, _ = hidden_states.shape
@@ -144,10 +174,24 @@ class Phi4MMVisionMLP(nn.Module):
         fc2.weight / fc2.bias
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size)
+        self.fc1 = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc1" if name_prefix else "")
+        self.fc2 = make_linear(
+            model_config,
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc2" if name_prefix else "")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
@@ -165,13 +209,26 @@ class Phi4MMVisionEncoderLayer(nn.Module):
         layer_norm1.*, self_attn.*, layer_norm2.*, mlp.*
     """
 
-    def __init__(self, hidden_size: int, num_heads: int,
-                 intermediate_size: int, layer_norm_eps: float) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 layer_norm_eps: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.self_attn = Phi4MMVisionAttention(hidden_size, num_heads)
+        self.self_attn = Phi4MMVisionAttention(
+            hidden_size,
+            num_heads,
+            model_config,
+            name_prefix=f"{name_prefix}.self_attn" if name_prefix else "")
         self.layer_norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.mlp = Phi4MMVisionMLP(hidden_size, intermediate_size)
+        self.mlp = Phi4MMVisionMLP(
+            hidden_size,
+            intermediate_size,
+            model_config,
+            name_prefix=f"{name_prefix}.mlp" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states + self.self_attn(
@@ -192,12 +249,24 @@ class Phi4MMVisionEncoder(nn.Module):
     Checkpoint keys: ``img_processor.encoder.layers.N.*``
     """
 
-    def __init__(self, num_layers: int, hidden_size: int, num_heads: int,
-                 intermediate_size: int, layer_norm_eps: float) -> None:
+    def __init__(self,
+                 num_layers: int,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 layer_norm_eps: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.layers = nn.ModuleList([
-            Phi4MMVisionEncoderLayer(hidden_size, num_heads, intermediate_size,
-                                     layer_norm_eps) for _ in range(num_layers)
+            Phi4MMVisionEncoderLayer(
+                hidden_size,
+                num_heads,
+                intermediate_size,
+                layer_norm_eps,
+                model_config,
+                name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
+            for i in range(num_layers)
         ])
 
     def forward(self, hidden_states: torch.Tensor,
@@ -223,15 +292,29 @@ class Phi4MMVisionModel(nn.Module):
     Checkpoint keys: ``img_processor.*``
     """
 
-    def __init__(self, hidden_size: int, num_layers: int, num_heads: int,
-                 intermediate_size: int, num_patches: int, num_channels: int,
-                 patch_size: int, layer_norm_eps: float,
-                 feature_layer: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_layers: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 num_patches: int,
+                 num_channels: int,
+                 patch_size: int,
+                 layer_norm_eps: float,
+                 feature_layer: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.embeddings = Phi4MMVisionEmbeddings(hidden_size, num_patches,
                                                  num_channels, patch_size)
-        self.encoder = Phi4MMVisionEncoder(num_layers, hidden_size, num_heads,
-                                           intermediate_size, layer_norm_eps)
+        self.encoder = Phi4MMVisionEncoder(
+            num_layers,
+            hidden_size,
+            num_heads,
+            intermediate_size,
+            layer_norm_eps,
+            model_config,
+            name_prefix=f"{name_prefix}.encoder" if name_prefix else "")
         self.post_layernorm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         # Absolute index of the feature layer inside the encoder
         # feature_layer = -2 ⟹ second-to-last out of num_layers outputs
@@ -265,7 +348,7 @@ class Phi4MMVisualModel(nn.Module):
         sub_GN                      [1, 1, 1, 1152]
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         hidden_size: int = config["hidden_size"]
         num_layers: int = config["num_hidden_layers"]
@@ -286,6 +369,16 @@ class Phi4MMVisualModel(nn.Module):
         self._hidden_size = hidden_size
         self._proj_hidden_size = proj_hidden_size
 
+        # Phi-4mm checkpoint stores image+audio under
+        # ``model.embed_tokens_extend.image_embed.*``.  Use the leading-``model.``
+        # stripped form for ``module_name`` so it matches what
+        # ``layer_overrides`` / ``excluded`` carry — the parser strips ``model.``
+        # from both via ``_normalize_module_name`` (see config.py).  Other VLM
+        # families (Qwen3-VL ``visual.*``, InternVL3 ``vision_model.*``) follow
+        # the same convention; Phi-4mm previously kept the full ``model.``
+        # prefix and silently fell through to the dominant-quant fallback for
+        # FP8 checkpoints, producing FP8Linear against FP16 weights.
+        img_embed_prefix = "embed_tokens_extend.image_embed"
         self.img_processor = Phi4MMVisionModel(
             hidden_size=hidden_size,
             num_layers=num_layers,
@@ -296,12 +389,23 @@ class Phi4MMVisualModel(nn.Module):
             patch_size=patch_size,
             layer_norm_eps=layer_norm_eps,
             feature_layer=feature_layer,
+            model_config=model_config,
+            name_prefix=f"{img_embed_prefix}.img_processor",
         )
         self.image_token_compression = nn.AvgPool2d(kernel_size=2, stride=2)
+        # img_projection.0 = Linear, img_projection.1 = GELU, img_projection.2 = Linear
         self.img_projection = nn.Sequential(
-            nn.Linear(hidden_size, proj_hidden_size),
+            make_linear(model_config,
+                        hidden_size,
+                        proj_hidden_size,
+                        bias=True,
+                        module_name=f"{img_embed_prefix}.img_projection.0"),
             nn.GELU(approximate="tanh"),
-            nn.Linear(proj_hidden_size, proj_hidden_size),
+            make_linear(model_config,
+                        proj_hidden_size,
+                        proj_hidden_size,
+                        bias=True,
+                        module_name=f"{img_embed_prefix}.img_projection.2"),
         )
         # GN separator tokens (buffers — not registered as parameters so
         # load_state_dict can set them from the checkpoint)
@@ -390,18 +494,19 @@ def _load_phi4mm_weights(
     weights: dict,
     prefix: str = "model.embed_tokens_extend.image_embed.",
 ) -> None:
-    """Load safetensors weights into *model* stripping *prefix*."""
-    stripped: dict = {}
-    for k, v in weights.items():
-        if k.startswith(prefix):
-            stripped[k[len(prefix):]] = v
-    missing, unexpected = model.load_state_dict(stripped, strict=False)
-    if missing:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Phi4MMVisualModel: missing keys after load: %s",
-            missing[:10],
-        )
+    """Load Phi-4mm visual weights via the shared ``load_submodule_weights``
+    pipeline so quantized ``make_linear`` classes get their weights set
+    through ``_set_tensor`` (preserves dtype) and ``apply_all_repacking``
+    runs at the end.
+    """
+    from ...checkpoint.loader import load_submodule_weights
+
+    def _remap(k: str) -> "str | None":
+        if not k.startswith(prefix):
+            return None
+        return k[len(prefix):]
+
+    load_submodule_weights(model, weights, _remap, label="Phi4MMVisualModel")
 
 
 # ---------------------------------------------------------------------------
@@ -412,18 +517,20 @@ def _load_phi4mm_weights(
 def build_phi4mm_visual(
     config: dict,
     weights: dict,
+    model_config: "ModelConfig",
     dtype: torch.dtype = torch.float16,
 ) -> Phi4MMVisualModel:
     """Build and return a :class:`Phi4MMVisualModel` with loaded weights.
 
     Args:
-        config:  Model config dict (reads architecture values with sensible defaults).
-        weights: Flat ``{key: tensor}`` dict from safetensors.
-        dtype:   Weight dtype (default ``float16``).
+        config:       Model config dict (reads architecture values with sensible defaults).
+        weights:      Flat ``{key: tensor}`` dict from safetensors.
+        model_config: Top-level ``ModelConfig`` for quantized Linear dispatch.
+        dtype:        Weight dtype (default ``float16``).
     """
-    model = Phi4MMVisualModel(config)
+    model = Phi4MMVisualModel(config,
+                              model_config=model_config).to(dtype=dtype)
     _load_phi4mm_weights(model, weights)
-    model = model.to(dtype=dtype)
     model.eval()
     return model
 

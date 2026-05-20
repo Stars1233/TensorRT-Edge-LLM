@@ -348,23 +348,24 @@ def main():
         help="Use TensorRT native ops instead of custom plugins",
     )
     parser.add_argument(
-        "--eagle-engine-dir",
+        "--spec-decode-engine-dir",
+        "--eagle-engine-dir",  # deprecated alias, kept for backward compat
+        dest="spec_decode_engine_dir",
         default="",
-        help=
-        "Pre-built EAGLE engine dir (eagle_base.engine + eagle_draft.engine)",
+        help="Pre-built speculative decoding engine dir (EAGLE or MTP)",
     )
     parser.add_argument("--draft-top-k",
                         type=int,
                         default=10,
-                        help="Eagle: tokens per predecessor")
+                        help="Speculative decoding: tokens per predecessor")
     parser.add_argument("--draft-step",
                         type=int,
                         default=6,
-                        help="Eagle: number of draft steps")
+                        help="Speculative decoding: number of draft steps")
     parser.add_argument("--verify-tree-size",
                         type=int,
                         default=60,
-                        help="Eagle: verification tree size")
+                        help="Speculative decoding: verification tree size")
     args = parser.parse_args()
 
     from .engine import LLM
@@ -375,7 +376,7 @@ def main():
         max_batch_size=args.max_batch_size,
         max_kv_cache_capacity=args.max_kv_cache_capacity,
         use_trt_native_ops=args.use_trt_native_ops,
-        eagle_engine_dir=args.eagle_engine_dir,
+        eagle_engine_dir=args.spec_decode_engine_dir,
         draft_top_k=args.draft_top_k,
         draft_step=args.draft_step,
         verify_tree_size=args.verify_tree_size,

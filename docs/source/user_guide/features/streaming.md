@@ -186,7 +186,7 @@ export EDGELLM_PLUGIN_PATH=$(pwd)/libNvInfer_edgellm_plugin.so
 # Eagle spec-decode
 ./examples/llm/llm_stream \
     --engineDir /path/to/Qwen3-4B-Eagle-Engine-bs4 \
-    --inputFile /path/to/input.json --eagle
+    --inputFile /path/to/input.json --specDecode
 ```
 
 Hotkeys while streaming:

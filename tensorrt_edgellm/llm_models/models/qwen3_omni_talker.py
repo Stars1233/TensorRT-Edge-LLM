@@ -603,11 +603,12 @@ def export_qwen3_omni_submodel_to_onnx(model: nn.Module,
         "context_lengths": {
             0: "batch_size"
         },
+        "last_token_ids": {
+            0: "batch_size"
+        },
         "kvcache_start_index": {
             0: "kv_cache_start_batch_size"
         },
-        # NOTE: logits dynamic axes removed - TensorRT will squeeze dim=1 (num_tokens=1)
-        # to match standard LLM pattern: [batch, vocab_size]
     })
 
     # Output names

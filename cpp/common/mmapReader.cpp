@@ -17,6 +17,7 @@
 
 #include "mmapReader.h"
 
+#include "common/checkMacros.h"
 #include "stringUtils.h"
 #include <cerrno>
 #include <cstdarg>
@@ -44,10 +45,8 @@ MmapReader::MmapReader(std::filesystem::path const& fp)
     : mData(nullptr)
     , mBytes(0)
 {
-    if (!loadFile(fp))
-    {
-        throw std::runtime_error("Failed to load file in MmapReader constructor");
-    }
+    bool const fileLoaded = loadFile(fp);
+    ELLM_CHECK(fileLoaded, "Failed to load file in MmapReader constructor");
 }
 
 MmapReader::~MmapReader() noexcept

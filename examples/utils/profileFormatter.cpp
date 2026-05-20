@@ -55,7 +55,6 @@ float getPrefillTokensPerSecond(metrics::LLMPrefillMetrics const& prefillMetrics
     return 0.0f;
 }
 
-//! Utility function for calculating generation tokens per second
 float getGenerationTokensPerSecond(metrics::LLMGenerationMetrics const& generationMetrics)
 {
     auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_GENERATION);
@@ -107,7 +106,6 @@ float getPrefillAverageTimePerRun(metrics::LLMPrefillMetrics const& prefillMetri
     return timingData->getAverageTimeMs();
 }
 
-//! Utility function for calculating generation average time per token
 float getGenerationAverageTimePerToken(metrics::LLMGenerationMetrics const& generationMetrics)
 {
     auto timingData = gTimer.getTimingData(metrics::StageNames::kLLM_GENERATION);
@@ -123,18 +121,38 @@ float getGenerationAverageTimePerToken(metrics::LLMGenerationMetrics const& gene
     return 0.0f;
 }
 
-//! Utility function for calculating multimodal average time per token
+//! Utility function for calculating multimodal average time per token.
+//! Tries stage names in priority order: legacy kMULTIMODAL_PROCESSING, then
+//! kVISION_ENCODER + kAUDIO_ENCODER for Qwen3-Omni input encoders.
 float getMultimodalAverageTimePerToken(metrics::MultimodalMetrics const& multimodalMetrics)
 {
-    auto timingData = gTimer.getTimingData(metrics::StageNames::kMULTIMODAL_PROCESSING);
-    if (!timingData || timingData->getTotalGpuTimeMs() <= 0.0f)
+    float totalGpuTimeMs = 0.0f;
+
+    auto legacyData = gTimer.getTimingData(metrics::StageNames::kMULTIMODAL_PROCESSING);
+    if (legacyData)
+    {
+        totalGpuTimeMs += legacyData->getTotalGpuTimeMs();
+    }
+    auto visionData = gTimer.getTimingData(metrics::StageNames::kVISION_ENCODER);
+    if (visionData)
+    {
+        totalGpuTimeMs += visionData->getTotalGpuTimeMs();
+    }
+    auto audioData = gTimer.getTimingData(metrics::StageNames::kAUDIO_ENCODER);
+    if (audioData)
+    {
+        totalGpuTimeMs += audioData->getTotalGpuTimeMs();
+    }
+
+    if (totalGpuTimeMs <= 0.0f)
     {
         return 0.0f;
     }
 
-    if (multimodalMetrics.totalImageTokens > 0)
+    int64_t totalTokens = multimodalMetrics.totalImageTokens + multimodalMetrics.totalAudioTokens;
+    if (totalTokens > 0)
     {
-        return timingData->getTotalGpuTimeMs() / multimodalMetrics.totalImageTokens;
+        return totalGpuTimeMs / totalTokens;
     }
     return 0.0f;
 }
@@ -332,6 +350,8 @@ void outputMultimodalProfile(std::ostream& output, metrics::MultimodalMetrics co
         output << "Average Time per Token: " << std::fixed << std::setprecision(4)
                << getMultimodalAverageTimePerToken(multimodalMetrics) << " ms" << std::endl;
         appendStageTimingData(output, metrics::StageNames::kMULTIMODAL_PROCESSING, "Multimodal Processing");
+        appendStageTimingData(output, metrics::StageNames::kVISION_ENCODER, "Vision Encoder");
+        appendStageTimingData(output, metrics::StageNames::kAUDIO_ENCODER, "Audio Encoder");
     }
 }
 
@@ -350,8 +370,48 @@ void outputTalkerProfile(std::ostream& output, metrics::MultimodalMetrics const&
         }
 
         appendStageTimingData(output, metrics::StageNames::kTALKER_GENERATION, "Talker Generation");
-        appendStageTimingData(output, metrics::StageNames::kCODE_PREDICTOR, "CodePredictor");
+        appendStageTimingData(output, metrics::StageNames::kCODEPREDICTOR_PREFILL, "CodePredictor Prefill");
+        appendStageTimingData(output, metrics::StageNames::kCODEPREDICTOR_GENERATION, "CodePredictor Generation");
+        appendStageTimingData(output, metrics::StageNames::kCODE2WAV, "Code2Wav");
     }
+}
+
+void outputOmniProfile(std::ostream& output, metrics::OmniTalkerMetrics const& talkerMetrics,
+    metrics::OmniLatencyMetrics const& latencyMetrics)
+{
+    if (talkerMetrics.getTotalRuns() == 0)
+    {
+        return;
+    }
+
+    output << "=== Audio Latency ===" << std::endl;
+    output << "Mode: " << (talkerMetrics.isStreaming ? "streaming" : "sequential") << std::endl;
+    if (latencyMetrics.timeToFirstAudioCodeMs > 0.0f)
+    {
+        output << "Time to First Audio Code (TTFA): " << std::fixed << std::setprecision(2)
+               << latencyMetrics.timeToFirstAudioCodeMs << " ms" << std::endl;
+    }
+    if (latencyMetrics.endToEndMs > 0.0f)
+    {
+        output << "End-to-End (request to audio output): " << std::fixed << std::setprecision(2)
+               << latencyMetrics.endToEndMs << " ms" << std::endl;
+    }
+    if (latencyMetrics.realTimeFactor > 0.0f)
+    {
+        output << "Real-Time Factor (RTF): " << std::fixed << std::setprecision(3) << latencyMetrics.realTimeFactor
+               << (latencyMetrics.realTimeFactor < 1.0f ? " (faster than real-time)" : " (slower than real-time)")
+               << std::endl;
+    }
+    if (latencyMetrics.audioDurationSeconds > 0.0f)
+    {
+        output << "Audio Duration: " << std::fixed << std::setprecision(2) << latencyMetrics.audioDurationSeconds
+               << " s (" << latencyMetrics.audioSamples << " samples @ " << latencyMetrics.sampleRate << " Hz)"
+               << std::endl;
+    }
+    output << "Audio Frames: " << talkerMetrics.totalFrames << " (RVQ Codes: " << talkerMetrics.totalRvqCodes << ")"
+           << std::endl;
+    output << "Exit Reason: " << talkerMetrics.exitReason << std::endl;
+    appendStageTimingData(output, metrics::StageNames::kTALKER_PREFILL, "Talker Prefill");
 }
 
 void outputMemoryProfile(std::ostream& output, MemoryMonitor const& memoryMonitor)
@@ -448,6 +508,70 @@ void addJsonTalkerSummary(nlohmann::json& summary, metrics::MultimodalMetrics co
     }
 }
 
+void addJsonOmniStageExtensions(nlohmann::json& summary, metrics::OmniTalkerMetrics const& talkerMetrics,
+    metrics::OmniLatencyMetrics const& latencyMetrics)
+{
+    if (!summary.contains("stages") || talkerMetrics.getTotalRuns() == 0)
+    {
+        return;
+    }
+
+    for (auto& stageJson : summary["stages"])
+    {
+        if (stageJson["stage_id"] == metrics::StageNames::kTALKER_GENERATION)
+        {
+            stageJson["mode"] = talkerMetrics.isStreaming ? "streaming" : "sequential";
+            stageJson["audio_frames"] = talkerMetrics.totalFrames;
+            stageJson["total_rvq_codes"] = talkerMetrics.totalRvqCodes;
+            stageJson["exit_reason"] = talkerMetrics.exitReason;
+
+            auto talkerGenData = gTimer.getTimingData(metrics::StageNames::kTALKER_GENERATION);
+            float talkerGenMs = talkerGenData ? talkerGenData->getTotalGpuTimeMs() : 0.0f;
+
+            if (talkerMetrics.totalFrames > 0 && talkerGenMs > 0.0f)
+            {
+                stageJson["talker_frames_per_second"]
+                    = static_cast<float>(talkerMetrics.totalFrames) / (talkerGenMs / 1000.0f);
+            }
+
+            if (latencyMetrics.timeToFirstAudioCodeMs > 0.0f)
+            {
+                stageJson["time_to_first_audio_code_ms"] = latencyMetrics.timeToFirstAudioCodeMs;
+            }
+
+            if (latencyMetrics.timeToFirstPlayableAudioMs > 0.0f)
+            {
+                stageJson["time_to_first_playable_audio_ms"] = latencyMetrics.timeToFirstPlayableAudioMs;
+            }
+            if (latencyMetrics.realTimeFactor > 0.0f)
+            {
+                stageJson["real_time_factor"] = latencyMetrics.realTimeFactor;
+            }
+            if (latencyMetrics.endToEndMs > 0.0f)
+            {
+                stageJson["end_to_end_ms"] = latencyMetrics.endToEndMs;
+            }
+            if (latencyMetrics.audioSamples > 0)
+            {
+                stageJson["audio_duration_seconds"] = latencyMetrics.audioDurationSeconds;
+                stageJson["audio_samples"] = latencyMetrics.audioSamples;
+                stageJson["sample_rate"] = latencyMetrics.sampleRate;
+            }
+        }
+
+        if (stageJson["stage_id"] == metrics::StageNames::kCODEPREDICTOR_GENERATION)
+        {
+            int64_t genCodes = talkerMetrics.totalRvqCodes - talkerMetrics.totalFrames;
+            stageJson["total_codes"] = genCodes;
+            float gpuMs = stageJson.value("total_gpu_time_ms", 0.0f);
+            if (genCodes > 0 && gpuMs > 0.0f)
+            {
+                stageJson["codes_per_second"] = static_cast<float>(genCodes) / (gpuMs / 1000.0f);
+            }
+        }
+    }
+}
+
 void addJsonTimingStages(nlohmann::json& summary)
 {
     summary["stages"] = nlohmann::json::array();
@@ -463,7 +587,6 @@ void addJsonTimingStages(nlohmann::json& summary)
         stageJson["total_gpu_time_ms"] = timingData.getTotalGpuTimeMs();
         stageJson["average_time_per_run_ms"] = timingData.getAverageTimeMs();
 
-        // Add statistical analysis if available
         auto gpuStats = StatisticalAnalysis::calculate(timingData.gpuTimesMs);
         stageJson["gpu_time_stats"] = {{"count", gpuStats.count}, {"min_ms", gpuStats.min}, {"max_ms", gpuStats.max},
             {"mean_ms", gpuStats.mean}, {"median_ms", gpuStats.median}, {"p95_ms", gpuStats.p95},

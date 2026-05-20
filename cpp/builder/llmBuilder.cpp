@@ -135,7 +135,9 @@ bool LLMBuilder::build()
 
     // Build and save engine
     std::string const engineFilePath = (mEngineDir / engineFileName).string();
-#if NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    setenv("__LUNOWUD", "-peep:match_dual_gemm=off", 1);
+#elif NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
     setenv("__LUNOWUD", "-mlir:autotune:num_threads=1 -mlir:collective:fp4=off -cask_fusion:async_policy=1", 1);
 #endif
     if (!buildAndSerializeEngine(builder.get(), network.get(), config.get(), engineFilePath))
@@ -200,7 +202,9 @@ bool LLMBuilder::parseConfig()
     version::checkVersion(modelVersion);
 
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
-    mTargetModelOutputHiddenDim = mHiddenSize * 3;
+    // For MTP draft, base model outputs hidden_size (1x); for EAGLE3 draft, it outputs hidden_size * 3.
+    std::string const modelType = mModelConfig.value("model_type", "");
+    mTargetModelOutputHiddenDim = (modelType == "mtp_draft") ? mHiddenSize : mHiddenSize * 3;
     mNumKVHeads = mModelConfig["num_key_value_heads"].get<int32_t>();
     auto numAttentionHeads = mModelConfig["num_attention_heads"].get<int32_t>();
 
@@ -267,6 +271,14 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     else
     {
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
+    }
+
+    // Setup intermediate state profiles for MTP base models
+    std::string const modelType = mModelConfig.value("model_type", "");
+    if (modelType == "mtp_base")
+    {
+        result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
+        result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
     }
 
     // Setup Deepstack profiles for Qwen3VL models
@@ -720,6 +732,70 @@ bool LLMBuilder::setupConvStateProfiles(
     return result;
 }
 
+bool LLMBuilder::setupIntermediateRecurrentStateProfiles(
+    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+{
+    if (mNumLinearAttnLayers == 0)
+    {
+        return true;
+    }
+
+    bool result = true;
+
+    // Intermediate recurrent state shape: [batch, seq_len, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
+    nvinfer1::Dims minShape = createDims({1, 1, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2,
+        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims maxCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen,
+        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optGenShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize / 2,
+        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims maxGenShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize,
+        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+
+    for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
+    {
+        std::string const name = binding_names::formatIntermediateRecurrentStateName(i);
+        result &= setOptimizationProfile(&contextProfile, name.c_str(), minShape, optCtxShape, maxCtxShape);
+        result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
+    }
+
+    LOG_DEBUG("Set up intermediate recurrent state profiles for %d recurrent layers (MTP)", mNumLinearAttnLayers);
+    return result;
+}
+
+bool LLMBuilder::setupIntermediateConvStateProfiles(
+    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+{
+    if (mNumLinearAttnLayers == 0 || mConvDim == 0 || mConvKernel == 0)
+    {
+        return true;
+    }
+
+    bool result = true;
+
+    // Intermediate conv state shape: [batch, seq_len, conv_dim, conv_kernel]
+    nvinfer1::Dims minShape = createDims({1, 1, mConvDim, mConvKernel});
+    nvinfer1::Dims optCtxShape
+        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mConvDim, mConvKernel});
+    nvinfer1::Dims maxCtxShape
+        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mConvDim, mConvKernel});
+    nvinfer1::Dims optGenShape
+        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize / 2, mConvDim, mConvKernel});
+    nvinfer1::Dims maxGenShape
+        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize, mConvDim, mConvKernel});
+
+    for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
+    {
+        std::string const name = binding_names::formatIntermediateConvStateName(i);
+        result &= setOptimizationProfile(&contextProfile, name.c_str(), minShape, optCtxShape, maxCtxShape);
+        result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
+    }
+
+    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP)", mNumLinearAttnLayers);
+    return result;
+}
+
 bool LLMBuilder::copyConfig()
 {
     // Determine config file name based on model type
@@ -801,8 +877,9 @@ bool LLMBuilder::copyTokenizerFiles()
 
 bool LLMBuilder::copyEagleFiles()
 {
-    // Copy d2t.safetensors for Eagle3 draft models
-    if (mBuilderConfig.eagleDraft)
+    // Copy d2t.safetensors for Eagle3 draft models only. MTP draft shares vocab with base and has no d2t mapping.
+    std::string const modelType = mModelConfig.value("model_type", "");
+    if (mBuilderConfig.eagleDraft && modelType != "mtp_draft")
     {
         std::string const d2tPath = (mOnnxDir / "d2t.safetensors").string();
         std::string const targetD2tPath = (mEngineDir / "d2t.safetensors").string();
@@ -859,9 +936,8 @@ bool LLMBuilder::copyEmbeddingFile()
         // Talker: copy embedding + text_projection + hidden_projection (optional, text-only TTS omits it)
         LOG_INFO("Detected Talker model, copying projection files...");
 
-        std::vector<std::string> requiredFiles
-            = {"embedding.safetensors", "text_projection.safetensors", "text_embedding.safetensors"};
-        std::vector<std::string> optionalFiles = {"hidden_projection.safetensors"};
+        std::vector<std::string> requiredFiles = {"embedding.safetensors", "text_projection.safetensors"};
+        std::vector<std::string> optionalFiles = {"text_embedding.safetensors", "hidden_projection.safetensors"};
 
         bool allSuccess = true;
         for (auto const& filename : requiredFiles)
@@ -902,10 +978,10 @@ bool LLMBuilder::copyEmbeddingFile()
     if (std::filesystem::exists(codecEmbedPath))
     {
         LOG_INFO("Detected CodePredictor model, copying codec files...");
-        std::vector<std::string> cpFiles
-            = {"codec_embeddings.safetensors", "lm_heads.safetensors", "small_to_mtp_projection.safetensors"};
+        std::vector<std::string> cpRequiredFiles = {"codec_embeddings.safetensors", "lm_heads.safetensors"};
+        std::vector<std::string> cpOptionalFiles = {"small_to_mtp_projection.safetensors"};
         bool allSuccess = true;
-        for (auto const& filename : cpFiles)
+        for (auto const& filename : cpRequiredFiles)
         {
             std::string const srcPath = (mOnnxDir / filename).string();
             std::string const dstPath = (mEngineDir / filename).string();
@@ -917,6 +993,19 @@ bool LLMBuilder::copyEmbeddingFile()
             {
                 LOG_ERROR("Failed to copy required CodePredictor file: %s", filename.c_str());
                 allSuccess = false;
+            }
+        }
+        for (auto const& filename : cpOptionalFiles)
+        {
+            std::string const srcPath = (mOnnxDir / filename).string();
+            std::string const dstPath = (mEngineDir / filename).string();
+            if (file_io::copyFile(srcPath, dstPath))
+            {
+                LOG_INFO("Copied %s", filename.c_str());
+            }
+            else
+            {
+                LOG_INFO("Optional %s not found, skipping", filename.c_str());
             }
         }
         return allSuccess;

@@ -1,6 +1,6 @@
 # L0 Pipeline Tests - Drive Thor 1 (SM110 Blackwell)
-# Lightweight: FP8 base LLM only (boards are rare, heavier tests on Thor 2 and Jedha)
-# Model families: Qwen2.5
+# Lightweight: FP8 base LLM plus ASR/TTS smoke coverage
+# Model families: Qwen2.5, Qwen3-ASR, Qwen3-TTS
 
 tests:
   - tests/defs/test_common.py::test_build_project
@@ -10,3 +10,11 @@ tests:
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil2048-llm_basic]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
+
+  # === Qwen3-ASR-0.6B FP16 (audio encoder + LLM) ===
+  - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_engine_build[Qwen3-ASR-0.6B-fp16-mxsl4096-mxbs1-mxil1024-mnts100-mxts3000]
+  - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_inference[Qwen3-ASR-0.6B-fp16-mxsl4096-mxbs1-mxil1024-mnts100-mxts3000-asr_basic]
+
+  # === Qwen3-TTS-12Hz-0.6B-CustomVoice FP16 (Talker + CodePredictor + Code2Wav) ===
+  - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_engine_build[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096]
+  - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_inference[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096-tts_basic]

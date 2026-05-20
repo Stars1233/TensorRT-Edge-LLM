@@ -22,153 +22,342 @@ The model class names were checked against the installed `transformers==5.3.0` p
 
 ## Support Matrix
 
-| Category | Model series | Transformers class / checkpoint architecture | `llm_loader` handling | Checkpoint type | Checkpoint ID | Supported precisions |
-|----------|--------------|----------------------------------------------|-----------------------|-----------------|---------------|----------------------|
-| Dense LLM | Llama 3.x Instruct / selected Llama-derived Instruct | [`LlamaForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py) | `llama` -> default `CausalLM` | Original | [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct) | Dense precision set |
-|  |  |  |  | Original | [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) |  |
-|  |  |  |  | Original | [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) |  |
-|  |  |  |  | Original | [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct) |  |
-|  |  |  |  | Quantized | [nvidia/Llama-3.1-8B-Instruct-FP8](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/Llama-3.1-8B-Instruct-NVFP4](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-NVFP4) |  |
-| Dense LLM | Qwen2/Qwen2.5 dense and Qwen-derived dense | [`Qwen2ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py) | `qwen2` -> default `CausalLM` | Original | [Qwen/Qwen2-0.5B](https://huggingface.co/Qwen/Qwen2-0.5B) | Dense precision set |
-|  |  |  |  | Original | [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-7B](https://huggingface.co/Qwen/Qwen2-7B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-7B-Instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-Math-1.5B](https://huggingface.co/Qwen/Qwen2-Math-1.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-Math-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2-Math-1.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-Math-7B](https://huggingface.co/Qwen/Qwen2-Math-7B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2-Math-7B-Instruct](https://huggingface.co/Qwen/Qwen2-Math-7B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-3B](https://huggingface.co/Qwen/Qwen2.5-3B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-7B](https://huggingface.co/Qwen/Qwen2.5-7B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-14B](https://huggingface.co/Qwen/Qwen2.5-14B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-14B-Instruct](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-0.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-3B](https://huggingface.co/Qwen/Qwen2.5-Coder-3B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-7B](https://huggingface.co/Qwen/Qwen2.5-Coder-7B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-14B](https://huggingface.co/Qwen/Qwen2.5-Coder-14B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Coder-14B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Math-1.5B](https://huggingface.co/Qwen/Qwen2.5-Math-1.5B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Math-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Math-1.5B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Math-7B](https://huggingface.co/Qwen/Qwen2.5-Math-7B) |  |
-|  |  |  |  | Original | [Qwen/Qwen2.5-Math-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Math-7B-Instruct) |  |
-|  |  |  |  | Original | [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) |  |
-|  |  |  |  | Original | [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B) |  |
-|  |  |  |  | Original | [deepseek-ai/DeepSeek-R1-Distill-Qwen-14B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2-0.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2-0.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2-1.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2-1.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2-7B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2-7B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2-7B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-0.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-1.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-3B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-14B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-0.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-0.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-1.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-1.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-3B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-3B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-14B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4) |  |
-| Dense LLM | Qwen3 dense | [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `qwen3` -> default `CausalLM` | Original | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Dense precision set |
-|  |  |  |  | Original | [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-1.7B-Base](https://huggingface.co/Qwen/Qwen3-1.7B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-4B-Base](https://huggingface.co/Qwen/Qwen3-4B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-4B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-8B-Base](https://huggingface.co/Qwen/Qwen3-8B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-14B](https://huggingface.co/Qwen/Qwen3-14B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-Base) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen3-4B-AWQ](https://huggingface.co/Qwen/Qwen3-4B-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen3-8B-AWQ](https://huggingface.co/Qwen/Qwen3-8B-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen3-14B-AWQ](https://huggingface.co/Qwen/Qwen3-14B-AWQ) |  |
-|  |  |  |  | Quantized | [nvidia/Qwen3-8B-FP8](https://huggingface.co/nvidia/Qwen3-8B-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/Qwen3-8B-NVFP4](https://huggingface.co/nvidia/Qwen3-8B-NVFP4) |  |
-|  |  |  |  | Quantized | [nvidia/Qwen3-14B-FP8](https://huggingface.co/nvidia/Qwen3-14B-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/Qwen3-14B-NVFP4](https://huggingface.co/nvidia/Qwen3-14B-NVFP4) |  |
-| Dense LLM / VLM | Qwen3.5 text and VLM | [Qwen3_5ForCausalLM](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py); [Qwen3_5ForConditionalGeneration](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | Text: `qwen3_5_text` -> `Qwen3_5CausalLM`; VLM: `qwen3_5` -> `Qwen3_5CausalLM` + `Qwen3_5VLVisualModel` | Original | [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) | Dense precision set for text; VLM original checkpoints only |
-|  |  |  |  | Original | [Qwen/Qwen3.5-0.8B-Base](https://huggingface.co/Qwen/Qwen3.5-0.8B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-2B-Base](https://huggingface.co/Qwen/Qwen3.5-2B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-4B-Base](https://huggingface.co/Qwen/Qwen3.5-4B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-9B-Base](https://huggingface.co/Qwen/Qwen3.5-9B-Base) |  |
-|  |  |  |  | Original | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) |  |
-| Dense LLM | Nemotron Nano dense | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | Original | [nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16) | BF16, FP8, NVFP4 |
-|  |  |  |  | Original | [nvidia/NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2) |  |
-|  |  |  |  | Quantized | [nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/NVIDIA-Nemotron-3-Nano-4B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-NVFP4) |  |
-|  |  |  |  | Quantized | [nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4) |  |
-| MoE | Qwen3-MoE | [`Qwen3MoeForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) | `qwen3_moe` -> `Qwen3MoeCausalLM` | Quantized | [Qwen/Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4) | INT4 only |
-| MoE | Nemotron3-MoE | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | Quantized | [nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4) | NVFP4 only |
-| VLM | Qwen2.5-VL | [`Qwen2_5_VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py) | `qwen2_5_vl` + `Qwen2_5VLVisualModel` | Original | [Qwen/Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) | Dense precision set for LLM backbone |
-|  |  |  |  | Original | [Qwen/Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-VL-3B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [Qwen/Qwen2.5-VL-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct-AWQ) |  |
-|  |  |  |  | Quantized | [nvidia/Qwen2.5-VL-7B-Instruct-FP8](https://huggingface.co/nvidia/Qwen2.5-VL-7B-Instruct-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/Qwen2.5-VL-7B-Instruct-NVFP4](https://huggingface.co/nvidia/Qwen2.5-VL-7B-Instruct-NVFP4) |  |
-| VLM | Qwen3-VL / compatible | [`Qwen3VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py) | `qwen3_vl` + `Qwen3VLVisualModel` | Original | [Qwen/Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) | Dense precision set for LLM backbone |
-|  |  |  |  | Original | [Qwen/Qwen3-VL-2B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-2B-Thinking) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-VL-4B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) |  |
-|  |  |  |  | Original | [Qwen/Qwen3-VL-8B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-8B-Thinking) |  |
-|  |  |  |  | Original | [nvidia/Cosmos-Reason2-2B](https://huggingface.co/nvidia/Cosmos-Reason2-2B) |  |
-|  |  |  |  | Original | [nvidia/Cosmos-Reason2-8B](https://huggingface.co/nvidia/Cosmos-Reason2-8B) |  |
-|  |  |  |  | Quantized | [nvidia/Cosmos-Reason2-2B-FP8](https://huggingface.co/nvidia/Cosmos-Reason2-2B-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/Cosmos-Reason2-2B-NVFP4](https://huggingface.co/nvidia/Cosmos-Reason2-2B-NVFP4) |  |
-|  |  |  |  | Quantized | [nvidia/Cosmos-Reason2-8B-FP8](https://huggingface.co/nvidia/Cosmos-Reason2-8B-FP8) |  |
-|  |  |  |  | Quantized | [nvidia/Cosmos-Reason2-8B-NVFP4](https://huggingface.co/nvidia/Cosmos-Reason2-8B-NVFP4) |  |
-| VLM | InternVL3 / InternVL3.5 HF format | [`InternVLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/internvl/modeling_internvl.py) | `internvl_chat` / `internvl` + InternVL visual models | Original | [OpenGVLab/InternVL3-1B-hf](https://huggingface.co/OpenGVLab/InternVL3-1B-hf) | Dense precision set for LLM backbone |
-|  |  |  |  | Original | [OpenGVLab/InternVL3-2B-hf](https://huggingface.co/OpenGVLab/InternVL3-2B-hf) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3-8B-hf](https://huggingface.co/OpenGVLab/InternVL3-8B-hf) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3-9B](https://huggingface.co/OpenGVLab/InternVL3-9B) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3-9B-Instruct](https://huggingface.co/OpenGVLab/InternVL3-9B-Instruct) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3-14B-hf](https://huggingface.co/OpenGVLab/InternVL3-14B-hf) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3_5-1B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-1B-HF) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3_5-2B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-2B-HF) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3_5-4B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-4B-HF) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3_5-8B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-8B-HF) |  |
-|  |  |  |  | Original | [OpenGVLab/InternVL3_5-14B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-14B-HF) |  |
-|  |  |  |  | Quantized | [OpenGVLab/InternVL3-1B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-1B-AWQ) |  |
-|  |  |  |  | Quantized | [OpenGVLab/InternVL3-2B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-2B-AWQ) |  |
-|  |  |  |  | Quantized | [OpenGVLab/InternVL3-8B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-8B-AWQ) |  |
-|  |  |  |  | Quantized | [OpenGVLab/InternVL3-14B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-14B-AWQ) |  |
-| VLM | Phi-4-Multimodal | [`Phi4MultimodalForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py) | `phi4mm` / `phi4_multimodal` + `Phi4MMVisualModel` | Original | [microsoft/Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct) | Merge vision LoRA, then dense precision set for the LLM backbone |
-| Audio / Speech | Qwen3-ASR | Checkpoint architecture `Qwen3ASRForConditionalGeneration`; text backbone compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `Qwen3ASRLanguageModel` + `QwenAudioEncoder` | Original | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) | FP16 |
-|  |  |  |  | Original | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) |  |
-| TTS | Qwen3-TTS | Checkpoint architecture `Qwen3TTSForConditionalGeneration`; talker/code-predictor decoders compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `TalkerCausalLM` + `CodePredictorCausalLM` | Original | [Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | FP16 |
-| Omni | Nemotron-Omni | Checkpoint architecture `NemotronH_Nano_Omni_Reasoning_V3`; LLM is Nemotron-H compatible with [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `NemotronHCausalLM` + `NemotronOmniVisualModel` + `NemotronOmniAudioModel` | Quantized | [nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4) | NVFP4 only |
+### Dense LLM
 
-Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker components with local model implementations.
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| Llama 3.x Instruct | [`LlamaForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py) | `llama` -> default `CausalLM` | Dense precision set |
+| Qwen2/Qwen2.5 dense | [`Qwen2ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py) | `qwen2` -> default `CausalLM` | Dense precision set |
+| Qwen3 dense | [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `qwen3` -> default `CausalLM` | Dense precision set |
+| Qwen3.5/3.6 text | [`Qwen3_5ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5_text` -> `Qwen3_5CausalLM` | Dense precision set |
+| Nemotron Nano dense | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | BF16, FP8, NVFP4 |
+
+<details>
+<summary><b>Llama 3.x Instruct</b> checkpoints</summary>
+
+**Original:**
+- [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)
+- [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+- [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
+- [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)
+
+**Quantized:**
+- [nvidia/Llama-3.1-8B-Instruct-FP8](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8)
+- [nvidia/Llama-3.1-8B-Instruct-NVFP4](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-NVFP4)
+
+</details>
+
+<details>
+<summary><b>Qwen2/Qwen2.5 dense and Qwen-derived dense</b> checkpoints</summary>
+
+**Original:**
+- [Qwen/Qwen2-0.5B](https://huggingface.co/Qwen/Qwen2-0.5B)
+- [Qwen/Qwen2-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct)
+- [Qwen/Qwen2-1.5B](https://huggingface.co/Qwen/Qwen2-1.5B)
+- [Qwen/Qwen2-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct)
+- [Qwen/Qwen2-7B](https://huggingface.co/Qwen/Qwen2-7B)
+- [Qwen/Qwen2-7B-Instruct](https://huggingface.co/Qwen/Qwen2-7B-Instruct)
+- [Qwen/Qwen2-Math-1.5B](https://huggingface.co/Qwen/Qwen2-Math-1.5B)
+- [Qwen/Qwen2-Math-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2-Math-1.5B-Instruct)
+- [Qwen/Qwen2-Math-7B](https://huggingface.co/Qwen/Qwen2-Math-7B)
+- [Qwen/Qwen2-Math-7B-Instruct](https://huggingface.co/Qwen/Qwen2-Math-7B-Instruct)
+- [Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)
+- [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
+- [Qwen/Qwen2.5-1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B)
+- [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
+- [Qwen/Qwen2.5-3B](https://huggingface.co/Qwen/Qwen2.5-3B)
+- [Qwen/Qwen2.5-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
+- [Qwen/Qwen2.5-7B](https://huggingface.co/Qwen/Qwen2.5-7B)
+- [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
+- [Qwen/Qwen2.5-14B](https://huggingface.co/Qwen/Qwen2.5-14B)
+- [Qwen/Qwen2.5-14B-Instruct](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct)
+- [Qwen/Qwen2.5-Coder-0.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B)
+- [Qwen/Qwen2.5-Coder-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct)
+- [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B)
+- [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct)
+- [Qwen/Qwen2.5-Coder-3B](https://huggingface.co/Qwen/Qwen2.5-Coder-3B)
+- [Qwen/Qwen2.5-Coder-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct)
+- [Qwen/Qwen2.5-Coder-7B](https://huggingface.co/Qwen/Qwen2.5-Coder-7B)
+- [Qwen/Qwen2.5-Coder-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct)
+- [Qwen/Qwen2.5-Coder-14B](https://huggingface.co/Qwen/Qwen2.5-Coder-14B)
+- [Qwen/Qwen2.5-Coder-14B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct)
+- [Qwen/Qwen2.5-Math-1.5B](https://huggingface.co/Qwen/Qwen2.5-Math-1.5B)
+- [Qwen/Qwen2.5-Math-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Math-1.5B-Instruct)
+- [Qwen/Qwen2.5-Math-7B](https://huggingface.co/Qwen/Qwen2.5-Math-7B)
+- [Qwen/Qwen2.5-Math-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Math-7B-Instruct)
+- [deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B)
+- [deepseek-ai/DeepSeek-R1-Distill-Qwen-7B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B)
+- [deepseek-ai/DeepSeek-R1-Distill-Qwen-14B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B)
+
+**Quantized:**
+- [Qwen/Qwen2-0.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-AWQ)
+- [Qwen/Qwen2-0.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2-1.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-AWQ)
+- [Qwen/Qwen2-1.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2-7B-Instruct-AWQ)
+- [Qwen/Qwen2-7B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2-7B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-0.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-AWQ)
+- [Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-1.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-AWQ)
+- [Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-3B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-AWQ)
+- [Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-AWQ)
+- [Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-14B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-AWQ)
+- [Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-Coder-0.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-AWQ)
+- [Qwen/Qwen2.5-Coder-0.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-Coder-1.5B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-AWQ)
+- [Qwen/Qwen2.5-Coder-1.5B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-Coder-3B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-AWQ)
+- [Qwen/Qwen2.5-Coder-3B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-Coder-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-AWQ)
+- [Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GPTQ-Int4)
+- [Qwen/Qwen2.5-Coder-14B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ)
+- [Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4](https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-GPTQ-Int4)
+
+</details>
+
+<details>
+<summary><b>Qwen3 dense</b> checkpoints</summary>
+
+**Original:**
+- [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)
+- [Qwen/Qwen3-0.6B-Base](https://huggingface.co/Qwen/Qwen3-0.6B-Base)
+- [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B)
+- [Qwen/Qwen3-1.7B-Base](https://huggingface.co/Qwen/Qwen3-1.7B-Base)
+- [Qwen/Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B)
+- [Qwen/Qwen3-4B-Base](https://huggingface.co/Qwen/Qwen3-4B-Base)
+- [Qwen/Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)
+- [Qwen/Qwen3-4B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507)
+- [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B)
+- [Qwen/Qwen3-8B-Base](https://huggingface.co/Qwen/Qwen3-8B-Base)
+- [Qwen/Qwen3-14B](https://huggingface.co/Qwen/Qwen3-14B)
+- [Qwen/Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-Base)
+
+**Quantized:**
+- [Qwen/Qwen3-4B-AWQ](https://huggingface.co/Qwen/Qwen3-4B-AWQ)
+- [Qwen/Qwen3-8B-AWQ](https://huggingface.co/Qwen/Qwen3-8B-AWQ)
+- [Qwen/Qwen3-14B-AWQ](https://huggingface.co/Qwen/Qwen3-14B-AWQ)
+- [nvidia/Qwen3-8B-FP8](https://huggingface.co/nvidia/Qwen3-8B-FP8)
+- [nvidia/Qwen3-8B-NVFP4](https://huggingface.co/nvidia/Qwen3-8B-NVFP4)
+- [nvidia/Qwen3-14B-FP8](https://huggingface.co/nvidia/Qwen3-14B-FP8)
+- [nvidia/Qwen3-14B-NVFP4](https://huggingface.co/nvidia/Qwen3-14B-NVFP4)
+
+</details>
+
+<details>
+<summary><b>Qwen3.5/3.6 text</b> checkpoints</summary>
+
+**Qwen3.5:**
+- [Qwen/Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
+- [Qwen/Qwen3.5-0.8B-Base](https://huggingface.co/Qwen/Qwen3.5-0.8B-Base)
+- [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B)
+- [Qwen/Qwen3.5-2B-Base](https://huggingface.co/Qwen/Qwen3.5-2B-Base)
+- [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)
+- [Qwen/Qwen3.5-4B-Base](https://huggingface.co/Qwen/Qwen3.5-4B-Base)
+- [Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
+- [Qwen/Qwen3.5-9B-Base](https://huggingface.co/Qwen/Qwen3.5-9B-Base)
+- [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B)
+
+**Qwen3.6 (same architecture as Qwen3.5):**
+- [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
+
+**Quantized:**
+- [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)
+
+</details>
+
+<details>
+<summary><b>Nemotron Nano dense</b> checkpoints</summary>
+
+**Original:**
+- [nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16)
+- [nvidia/NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2)
+
+**Quantized:**
+- [nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8)
+- [nvidia/NVIDIA-Nemotron-3-Nano-4B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-NVFP4)
+- [nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8)
+- [nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4)
+
+</details>
+
+---
+
+### MoE
+
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| Qwen3-MoE | [`Qwen3MoeForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) | `qwen3_moe` -> `Qwen3MoeCausalLM` | INT4 only |
+| Nemotron3-MoE | [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `nemotron_h` -> `NemotronHCausalLM` | NVFP4 only |
+
+<details>
+<summary><b>Qwen3-MoE</b> checkpoints</summary>
+
+- [Qwen/Qwen3-30B-A3B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4)
+
+</details>
+
+<details>
+<summary><b>Nemotron3-MoE</b> checkpoints</summary>
+
+- [nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4)
+
+</details>
+
+---
+
+### VLM
+
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| Qwen2.5-VL | [`Qwen2_5_VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py) | `qwen2_5_vl` + `Qwen2_5VLVisualModel` | Dense precision set for LLM backbone |
+| Qwen3-VL / compatible | [`Qwen3VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py) | `qwen3_vl` + `Qwen3VLVisualModel` | Dense precision set for LLM backbone |
+| Qwen3.5/3.6 VLM | [`Qwen3_5ForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py) | `qwen3_5` -> `Qwen3_5CausalLM` + `Qwen3_5VLVisualModel` | VLM original checkpoints only |
+| InternVL3 / InternVL3.5 HF format | [`InternVLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/internvl/modeling_internvl.py) | `internvl_chat` / `internvl` + InternVL visual models | Dense precision set for LLM backbone |
+| Phi-4-Multimodal | [`Phi4MultimodalForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/phi4_multimodal/modeling_phi4_multimodal.py) | `phi4mm` / `phi4_multimodal` + `Phi4MMVisualModel` | Merge vision LoRA, then dense precision set for the LLM backbone |
+
+<details>
+<summary><b>Qwen2.5-VL</b> checkpoints</summary>
+
+**Original:**
+- [Qwen/Qwen2.5-VL-3B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
+- [Qwen/Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct)
+
+**Quantized:**
+- [Qwen/Qwen2.5-VL-3B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct-AWQ)
+- [Qwen/Qwen2.5-VL-7B-Instruct-AWQ](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct-AWQ)
+- [nvidia/Qwen2.5-VL-7B-Instruct-FP8](https://huggingface.co/nvidia/Qwen2.5-VL-7B-Instruct-FP8)
+- [nvidia/Qwen2.5-VL-7B-Instruct-NVFP4](https://huggingface.co/nvidia/Qwen2.5-VL-7B-Instruct-NVFP4)
+
+</details>
+
+<details>
+<summary><b>Qwen3-VL / compatible</b> checkpoints</summary>
+
+**Original:**
+- [Qwen/Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct)
+- [Qwen/Qwen3-VL-2B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-2B-Thinking)
+- [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)
+- [Qwen/Qwen3-VL-4B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking)
+- [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
+- [Qwen/Qwen3-VL-8B-Thinking](https://huggingface.co/Qwen/Qwen3-VL-8B-Thinking)
+- [nvidia/Cosmos-Reason2-2B](https://huggingface.co/nvidia/Cosmos-Reason2-2B)
+- [nvidia/Cosmos-Reason2-8B](https://huggingface.co/nvidia/Cosmos-Reason2-8B)
+
+**Quantized:**
+- [nvidia/Cosmos-Reason2-2B-FP8](https://huggingface.co/nvidia/Cosmos-Reason2-2B-FP8)
+- [nvidia/Cosmos-Reason2-2B-NVFP4](https://huggingface.co/nvidia/Cosmos-Reason2-2B-NVFP4)
+- [nvidia/Cosmos-Reason2-8B-FP8](https://huggingface.co/nvidia/Cosmos-Reason2-8B-FP8)
+- [nvidia/Cosmos-Reason2-8B-NVFP4](https://huggingface.co/nvidia/Cosmos-Reason2-8B-NVFP4)
+
+</details>
+
+<details>
+<summary><b>Qwen3.5/3.6 VLM</b> — same checkpoints as Qwen3.5/3.6 text</summary>
+
+Qwen3.5 and Qwen3.6 checkpoints are unified text+VLM models. The same checkpoints listed under [Qwen3.5/3.6 text](#dense-llm) are used; `llm_loader` selects the VLM path (`qwen3_5` handler) when visual inputs are provided.
+
+</details>
+
+<details>
+<summary><b>InternVL3 / InternVL3.5 HF format</b> checkpoints</summary>
+
+**Original:**
+- [OpenGVLab/InternVL3-1B-hf](https://huggingface.co/OpenGVLab/InternVL3-1B-hf)
+- [OpenGVLab/InternVL3-2B-hf](https://huggingface.co/OpenGVLab/InternVL3-2B-hf)
+- [OpenGVLab/InternVL3-8B-hf](https://huggingface.co/OpenGVLab/InternVL3-8B-hf)
+- [OpenGVLab/InternVL3-9B](https://huggingface.co/OpenGVLab/InternVL3-9B)
+- [OpenGVLab/InternVL3-9B-Instruct](https://huggingface.co/OpenGVLab/InternVL3-9B-Instruct)
+- [OpenGVLab/InternVL3-14B-hf](https://huggingface.co/OpenGVLab/InternVL3-14B-hf)
+- [OpenGVLab/InternVL3_5-1B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-1B-HF)
+- [OpenGVLab/InternVL3_5-2B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-2B-HF)
+- [OpenGVLab/InternVL3_5-4B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-4B-HF)
+- [OpenGVLab/InternVL3_5-8B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-8B-HF)
+- [OpenGVLab/InternVL3_5-14B-HF](https://huggingface.co/OpenGVLab/InternVL3_5-14B-HF)
+
+**Quantized:**
+- [OpenGVLab/InternVL3-1B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-1B-AWQ)
+- [OpenGVLab/InternVL3-2B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-2B-AWQ)
+- [OpenGVLab/InternVL3-8B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-8B-AWQ)
+- [OpenGVLab/InternVL3-14B-AWQ](https://huggingface.co/OpenGVLab/InternVL3-14B-AWQ)
+
+</details>
+
+<details>
+<summary><b>Phi-4-Multimodal</b> checkpoints</summary>
+
+- [microsoft/Phi-4-multimodal-instruct](https://huggingface.co/microsoft/Phi-4-multimodal-instruct)
+
+</details>
+
+---
+
+### VLA
+
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| Alpamayo R1 | Checkpoint architecture `alpamayo_r1`; VLM backbone compatible with [`Qwen3VLForConditionalGeneration`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py) | `qwen3_vl` + `Qwen3VLVisualModel` + `AlpamayoAction` | FP16 |
+
+<details>
+<summary><b>Alpamayo R1</b> checkpoints</summary>
+
+- [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
+
+</details>
+
+---
+
+### Audio / Speech
+
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| Qwen3-ASR | Checkpoint architecture `Qwen3ASRForConditionalGeneration`; text backbone compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `Qwen3ASRLanguageModel` + `QwenAudioEncoder` | FP16 |
+
+<details>
+<summary><b>Qwen3-ASR</b> checkpoints</summary>
+
+- [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B)
+- [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B)
+
+</details>
+
+---
+
+### TTS
+
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| Qwen3-TTS | Checkpoint architecture `Qwen3TTSForConditionalGeneration`; talker/code-predictor decoders compatible with [`Qwen3ForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3/modeling_qwen3.py) | `TalkerCausalLM` + `CodePredictorCausalLM` + Code2Wav from `speech_tokenizer/` | FP16 |
+
+<details>
+<summary><b>Qwen3-TTS</b> checkpoints</summary>
+
+- [Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
+- [Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
+
+</details>
+
+---
+
+### Omni
+
+| Model Series | Transformers Class | `llm_loader` Handling | Supported Precisions |
+|--------------|--------------------|-----------------------|----------------------|
+| [Nemotron-Omni](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4/blob/main/modeling.py) | Checkpoint architecture `NemotronH_Nano_Omni_Reasoning_V3`; LLM is Nemotron-H compatible with [`NemotronHForCausalLM`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/nemotron_h/modeling_nemotron_h.py) | `NemotronHCausalLM` + `NemotronOmniVisualModel` + `NemotronOmniAudioModel` | NVFP4 only |
+
+<details>
+<summary><b>Nemotron-Omni</b> checkpoints</summary>
+
+- [nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4)
+
+</details>
+
+---
+
+Qwen3-ASR and Qwen3-TTS use checkpoint architecture names that are not present in the installed `transformers==5.3.0` package, so TensorRT Edge-LLM handles their speech/audio/talker/Code2Wav components with local model implementations. Qwen3-TTS support is limited to the CustomVoice checkpoints listed above.
 
 ## EAGLE3 Draft Models
 

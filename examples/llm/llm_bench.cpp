@@ -59,14 +59,14 @@ enum ProfileBenchOptionId : int
     VERIFY_TREE_SIZE = 815,
     DRAFT_TREE_SIZE = 816,
     IMAGE_SIZE = 818,
-    NO_PROFILE = 821,
     OSL = 827,
     OUTPUT_DIR = 828,
     SEED = 829,
-    USE_CUDA_GRAPH = 830,
+    NO_CUDA_GRAPH = 830,
     EXTRACT_LAYER_INFO = 831,
     ACCEPT_RATE = 832,
-    DRAFT_STEP = 833
+    DRAFT_STEP = 833,
+    PROFILE = 834
 };
 
 struct ProfileBenchArgs
@@ -78,7 +78,7 @@ struct ProfileBenchArgs
     int32_t inputLen{-1}; // Input sequence length per batch (required for prefill modes)
     int32_t iterations{10};
     int32_t warmup{3};
-    bool noProfile{false};  // Disable layer profiling phase (--noProfile), E2E only
+    bool noProfile{true};   // Layer profiling is disabled by default; --profile enables it.
     std::string outputDir;  // Directory to dump output CSV files (layer profiling and E2E timing)
     int32_t imageHeight{0}; // Image height in pixels (required for visual mode)
     int32_t imageWidth{0};  // Image width in pixels (required for visual mode)
@@ -90,19 +90,19 @@ struct ProfileBenchArgs
     int32_t reuseKVLen{0}; // For prefill: reused KV cache length per batch
     int32_t pastKVLen{-1}; // For decode/verify/draft: past KV cache length per batch (required)
 
-    // Eagle parameters - no defaults
-    int32_t verifyTreeSize{-1}; // For eagle_verify
-    int32_t draftTreeSize{-1};  // For eagle_draft_proposal/eagle_draft_prefill
+    // Speculative decoding parameters - no defaults
+    int32_t verifyTreeSize{-1}; // For spec_verify
+    int32_t draftTreeSize{-1};  // For spec_draft_proposal/spec_draft_prefill
 
     int32_t osl{1};        // Output sequence length (LLM OSL per batch, default: 1)
-    int32_t acceptRate{5}; // Avg accepted tokens per EAGLE iteration (default: 5)
-    int32_t draftStep{6};  // Number of drafting steps per EAGLE iteration (default: 6)
+    int32_t acceptRate{5}; // Avg accepted tokens per spec-decode iteration (default: 5)
+    int32_t draftStep{6};  // Number of drafting steps per spec-decode iteration (default: 6)
 
     // Random seed for reproducibility
     uint64_t seed{0};
 
-    // CUDA graph optimization
-    bool useCudaGraph{false};
+    // CUDA graph is enabled by default for decode/EAGLE E2E timing.
+    bool noCudaGraph{false};
 
     // Metadata extraction flags - disabled by default for performance.
     // Set via --extractLayerInfo <comma-separated list>.
@@ -140,9 +140,13 @@ void printUsage(char const* programName)
     std::cerr << "  --mode                    Benchmarking mode. Required. One of:" << std::endl;
     std::cerr << "                              prefill           - LLM prefill phase" << std::endl;
     std::cerr << "                              decode            - LLM decode phase" << std::endl;
-    std::cerr << "                              eagle_verify      - Eagle base model verification" << std::endl;
-    std::cerr << "                              eagle_draft_proposal - Eagle draft proposal" << std::endl;
-    std::cerr << "                              eagle_draft_prefill - Eagle draft model prefill" << std::endl;
+    std::cerr
+        << "                              spec_verify       - Speculative decoding base model verification (EAGLE/MTP)"
+        << std::endl;
+    std::cerr << "                              spec_draft_proposal - Speculative decoding draft proposal (EAGLE/MTP)"
+              << std::endl;
+    std::cerr << "                              spec_draft_prefill - Speculative decoding draft prefill (EAGLE/MTP)"
+              << std::endl;
     std::cerr << "                              visual            - Visual encoder" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Mode-Specific Required Options:" << std::endl;
@@ -151,13 +155,13 @@ void printUsage(char const* programName)
     std::cerr << "    --reuseKVLen            Reused KV cache length. Optional, default=0." << std::endl;
     std::cerr << "  For decode mode:" << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
-    std::cerr << "  For eagle_verify mode:" << std::endl;
+    std::cerr << "  For spec_verify mode:" << std::endl;
     std::cerr << "    --verifyTreeSize        Verify tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
-    std::cerr << "  For eagle_draft_proposal mode:" << std::endl;
+    std::cerr << "  For spec_draft_proposal mode:" << std::endl;
     std::cerr << "    --draftTreeSize         Draft tree size. Required." << std::endl;
     std::cerr << "    --pastKVLen             Past KV cache length. Required." << std::endl;
-    std::cerr << "  For eagle_draft_prefill mode:" << std::endl;
+    std::cerr << "  For spec_draft_prefill mode:" << std::endl;
     std::cerr << "    --inputLen              Input sequence length. Required." << std::endl;
     std::cerr << "    --reuseKVLen            Reused KV cache length. Optional, default=0." << std::endl;
     std::cerr << "  For visual mode:" << std::endl;
@@ -171,24 +175,24 @@ void printUsage(char const* programName)
     std::cerr << "  --iterations              Number of profiling iterations (after warmup). Default = 10" << std::endl;
     std::cerr << "  --warmup                  Number of warmup iterations. Default = 3" << std::endl;
     std::cerr << "  --osl                     Output sequence length for decode E2E timing. Default = 1." << std::endl;
-    std::cerr << "                            osl=1: layer profiling + E2E both run --iterations times." << std::endl;
-    std::cerr << "                            osl>1: layer profiling runs --iterations times (single-step),"
-              << std::endl;
-    std::cerr << "                                   E2E runs full sequence decode once." << std::endl;
-    std::cerr << "  --noProfile               Disable per-layer profiling (E2E timing only)." << std::endl;
-    std::cerr << "                            By default both E2E and layer profiling run." << std::endl;
+    std::cerr << "                            osl=1: E2E runs --iterations times." << std::endl;
+    std::cerr << "                            osl>1: E2E runs full sequence decode once." << std::endl;
+    std::cerr << "  --profile                 Enable per-layer profiling. Disabled by default." << std::endl;
     std::cerr << "  --outputDir               Directory to dump output CSV files (layer profiling and E2E timing)"
               << std::endl;
     std::cerr << "  --seed                    Random seed for reproducible data. Default = 0" << std::endl;
-    std::cerr << "  --useCudaGraph            Capture CUDA graph before E2E timing for faster per-step execution."
+    std::cerr << "  --noCudaGraph             Disable CUDA graph capture for decode/EAGLE E2E timing." << std::endl;
+    std::cerr << "                            Capture is enabled by default and falls back to non-graph on failure."
               << std::endl;
     std::cerr << "  --extractLayerInfo <opts>  Comma-separated list of layer info to extract:" << std::endl;
     std::cerr << "                              all, shapes, onnx_ops, tactics, data_types" << std::endl;
+    std::cerr << "                            Implies --profile." << std::endl;
     std::cerr << std::endl;
-    std::cerr << "EAGLE-Specific Options:" << std::endl;
-    std::cerr << "  --acceptRate              Avg accepted tokens per EAGLE iteration (default: 5)." << std::endl;
+    std::cerr << "Speculative Decoding Options:" << std::endl;
+    std::cerr << "  --acceptRate              Avg accepted tokens per spec-decode iteration (default: 5)." << std::endl;
     std::cerr << "                            verify_steps = ceil((osl-1) / acceptRate)." << std::endl;
-    std::cerr << "  --draftStep               Number of drafting steps per EAGLE iteration (default: 6)." << std::endl;
+    std::cerr << "  --draftStep               Number of drafting steps per spec-decode iteration (default: 6)."
+              << std::endl;
     std::cerr << "                            draft_calls = verify_steps * (draftStep-1)." << std::endl;
     std::cerr << std::endl;
     std::cerr << "Examples:" << std::endl;
@@ -198,13 +202,13 @@ void printUsage(char const* programName)
     std::cerr << "  # Decode mode" << std::endl;
     std::cerr << "  " << programName << " --engineDir ./engines --mode decode --pastKVLen 128" << std::endl;
     std::cerr << std::endl;
-    std::cerr << "  # Eagle verify mode" << std::endl;
-    std::cerr << "  " << programName << " --engineDir ./engines --mode eagle_verify --verifyTreeSize 60 --pastKVLen 128"
+    std::cerr << "  # Spec-decode verify mode" << std::endl;
+    std::cerr << "  " << programName << " --engineDir ./engines --mode spec_verify --verifyTreeSize 60 --pastKVLen 128"
               << std::endl;
     std::cerr << std::endl;
-    std::cerr << "  # Eagle draft proposal mode" << std::endl;
+    std::cerr << "  # Spec-decode draft proposal mode" << std::endl;
     std::cerr << "  " << programName
-              << " --engineDir ./engines --mode eagle_draft_proposal --draftTreeSize 60 --pastKVLen 128" << std::endl;
+              << " --engineDir ./engines --mode spec_draft_proposal --draftTreeSize 60 --pastKVLen 128" << std::endl;
     std::cerr << std::endl;
     std::cerr << "  # Visual encoder mode" << std::endl;
     std::cerr << "  " << programName << " --engineDir ./visual_engines --mode visual --imageSize 896x448" << std::endl;
@@ -226,12 +230,12 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
         {"pastKVLen", required_argument, 0, ProfileBenchOptionId::PAST_KV_LEN},
         {"verifyTreeSize", required_argument, 0, ProfileBenchOptionId::VERIFY_TREE_SIZE},
         {"draftTreeSize", required_argument, 0, ProfileBenchOptionId::DRAFT_TREE_SIZE},
-        {"noProfile", no_argument, 0, ProfileBenchOptionId::NO_PROFILE},
+        {"profile", no_argument, 0, ProfileBenchOptionId::PROFILE},
         {"outputDir", required_argument, 0, ProfileBenchOptionId::OUTPUT_DIR},
         {"osl", required_argument, 0, ProfileBenchOptionId::OSL},
         {"seed", required_argument, 0, ProfileBenchOptionId::SEED},
         {"imageSize", required_argument, 0, ProfileBenchOptionId::IMAGE_SIZE},
-        {"useCudaGraph", no_argument, 0, ProfileBenchOptionId::USE_CUDA_GRAPH},
+        {"noCudaGraph", no_argument, 0, ProfileBenchOptionId::NO_CUDA_GRAPH},
         {"extractLayerInfo", required_argument, 0, ProfileBenchOptionId::EXTRACT_LAYER_INFO},
         {"acceptRate", required_argument, 0, ProfileBenchOptionId::ACCEPT_RATE},
         {"draftStep", required_argument, 0, ProfileBenchOptionId::DRAFT_STEP}, {0, 0, 0, 0}};
@@ -289,15 +293,15 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 {
                     args.mode = BenchMode::kDECODE;
                 }
-                else if (modeStr == "eagle_verify")
+                else if (modeStr == "spec_verify" || modeStr == "eagle_verify")
                 {
                     args.mode = BenchMode::kEAGLE_VERIFY;
                 }
-                else if (modeStr == "eagle_draft_proposal")
+                else if (modeStr == "spec_draft_proposal" || modeStr == "eagle_draft_proposal")
                 {
                     args.mode = BenchMode::kEAGLE_DRAFT_PROPOSAL;
                 }
-                else if (modeStr == "eagle_draft_prefill")
+                else if (modeStr == "spec_draft_prefill" || modeStr == "eagle_draft_prefill")
                 {
                     args.mode = BenchMode::kEAGLE_DRAFT_PREFILL;
                 }
@@ -368,7 +372,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 }
                 break;
             }
-            case ProfileBenchOptionId::NO_PROFILE: args.noProfile = true; break;
+            case ProfileBenchOptionId::PROFILE: args.noProfile = false; break;
             case ProfileBenchOptionId::OUTPUT_DIR: args.outputDir = optarg; break;
             case ProfileBenchOptionId::OSL:
                 args.osl = std::stoi(optarg);
@@ -379,7 +383,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 }
                 break;
             case ProfileBenchOptionId::SEED: args.seed = std::stoull(optarg); break;
-            case ProfileBenchOptionId::USE_CUDA_GRAPH: args.useCudaGraph = true; break;
+            case ProfileBenchOptionId::NO_CUDA_GRAPH: args.noCudaGraph = true; break;
             case ProfileBenchOptionId::EXTRACT_LAYER_INFO:
             {
                 std::string val = optarg;
@@ -424,6 +428,12 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
         }
     }
 
+    // Layer metadata is only emitted through the layer profiling CSV.
+    if (args.extractLayerInfo.any())
+    {
+        args.noProfile = false;
+    }
+
     return true;
 }
 
@@ -461,31 +471,31 @@ bool validateArgs(ProfileBenchArgs const& args)
     case BenchMode::kEAGLE_VERIFY:
         if (args.verifyTreeSize < 0)
         {
-            LOG_ERROR("--verifyTreeSize is required for eagle_verify mode");
+            LOG_ERROR("--verifyTreeSize is required for spec_verify mode");
             return false;
         }
         if (args.pastKVLen < 0)
         {
-            LOG_ERROR("--pastKVLen is required for eagle_verify mode");
+            LOG_ERROR("--pastKVLen is required for spec_verify mode");
             return false;
         }
         break;
     case BenchMode::kEAGLE_DRAFT_PROPOSAL:
         if (args.draftTreeSize < 0)
         {
-            LOG_ERROR("--draftTreeSize is required for eagle_draft_proposal mode");
+            LOG_ERROR("--draftTreeSize is required for spec_draft_proposal mode");
             return false;
         }
         if (args.pastKVLen < 0)
         {
-            LOG_ERROR("--pastKVLen is required for eagle_draft_proposal mode");
+            LOG_ERROR("--pastKVLen is required for spec_draft_proposal mode");
             return false;
         }
         break;
     case BenchMode::kEAGLE_DRAFT_PREFILL:
         if (args.inputLen < 0)
         {
-            LOG_ERROR("--inputLen is required for eagle_draft_prefill mode");
+            LOG_ERROR("--inputLen is required for spec_draft_prefill mode");
             return false;
         }
         break;
@@ -543,15 +553,15 @@ int main(int argc, char** argv)
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // Enable layer profiler unless --noProfile is set (E2E only mode).
+    // Layer profiling is opt-in; E2E timing is the default benchmark path.
     if (!args.noProfile)
     {
         layerProfiler::LayerProfiler::getInstance().setEnabled(true);
-        LOG_INFO("Layer profiling enabled.");
+        LOG_INFO("Layer profiling enabled. E2E CUDA graph timing will be skipped.");
     }
     else
     {
-        LOG_INFO("Layer profiling disabled (--noProfile). E2E timing only.");
+        LOG_INFO("Layer profiling disabled from startup. E2E timing only.");
     }
 
     // Layer metadata (ONNX ops, shapes, tactics, data types) extracted from engine inspector
@@ -887,10 +897,7 @@ int main(int argc, char** argv)
         int32_t osl = args.osl;
         int32_t decodeTokens = (osl > 1) ? (osl - 1) : 1;
         LOG_INFO("OSL=%d: will run %d decode steps for E2E timing", osl, decodeTokens);
-        if (args.useCudaGraph)
-        {
-            LOG_INFO("CUDA graph enabled for faster per-step execution");
-        }
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         decodeInputs
             = rt::Tensor(rt::Coords{args.batchSize, 1, hiddenSize}, rt::DeviceType::kGPU, dtype, "decode_input");
@@ -917,8 +924,8 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_VERIFY)
     {
-        modeName = "Eagle Verify";
-        LOG_INFO("Eagle Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
+        modeName = "Spec Verify";
+        LOG_INFO("Spec Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
 
         pastKVLenVec.assign(args.batchSize, args.pastKVLen);
 
@@ -936,10 +943,7 @@ int main(int argc, char** argv)
         verifyHiddenStates = rt::Tensor(
             rt::Coords{selectTokenSize, eagleHiddenDim}, rt::DeviceType::kGPU, dtype, "verify_hidden_states");
 
-        if (args.useCudaGraph)
-        {
-            LOG_INFO("CUDA graph enabled: will run layer profiling + CUDA graph timing");
-        }
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
@@ -964,8 +968,8 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PROPOSAL)
     {
-        modeName = "Eagle Draft";
-        LOG_INFO("Eagle Draft mode: DraftTreeSize=%d, PastKVLen=%d", args.draftTreeSize, args.pastKVLen);
+        modeName = "Spec Draft";
+        LOG_INFO("Spec Draft mode: DraftTreeSize=%d, PastKVLen=%d", args.draftTreeSize, args.pastKVLen);
 
         pastKVLenVec.assign(args.batchSize, args.pastKVLen);
 
@@ -995,10 +999,7 @@ int main(int argc, char** argv)
         draftOutputHiddenStates = rt::Tensor(rt::Coords{args.batchSize, numSelectedTokens, hiddenSize},
             rt::DeviceType::kGPU, dtype, "draft_hidden_output");
 
-        if (args.useCudaGraph)
-        {
-            LOG_INFO("CUDA graph enabled: will run layer profiling + CUDA graph timing");
-        }
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
 
         resetState = [&]() {
             std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
@@ -1030,8 +1031,8 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
     {
-        modeName = "Eagle Draft Prefill";
-        LOG_INFO("Eagle Draft Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
+        modeName = "Spec Draft Prefill";
+        LOG_INFO("Spec Draft Prefill mode: InputLen=%d, ReuseKVLen=%d", args.inputLen, args.reuseKVLen);
 
         reuseKVLenVec.assign(args.batchSize, args.reuseKVLen);
 
@@ -1103,6 +1104,16 @@ int main(int argc, char** argv)
             writeLayerInfoCsv(
                 layerTimings, buildLayerCsvPath(args.outputDir, outParams), outParams, imageTokens, layerMetadata);
         }
+
+        // A TensorRT profiler attached to an execution context cannot be fully detached in this benchmark process.
+        // Keep --profile isolated to non-CUDA-graph layer profiling so E2E CUDA graph timing stays uncontaminated.
+        logResultsSummary(args.toOutputParams(), timesPerIter, e2eTimeMsResult, imageTokens);
+        if (!args.outputDir.empty())
+        {
+            LOG_INFO("Output CSV files saved to: %s", args.outputDir.c_str());
+        }
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        return EXIT_SUCCESS;
     }
 
     // ===== Phase 7: E2E Timing =====
@@ -1122,21 +1133,21 @@ int main(int argc, char** argv)
     }
     else if (args.mode == BenchMode::kEAGLE_DRAFT_PREFILL)
     {
-        e2eTimeMsResult = runRepeatedE2ETiming("Eagle Draft Prefill", args.iterations, resetState, step, stream);
+        e2eTimeMsResult = runRepeatedE2ETiming("Spec Draft Prefill", args.iterations, resetState, step, stream);
         e2eNumTokens = args.inputLen;
     }
     else if (useSequentialE2E)
     {
         // osl > 1: full sequence decode, single run
         e2eTimeMsResult = runSequentialE2ETiming(
-            modeName, decodeSteps, resetState, step, postStep, args.useCudaGraph, captureGraph, stream);
+            modeName, decodeSteps, resetState, step, postStep, !args.noCudaGraph, captureGraph, stream);
         e2eNumTokens = decodeSteps;
     }
     else
     {
-        // osl=1: single-step, multiple iterations (decode/eagle modes)
+        // osl=1: single-step, multiple iterations (decode/spec-decode modes)
         e2eTimeMsResult = runRepeatedE2ETiming(
-            modeName, args.iterations, resetState, step, stream, args.useCudaGraph, captureGraph);
+            modeName, args.iterations, resetState, step, stream, !args.noCudaGraph, captureGraph);
         e2eNumTokens = 1;
     }
 

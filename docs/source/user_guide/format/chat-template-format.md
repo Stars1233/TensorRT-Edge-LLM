@@ -43,14 +43,45 @@ The system automatically detects thinking mode support during model export. If n
 
 ## Custom Templates
 
-Override the default template during export:
+`llm_loader` extracts the chat template from the checkpoint during export and
+writes `processed_chat_template.json` next to the exported LLM ONNX graph.
+
+To customize the chat template, first export the model normally, then edit the
+generated file in place:
 
 ```bash
-tensorrt-edgellm-export-llm \
-    --model_dir /path/to/model \
-    --output_dir /path/to/output \
-    --chat_template /path/to/custom_template.json
+# 1. Export (generates processed_chat_template.json with auto-detected template)
+python -m llm_loader.export_all_cli \
+    /path/to/model \
+    /path/to/output
+
+# 2. Edit the generated template to customize roles, delimiters, etc.
+vi /path/to/output/llm/processed_chat_template.json
 ```
+
+The generated `processed_chat_template.json` is a structured JSON with the
+following schema (not a raw Jinja template):
+
+```json
+{
+  "model_path": "path/to/model",
+  "roles": {
+    "system":    {"prefix": "<prefix>", "suffix": "<suffix>"},
+    "user":      {"prefix": "<prefix>", "suffix": "<suffix>"},
+    "assistant": {"prefix": "<prefix>", "suffix": "<suffix>"}
+  },
+  "content_types": {
+    "image": {"format": "<placeholder>"},
+    "video": {"format": "<placeholder>"},
+    "audio": {"format": "<placeholder>"}
+  },
+  "generation_prompt": "<prompt>",
+  "default_system_prompt": "<system_message>"
+}
+```
+
+Reference templates are available under `experimental/llm_loader/chat_templates/`
+(e.g., `phi4mm.json`, `qwen3asr.json`, `nemotron_nano_v2.json`).
 
 Pre-built templates are automatically used for models with known tokenizer issues (e.g., Phi-4-Multimodal).
 

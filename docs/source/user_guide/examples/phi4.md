@@ -13,7 +13,9 @@ Phi-4-Multimodal requires merging its vision LoRA adapter into the base model be
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Phi-4-multimodal-instruct
+export MODEL_DIR=$WORKSPACE_DIR/$MODEL_NAME
 export EDGE_LLM_PATH=$HOME/tensorrt-edge-llm   # path to TensorRT-Edge-LLM repo root
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
@@ -22,34 +24,30 @@ git clone https://huggingface.co/microsoft/Phi-4-multimodal-instruct
 cd Phi-4-multimodal-instruct && git lfs pull && cd ..
 
 # Merge vision LoRA adapter into base model
-tensorrt-edgellm-merge-lora \
+python -m llm_loader.lora.merge_lora_cli \
   --model_dir Phi-4-multimodal-instruct \
   --lora_dir Phi-4-multimodal-instruct/vision-lora \
-  --output_dir $MODEL_NAME/merged
+  --output_dir $MODEL_DIR/merged
 
 # Quantize merged model
-tensorrt-edgellm-quantize-llm \
-  --model_dir $MODEL_NAME/merged \
-  --output_dir $MODEL_NAME/quantized \
-  --quantization nvfp4
+cd $EDGE_LLM_PATH
+python -m experimental.quantization llm \
+  --model_dir $MODEL_DIR/merged \
+  --output_dir $MODEL_DIR/quantized \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
 
-# Export language model
-tensorrt-edgellm-export-llm \
-  --model_dir $MODEL_NAME/quantized \
-  --output_dir $MODEL_NAME/onnx/llm \
-  --chat_template $EDGE_LLM_PATH/tensorrt_edgellm/chat_templates/templates/phi4mm.json
-
-# Export visual encoder (use original weights, not merged)
-tensorrt-edgellm-export-visual \
-  --model_dir Phi-4-multimodal-instruct \
-  --output_dir $MODEL_NAME/onnx/visual
+# Export language model and visual encoder
+python -m llm_loader.export_all_cli \
+  $MODEL_DIR/quantized \
+  $MODEL_DIR/onnx
 ```
 
 ## Step 2: Transfer to Device
 
 ```bash
 # Transfer ONNX to device
-scp -r $MODEL_NAME/onnx \
+scp -r $MODEL_DIR/onnx \
   <device_user>@<device_ip>:~/tensorrt-edgellm-workspace/$MODEL_NAME/
 ```
 
@@ -65,15 +63,15 @@ cd ~/TensorRT-Edge-LLM
   --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/llm \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \
   --maxBatchSize 1 \
-  --maxInputLen 1024 \
-  --maxKVCacheCapacity 4096
+  --maxInputLen 1536 \
+  --maxKVCacheCapacity 2048
 
 # Build visual encoder engine
 ./build/examples/multimodal/visual_build \
   --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/visual \
-  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/visual \
-  --minImageTokens 128 \
-  --maxImageTokens 512 \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+  --minImageTokens 256 \
+  --maxImageTokens 1024 \
   --maxImageTokensPerImage 512
 ```
 

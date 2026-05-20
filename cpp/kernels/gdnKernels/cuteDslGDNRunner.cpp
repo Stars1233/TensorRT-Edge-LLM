@@ -22,6 +22,8 @@
 
 #include "common/logger.h"
 
+#include <cmath>
+#include <cstring>
 #include <mutex>
 
 namespace trt_edgellm
@@ -32,6 +34,7 @@ gdn_prefill_Kernel_Module_t CuteDslGDNRunner::sPrefillModule = {};
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
 gdn_prefill_blackwell_Kernel_Module_t CuteDslGDNRunner::sBlackwellPrefillModule = {};
 #endif
+gdn_decode_mtp_cache_Kernel_Module_t CuteDslGDNRunner::sMTPDecodeCacheModule = {};
 bool CuteDslGDNRunner::sLoaded = false;
 
 static std::mutex sGDNMutex;
@@ -85,10 +88,14 @@ bool CuteDslGDNRunner::loadKernelModules()
         gdn_prefill_Kernel_Module_Load(&sPrefillModule);
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
         gdn_prefill_blackwell_Kernel_Module_Load(&sBlackwellPrefillModule);
-        LOG_DEBUG("CuTe DSL GDN kernel modules (decode + prefill + prefill_blackwell) loaded");
-#else
-        LOG_DEBUG("CuTe DSL GDN kernel modules (decode + prefill) loaded");
 #endif
+        gdn_decode_mtp_cache_Kernel_Module_Load(&sMTPDecodeCacheModule);
+        LOG_DEBUG(
+            "CuTe DSL GDN kernel modules loaded (decode + prefill + MTP"
+#ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
+            " + blackwell"
+#endif
+            ")");
         sLoaded = true;
         return true;
     }
@@ -109,12 +116,16 @@ void CuteDslGDNRunner::unloadKernelModules()
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
         gdn_prefill_blackwell_Kernel_Module_Unload(&sBlackwellPrefillModule);
 #endif
+        gdn_decode_mtp_cache_Kernel_Module_Unload(&sMTPDecodeCacheModule);
         sLoaded = false;
     }
 }
 
 int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 {
+    // MTP decode takes priority: handles any seq_len for speculative-decoding verification.
+    if (params.use_mtp)
+        return runDecodeMTP(params, stream);
     if (params.seq_len == 1)
         return runDecode(params, stream);
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
@@ -329,6 +340,94 @@ int CuteDslGDNRunner::runPrefillBlackwell(GDNParams const& params, cudaStream_t 
     LOG_ERROR("Blackwell GDN prefill not compiled in this build.");
     return -1;
 #endif
+}
+
+int CuteDslGDNRunner::runDecodeMTP(GDNParams const& params, cudaStream_t stream)
+{
+    if (!sLoaded)
+    {
+        LOG_ERROR("CuTe DSL GDN MTP decode kernel module not loaded.");
+        return -1;
+    }
+
+    int32_t const n = params.n;
+    int32_t const seq_len = params.seq_len;
+    int32_t const h = params.h;
+    int32_t const hv = params.hv;
+    int32_t const k = params.k_dim;
+    int32_t const v = params.v_dim;
+
+    if (seq_len < 1)
+    {
+        LOG_ERROR("CuTe DSL GDN MTP decode requires seq_len >= 1, got %d", seq_len);
+        return -1;
+    }
+
+    // Must match T_MAX_AOT in gdn_decode_mtp.py.
+    constexpr int32_t kMTPMaxSeqLen = 8;
+    if (seq_len > kMTPMaxSeqLen)
+    {
+        LOG_ERROR("CuTe DSL GDN MTP decode requires seq_len <= %d, got %d", kMTPMaxSeqLen, seq_len);
+        return -1;
+    }
+
+    // q / k : [n, seq_len, h, k]
+    gdn_decode_mtp_cache_Tensor_q_t qTensor{};
+    SET_4D_TENSOR(qTensor, params.q, n, seq_len, h, k);
+
+    gdn_decode_mtp_cache_Tensor_k_t kTensor{};
+    SET_4D_TENSOR(kTensor, params.k, n, seq_len, h, k);
+
+    // v : [n, seq_len, hv, v]
+    gdn_decode_mtp_cache_Tensor_v_t vTensor{};
+    SET_4D_TENSOR(vTensor, params.v, n, seq_len, hv, v);
+
+    // a / b : [n, seq_len, hv]
+    gdn_decode_mtp_cache_Tensor_a_t aTensor{};
+    SET_3D_TENSOR(aTensor, params.a, n, seq_len, hv);
+
+    gdn_decode_mtp_cache_Tensor_b_t bTensor{};
+    SET_3D_TENSOR(bTensor, params.b, n, seq_len, hv);
+
+    // A_log / dt_bias : [hv]
+    gdn_decode_mtp_cache_Tensor_A_log_t A_logTensor{};
+    SET_1D_TENSOR(A_logTensor, params.A_log, hv);
+
+    gdn_decode_mtp_cache_Tensor_dt_bias_t dt_biasTensor{};
+    SET_1D_TENSOR(dt_biasTensor, params.dt_bias, hv);
+
+    // h0_source : [n, hv, k, v]  (batch-dense, in-place updated)
+    gdn_decode_mtp_cache_Tensor_h0_source_t h0Tensor{};
+    h0Tensor.data = params.h0_source;
+    h0Tensor.dynamic_shapes[0] = n;
+    h0Tensor.dynamic_shapes[1] = hv;
+    h0Tensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    // o : [n, seq_len, hv, v]
+    gdn_decode_mtp_cache_Tensor_o_t oTensor{};
+    SET_4D_TENSOR(oTensor, params.o, n, seq_len, hv, v);
+
+    if (params.intermediate_states == nullptr)
+    {
+        LOG_ERROR("CuTe DSL GDN MTP: intermediate_states is null.");
+        return -1;
+    }
+
+    // intermediate_states : [n, seq_len, hv, k, v]
+    gdn_decode_mtp_cache_Tensor_intermediate_states_t intermTensor{};
+    intermTensor.data = params.intermediate_states;
+    intermTensor.dynamic_shapes[0] = n;
+    intermTensor.dynamic_shapes[1] = seq_len;
+    intermTensor.dynamic_shapes[2] = hv;
+    intermTensor.dynamic_strides[0] = static_cast<int64_t>(seq_len) * hv * k * v;
+    intermTensor.dynamic_strides[1] = static_cast<int64_t>(hv) * k * v;
+    intermTensor.dynamic_strides[2] = static_cast<int64_t>(k) * v;
+    intermTensor.dynamic_strides[3] = static_cast<int64_t>(v);
+
+    cute_dsl_gdn_decode_mtp_cache_wrapper(&sMTPDecodeCacheModule, &h0Tensor, &qTensor, &kTensor, &vTensor, &aTensor,
+        &bTensor, &A_logTensor, &dt_biasTensor, &oTensor, &intermTensor, seq_len, stream);
+
+    return 0;
 }
 
 } // namespace trt_edgellm

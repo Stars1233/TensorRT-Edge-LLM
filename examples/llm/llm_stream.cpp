@@ -33,7 +33,7 @@
 //
 // Usage:
 //   llm_stream --engineDir DIR --inputFile PATH
-//     [--multimodalEngineDir DIR] [--eagle [--eagleDraftTopK K ...]]
+//     [--multimodalEngineDir DIR] [--specDecode [--specDraftTopK K ...]]
 //     [--maxGenerateLength N] [--streamInterval N]
 
 #include "common/checkMacros.h"
@@ -87,9 +87,9 @@ void printUsage(char const* argv0)
     std::cout << "Usage: " << argv0
               << " --engineDir DIR --inputFile PATH\n"
                  "           [--multimodalEngineDir DIR] [--maxGenerateLength N]\n"
-                 "           [--streamInterval N] [--eagle [--eagleDraftTopK K]\n"
-                 "                                       [--eagleDraftStep S]\n"
-                 "                                       [--eagleVerifyTreeSize V]]\n\n"
+                 "           [--streamInterval N] [--specDecode [--specDraftTopK K]\n"
+                 "                                             [--specDraftStep S]\n"
+                 "                                             [--specVerifyTreeSize V]]\n\n"
                  "Hotkeys while streaming:\n"
                  "   s         skip the current request\n"
                  "   q         quit (cancel current + stop)\n"
@@ -167,25 +167,25 @@ bool parseArgs(int argc, char** argv, Args& args)
         {
             args.showSpecialTokens = true;
         }
-        else if (a == "--eagle")
+        else if (a == "--specDecode" || a == "--eagle")
         {
             args.eagle = true;
         }
-        else if (a == "--eagleDraftTopK")
+        else if (a == "--specDraftTopK" || a == "--eagleDraftTopK")
         {
             if (!takeInt(i, a, args.eagleDraftTopK))
             {
                 return false;
             }
         }
-        else if (a == "--eagleDraftStep")
+        else if (a == "--specDraftStep" || a == "--eagleDraftStep")
         {
             if (!takeInt(i, a, args.eagleDraftStep))
             {
                 return false;
             }
         }
-        else if (a == "--eagleVerifyTreeSize")
+        else if (a == "--specVerifyTreeSize" || a == "--eagleVerifyTreeSize")
         {
             if (!takeInt(i, a, args.eagleVerifyTreeSize))
             {

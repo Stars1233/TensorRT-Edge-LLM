@@ -36,51 +36,35 @@ namespace builder
 //! (e.g. Alpamayo 1 flow-matching decoder).
 struct ActionBuilderConfig
 {
-    //! Minimum sequence length for dynamic dimensions (e.g. seq_length, past_kv sequence dim).
-    //! Must match the range used when exporting the action ONNX (e.g. 2808 for Alpamayo).
-    int32_t minSeqLen{2808};
+    //! Maximum batch size for dynamic batch dimensions.
+    int32_t maxBatchSize{4};
 
-    //! Maximum sequence length for dynamic dimensions.
-    //! Must match the export range (e.g. 3424 for Alpamayo).
-    int32_t maxSeqLen{3424};
-
-    //! Optimal sequence length for TensorRT to optimize for.
-    //! When loading from JSON, if omitted, defaults to (minSeqLen + maxSeqLen) / 2 in fromJson().
-    int32_t optSeqLen{(2808 + 3424) / 2};
+    //! Maximum KV cache capacity (must match the LLM engine's maxKVCacheCapacity).
+    int32_t maxKVCacheCapacity{0};
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
     Json toJson() const
     {
         Json json;
-        json["min_seq_len"] = minSeqLen;
-        json["max_seq_len"] = maxSeqLen;
-        json["opt_seq_len"] = optSeqLen;
+        json["max_batch_size"] = maxBatchSize;
+        json["max_kv_cache_capacity"] = maxKVCacheCapacity;
         return json;
     }
 
     //! Create configuration from JSON format.
-    //! If opt_seq_len is omitted, sets optSeqLen to (minSeqLen + maxSeqLen) / 2.
     //! @param json JSON object containing configuration parameters
     //! @return ActionBuilderConfig object with parsed parameters
     static ActionBuilderConfig fromJson(Json const& json)
     {
         ActionBuilderConfig config;
-        if (json.contains("min_seq_len"))
+        if (json.contains("max_batch_size"))
         {
-            config.minSeqLen = json["min_seq_len"];
+            config.maxBatchSize = json["max_batch_size"];
         }
-        if (json.contains("max_seq_len"))
+        if (json.contains("max_kv_cache_capacity"))
         {
-            config.maxSeqLen = json["max_seq_len"];
-        }
-        if (json.contains("opt_seq_len"))
-        {
-            config.optSeqLen = json["opt_seq_len"];
-        }
-        else
-        {
-            config.optSeqLen = (config.minSeqLen + config.maxSeqLen) / 2;
+            config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
         return config;
     }
@@ -91,9 +75,8 @@ struct ActionBuilderConfig
     {
         std::ostringstream oss;
         oss << "ActionBuilderConfig:\n";
-        oss << "  minSeqLen: " << minSeqLen << "\n";
-        oss << "  maxSeqLen: " << maxSeqLen << "\n";
-        oss << "  optSeqLen: " << optSeqLen << "\n";
+        oss << "  maxBatchSize: " << maxBatchSize << "\n";
+        oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
         return oss.str();
     }
 };
@@ -127,6 +110,12 @@ private:
     std::filesystem::path mOnnxDir;     //!< Directory containing ONNX model files
     std::filesystem::path mEngineDir;   //!< Directory for saving built engine
     ActionBuilderConfig mBuilderConfig; //!< Build configuration
+
+    // Model architecture parameters (read from config.json)
+    int32_t mNumLayers{0};          //!< Number of transformer layers
+    int32_t mNumHeads{0};           //!< Number of key-value heads
+    int32_t mHeadDim{0};            //!< Head dimension
+    int32_t mNumDiffusionTokens{0}; //!< Number of diffusion tokens (waypoints)
 
     //! Parse the model configuration from config.json
     //! @return true if parsing was successful, false otherwise

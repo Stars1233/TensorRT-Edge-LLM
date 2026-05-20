@@ -36,6 +36,7 @@
 
 #include "NvFP4MoEFC2FinalizeRunner.h"
 
+#include "common/checkMacros.h"
 #include <stdexcept>
 #include <string>
 
@@ -111,17 +112,10 @@ void NvFP4MoEFC2FinalizeRunner::run(void const* inputFP4, void const* weight, vo
     int64_t numTokens, cudaStream_t stream)
 {
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-    if (!sLoaded)
-    {
-        throw std::runtime_error("NvFP4MoEFC2FinalizeRunner: kernel modules not loaded");
-    }
+    ELLM_CHECK(sLoaded, "kernel modules not loaded");
 
     int32_t const tactic = selectTactic(mN, mK);
-    if (tactic == 0)
-    {
-        throw std::runtime_error(
-            "NvFP4MoEFC2FinalizeRunner: no valid tactic for N=" + std::to_string(mN) + " K=" + std::to_string(mK));
-    }
+    ELLM_CHECK(tactic > 0, "no valid tactic for N=" + std::to_string(mN) + " K=" + std::to_string(mK));
 
     int64_t const n = static_cast<int64_t>(mN);
     int64_t const k = static_cast<int64_t>(mK);

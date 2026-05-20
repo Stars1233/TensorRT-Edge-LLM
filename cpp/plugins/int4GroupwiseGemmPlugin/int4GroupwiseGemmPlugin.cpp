@@ -19,6 +19,7 @@
 #include "kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h"
 #include "plugins/utils/pluginUtils.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cuda_fp16.h>
 #include <mutex>
@@ -251,10 +252,22 @@ int32_t Int4GroupwiseGemmPlugin::enqueue(PluginTensorDesc const* inputDesc, Plug
         half* ScaleInPtr = reinterpret_cast<half*>(const_cast<void*>(inputs[2]));
         half* gemmOutDevicePtr = reinterpret_cast<half*>(outputs[0]);
 
-        if (M <= 6)
+        // gemm_forward_cuda_new requires N divisible by its CTA_N tile size (128).
+        // Smaller / non-aligned N (e.g. GDN's in_proj_a / in_proj_b = num_recurrent_heads
+        // = 32 in Qwen3.5-4B) must use the GEMV kernel. GEMV only has template
+        // instantiations for M=1..6, so split M into <=6-row chunks.
+        // TODO: Iteration causes overhead. Need optimization if M is small and not divisible by 128. Possible
+        // solutions: 1) Add more GEMV instantiations for larger M (e.g. 8, 16, 32). 2) Add a fallback GEMV kernel that
+        // can handle arbitrary M without template instantiation (e.g. using dynamic shared memory).
+        bool const useGemv = (M <= trt_edgellm::kernel::kGemvMaxM) || (mGemmN % trt_edgellm::kernel::kGemmCtaN != 0);
+        if (useGemv)
         {
-            trt_edgellm::kernel::gemv_forward_cuda_new(
-                gemmInPtr, weightsInPtr, ScaleInPtr, gemmOutDevicePtr, M, mGemmN, mGemmK, mGroupSize, stream);
+            for (int32_t m_start = 0; m_start < M; m_start += trt_edgellm::kernel::kGemvMaxM)
+            {
+                int32_t const m_chunk = std::min(trt_edgellm::kernel::kGemvMaxM, M - m_start);
+                trt_edgellm::kernel::gemv_forward_cuda_new(gemmInPtr + m_start * mGemmK, weightsInPtr, ScaleInPtr,
+                    gemmOutDevicePtr + m_start * mGemmN, m_chunk, mGemmN, mGemmK, mGroupSize, stream);
+            }
         }
         else
         {

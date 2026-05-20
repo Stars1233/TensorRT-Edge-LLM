@@ -62,8 +62,6 @@ def test_llm_loader_export(test_param: str, test_logger,
             "llm_loader.export_all_cli",
             torch_dir,
             tmp_dir,
-            "--device",
-            "cpu",
         ]
 
         with timer_context(f"Exporting {config.model_name} via llm_loader",
@@ -77,15 +75,29 @@ def test_llm_loader_export(test_param: str, test_logger,
                     f"llm_loader export failed: {result.get('error', 'Unknown error')}"
                 )
 
-        # Move the LLM ONNX output to the expected directory
+        # Move the LLM ONNX output to the expected directory.
+        # TTS exports two LLM-class sub-models (talker + code_predictor); build
+        # expects them under ``<llm_onnx_dir>/{talker,code_predictor}/``. The
+        # standard non-TTS export emits a single ``tmp/llm/`` that maps
+        # directly to ``<llm_onnx_dir>/``.
         llm_output = os.path.join(tmp_dir, "llm")
+        cp_output = os.path.join(tmp_dir, "code_predictor")
         if not os.path.isdir(llm_output):
             pytest.fail(
                 f"llm_loader did not produce llm/ output directory in {tmp_dir}"
             )
-
-        # Copy all files from tmp_dir/llm/ into the final ONNX directory
-        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+        if os.path.isdir(cp_output):
+            # TTS layout: tmp/llm/         -> onnx/llm-<prec>/talker/
+            #             tmp/code_predictor/ -> onnx/llm-<prec>/code_predictor/
+            shutil.copytree(llm_output,
+                            os.path.join(llm_onnx_dir, "talker"),
+                            dirs_exist_ok=True)
+            shutil.copytree(cp_output,
+                            os.path.join(llm_onnx_dir, "code_predictor"),
+                            dirs_exist_ok=True)
+        else:
+            # Standard layout: tmp/llm/ -> onnx/llm-<prec>/
+            shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
 
         # If the model also has a visual encoder output, move that too
         visual_output = os.path.join(tmp_dir, "visual")
@@ -94,14 +106,37 @@ def test_llm_loader_export(test_param: str, test_logger,
                                            "visual-fp16")
             shutil.copytree(visual_output, visual_onnx_dir, dirs_exist_ok=True)
 
+        # Same for audio encoder (ASR / Qwen3-Omni / Nemotron-Omni).
+        audio_output = os.path.join(tmp_dir, "audio")
+        if os.path.isdir(audio_output):
+            audio_onnx_dir = os.path.join(config.get_onnx_base_dir(),
+                                          "audio-fp16")
+            shutil.copytree(audio_output, audio_onnx_dir, dirs_exist_ok=True)
+
+        # Same for Qwen3-Omni Code2Wav vocoder.
+        code2wav_output = os.path.join(tmp_dir, "code2wav")
+        if os.path.isdir(code2wav_output):
+            code2wav_onnx_dir = os.path.join(config.get_onnx_base_dir(),
+                                             "code2wav-fp16")
+            shutil.copytree(code2wav_output,
+                            code2wav_onnx_dir,
+                            dirs_exist_ok=True)
+
     finally:
         # Clean up temp directory
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Validate the exported ONNX model exists
-    onnx_model = os.path.join(llm_onnx_dir, "model.onnx")
-    if not os.path.exists(onnx_model):
-        pytest.fail(f"LLM ONNX model not found after export: {onnx_model}")
+    # Validate the exported ONNX model exists. TTS produces model.onnx under
+    # ``talker/`` (the talker is the LLM-class submodel); non-TTS produces it
+    # at the root of llm_onnx_dir.
+    onnx_candidates = [
+        os.path.join(llm_onnx_dir, "model.onnx"),
+        os.path.join(llm_onnx_dir, "talker", "model.onnx"),
+    ]
+    if not any(os.path.exists(p) for p in onnx_candidates):
+        pytest.fail(
+            f"LLM ONNX model not found after export at any of: {onnx_candidates}"
+        )
 
 
 def _run_llm_loader_export(cmd, timeout, test_logger, label):
@@ -171,8 +206,6 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
             base_torch_dir,
             tmp_base,
             "--eagle-base",
-            "--device",
-            "cpu",
         ]
         _run_llm_loader_export(
             base_cmd, 600, test_logger,
@@ -198,8 +231,6 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
             "llm_loader.export_all_cli",
             draft_torch_dir,
             tmp_draft,
-            "--device",
-            "cpu",
         ]
         _run_llm_loader_export(
             draft_cmd, 600, test_logger,
@@ -223,6 +254,67 @@ def test_llm_loader_eagle_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"Draft ONNX model not found: {draft_onnx}")
+
+
+def test_llm_loader_mtp_export(test_param: str, test_logger,
+                               env_config: EnvironmentConfig):
+    """Export MTP base + draft from a single checkpoint via --mtp flag."""
+
+    config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                          TaskType.EXPORT, env_config)
+
+    torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(torch_dir):
+        raise FileNotFoundError(f"Model checkpoint not found: {torch_dir}")
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+    os.makedirs(draft_onnx_dir, exist_ok=True)
+
+    tmp_dir = tempfile.mkdtemp(prefix="mtp_export_")
+
+    try:
+        export_cmd = [
+            "python3",
+            "-m",
+            "llm_loader.export_all_cli",
+            torch_dir,
+            tmp_dir,
+            "--mtp",
+        ]
+
+        with timer_context(f"Exporting MTP {config.model_name} via llm_loader",
+                           test_logger):
+            result = run_command(export_cmd,
+                                 timeout=600,
+                                 remote_config=None,
+                                 logger=test_logger)
+            if not result['success']:
+                pytest.fail(
+                    f"MTP export failed: {result.get('error', 'Unknown error')}"
+                )
+
+        llm_output = os.path.join(tmp_dir, "llm")
+        if not os.path.isdir(llm_output):
+            pytest.fail(f"MTP export did not produce llm/ in {tmp_dir}")
+        shutil.copytree(llm_output, llm_onnx_dir, dirs_exist_ok=True)
+
+        draft_output = os.path.join(tmp_dir, "mtp_draft")
+        if not os.path.isdir(draft_output):
+            pytest.fail(f"MTP export did not produce mtp_draft/ in {tmp_dir}")
+        shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
+    if not os.path.exists(base_onnx):
+        pytest.fail(f"MTP base ONNX not found: {base_onnx}")
+
+    draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
+    if not os.path.exists(draft_onnx):
+        pytest.fail(f"MTP draft ONNX not found: {draft_onnx}")
 
 
 def test_llm_loader_lora_export(test_param: str, test_logger,
@@ -253,8 +345,6 @@ def test_llm_loader_lora_export(test_param: str, test_logger,
             "llm_loader.export_all_cli",
             torch_dir,
             tmp_dir,
-            "--device",
-            "cpu",
         ]
 
         _run_llm_loader_export(

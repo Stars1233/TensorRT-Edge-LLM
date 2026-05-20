@@ -122,6 +122,7 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Code2Wav execution context
     rt::Tensor mInputCodesDevice{};                                //!< [1, numQuantizers, seqLen] Input codes on GPU
     rt::Tensor mOutputWaveform{};                                  //!< [1, 1, waveformLen] Output waveform
+    nvinfer1::DataType mWaveformDtype{nvinfer1::DataType::kHALF};  //!< Engine's actual waveform output dtype
     rt::Tensor mInputCodesHost{};                                  //!< Host buffer for code preparation
 };
 

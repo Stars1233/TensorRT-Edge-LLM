@@ -18,7 +18,8 @@ The export pipeline loads the Qwen3-ASR model via the `qwen-asr` package. Instal
 cd TensorRT-Edge-LLM
 python3 -m venv venv-qwen3-asr
 source venv-qwen3-asr/bin/activate
-pip3 install .              # install TensorRT Edge-LLM export dependencies
+pip3 install -r requirements.txt
+pip3 install -r experimental/llm_loader/requirements.txt
 pip3 install qwen-asr       # install qwen3-asr and its required dependencies.
 ```
 
@@ -27,20 +28,17 @@ pip3 install qwen-asr       # install qwen3-asr and its required dependencies.
 ## Step 1: Export (x86 Host)
 
 ```bash
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3-ASR-0.6B
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
-# Export audio encoder
-tensorrt-edgellm-export-audio \
-  --model_dir Qwen/Qwen3-ASR-0.6B \
-  --output_dir $MODEL_NAME/onnx/audio
-
-# Export language model
-tensorrt-edgellm-export-llm \
-  --model_dir Qwen/Qwen3-ASR-0.6B \
-  --output_dir $MODEL_NAME/onnx/llm
+# Export language model and audio encoder
+python -m llm_loader.export_all_cli \
+  Qwen/Qwen3-ASR-0.6B \
+  $MODEL_NAME/onnx
 ```
 
 ## Step 2: Transfer to Device
@@ -77,12 +75,17 @@ cd ~/TensorRT-Edge-LLM
 
 ## Step 4: Preprocess Audio Input (x86 Host or Thor Device)
 
-Audio files must be converted to mel-spectrogram safetensors format before inference:
+Audio files must be converted to mel-spectrogram safetensors format before inference.
+
+> **Note:** This step uses the `tensorrt_edgellm.scripts.preprocess_audio` utility, which requires the deprecated `tensorrt_edgellm` package. This is an audio preprocessing utility (not the deprecated LLM exporter) and is expected for this release. Set `EDGE_LLM_PATH` if running on a device where it was not defined in Step 1.
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 
-# Convert WAV to safetensors mel-spectrogram format
+pip3 install -e $EDGE_LLM_PATH  # required for tensorrt_edgellm.scripts.preprocess_audio
+
 python -m tensorrt_edgellm.scripts.preprocess_audio \
   --input /path/to/audio.wav \
   --output $WORKSPACE_DIR/audio_input.safetensors

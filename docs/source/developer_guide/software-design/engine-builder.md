@@ -13,7 +13,7 @@ The Engine Builder serves as the **second stage** in the TensorRT Edge-LLM workf
 %%{init: {'theme':'neutral', 'themeVariables': {'primaryColor':'#76B900','primaryTextColor':'#fff','primaryBorderColor':'#5a8f00','lineColor':'#666','edgeLabelBackground':'#ffffff','labelTextColor':'#000','clusterBkg':'#ffffff','clusterBorder':'#999'}}}%%
 graph LR
     HF_MODEL[HuggingFace<br>Model]
-    PYTHON_EXPORT[Python<br>Export<br>Pipeline]
+    PYTHON_EXPORT[llm_loader<br>ONNX<br>Export]
     ONNX_FILES[ONNX<br>Models]
     TRT_ENGINE[TensorRT<br>Engine]
     CPP_RUNTIME[C++<br>Runtime]
@@ -60,7 +60,7 @@ graph LR
 
 **⚠️ VERSION COMPATIBILITY**: ONNX models and TensorRT engines are **NOT portable** across different versions of TensorRT Edge-LLM or TensorRT. Always re-export ONNX models and rebuild engines when upgrading versions.
 
-**⚠️ USER RESPONSIBILITY**: Users are responsible for verifying model integrity before export and build, validating outputs, and maintaining proper model sanity throughout the pipeline. See the [Model Signing and Verification](python-export-pipeline.md#model-signing-and-verification) section in the Python Export Pipeline guide for verification best practices.
+**⚠️ USER RESPONSIBILITY**: Users are responsible for verifying checkpoint integrity before export and build, validating outputs, and maintaining proper model sanity throughout the pipeline.
 
 ---
 
@@ -332,7 +332,7 @@ Base and draft engine directories should be the same.
   --maxBatchSize=1 \
   --maxInputLen=1024 \
   --maxKVCacheCapacity=4096 \
-  --eagleBase
+  --specBase
 
 # Build draft model
 ./build/examples/llm/llm_build \
@@ -341,7 +341,7 @@ Base and draft engine directories should be the same.
   --maxBatchSize=1 \
   --maxInputLen=1024 \
   --maxKVCacheCapacity=4096 \
-  --eagleDraft
+  --specDraft
 
 # Build visual encoder (required for VLM)
 ./build/examples/multimodal/visual_build \

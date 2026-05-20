@@ -124,3 +124,16 @@ TEST(WOQInt4GemvTest, accuracyGemv)
     TestInt4GroupwiseGemvAccuracy(1, 512, 896, 128);
     TestInt4GroupwiseGemvAccuracy(1, 640, 1024, 128);
 }
+
+// Small-N coverage: when N < CTA_N (=128) the plugin dispatcher falls back to GEMV
+// even for M > 1 (split into <=6-row chunks).  Qwen3.5-4B's GDN in_proj_a / in_proj_b
+// project hidden=2560 -> num_recurrent_heads=32, so N=32, K=2560 is the production
+// case.  Exercise the kernel directly across M=1..6 (the template-instantiated range)
+// to keep the fallback path covered.
+TEST(WOQInt4GemvTest, accuracySmallNGemv)
+{
+    for (int m = 1; m <= 6; ++m)
+    {
+        TestInt4GroupwiseGemvAccuracy(m, 32, 2560, 128);
+    }
+}

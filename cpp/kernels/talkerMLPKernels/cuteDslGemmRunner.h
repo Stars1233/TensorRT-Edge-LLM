@@ -17,6 +17,19 @@
 
 #pragma once
 
+#include <cuda.h>
+#if defined(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT)
+#include <cuda_runtime.h>
+#if CUDA_VERSION < 12800
+typedef CUlibrary cudaLibrary_t;
+static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
+{
+    CUresult r = cuLibraryUnload(lib);
+    return static_cast<cudaError_t>(r);
+}
+#endif // CUDA_VERSION < 12800
+#endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
+
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -142,6 +155,29 @@ private:
     static gemm_blackwell_bias_fp16_Kernel_Module_t sBlackwellBiasModule;
 #endif
 
+// Blackwell DC small-tile (tile=64x128 cluster=(1,2)) variants for M <= 512.
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED
+    static gemm_blackwell_small_fp16_Kernel_Module_t sBlackwellSmallModule;
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_SILU_ENABLED
+    static gemm_blackwell_small_bias_silu_fp16_Kernel_Module_t sBlackwellSmallBiasSiLUModule;
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
+    static gemm_blackwell_small_bias_fp16_Kernel_Module_t sBlackwellSmallBiasModule;
+#endif
+
+// Blackwell DC 2-CTA variants (tile=256x256 cluster=(2,1) use_2cta=True)
+// for low-SM-count GPUs (Thor) at M >= sBlackwell2ctaMinM.
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
+    static gemm_blackwell_2cta_fp16_Kernel_Module_t sBlackwell2ctaModule;
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_SILU_ENABLED
+    static gemm_blackwell_2cta_bias_silu_fp16_Kernel_Module_t sBlackwell2ctaBiasSiLUModule;
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_BIAS_ENABLED
+    static gemm_blackwell_2cta_bias_fp16_Kernel_Module_t sBlackwell2ctaBiasModule;
+#endif
+
 #ifdef CUTE_DSL_GEMM_BLACKWELL_GEFORCE_ENABLED
     static gemm_bw_geforce_fp16_Kernel_Module_t sBlackwellGeforceModule;
 #endif
@@ -165,6 +201,15 @@ private:
 
     static bool sLoaded;
     static int32_t sActiveVariant;
+    // M threshold below which Blackwell GEMM dispatches to the small (64x128)
+    // tile variant. Captured at loadKernelModule() time from device SM count
+    // since the optimal small-vs-default cutover scales with available SMs:
+    // B100/sm100 (144 SMs) wants threshold ~512; Thor/sm110 (20 SMs) wants ~64.
+    static int32_t sBlackwellSmallTileMaxM;
+    // Min M to dispatch to 2-CTA tile (256x256, cluster (2,1)). Set only on
+    // low-SM-count GPUs (e.g. Thor) where larger arithmetic intensity per MMA
+    // op beats CTA-count parallelism. 0 disables 2-CTA dispatch entirely.
+    static int32_t sBlackwell2ctaMinM;
     static std::mutex sMutex;
 };
 

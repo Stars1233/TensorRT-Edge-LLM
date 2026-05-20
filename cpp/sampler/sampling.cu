@@ -150,11 +150,9 @@ struct SamplingWorkspace
         }
 
         // Validate workspace size
-        if (offset > workspaceSize)
-        {
-            throw std::runtime_error("Workspace size too small. Required: " + std::to_string(offset)
+        ELLM_CHECK(offset <= workspaceSize,
+            "Workspace size too small. Required: " + std::to_string(offset)
                 + ", provided: " + std::to_string(workspaceSize));
-        }
     }
 
     // Setup workspace for selectAllTopK
@@ -187,11 +185,9 @@ struct SamplingWorkspace
         offset += valuesSize;
 
         // Validate workspace size
-        if (offset > workspaceSize)
-        {
-            throw std::runtime_error("Workspace size too small for topK. Required: " + std::to_string(offset)
+        ELLM_CHECK(offset <= workspaceSize,
+            "Workspace size too small for topK. Required: " + std::to_string(offset)
                 + ", provided: " + std::to_string(workspaceSize));
-        }
     }
 };
 

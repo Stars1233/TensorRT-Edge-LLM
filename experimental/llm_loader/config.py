@@ -50,8 +50,11 @@ shape in the checkpoint to break the circular dependency with ``n_groups``.
 
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 from .checkpoint.checkpoint_utils import load_checkpoint_config_dicts
 
@@ -97,6 +100,33 @@ def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
         if isinstance(nested, dict) and nested.get("rope_theta") is not None:
             return float(nested["rope_theta"])
     return _DEFAULT_ROPE_THETA
+
+
+@dataclass
+class ActionConfig:
+    """Action expert hyper-parameters for Alpamayo models.
+
+    Used only for the action expert ONNX export and its sidecar config.json.
+    These fields do NOT feed into the LLM config.json.
+    """
+
+    rope_theta: float = 5_000_000.0
+    mrope_section: List[int] = field(default_factory=lambda: [24, 20, 20])
+    mrope_interleaved: bool = True
+    num_hidden_layers: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 128
+    hidden_size: int = 0
+    intermediate_size: int = 0
+    rms_norm_eps: float = 1e-6
+    num_traj_tokens: int = 1000
+    traj_token_start: int = 0
+    n_diffusion_tokens: int = 64
+    in_proj_hidden_size: int = 512
+    in_proj_num_enc_layers: int = 2
+    in_proj_max_freq: float = 100.0
+    in_proj_num_fourier_feats: int = 20
 
 
 @dataclass
@@ -235,6 +265,13 @@ class ModelConfig:
     gdn_cfg: Optional[GdnConfig] = None
     # ------------------------------------------ gated attention (Qwen3.5)
     attn_output_gate: bool = False
+    # ------------------------------------------ MTP config
+    mtp_num_hidden_layers: Optional[int] = None
+    mtp_use_dedicated_embeddings: bool = False
+    # When True, the standard CausalLM is exported as the MTP base model variant
+    # with tree-attention inputs (attention_mask, attention_pos_id) and
+    # an extra hidden_states output.
+    mtp_base: bool = False
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
@@ -262,6 +299,9 @@ class ModelConfig:
     # Note: the C++ Int4MoePlugin hardcodes renormalize=true, so this field
     # currently serves as documentation of the HF config value.
     norm_topk_prob: bool = True
+    # Runtime vocabulary reduction. ``vocab_size`` remains the original
+    # tokenizer/embedding size; this field is only the exported logits size.
+    reduced_vocab_size: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -270,6 +310,13 @@ class ModelConfig:
     @property
     def is_eagle3_draft(self) -> bool:
         return self.draft_vocab_size is not None
+
+    @property
+    def is_mtp_draft(self) -> bool:
+        """True for a derived MTP draft config built from a base checkpoint."""
+        return bool(self.mtp_num_hidden_layers is not None
+                    and self.gdn_cfg is None and not self.mtp_base
+                    and not self.is_eagle3_draft)
 
     @property
     def eagle3_target_hidden_size(self) -> int:
@@ -345,6 +392,18 @@ class ModelConfig:
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
 
+        # MTP config
+        mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
+        if mtp_num_hidden_layers is not None:
+            mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        mtp_use_dedicated_embeddings = bool(
+            llm_dict.get("mtp_use_dedicated_embeddings", False))
+        _validate_mtp_constraints(
+            model_type=model_type,
+            mtp_num_hidden_layers=mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+        )
+
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
@@ -399,6 +458,9 @@ class ModelConfig:
             mamba_cfg=mamba_cfg,
             gdn_cfg=gdn_cfg,
             attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
+            mtp_num_hidden_layers=mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+            mtp_base=bool(llm_dict.get("mtp_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             draft_vocab_size=draft_vocab_size,
@@ -425,6 +487,69 @@ class ModelConfig:
 # When HF omits ``deepstack_visual_indexes`` / ``num_deepstack_features``,
 # these model families still expect three visual deepstack injections (legacy).
 _DEEPSTACK_MODEL_TYPES = ("qwen3_vl", "qwen3_omni")
+
+
+def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
+    """Derive the currently supported MTP draft config from a base config."""
+    _validate_mtp_constraints(
+        model_type=base_config.model_type,
+        mtp_num_hidden_layers=base_config.mtp_num_hidden_layers,
+        mtp_use_dedicated_embeddings=base_config.mtp_use_dedicated_embeddings,
+    )
+    mtp_num_hidden_layers = base_config.mtp_num_hidden_layers
+    if mtp_num_hidden_layers is None:
+        raise ValueError(
+            "MTP draft config requires mtp_num_hidden_layers in the base config."
+        )
+
+    # MTP modules in the exclude list → unquantized (FP16); otherwise inherit
+    # base quant.  Only *compute linear* modules matter (fc, proj, etc.).
+    # Norms, embeddings, and lm_head always appear in `excluded` when lm_head
+    # is FP16 — their presence does NOT mean the whole draft is unquantized.
+    _MTP_COMPUTE_PREFIXES = ("mtp.fc", "mtp.layers.")
+    mtp_is_quantized = not any(
+        any(e.startswith(p) for p in _MTP_COMPUTE_PREFIXES) and
+        ("norm" not in e and "embed" not in e)
+        for e in base_config.quant.excluded)
+
+    if mtp_is_quantized:
+        # MTP draft modules are independently quantized.  Strip base-model
+        # layer_overrides that use module paths absent from the draft
+        # (e.g. "model.layers.0.linear_attn.in_proj_qkv") — they would
+        # cause spurious FP16 fallback for draft-specific layers like "fc".
+        # Keep entries whose keys also exist in the draft module namespace
+        # (e.g. "lm_head") so that lm_head_quantization is honoured.
+        _DRAFT_MODULE_PREFIXES = ("lm_head", "fc", "layers.", "norm")
+        draft_overrides = {
+            k: v
+            for k, v in base_config.quant.layer_overrides.items()
+            if any(k == p or k.startswith(p) for p in _DRAFT_MODULE_PREFIXES)
+        }
+        # Preserve MTP-specific exclusions (e.g. mtp.lm_head when lm_head
+        # is FP16) but drop base-model exclusions irrelevant to the draft.
+        draft_excluded = [
+            e[len("mtp."):] for e in base_config.quant.excluded
+            if e.startswith("mtp.")
+        ]
+        # is_mixed_precision=False so unlisted modules (fc, q_proj, etc.)
+        # fall back to the dominant quant type, not FP16.  Explicit
+        # overrides (lm_head→fp8) still take effect via layer_overrides.
+        draft_quant = replace(base_config.quant,
+                              excluded=draft_excluded,
+                              layer_overrides=draft_overrides,
+                              is_mixed_precision=False)
+    else:
+        draft_quant = QuantConfig()
+
+    return replace(
+        base_config,
+        num_hidden_layers=mtp_num_hidden_layers,
+        layer_types=[LAYER_ATTN] * mtp_num_hidden_layers,
+        gdn_cfg=None,
+        mtp_base=False,
+        quant=draft_quant,
+        tie_word_embeddings=False,
+    )
 
 
 def _parse_num_deepstack_features(
@@ -460,6 +585,29 @@ def _parse_num_deepstack_features(
     if any(t in merged for t in _DEEPSTACK_MODEL_TYPES):
         return 3
     return 0
+
+
+def _validate_mtp_constraints(
+    *,
+    model_type: str,
+    mtp_num_hidden_layers: Optional[int],
+    mtp_use_dedicated_embeddings: bool,
+) -> None:
+    """Validate the currently supported MTP config subset."""
+    if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
+        return
+    if model_type != "qwen3_5_text":
+        raise NotImplementedError(
+            "MTP config parsing is only supported for qwen3_5_text checkpoints."
+        )
+    if mtp_num_hidden_layers != 1:
+        raise NotImplementedError(
+            "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 dense MTP."
+        )
+    if mtp_use_dedicated_embeddings:
+        raise NotImplementedError(
+            "Dedicated MTP embeddings are not supported for Qwen3.5 dense MTP."
+        )
 
 
 def _parse_layer_types(config: dict) -> List[str]:
@@ -655,6 +803,30 @@ def _strip_vl_prefix(name: str) -> str:
     return name
 
 
+def _normalize_module_name(name: str) -> str:
+    """Normalise a checkpoint / hf_quant_config module name to the namespace
+    that ``make_linear`` uses (``model.layers.N...``, ``lm_head``, etc.).
+
+    Handles compound VL prefixes like ``model.language_model.`` (Qwen3.5-VL)
+    which must be stripped and replaced with ``model.`` to match the module
+    tree built by the modeling code.  Single VL prefixes (``language_model.``,
+    ``text_model.``, ``llm.``) and the generic ``model.`` are stripped
+    without replacement.  At most one prefix is removed per key.
+
+    Used by ``_effective_excluded_modules``, ``_detect_modelopt_unquantized_linears``,
+    and ``_parse_mixed_precision`` so that ``excluded``, ``layer_overrides``,
+    and ``module_name`` all share the same name space.
+    """
+    # Compound VL prefix: strip outer wrapper, keep inner ``model.``.
+    # Must be checked before "model." to avoid partial strip.
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model."):]
+    for prefix in _VL_LLM_PREFIXES + ("model.", ):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
 def _detect_unquantized_modules(model_dir: str) -> List[str]:
     """Return module names whose weights are plain float (not int4 quantized).
 
@@ -702,6 +874,130 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
     return sorted(excluded)
 
 
+def _detect_quantized_modules(model_dir: str) -> List[str]:
+    """Return modules that have checkpoint quantization sidecars."""
+    all_keys: List[str] = []
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        all_keys = list(index.get("weight_map", {}).keys())
+    else:
+        single_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            try:
+                from safetensors import safe_open
+                with safe_open(single_path, framework="pt") as f:
+                    all_keys = list(f.keys())
+            except (OSError, ImportError):
+                pass
+
+    suffixes = (".qweight", ".weight_scale", ".weight_scale_2", ".input_scale",
+                ".scales")
+    modules = {
+        _strip_vl_prefix(k.rsplit(".", 1)[0])
+        for k in all_keys if k.endswith(suffixes)
+    }
+    return sorted(modules)
+
+
+def _effective_excluded_modules(model_dir: str,
+                                excluded: List[str]) -> List[str]:
+    """Drop exclusions contradicted by quantized tensors in the checkpoint,
+    and normalize remaining names so they match what ``make_linear`` looks up.
+
+    Normalisation mirrors ``_parse_mixed_precision``'s strip on
+    ``layer_overrides`` keys (``language_model.`` / ``text_model.`` / ``llm.``
+    / ``model.``) so a checkpoint that writes ``model.visual.blocks.X.Y`` to
+    ``exclude_modules`` matches the ``visual.blocks.X.Y`` ``module_name`` the
+    modeling code passes.
+    """
+    quantized_modules = set(_detect_quantized_modules(model_dir))
+    return [
+        _normalize_module_name(module) for module in excluded
+        if _strip_vl_prefix(module) not in quantized_modules
+    ]
+
+
+def _detect_modelopt_unquantized_linears(model_dir: str) -> List[str]:
+    """Return module_name strings of Linears the ModelOpt checkpoint left unquantized.
+
+    A ModelOpt-quantized Linear stores both ``<name>.weight`` (packed) and
+    ``<name>.weight_scale`` (scale tensor; FP8 / NVFP4 / MXFP8 / AWQ / INT8-SQ
+    all emit this).  Linears that ModelOpt skipped — typically because their
+    wildcard had ``enable: False`` (visual / audio / lm_head) — only have
+    ``<name>.weight``.
+
+    We compute the set of "has .weight without .weight_scale" modules from the
+    checkpoint index, then return them in the short form ``make_linear`` uses
+    (leading ``model.`` and VL wrapper prefixes stripped).  Norm and embedding
+    names also fall into this set but are harmless: ``make_linear`` only
+    consults ``excluded`` for paths that actually go through it (i.e. real
+    Linears), so extra entries are inert.
+
+    Used by ``_parse_quant`` to plug a long-standing gap: for dominant-quant
+    checkpoints (``quant_algo: FP8 / NVFP4 / W4A16_AWQ / ...``) ModelOpt does
+    NOT populate ``exclude_modules`` even when whole submodules (visual tower,
+    audio encoder) were skipped during PTQ.  Without this augmentation,
+    ``make_linear``'s dominant fallback would build NVFP4Linear / FP8Linear
+    against FP16 weights → shape mismatch on export.
+
+    Complements ``_effective_excluded_modules`` (which drops false-positive
+    excludes when the checkpoint contradicts them).  This helper supplies the
+    opposite direction: false-negative excludes when ``exclude_modules`` is
+    silent on a submodule that was actually skipped during PTQ.
+    """
+    all_keys: List[str] = []
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            all_keys = list(index.get("weight_map", {}).keys())
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not all_keys:
+        single_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            try:
+                from safetensors import safe_open
+                with safe_open(single_path, framework="pt") as f:
+                    all_keys = list(f.keys())
+            except (OSError, ImportError):
+                pass
+
+    if not all_keys:
+        return []
+
+    weight_modules = {
+        k.rsplit(".", 1)[0]
+        for k in all_keys if k.endswith(".weight")
+    }
+    scale_modules = {
+        k.rsplit(".", 1)[0]
+        for k in all_keys if k.endswith(".weight_scale")
+    }
+    unquantized = weight_modules - scale_modules
+
+    excluded = set()
+    for name in unquantized:
+        normalized = _normalize_module_name(name)
+        if normalized.endswith(".self_attn.qkv_proj"):
+            prefix = normalized[:-len("qkv_proj")]
+            excluded.update(f"{prefix}{proj}"
+                            for proj in ("q_proj", "k_proj", "v_proj"))
+        elif normalized.endswith(".mlp.gate_up_proj"):
+            prefix = normalized[:-len("gate_up_proj")]
+            excluded.update(f"{prefix}{proj}"
+                            for proj in ("gate_proj", "up_proj"))
+        else:
+            excluded.add(normalized)
+
+    # Normalise to the same name space ``layer_overrides`` and ``excluded``
+    # use, so ``make_linear`` finds entries via its ``module_name`` lookup.
+    return sorted(excluded)
+
+
 def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
     """Determine quantisation config from hf_quant_config.json or config.json."""
 
@@ -713,10 +1009,18 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         q = hq.get("quantization", {})
         algo = (q.get("quant_algo") or "").upper()
         if "AWQ" in algo and "W4A16" in algo:
+            # Drop exclusions that the checkpoint contradicts (false positives),
+            # then augment with submodules ModelOpt actually left unquantized
+            # (false negatives — typically visual tower / audio encoder).
+            excluded = _effective_excluded_modules(
+                model_dir, list(q.get("exclude_modules", [])))
+            excluded.extend(
+                m for m in _detect_modelopt_unquantized_linears(model_dir)
+                if m not in excluded)
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(q.get("group_size", 128)),
-                excluded=list(q.get("exclude_modules", [])),
+                excluded=excluded,
             )
         if algo == "MIXED_PRECISION":
             quantized_layers = q.get("quantized_layers", {})
@@ -726,7 +1030,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
                 quant_type=dominant,
                 group_size=group_size,
                 kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
-                excluded=list(q.get("exclude_modules", [])),
+                excluded=_effective_excluded_modules(
+                    model_dir, list(q.get("exclude_modules", []))),
                 layer_overrides=layer_overrides,
                 is_mixed_precision=True,
             )
@@ -734,11 +1039,16 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
         gs = int(q.get("group_size", 1))
         if qt == QUANT_MXFP8 and gs == 1:
             gs = 32  # MXFP8 default block_size
+        excluded = _effective_excluded_modules(
+            model_dir, list(q.get("exclude_modules", [])))
+        excluded.extend(
+            m for m in _detect_modelopt_unquantized_linears(model_dir)
+            if m not in excluded)
         return QuantConfig(
             quant_type=qt,
             group_size=gs,
             kv_cache_quant=_kv_norm(q.get("kv_cache_quant_algo", "")),
-            excluded=list(q.get("exclude_modules", [])),
+            excluded=excluded,
         )
 
     # ---- Embedded quantization_config in config.json ------------------------
@@ -753,7 +1063,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             return QuantConfig(
                 quant_type=QUANT_INT4_AWQ_MODELOPT,
                 group_size=int(qc.get("group_size", 128)),
-                excluded=list(qc.get("ignore", [])),
+                excluded=_effective_excluded_modules(
+                    model_dir, list(qc.get("ignore", []))),
             )
         group_size = 1
         cg = qc.get("config_groups", {})
@@ -767,7 +1078,8 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             quant_type=_algo_to_quant_type(algo),
             group_size=group_size,
             kv_cache_quant=kv_str,
-            excluded=list(qc.get("ignore", [])),
+            excluded=_effective_excluded_modules(model_dir,
+                                                 list(qc.get("ignore", []))),
         )
 
     # quant_method == awq (column-packed int4 checkpoints)
@@ -798,6 +1110,10 @@ def _algo_to_quant_type(algo: str) -> str:
         return QUANT_FP8
     if "FP4" in algo or "NVFP4" in algo:
         return QUANT_NVFP4
+    # W4A16_AWQ from ModelOpt unified checkpoints uses prepacked uint8 weights;
+    # plain AWQ / INT4_AWQ from HuggingFace uses column-packed int32 qweight.
+    if "W4A16" in algo and "AWQ" in algo:
+        return QUANT_INT4_AWQ_MODELOPT
     if "AWQ" in algo or "INT4_AWQ" in algo:
         return QUANT_INT4_AWQ
     if "W8A8" in algo or "INT8" in algo:
@@ -832,11 +1148,7 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     layer_overrides: dict = {}
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
-        short_name = name
-        for prefix in ("language_model.", "model."):
-            if short_name.startswith(prefix):
-                short_name = short_name[len(prefix):]
-                break
+        short_name = _normalize_module_name(name)
         layer_overrides[short_name] = _algo_to_quant_type(algo)
     return dominant_type, dominant_group_size, layer_overrides
 

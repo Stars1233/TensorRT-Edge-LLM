@@ -30,7 +30,7 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 ### Supported Model Families
 
-TensorRT Edge-LLM supports Llama/Qwen/Nemotron language models, Qwen and InternVL vision-language models, Phi-4-Multimodal, Qwen3-ASR/TTS, Nemotron-Omni, EAGLE3 draft models, and selected MoE checkpoints. For the complete support matrix, including Transformers class names, example checkpoints, precision requirements, and platform compatibility, see **[Supported Models](user_guide/getting_started/supported-models.md)**.
+TensorRT Edge-LLM supports Llama/Qwen/Nemotron language models, Qwen and InternVL vision-language models, Alpamayo 1, Phi-4-Multimodal, Qwen3-ASR/TTS, Nemotron-Omni, EAGLE3 draft models, and selected MoE checkpoints. For the complete support matrix, including Transformers class names, example checkpoints, precision requirements, and platform compatibility, see **[Supported Models](user_guide/getting_started/supported-models.md)**.
 
 ---
 
@@ -88,7 +88,7 @@ graph LR
 | **Experimental Quantization Package** | Creates quantized HuggingFace-style checkpoints for `llm_loader`. [Usage](user_guide/features/quantization.md), [Design](developer_guide/software-design/experimental-quantization.md) |
 | **Checkpoint-Based Model Loader** | **Recommended.** Reads HuggingFace checkpoints directly and exports ONNX artifacts. [Learn More](developer_guide/software-design/llm-loader.md) |
 | **Experimental Python API and Server** | Provides a vLLM-style Python API and OpenAI-compatible server. [Learn More](user_guide/examples/experimental-server.md) |
-| **Legacy Python Export Pipeline** | **Deprecated.** FX-tracing compatibility pipeline for existing workflows. `tensorrt_edgellm/` will be removed in 0.8.0 after `experimental/quantization` -> `experimental/llm_loader` reaches full feature parity for all models and features. [Learn More](developer_guide/software-design/python-export-pipeline.md) |
+| **Deprecated Python Export Pipeline** | FX-tracing compatibility path for existing workflows. `tensorrt_edgellm/` will be removed in 0.8.0 after `experimental/quantization` -> `experimental/llm_loader` reaches full feature parity for all models and features. [Learn More](developer_guide/software-design/python-export-pipeline.md) |
 | **Engine Builder** | C++-based application that compiles ONNX models into optimized TensorRT engines. [Learn More](developer_guide/software-design/engine-builder.md) |
 | **C++ Runtime** | C++-based runtime that executes TensorRT engines with CUDA graphs, LoRA, and EAGLE support. [Learn More](developer_guide/software-design/cpp-runtime-overview.md) |
 | **Examples** | Reference implementations demonstrating LLM, multimodal, and utility use cases. See the [Quick Start Guide](user_guide/getting_started/quick-start-guide.md) and example guides in the User Guide. |
@@ -99,11 +99,11 @@ graph LR
 
 Ready to get started with TensorRT Edge-LLM? Follow these steps:
 
-1. **[Installation Guide](user_guide/getting_started/installation.md)** - Set up the Python export pipeline on your x86 host and build the C++ runtime on your edge device
+1. **[Installation Guide](user_guide/getting_started/installation.md)** - Set up experimental quantization and `llm_loader` on your x86 host and build the C++ runtime on your edge device
 
 2. **[Quick Start Guide](user_guide/getting_started/quick-start-guide.md)** - Run your first LLM inference in ~15 minutes with step-by-step instructions
 
-3. **Examples** - Explore advanced workflows including [VLM inference](user_guide/examples/vlm.md), [speculative decoding](user_guide/examples/speculative-decoding.md), [ASR](user_guide/examples/asr.md), [MoE](user_guide/examples/moe.md), and [TTS](user_guide/examples/tts.md)
+3. **Examples** - Explore advanced workflows including [VLM inference](user_guide/examples/vlm.md), [speculative decoding](user_guide/examples/speculative-decoding.md), [ASR](user_guide/examples/asr.md), [MoE](user_guide/examples/moe.md), [TTS](user_guide/examples/tts.md), and [VLA model inference](user_guide/examples/vla.md)
 
 ---
 

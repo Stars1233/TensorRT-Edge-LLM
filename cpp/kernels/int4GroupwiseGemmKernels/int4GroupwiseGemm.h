@@ -25,6 +25,12 @@ namespace trt_edgellm
 namespace kernel
 {
 
+// Authoritative tile/template constraints for gemm_forward_cuda_new and gemv_forward_cuda_new.
+// The plugin dispatcher (Int4GroupwiseGemmPlugin::enqueue) routes between the two kernels based
+// on M and N alignment; keep these names referenced on both sides instead of hard-coding.
+constexpr int32_t kGemmCtaN = 128; // gemm_forward_cuda_new requires N % kGemmCtaN == 0
+constexpr int32_t kGemvMaxM = 6;   // gemv_forward_cuda_new has template instantiations for M=1..6
+
 /*!
  * @brief INT4 group-wise quantized GEMV (matrix-vector multiplication)
  *

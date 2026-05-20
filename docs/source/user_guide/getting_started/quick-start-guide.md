@@ -10,7 +10,7 @@ This quick start guide will get you up and running with TensorRT Edge-LLM in ~15
 
 ## Recommended: High-Level API or Server
 
-For Jetson Thor and x86 development, use the high-level Python API (HLAPI) or the OpenAI-compatible server. Build the project once with Python bindings enabled, then let the HLAPI export, build, load, and run the model from a HuggingFace checkpoint.
+For Jetson Thor and x86 development, use the high-level Python API or the OpenAI-compatible server. Build the project once with Python bindings enabled, then let the high-level Python API export, build, load, and run the model from a HuggingFace checkpoint.
 
 For x86 development:
 
@@ -53,7 +53,7 @@ export PYTHONPATH=$PWD:$PWD/experimental:$PYTHONPATH
 pip install pybind11 fastapi uvicorn
 ```
 
-Run a prompt with the HLAPI:
+Run a prompt with the high-level Python API:
 
 ```bash
 python - <<'PY'
@@ -98,7 +98,7 @@ This part runs on a standard x86 host with an NVIDIA GPU. **DriveOS users:** thi
 
 #### Recommended: Checkpoint-Based Loader
 
-The checkpoint-based loader (`llm_loader`) is the recommended export path. It reads pre-quantized HuggingFace checkpoints directly and exports to ONNX in a single command.
+The checkpoint-based loader (`llm_loader`) is the recommended export path. It reads FP16/BF16 and pre-quantized HuggingFace checkpoints directly and exports to ONNX in a single command. If you need to create a quantized checkpoint from an FP16/BF16 source model, install the standalone quantization requirements from the Installation Guide, run `experimental.quantization`, and then export the generated checkpoint with `llm_loader`.
 
 Let's use [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) as a lightweight example:
 
@@ -112,9 +112,20 @@ cd $WORKSPACE_DIR
 # Set PYTHONPATH to include the quantization package and loader
 export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
 
-# Export FP16 model to ONNX (single command)
+# Export FP16 model to ONNX
 python -m llm_loader.export_all_cli \
     Qwen/Qwen3-0.6B \
+    $MODEL_NAME/onnx
+
+# Or quantize an FP16/BF16 model first, then export the quantized checkpoint
+python -m experimental.quantization llm \
+    --model_dir Qwen/Qwen3-0.6B \
+    --output_dir $MODEL_NAME/quantized \
+    --quantization nvfp4 \
+    --lm_head_quantization nvfp4
+
+python -m llm_loader.export_all_cli \
+    $MODEL_NAME/quantized \
     $MODEL_NAME/onnx
 
 # Or export a pre-quantized NVFP4 checkpoint (no separate quantization step)
@@ -130,28 +141,7 @@ python -m llm_loader.export_all_cli \
     Qwen3-4B-AWQ/onnx
 ```
 
-For pre-quantized checkpoints (FP8, INT4 AWQ/GPTQ, NVFP4), simply point the loader at the quantized checkpoint directory — no separate quantization step is needed. See [Checkpoint-Based Model Loader](../../developer_guide/software-design/llm-loader.md) for full details.
-
-To create a quantized checkpoint from an FP16 model, use [Quantization](../features/quantization.md), then export the generated checkpoint with `llm_loader`.
-
-#### Alternative: Legacy Pipeline
-
-> **Deprecated:** The legacy `tensorrt_edgellm` pipeline is kept for compatibility. New workflows should use `llm_loader`. The `tensorrt_edgellm/` folder will be removed in 0.8.0, with full feature parity provided by the `experimental/quantization` -> `experimental/llm_loader` workflow for all models and features. See the [migration guide](../../developer_guide/software-design/llm-loader.md#migrating-from-the-legacy-pipeline).
-
-```bash
-# Step 1: Quantize to FP8 (downloads model automatically)
-tensorrt-edgellm-quantize-llm \
-    --model_dir Qwen/Qwen3-0.6B \
-    --output_dir $MODEL_NAME/quantized \
-    --quantization fp8
-
-# Step 2: Export to ONNX
-tensorrt-edgellm-export-llm \
-    --model_dir $MODEL_NAME/quantized \
-    --output_dir $MODEL_NAME/onnx
-```
-
-> **Troubleshooting:** If you encounter issues during export, see the [Python Export Pipeline - Common Issues and Solutions](../../developer_guide/software-design/python-export-pipeline.md#common-issues-and-solutions).
+For pre-quantized checkpoints (FP8, INT4 AWQ/GPTQ, NVFP4), simply point the loader at the quantized checkpoint directory. For quantization options, FP8 KV cache, FP8 embedding, LoRA, and vocabulary reduction, see [Quantization](../features/quantization.md), [FP8 KV Cache](../features/FP8KV.md), [FP8 Embedding](../features/fp8-embedding.md), [LoRA](../features/lora.md), and [Vocabulary Reduction](../features/reduce-vocab.md).
 
 #### Transfer to Device
 
@@ -180,7 +170,7 @@ cd ~/TensorRT-Edge-LLM
 
 # Build engine
 ./build/examples/llm/llm_build \
-    --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx \
+    --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/llm \
     --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
     --maxBatchSize 1 \
     --maxInputLen 1024 \
@@ -248,6 +238,25 @@ You should see a JSON response with the model's answer, similar to:
 }
 ```
 
+### Inference and Benchmarking Tools
+
+TensorRT Edge-LLM provides two LLM runtime examples for different purposes:
+
+- `llm_inference` is the end-to-end inference example. Use it when you want to run real JSON requests, apply chat templates, generate text, write response JSON, and validate application-level behavior. It can also report overall performance metrics such as tokens/sec.
+- `llm_bench` is the benchmark example. Use it when you want synthetic prefill/decode timing for a built engine without preparing an input JSON file. By default it reports overall E2E timing; pass `--profile` to collect per-layer profiling for kernel-level breakdowns.
+
+For example, benchmark prefill latency for the engine built above:
+
+```bash
+./build/examples/llm/llm_bench \
+    --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
+    --mode prefill \
+    --inputLen 128 \
+    --batchSize 1
+```
+
+To collect layer-level profiling in addition to the benchmark summary, add `--profile`.
+
 **Success!** 🎉 You've successfully run LLM inference on your edge device!
 
 ---
@@ -261,8 +270,9 @@ You should see a JSON response with the model's answer, similar to:
 - **[ASR](../examples/asr.md)** - Automatic speech recognition
 - **[MoE](../examples/moe.md)** - Mixture of Experts models (CPU-only export, Qwen3-30B-A3B-GPTQ-Int4)
 - **[TTS](../examples/tts.md)** - Text-to-speech synthesis
+- **[Alpamayo-R1-10B](../examples/vla.md)** - Vision-language-action inference with trajectory prediction
 
-**Checkpoint-Based Loader:** For detailed documentation on the recommended export pipeline, pre-quantized checkpoint support, and migration from the legacy tools, see [Checkpoint-Based Model Loader](../../developer_guide/software-design/llm-loader.md).
+**Checkpoint-Based Loader:** For detailed documentation on the recommended export pipeline, pre-quantized checkpoint support, and migration from the deprecated tools, see [Checkpoint-Based Model Loader](../../developer_guide/software-design/llm-loader.md).
 
 **Quantization:** To create quantized checkpoints for `llm_loader`, see [Quantization](../features/quantization.md).
 

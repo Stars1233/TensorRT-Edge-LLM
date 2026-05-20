@@ -48,6 +48,7 @@
 #include "tokenizerUtils.h"
 #include "unicodeData.h"
 
+#include "common/checkMacros.h"
 namespace trt_edgellm
 {
 namespace tokenizer
@@ -301,11 +302,8 @@ bool unicodeCollapseRegex(std::string const& expr, std::regex& regex)
             auto const cpts_regex = unicodeCptsFromUtf8(expr);
             for (size_t i = 0; i < cpts_regex.size(); ++i)
             {
-                if (cpts_regex[i] >= 128)
-                {
-                    throw std::runtime_error(
-                        "Regex includes both unicode categories and non-ASCII characters - not supported");
-                }
+                ELLM_CHECK(cpts_regex[i] < 128,
+                    "Regex includes both unicode categories and non-ASCII characters - not supported");
             }
 
             // generate a collapsed representation of the regex

@@ -22,23 +22,28 @@ For Qwen3-Omni, multimodal calibration is handled by ``omni_quantization.py``.
 """
 
 import contextlib
+import glob
 import json
 import os
 import shutil
 import time
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
 from modelopt.torch.export.quant_utils import get_quant_config
 from modelopt.torch.quantization.utils import is_quantized
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
                           AutoTokenizer)
 
 from ..llm_models.model_utils import (_is_qwen3_asr_model,
                                       _is_qwen3_omni_model,
-                                      load_eagle3_draft_model, load_hf_model)
+                                      load_eagle3_draft_model, load_hf_model,
+                                      load_mtp_draft_model)
 from ..llm_models.models.eagle3_draft import Eagle3DraftModel
+from ..llm_models.models.mtp_draft import MtpDraftModel
 from .calib_dataloaders import (get_audio_llm_calib_dataloader,
                                 get_text_calib_dataloader)
 from .quantization_utils import (enable_huggingface_checkpointing_patch,
@@ -491,6 +496,69 @@ def _sanitize_generation_config(model: Any) -> None:
         gc.eta_cutoff = 0.0
 
 
+def _graft_mtp_weights(model_dir: str, output_dir: str) -> None:
+    """Copy unquantized MTP tensors from the original checkpoint into the
+    quantized output, and mark them as excluded from quantization in configs.
+    """
+    mtp_tensors: Dict[str, torch.Tensor] = {}
+    for sf_path in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+        with safe_open(sf_path, framework="pt") as f:
+            for key in f.keys():
+                if key.startswith("mtp."):
+                    mtp_tensors[key] = f.get_tensor(key)
+
+    if not mtp_tensors:
+        return
+
+    _merge_tensors_into_safetensors(output_dir, mtp_tensors)
+
+    # Mark MTP linear layers as excluded from quantization so downstream
+    # loaders (e.g. llm_loader) build FP16 linears for them.
+    mtp_linear_names = sorted(
+        {k.rsplit(".", 1)[0]
+         for k, v in mtp_tensors.items() if v.dim() >= 2})
+    _patch_quant_exclude_list(output_dir, mtp_linear_names)
+
+    print(f"Grafted {len(mtp_tensors)} unquantized MTP weight(s) into "
+          f"{output_dir}.")
+
+
+def _quantize_mtp_draft_from_base(
+    model_dir: str,
+    base_model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    quantization: str,
+    lm_head_quantization: Optional[str],
+    dataset_dir: str,
+    dtype: str,
+    device: str,
+) -> MtpDraftModel:
+    """Load and quantize the MTP draft model using the unquantized base model.
+
+    Called *before* base model quantization so the unquantized base model can
+    generate calibration hidden states without a redundant reload.
+    """
+    mtp_draft = load_mtp_draft_model(model_dir, dtype, device)
+
+    if is_quantized(mtp_draft):
+        print("MTP draft model is already quantized, skipping quantization.")
+    else:
+        _share_embed_tokens(base_model, mtp_draft)
+        mtp_draft = quantize_mtp_draft(base_model, mtp_draft, tokenizer,
+                                       quantization, dataset_dir,
+                                       lm_head_quantization)
+    return mtp_draft
+
+
+def _save_mtp_draft(mtp_draft: MtpDraftModel, output_dir: str, dtype: str,
+                    unified_checkpoint: bool) -> None:
+    """Extract, pack, and merge quantized MTP weights into *output_dir*."""
+    mtp_tensors = _extract_mtp_state_dict(mtp_draft, dtype, unified_checkpoint)
+    _merge_tensors_into_safetensors(output_dir, mtp_tensors)
+    print(f"Merged {len(mtp_tensors)} quantized MTP weight(s) into "
+          f"{output_dir}.")
+
+
 def quantize_and_save_llm(model_dir: str,
                           output_dir: str,
                           quantization: Optional[str] = None,
@@ -532,7 +600,30 @@ def quantize_and_save_llm(model_dir: str,
     if _is_qwen3_asr_model(model_dir):
         type(model).forward = lambda self, *args, **kwargs: self.thinker(
             *args, **kwargs)
+    # TODO: unify base and MTP draft quantization into a single pass
+    # to avoid redundant calibration and speed up the process.
+    # --- MTP draft: detect and quantize BEFORE base quantization ----------
+    # TODO: unify base and MTP draft quantization into a single pass to avoid redundant calibration and speed up the process.
+    text_config = getattr(model.config, "text_config", model.config)
+    mtp_layers = getattr(text_config, "mtp_num_hidden_layers", 0) or 0
+    model_type = getattr(text_config, "model_type", "")
+    quantized_mtp_draft: Optional[MtpDraftModel] = None
 
+    if (mtp_layers > 0 and quantization is not None
+            and model_type in ("qwen3_5", "qwen3_5_text")
+            and not is_quantized(model)):
+        quantized_mtp_draft = _quantize_mtp_draft_from_base(
+            model_dir=model_dir,
+            base_model=model,
+            tokenizer=tokenizer,
+            quantization=quantization,
+            lm_head_quantization=lm_head_quantization,
+            dataset_dir=dataset_dir,
+            dtype=dtype,
+            device=device,
+        )
+
+    # --- Quantize base model ----------------------------------------------
     if is_quantized(model):
         print(f"Model is already quantized, skipping quantization.")
     else:
@@ -575,6 +666,18 @@ def quantize_and_save_llm(model_dir: str,
     tokenizer.save_pretrained(output_dir)
     if processor is not None:
         processor.save_pretrained(output_dir)
+
+    # --- MTP draft: merge quantized weights or graft unquantized ----------
+    if mtp_layers > 0:
+        if quantized_mtp_draft is not None:
+            _save_mtp_draft(quantized_mtp_draft, output_dir, dtype,
+                            unified_checkpoint)
+        else:
+            if quantization is not None:
+                print(f"Warning: MTP quantization is not supported for "
+                      f"model_type '{model_type}'. "
+                      f"Grafting unquantized MTP weights.")
+            _graft_mtp_weights(model_dir, output_dir)
 
     end_time = time.time()
     print(
@@ -680,3 +783,200 @@ def quantize_and_save_draft(
         f"Quantized model saved to {output_dir} in {end_time - quant_end_time}s."
     )
     print(f"Total time: {end_time - start_time}s.")
+
+
+# ---------------------------------------------------------------------------
+# MTP draft quantization
+# ---------------------------------------------------------------------------
+
+
+def quantize_mtp_draft(
+    base_model: AutoModelForCausalLM,
+    mtp_draft: MtpDraftModel,
+    tokenizer: AutoTokenizer,
+    quantization: str,
+    dataset_dir: str,
+    lm_head_quantization: Optional[str],
+) -> MtpDraftModel:
+    """Quantize the MTP draft model.
+
+    Same structure as ``quantize_draft`` but uses MTP-specific calibration
+    (last hidden state from base model) and no KV-cache quantization.
+    """
+    assert quantization in ["fp8", "int4_awq", "nvfp4", "int8_sq", "mxfp8"]
+    assert lm_head_quantization in [None, "fp8", "nvfp4", "mxfp8"]
+
+    batch_size = 16 if "int4" in quantization else 1
+    data_loader = get_text_calib_dataloader(tokenizer=tokenizer,
+                                            dataset_dir=dataset_dir,
+                                            batch_size=batch_size,
+                                            num_samples=512,
+                                            max_length=512)
+    quant_config = get_llm_quant_config(quantization, lm_head_quantization,
+                                        None)
+    return quantize_mtp_draft_model(base_model, mtp_draft, quant_config,
+                                    data_loader)
+
+
+def quantize_mtp_draft_model(
+    base_model: torch.nn.Module,
+    mtp_draft: MtpDraftModel,
+    quant_config: Dict[str, Any],
+    calib_dataloader,
+) -> MtpDraftModel:
+    """Calibrate and quantize the MTP draft model.
+
+    Mirrors ``quantize_draft_model`` for EAGLE: defines a calibration loop
+    that runs the base model to produce last-layer hidden states, feeds them
+    through the MTP draft's ``quant_forward``, and calls ``mtq.quantize``.
+
+    Args:
+        base_model: Unquantized base model for generating calibration hidden states.
+        mtp_draft: MTP draft model to quantize.
+        quant_config: Quantization configuration dictionary.
+        calib_dataloader: DataLoader for calibration data.
+
+    Returns:
+        Quantized MTP draft model.
+    """
+    from tqdm import tqdm
+
+    def calibrate_loop(draft: MtpDraftModel) -> None:
+        print(f"Calibrating MTP draft on {len(calib_dataloader)} samples...")
+        assert base_model.device == draft.device, \
+            "Base model and MTP draft must be on the same device"
+        for data in tqdm(calib_dataloader,
+                         desc="Calibrating MTP draft",
+                         unit="num_samples"):
+            data = data.to(base_model.device)
+            with torch.no_grad():
+                outputs = base_model(data, output_hidden_states=True)
+            last_hidden = outputs["hidden_states"][-1]
+            draft.quant_forward(data, last_hidden)
+
+    mtq.quantize(mtp_draft, quant_config, forward_loop=calibrate_loop)
+    mtq.print_quant_summary(mtp_draft)
+    return mtp_draft
+
+
+# ---------------------------------------------------------------------------
+# MTP draft save/merge helpers
+# ---------------------------------------------------------------------------
+
+
+def _share_embed_tokens(base_model: AutoModelForCausalLM,
+                        mtp_draft: MtpDraftModel) -> None:
+    """Share the base model's embedding table with the MTP draft model."""
+    if hasattr(base_model, "model"):
+        base_inner = base_model.model
+        if hasattr(base_inner, "language_model"):
+            mtp_draft.embed_tokens = base_inner.language_model.embed_tokens
+        elif hasattr(base_inner, "embed_tokens"):
+            mtp_draft.embed_tokens = base_inner.embed_tokens
+    if mtp_draft.embed_tokens is None:
+        raise ValueError("Could not find embed_tokens in the base model")
+
+
+def _extract_mtp_state_dict(
+        mtp_draft: MtpDraftModel, dtype: str,
+        unified_checkpoint: bool) -> Dict[str, torch.Tensor]:
+    """Extract the MTP state dict with ``mtp.*`` prefix and HF key names.
+
+    When *unified_checkpoint* is True, quantized weights are packed into
+    compressed format before extraction.
+    """
+    if unified_checkpoint:
+        from modelopt.torch.export.unified_export_hf import (
+            QUANTIZATION_NONE, _export_quantized_weight,
+            get_quantization_format, is_quantlinear, postprocess_state_dict)
+
+        model_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
+        with torch.inference_mode():
+            for _name, sub_module in mtp_draft.named_modules():
+                if get_quantization_format(sub_module) != QUANTIZATION_NONE:
+                    if is_quantlinear(sub_module):
+                        _export_quantized_weight(sub_module, model_dtype)
+
+        mtp_state = postprocess_state_dict(mtp_draft.state_dict(), 0, None)
+    else:
+        mtp_state = mtp_draft.state_dict()
+
+    mtp_tensors: Dict[str, torch.Tensor] = {}
+    for key, tensor in mtp_state.items():
+        if key.startswith("embed_tokens") or key.startswith("rotary_emb"):
+            continue
+        mtp_tensors[f"mtp.{_unremap_attn_key(key)}"] = tensor
+    return mtp_tensors
+
+
+def _unremap_attn_key(key: str) -> str:
+    """Reverse EdgeLLMAttention key remapping back to HF checkpoint format."""
+    for proj in ("q_proj", "k_proj", "v_proj"):
+        old = f"self_attn.qkv_proj.{proj}"
+        new = f"self_attn.{proj}"
+        if old in key:
+            return key.replace(old, new)
+    for norm in ("q_norm", "k_norm"):
+        old = f"self_attn.qk_norm.{norm}"
+        new = f"self_attn.{norm}"
+        if old in key:
+            return key.replace(old, new)
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Shared safetensors / config helpers
+# ---------------------------------------------------------------------------
+
+
+def _merge_tensors_into_safetensors(output_dir: str,
+                                    tensors: Dict[str, torch.Tensor]) -> None:
+    """Merge *tensors* into the safetensors file(s) in *output_dir*."""
+    index_path = os.path.join(output_dir, "model.safetensors.index.json")
+    single_path = os.path.join(output_dir, "model.safetensors")
+
+    if os.path.exists(index_path):
+        with open(index_path, "r") as f:
+            index = json.load(f)
+        first_shard = sorted(set(index["weight_map"].values()))[0]
+        shard_path = os.path.join(output_dir, first_shard)
+        existing = load_file(shard_path)
+        existing.update(tensors)
+        save_file(existing, shard_path)
+        for key in tensors:
+            index["weight_map"][key] = first_shard
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+    elif os.path.exists(single_path):
+        existing = load_file(single_path)
+        existing.update(tensors)
+        save_file(existing, single_path)
+    else:
+        save_file(tensors, os.path.join(output_dir, "mtp.safetensors"))
+
+
+def _patch_quant_exclude_list(output_dir: str,
+                              module_names: List[str]) -> None:
+    """Add *module_names* to quantization exclude lists in the output dir."""
+    for cfg_file, path_to_list in [
+        ("config.json", ("quantization_config", )),
+        ("hf_quant_config.json", ("quantization", )),
+    ]:
+        cfg_path = os.path.join(output_dir, cfg_file)
+        if not os.path.exists(cfg_path):
+            continue
+        with open(cfg_path, "r") as f:
+            cfg = json.load(f)
+        section = cfg
+        for key in path_to_list:
+            section = section.get(key, {})
+        if not section:
+            continue
+        list_key = "ignore" if "ignore" in section else "exclude_modules"
+        exclude = list(section.get(list_key, []))
+        for name in module_names:
+            if name not in exclude:
+                exclude.append(name)
+        section[list_key] = exclude
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)

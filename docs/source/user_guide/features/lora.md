@@ -1,24 +1,35 @@
 # LoRA (Low-Rank Adaptation)
 
-TensorRT Edge-LLM supports LoRA through the checkpoint-based `llm_loader` path and through the legacy `tensorrt_edgellm` export tools. Use `llm_loader` for new dynamic LoRA workflows.
+TensorRT Edge-LLM supports LoRA through the checkpoint-based `llm_loader` workflow.
 
-## Recommended: Checkpoint-Based Loader
+Use dynamic LoRA when you need to select adapters at runtime. Use static LoRA
+merge when the adapter is always required, such as the Phi-4-Multimodal
+`vision-lora` adapter.
 
-This path exports the base checkpoint with `llm_loader`, inserts LoRA inputs into the ONNX graph, and processes HuggingFace adapter weights for runtime loading.
+## Setup
 
 ```bash
-export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+```
 
-# Step 1: Export base model
+## Dynamic Runtime LoRA
+
+This workflow exports the base checkpoint, inserts LoRA inputs into the ONNX
+graph, processes HuggingFace adapter weights, then builds an engine with a
+maximum adapter rank.
+
+```bash
+# Step 1: Export the base model with llm_loader
 python -m llm_loader.export_all_cli \
-  /path/to/model \
+  /path/to/base_model \
   /tmp/onnx_output
 
-# Step 2: Insert LoRA support into ONNX (creates lora_model.onnx)
+# Step 2: Insert LoRA support into the exported LLM graph
 python -m llm_loader.lora.insert_lora_cli \
   --onnx_dir /tmp/onnx_output/llm
 
-# Step 3: Process each LoRA adapter
+# Step 3: Convert each adapter to the runtime sidecar format
 python -m llm_loader.lora.process_lora_weights_cli \
   --input_dir /path/to/adapter1 \
   --output_dir /tmp/onnx_output/llm/lora_weights/adapter1
@@ -27,111 +38,50 @@ python -m llm_loader.lora.process_lora_weights_cli \
   --input_dir /path/to/adapter2 \
   --output_dir /tmp/onnx_output/llm/lora_weights/adapter2
 
-# Step 4: Build engine with LoRA support
+# Step 4: Build the engine with LoRA support
 ./build/examples/llm/llm_build \
   --onnxDir /tmp/onnx_output/llm \
   --engineDir engines \
   --maxBatchSize 1 \
   --maxLoraRank 64
 
-# Step 5: Run inference with adapter selection (see Input Format below)
+# Step 5: Run inference with adapter selection in input.json
 ./build/examples/llm/llm_inference \
   --engineDir engines \
   --inputFile input.json \
   --outputFile output.json
 ```
 
----
+## Static LoRA Merge
 
-## Alternative: Legacy Export Tools
-
-The legacy `tensorrt_edgellm` tools remain available for compatibility. The `tensorrt_edgellm/` folder will be removed in 0.8.0 after the `experimental/quantization` -> `experimental/llm_loader` workflow reaches full feature parity for all models and features.
-
-| Approach | Scripts | Use Case |
-|----------|---------|----------|
-| **Static Merge** | `tensorrt-edgellm-merge-lora` | Permanently merge LoRA into base model before export |
-| **Dynamic Runtime** | `tensorrt-edgellm-insert-lora` + `tensorrt-edgellm-process-lora` | Switch between multiple adapters at runtime |
-
----
-
-## Approach 1: Static LoRA Merge
-
-Permanently merges LoRA weights into the base model. Use this when:
-- The LoRA is always required (e.g., Phi-4-multimodal vision-lora)
-- You don't need runtime adapter switching
-- You want simpler deployment with a single merged model
-
-### Workflow
+Static merge permanently applies a LoRA adapter to the base HuggingFace
+checkpoint before optional quantization and ONNX export.
 
 ```bash
-# Step 1: Merge LoRA into base model
-tensorrt-edgellm-merge-lora \
+# Step 1: Merge LoRA into the base checkpoint
+python -m llm_loader.lora.merge_lora_cli \
   --model_dir Phi-4-multimodal-instruct \
   --lora_dir Phi-4-multimodal-instruct/vision-lora \
   --output_dir merged_model
 
-# Step 2: Continue with standard export pipeline
-tensorrt-edgellm-quantize-llm \
+# Step 2: Optional quantization of the merged checkpoint
+python -m experimental.quantization llm \
   --model_dir merged_model \
-  --output_dir quantized \
-  --quantization fp8
+  --output_dir quantized_model \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
 
-tensorrt-edgellm-export-llm \
-  --model_dir quantized \
-  --output_dir llm_onnx
-
-# Step 3-4: Build and run as usual (no LoRA flags needed)
+# Step 3: Export the checkpoint with llm_loader
+python -m llm_loader.export_all_cli \
+  quantized_model \
+  onnx_output
 ```
 
----
+If you do not need weight quantization, export `merged_model` directly in step 3.
 
-## Approach 2: Dynamic Runtime LoRA
+## Input Format
 
-Enables switching between multiple LoRA adapters at runtime without rebuilding engines. Use this when:
-- You have multiple domain-specific adapters
-- You need multi-tenant serving with different fine-tuned models
-- You want A/B testing between adapter variants
-
-### Workflow
-
-```bash
-# Step 1: Export base model
-tensorrt-edgellm-export-llm \
-  --model_dir Qwen/Qwen2.5-0.5B-Instruct \
-  --output_dir llm_onnx
-
-# Step 2: Insert LoRA support into ONNX (creates lora_model.onnx)
-tensorrt-edgellm-insert-lora \
-  --onnx_dir llm_onnx
-
-# Step 3: Process each LoRA adapter
-tensorrt-edgellm-process-lora \
-  --input_dir /path/to/adapter1 \
-  --output_dir llm_onnx/lora_weights/adapter1
-
-tensorrt-edgellm-process-lora \
-  --input_dir /path/to/adapter2 \
-  --output_dir llm_onnx/lora_weights/adapter2
-
-# Step 4: Build engine with LoRA support
-./build/examples/llm/llm_build \
-  --onnxDir llm_onnx \
-  --engineDir engines \
-  --maxBatchSize 1 \
-  --maxLoraRank 64
-
-# Step 5: Run inference with adapter selection (see Input Format below)
-./build/examples/llm/llm_inference \
-  --engineDir engines \
-  --inputFile input.json \
-  --outputFile output.json
-```
-
----
-
-## Input Format for Runtime LoRA
-
-Specify available adapters and select per-request:
+Specify available adapters and select one adapter per request:
 
 ```json
 {
@@ -156,55 +106,21 @@ Specify available adapters and select per-request:
 }
 ```
 
-**Note**: All requests in the same batch must use the same LoRA adapter. To disable LoRA, omit `lora_name` or set it to empty string.
-
----
+All requests in the same batch must use the same LoRA adapter. To disable LoRA,
+omit `lora_name` or set it to an empty string.
 
 ## Script Reference
 
 ### `llm_loader.lora.insert_lora_cli`
 
-Inserts LoRA patterns into an exported `llm_loader` ONNX model, creating `lora_model.onnx`.
+Inserts LoRA patterns into an exported `llm_loader` ONNX model and creates
+`lora_model.onnx` in the same directory.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `--onnx_dir` | Yes | Directory containing `model.onnx` |
-
-**Output**: Creates `lora_model.onnx` in the same directory.
+| `--onnx_dir` | Yes | Directory containing `model.onnx` and `config.json` |
 
 ### `llm_loader.lora.process_lora_weights_cli`
-
-Processes HuggingFace LoRA adapter weights for runtime use with a `llm_loader` export.
-
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `--input_dir` | Yes | Directory with `adapter_config.json` and `adapter_model.safetensors` |
-| `--output_dir` | Yes | Output directory for processed weights |
-
-**Output**: Creates `processed_adapter_model.safetensors` and `config.json`.
-
-### `tensorrt-edgellm-merge-lora`
-
-Permanently merges LoRA weights into a base HuggingFace model.
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--model_dir` | Yes | - | Base model directory |
-| `--lora_dir` | Yes | - | LoRA checkpoint directory |
-| `--output_dir` | Yes | - | Output directory for merged model |
-| `--device` | No | `cuda` | Device for loading model |
-
-### `tensorrt-edgellm-insert-lora`
-
-Inserts LoRA patterns into an exported ONNX model, creating `lora_model.onnx`.
-
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `--onnx_dir` | Yes | Directory containing `model.onnx` |
-
-**Output**: Creates `lora_model.onnx` in the same directory.
-
-### `tensorrt-edgellm-process-lora`
 
 Processes HuggingFace LoRA adapter weights for runtime use.
 
@@ -213,29 +129,28 @@ Processes HuggingFace LoRA adapter weights for runtime use.
 | `--input_dir` | Yes | Directory with `adapter_config.json` and `adapter_model.safetensors` |
 | `--output_dir` | Yes | Output directory for processed weights |
 
-**Output**: Creates `processed_adapter_model.safetensors` and `config.json`.
+The output contains `processed_adapter_model.safetensors` and `config.json`.
 
-**Processing**:
-- Converts bf16 -> fp16
-- Applies scaling: `lora_B *= lora_alpha / r`
-- Transposes tensors to correct shapes
-- Filters out norm and lm_head layers
+### `llm_loader.lora.merge_lora_cli`
 
----
+Permanently merges LoRA weights into a base HuggingFace checkpoint.
+
+| Argument | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `--model_dir` | Yes | - | Base model directory |
+| `--lora_dir` | Yes | - | LoRA adapter directory |
+| `--output_dir` | Yes | - | Output directory for merged checkpoint |
+| `--device` | No | `cuda` | Device used while merging |
+| `--torch-dtype` | No | `float16` | Model dtype used while merging |
 
 ## Build Parameters
 
-When building with dynamic LoRA support:
-
 | Parameter | Description |
 |-----------|-------------|
-| `--maxLoraRank` | Maximum LoRA rank to support (e.g., 64). Set to 0 to disable LoRA. |
-
----
+| `--maxLoraRank` | Maximum LoRA rank to support. Set to `0` to disable dynamic LoRA. |
 
 ## Notes
 
-- Static merge is simpler but doesn't allow runtime switching
-- Dynamic LoRA adds slight overhead but enables multi-adapter deployments
-- All adapters must have rank <= `--maxLoraRank` specified at build time
-- CUDA graphs are captured separately for each LoRA configuration
+- Static merge produces a single checkpoint and does not require runtime LoRA flags.
+- Dynamic LoRA enables adapter switching without rebuilding, but all adapters must have rank less than or equal to `--maxLoraRank`.
+- CUDA graphs are captured separately for each LoRA configuration.

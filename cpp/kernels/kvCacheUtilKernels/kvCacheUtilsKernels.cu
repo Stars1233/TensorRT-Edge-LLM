@@ -145,20 +145,12 @@ void instantiateKVCacheLayerFromTensor(
     int32_t const kvCacheMaxBatch = dstShape[0];
     int32_t const kvCacheMaxSequenceLength = dstShape[3];
 
-    if (batchIdx >= kvCacheMaxBatch)
-    {
-        throw std::runtime_error("instantiateKVCacheLayerFromTensor(): batchIdx out of range. Max="
-            + std::to_string(kvCacheMaxBatch) + ", got=" + std::to_string(batchIdx));
-    }
-    if (sequenceLength > kvCacheMaxSequenceLength)
-    {
-        throw std::runtime_error("instantiateKVCacheLayerFromTensor(): sequenceLength exceeds max. Max="
-            + std::to_string(kvCacheMaxSequenceLength) + ", got=" + std::to_string(sequenceLength));
-    }
-    if (dstKVCacheLayer.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("instantiateKVCacheLayerFromTensor(): Only half type is supported.");
-    }
+    ELLM_CHECK(batchIdx < kvCacheMaxBatch,
+        "batchIdx out of range. Max=" + std::to_string(kvCacheMaxBatch) + ", got=" + std::to_string(batchIdx));
+    ELLM_CHECK(sequenceLength <= kvCacheMaxSequenceLength,
+        "sequenceLength exceeds max. Max=" + std::to_string(kvCacheMaxSequenceLength)
+            + ", got=" + std::to_string(sequenceLength));
+    ELLM_CHECK(dstKVCacheLayer.getDataType() == nvinfer1::DataType::kHALF, "Only half type is supported.");
 
     // Single layer: grid = 2 * numKVHeads CTAs
     dim3 gridDim(2 * numKVHeads);
@@ -206,20 +198,12 @@ void saveKVCacheLayerIntoTensor(
     int32_t const kvCacheMaxBatch = srcShape[0];
     int32_t const kvCacheMaxSequenceLength = srcShape[3];
 
-    if (batchIdx >= kvCacheMaxBatch)
-    {
-        throw std::runtime_error("saveKVCacheLayerIntoTensor(): batchIdx out of range. Max="
-            + std::to_string(kvCacheMaxBatch) + ", got=" + std::to_string(batchIdx));
-    }
-    if (sequenceLength > kvCacheMaxSequenceLength)
-    {
-        throw std::runtime_error("saveKVCacheLayerIntoTensor(): sequenceLength exceeds max. Max="
-            + std::to_string(kvCacheMaxSequenceLength) + ", got=" + std::to_string(sequenceLength));
-    }
-    if (dstKVCacheTensor.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("saveKVCacheLayerIntoTensor(): Only half type is supported.");
-    }
+    ELLM_CHECK(batchIdx < kvCacheMaxBatch,
+        "batchIdx out of range. Max=" + std::to_string(kvCacheMaxBatch) + ", got=" + std::to_string(batchIdx));
+    ELLM_CHECK(sequenceLength <= kvCacheMaxSequenceLength,
+        "sequenceLength exceeds max. Max=" + std::to_string(kvCacheMaxSequenceLength)
+            + ", got=" + std::to_string(sequenceLength));
+    ELLM_CHECK(dstKVCacheTensor.getDataType() == nvinfer1::DataType::kHALF, "Only half type is supported.");
 
     dim3 gridDim(2 * numKVHeads);
     dim3 blockDim(32, 4);

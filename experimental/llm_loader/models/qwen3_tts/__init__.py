@@ -17,12 +17,14 @@
 Qwen3-TTS has NO audio encoder. Its components are:
 - Talker: Qwen3-architecture LLM decoder for speech codec prediction.
 - CodePredictor: Small 5-layer Qwen3 decoder for multi-token prediction.
-- LLM backbone: Standard Qwen3 text model.
+- Code2Wav: speech_tokenizer decoder for waveform synthesis.
 
-See ``modeling_code_predictor.py`` for details.
+See ``modeling_code_predictor.py`` and ``modeling_qwen3_tts_code2wav.py``
+for details.
 """
 from .modeling_code_predictor import (CodePredictorCausalLM,
                                       apply_code_predictor_mlp_war)
+from .modeling_qwen3_tts_code2wav import export_qwen3_tts_code2wav
 from .modeling_qwen3_tts_talker import TalkerCausalLM
 from .modeling_qwen3_tts_text import Qwen3TTSLanguageModel
 
@@ -31,4 +33,5 @@ __all__ = [
     "TalkerCausalLM",
     "CodePredictorCausalLM",
     "apply_code_predictor_mlp_war",
+    "export_qwen3_tts_code2wav",
 ]

@@ -56,6 +56,13 @@ def main() -> None:
         choices=["fp16"],
         help="Export dtype (default: fp16)",
     )
+    parser.add_argument(
+        "--max_kv_cache_capacity",
+        type=int,
+        default=4096,
+        help=
+        "Maximum KV cache capacity. Must match maxKVCacheCapacity that the LLM engine is built with (default: 4096)",
+    )
 
     args = parser.parse_args()
 
@@ -65,6 +72,7 @@ def main() -> None:
             output_dir=args.output_dir,
             device=args.device,
             dtype=args.dtype,
+            max_kv_cache_capacity=args.max_kv_cache_capacity,
         )
         print("Action expert export completed successfully!")
     except Exception as e:

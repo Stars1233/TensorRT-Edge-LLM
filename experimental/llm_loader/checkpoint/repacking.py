@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ in-place on ``module._buffers`` or return new tensors; they are called by
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ __all__ = [
     "repack_awq_to_plugin",
     "repack_gptq_to_plugin",
     "decode_modelopt_nvfp4",
+    "repack_nvfp4_qwen3_moe_experts",
     "repack_nvfp4_expert_up",
     "repack_nvfp4_expert_down",
     "repack_nvfp4_expert_up_prefill_raw",
@@ -634,6 +635,136 @@ def decode_modelopt_nvfp4(
     dense = dense.reshape(out_f, in_f)
     dense *= ws2
     return dense.astype(np.float32)
+
+
+def _round_dense_to_bf16(dense: np.ndarray) -> np.ndarray:
+    """Round a dense fp32 weight through BF16 while returning fp32 storage."""
+    dense_t = torch.from_numpy(np.ascontiguousarray(dense, dtype=np.float32))
+    return dense_t.to(torch.bfloat16).to(torch.float32).cpu().numpy()
+
+
+def _swizzle_nvfp4_geforce_mma_scales(scale_bytes: np.ndarray, m_dim: int,
+                                      k_sf_dim: int) -> np.ndarray:
+    """Swizzle linear FP8 block scales to CuTeDSL's 6D MMA layout."""
+    if scale_bytes.dtype == np.int8:
+        sf = scale_bytes.view(np.uint8)
+    elif scale_bytes.dtype == np.uint8:
+        sf = scale_bytes
+    else:
+        raise TypeError(f"unexpected scale dtype {scale_bytes.dtype}")
+    if sf.shape != (m_dim, k_sf_dim):
+        raise ValueError(f"scale shape {sf.shape} != ({m_dim}, {k_sf_dim})")
+
+    m_tiles = (m_dim + 127) // 128
+    k_tiles = (k_sf_dim + 3) // 4
+    padded_m = m_tiles * 128
+    padded_k_sf = k_tiles * 4
+    sf_padded = np.zeros((padded_m, padded_k_sf), dtype=np.uint8)
+    sf_padded[:m_dim, :k_sf_dim] = sf
+
+    sf_5d = sf_padded.reshape(m_tiles, 4, 32, k_tiles, 4)
+    return sf_5d.transpose(0, 3, 2, 1, 4).copy().view(np.int8)
+
+
+def _pack_nvfp4_geforce_moe_weight(
+        dense_w_mk: np.ndarray,
+        group_size: int = 16) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack dense ``[M, K]`` weights for ``NvFP4MoEPluginGeforce``.
+
+    Returns ``(qweights [M, K/2] int8,
+    blocks_scale [m_tiles, k_tiles, 32, 4, 4] int8)``.  The scale tensor
+    stores raw FP8 E4M3 block scales in the physical CuTeDSL MMA layout.
+    """
+    if group_size != 16:
+        raise NotImplementedError(
+            "NvFP4MoEPluginGeforce requires group_size=16")
+
+    m_dim, k_dim = dense_w_mk.shape
+    if k_dim % group_size != 0 or k_dim % 2 != 0:
+        raise ValueError(
+            f"K ({k_dim}) must be a multiple of {group_size} and even")
+
+    dense = _round_dense_to_bf16(dense_w_mk)
+    k_sf_dim = k_dim // group_size
+    dense_blocks = dense.reshape(m_dim, k_sf_dim, group_size)
+    block_scales = np.maximum(np.abs(dense_blocks).max(axis=-1) / 6.0,
+                              1e-12).astype(np.float32)
+
+    scaled = (dense_blocks / block_scales[..., np.newaxis]).clip(-6.0, 6.0)
+    abs_idx = np.searchsorted(_E2M1_BOUNDS, np.abs(scaled)).astype(np.uint8)
+    sign_bit = (scaled < 0).astype(np.uint8) << np.uint8(3)
+    nibbles = (abs_idx | sign_bit).reshape(m_dim, k_dim)
+
+    lo = nibbles[:, 0::2]
+    hi = nibbles[:, 1::2]
+    qweights = (lo | (hi << np.uint8(4))).astype(np.uint8).view(np.int8)
+
+    sf_bytes = torch.from_numpy(block_scales.copy()).to(
+        torch.float8_e4m3fn).view(torch.uint8).cpu().numpy()
+    blocks_scale = _swizzle_nvfp4_geforce_mma_scales(sf_bytes, m_dim, k_sf_dim)
+
+    return (torch.from_numpy(qweights.copy()),
+            torch.from_numpy(blocks_scale.copy()))
+
+
+def repack_nvfp4_qwen3_moe_experts(
+    experts: Iterable[nn.Module],
+    hidden_size: int,
+    moe_inter_size: int,
+    group_size: int = 16,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack Qwen3 NVFP4 experts for ``NvFP4MoEPluginGeforce``.
+
+    Each expert is expected to contain ModelOpt ``NVFP4Linear`` gate/up/down
+    projection tensors.  Dense weights are decoded, rounded through BF16, and
+    repacked for the CuTeDSL GeForce plugin.  FC1 uses SwiGLU order
+    ``[up, gate]``.
+    """
+    from ..models.linear import \
+        NVFP4Linear  # local import to avoid circular dep
+
+    fc1_qweights = []
+    fc1_blocks_scale = []
+    fc2_qweights = []
+    fc2_blocks_scale = []
+
+    for expert in experts:
+        gate = expert.gate_proj
+        up = expert.up_proj
+        down = expert.down_proj
+        if not (isinstance(gate, NVFP4Linear) and isinstance(up, NVFP4Linear)
+                and isinstance(down, NVFP4Linear)):
+            raise TypeError("Qwen3 NVFP4 MoE experts must use NVFP4Linear")
+
+        gate_dense = decode_modelopt_nvfp4(gate.weight, gate.weight_scale,
+                                           gate.weight_scale_2, group_size)
+        up_dense = decode_modelopt_nvfp4(up.weight, up.weight_scale,
+                                         up.weight_scale_2, group_size)
+        down_dense = decode_modelopt_nvfp4(down.weight, down.weight_scale,
+                                           down.weight_scale_2, group_size)
+
+        if gate_dense.shape != (moe_inter_size, hidden_size):
+            raise ValueError(f"gate dense shape {gate_dense.shape} != "
+                             f"({moe_inter_size}, {hidden_size})")
+        if up_dense.shape != (moe_inter_size, hidden_size):
+            raise ValueError(f"up dense shape {up_dense.shape} != "
+                             f"({moe_inter_size}, {hidden_size})")
+        if down_dense.shape != (hidden_size, moe_inter_size):
+            raise ValueError(f"down dense shape {down_dense.shape} != "
+                             f"({hidden_size}, {moe_inter_size})")
+
+        fc1_dense = np.concatenate([up_dense, gate_dense], axis=0)
+        fc1_qw, fc1_sf = _pack_nvfp4_geforce_moe_weight(fc1_dense, group_size)
+        fc2_qw, fc2_sf = _pack_nvfp4_geforce_moe_weight(down_dense, group_size)
+        fc1_qweights.append(fc1_qw)
+        fc1_blocks_scale.append(fc1_sf)
+        fc2_qweights.append(fc2_qw)
+        fc2_blocks_scale.append(fc2_sf)
+
+    return (torch.stack(fc1_qweights,
+                        dim=0), torch.stack(fc1_blocks_scale, dim=0),
+            torch.stack(fc2_qweights,
+                        dim=0), torch.stack(fc2_blocks_scale, dim=0))
 
 
 def _atom_sf_offsets(M: int, num_sf_cols: int) -> np.ndarray:

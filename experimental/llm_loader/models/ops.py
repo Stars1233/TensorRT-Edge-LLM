@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -434,14 +434,43 @@ def causal_conv1d(
     padding: int,
     dilation: int,
     groups: int,
+    collect_intermediate_states: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: causal conv1d. Returns same-shape activations and cloned conv_state."""
+    """Stub: causal conv1d; with MTP enabled it returns an optional 3rd output."""
+    if collect_intermediate_states:
+        batch_size, seq_len, _ = hidden_states.shape
+        intermediate_conv_state = torch.zeros(batch_size,
+                                              seq_len,
+                                              conv_state.shape[1],
+                                              conv_state.shape[2],
+                                              dtype=conv_state.dtype,
+                                              device=conv_state.device)
+        return (torch.zeros_like(hidden_states), conv_state.clone(),
+                intermediate_conv_state)
     return torch.zeros_like(hidden_states), conv_state.clone()
 
 
 @causal_conv1d.register_fake
-def _(hidden_states, weight, bias, conv_state, context_lengths, stride,
-      padding, dilation, groups):
+def _(hidden_states,
+      weight,
+      bias,
+      conv_state,
+      context_lengths,
+      stride,
+      padding,
+      dilation,
+      groups,
+      collect_intermediate_states=False):
+    if collect_intermediate_states:
+        batch_size, seq_len, _ = hidden_states.shape
+        intermediate_conv_state = torch.empty(batch_size,
+                                              seq_len,
+                                              conv_state.shape[1],
+                                              conv_state.shape[2],
+                                              dtype=conv_state.dtype,
+                                              device=conv_state.device)
+        return (torch.empty_like(hidden_states), conv_state.clone(),
+                intermediate_conv_state)
     return torch.empty_like(hidden_states), conv_state.clone()
 
 
@@ -570,6 +599,69 @@ def _(value, indices):
 
 
 # ---------------------------------------------------------------------------
+# Custom op: trt::rope_onnx  (TRT native RotaryEmbedding)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::rope_onnx", mutates_args=())
+def rope_onnx(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Stub for TRT native RotaryEmbedding — returns tensor with same shape as input."""
+    return x.clone()
+
+
+@rope_onnx.register_fake
+def _(x, cos, sin, position_ids):
+    return torch.empty_like(x)
+
+
+# Custom op: trt::kv_cache_update_onnx  (TRT native KVCacheUpdate)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::kv_cache_update_onnx", mutates_args=())
+def kv_cache_update_onnx(
+    cache: torch.Tensor,
+    new_kv: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Stub for TRT native KVCacheUpdate — returns cache with same shape."""
+    return cache.clone()
+
+
+@kv_cache_update_onnx.register_fake
+def _(cache, new_kv, cache_indices):
+    return torch.empty_like(cache)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt::attention_onnx  (TRT native Attention)
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt::attention_onnx", mutates_args=())
+def attention_onnx(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Stub for TRT native Attention — returns tensor with same shape as query."""
+    return query.clone()
+
+
+@attention_onnx.register_fake
+def _(query, key, value, attn_mask, is_causal, scale):
+    return torch.empty_like(query)
+
+
+# ---------------------------------------------------------------------------
 # Custom op: trt_edgellm::gated_delta_net  (Qwen3.5 GDN linear attention)
 # ---------------------------------------------------------------------------
 
@@ -587,13 +679,47 @@ def gated_delta_net(
     context_lengths: torch.Tensor,  # [batch] int32
     k_dim: int,
     v_dim: int,
+    collect_intermediate_states: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stub: Qwen3.5 GatedDeltaNet. Returns same-shape output and cloned state."""
+    """Stub: GatedDeltaNet; with MTP enabled it returns an optional 3rd output."""
+    if collect_intermediate_states:
+        batch_size, seq_len, num_v_heads, _ = v.shape
+        intermediate_recurrent_state = torch.zeros(batch_size,
+                                                   seq_len,
+                                                   num_v_heads,
+                                                   k_dim,
+                                                   v_dim,
+                                                   dtype=h0_source.dtype,
+                                                   device=h0_source.device)
+        return (torch.zeros_like(v), h0_source.clone(),
+                intermediate_recurrent_state)
     return torch.zeros_like(v), h0_source.clone()
 
 
 @gated_delta_net.register_fake
-def _(q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim, v_dim):
+def _(q,
+      k,
+      v,
+      a,
+      b,
+      A_log,
+      dt_bias,
+      h0_source,
+      context_lengths,
+      k_dim,
+      v_dim,
+      collect_intermediate_states=False):
+    if collect_intermediate_states:
+        batch_size, seq_len, num_v_heads, _ = v.shape
+        intermediate_recurrent_state = torch.empty(batch_size,
+                                                   seq_len,
+                                                   num_v_heads,
+                                                   k_dim,
+                                                   v_dim,
+                                                   dtype=h0_source.dtype,
+                                                   device=h0_source.device)
+        return (torch.empty_like(v), h0_source.clone(),
+                intermediate_recurrent_state)
     return torch.empty_like(v), h0_source.clone()
 
 
@@ -637,4 +763,41 @@ def _(router_logits, hidden_states, hidden_global_scale, up_weights,
       e_score_correction_bias, num_experts, top_k, hidden_size, moe_inter_size,
       activation_type, n_group, topk_group, norm_topk_prob,
       routed_scaling_factor, routing_mode):
+    return torch.empty_like(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Custom op: trt_edgellm::NvFP4MoEPluginGeforce
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("trt_edgellm::NvFP4MoEPluginGeforce", mutates_args=())
+def nvfp4_moe_plugin_geforce(
+    router_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    fc1_qweights: torch.Tensor,
+    fc1_blocks_scale: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_qweights: torch.Tensor,
+    fc2_blocks_scale: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    backend: int,
+    io_dtype: int,
+    max_routed_rows: int,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+@nvfp4_moe_plugin_geforce.register_fake
+def _(router_logits, hidden_states, fc1_qweights, fc1_blocks_scale, fc1_alpha,
+      fc2_qweights, fc2_blocks_scale, fc2_alpha, input_global_scale,
+      down_input_scale, num_experts, top_k, hidden_size, moe_inter_size,
+      activation_type, backend, io_dtype, max_routed_rows):
     return torch.empty_like(hidden_states)

@@ -317,7 +317,7 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    // Initialize Code2Wav Runner
+    // Initialize Code2Wav Runner (scoped block limits lifetime of code2wavDir)
     std::unique_ptr<Code2WavRunner> code2wavRunner;
     std::filesystem::path const code2wavDir = args.code2wavEngineDir.empty()
         ? std::filesystem::path(args.talkerEngineDir).parent_path() / "code2wav"
@@ -397,17 +397,19 @@ int main(int argc, char** argv)
         // Run Code2Wav
         rt::audioUtils::AudioData audioOutput;
         bool hasAudio = false;
-        if (requestStatus && code2wavRunner && !talkerResp.rvqCodes.empty())
+        auto const& framesCodes
+            = talkerResp.batchRvqCodes.empty() ? std::vector<std::vector<int32_t>>{} : talkerResp.batchRvqCodes[0];
+        if (requestStatus && code2wavRunner && !framesCodes.empty())
         {
             // Transpose [frames][layers] → [layers][frames]
-            size_t const numFrames = talkerResp.rvqCodes.size();
-            size_t const numLayers = talkerResp.rvqCodes[0].size();
+            size_t const numFrames = framesCodes.size();
+            size_t const numLayers = framesCodes[0].size();
             std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
             for (size_t f = 0; f < numFrames; ++f)
             {
                 for (size_t l = 0; l < numLayers; ++l)
                 {
-                    transposed[l][f] = talkerResp.rvqCodes[f][l];
+                    transposed[l][f] = framesCodes[f][l];
                 }
             }
 
@@ -467,9 +469,9 @@ int main(int argc, char** argv)
                 responseJson["audio_duration_ms"] = static_cast<int64_t>(1000.0 * samples / audioOutput.sampleRate);
             }
 
-            if (requestStatus && !talkerResp.rvqCodes.empty() && !args.outputAudioDir.empty())
+            if (requestStatus && !framesCodes.empty() && !args.outputAudioDir.empty())
             {
-                auto const& frames = talkerResp.rvqCodes;
+                auto const& frames = framesCodes;
                 int64_t const numFrames = static_cast<int64_t>(frames.size());
                 int64_t const numCodes = frames.empty() ? 0 : static_cast<int64_t>(frames[0].size());
                 // Flatten [numFrames][numCodes] into a contiguous buffer for the Tensor wrapper

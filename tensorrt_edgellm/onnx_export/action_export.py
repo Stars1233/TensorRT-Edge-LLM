@@ -34,6 +34,7 @@ from .config_export import export_action_config
 def action_export(
     model_dir: str,
     output_dir: str,
+    max_kv_cache_capacity: int,
     device: str = "cuda",
     dtype: str = "fp16",
 ) -> str:
@@ -47,6 +48,7 @@ def action_export(
     Args:
         model_dir: Directory containing the Alpamayo 1 model.
         output_dir: Directory to save the exported ONNX model (model.onnx).
+        max_kv_cache_capacity: Maximum KV cache capacity.
         device: Device to load the model on (e.g. "cuda", "cuda:0").
         dtype: Export dtype; only "fp16" is supported.
 
@@ -82,11 +84,20 @@ def action_export(
         export_alpamayo1_action(
             patched_model,
             output_dir,
+            max_kv_cache_capacity,
             device=device,
             torch_dtype=torch_dtype,
         )
 
-        config_dict = export_action_config(model.expert.config)
+        # from https://github.com/NVlabs/alpamayo/blob/2d2b511ccd626b97aab0c9c211861c0e768551aa/src/alpamayo_r1/models/delta_tokenizer.py#L30
+        model.expert.config.num_traj_tokens = 1000
+        model.expert.config.traj_token_start = model.config.traj_token_start_idx + model.config.traj_tokenizer_cfg[
+            "num_bins"]
+        model.expert.config.n_diffusion_tokens = patched_model.n_diffusion_tokens
+
+        config_dict = export_action_config(model.expert.config,
+                                           max_kv_cache_capacity)
+
         with open(os.path.join(output_dir, "config.json"), "w") as f:
             json.dump(config_dict, f, indent=2)
     else:

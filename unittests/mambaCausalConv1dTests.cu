@@ -322,3 +322,131 @@ TEST(MambaCausalConv1dDecode, LargeDim)
 {
     runCausalConv1dDecodeTest(4, 512, 4);
 }
+
+// ---------------------------------------------------------------------------
+// invokeCausalConv1dDecodeMTP tests
+// ---------------------------------------------------------------------------
+
+/**
+ * CPU reference for MTP decode: processes T tokens sequentially, with per-step
+ * state checkpointing. Verifies output, final state, and intermediate states.
+ */
+void runCausalConv1dDecodeMTPReference(int32_t batch, int32_t dim, int32_t width, int32_t T,
+    std::vector<half> const& convState, std::vector<half> const& newCols, std::vector<half> const& weight,
+    std::vector<half> const& bias, std::vector<half>& convStateOut, std::vector<half>& outRef,
+    std::vector<half>& intermRef)
+{
+    convStateOut = convState;
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        for (int32_t d = 0; d < dim; ++d)
+        {
+            int64_t rowOff = (static_cast<int64_t>(b) * dim + d) * width;
+            for (int32_t t = 0; t < T; ++t)
+            {
+                // Shift left
+                for (int32_t k = 0; k < width - 1; ++k)
+                {
+                    convStateOut[rowOff + k] = convStateOut[rowOff + k + 1];
+                }
+                // Insert new token
+                int64_t const newIdx = (static_cast<int64_t>(b) * T + t) * dim + d;
+                convStateOut[rowOff + width - 1] = newCols[newIdx];
+                // Dot product
+                float acc = __half2float(bias[d]);
+                for (int32_t k = 0; k < width; ++k)
+                {
+                    int64_t const wIdx = static_cast<int64_t>(d) * width + k;
+                    acc += __half2float(convStateOut[rowOff + k]) * __half2float(weight[wIdx]);
+                }
+                int64_t const outIdx = (static_cast<int64_t>(b) * T + t) * dim + d;
+                outRef[outIdx] = __float2half(acc);
+                // Checkpoint intermediate state
+                int64_t const intermBase = ((static_cast<int64_t>(b) * T + t) * dim + d) * width;
+                for (int32_t k = 0; k < width; ++k)
+                {
+                    intermRef[intermBase + k] = convStateOut[rowOff + k];
+                }
+            }
+        }
+    }
+}
+
+void runCausalConv1dDecodeMTPTest(int32_t batch, int32_t dim, int32_t width, int32_t T)
+{
+    std::vector<half> convStateHost(batch * dim * width);
+    std::vector<half> weightHost(dim * width);
+    std::vector<half> biasHost(dim);
+    std::vector<half> newColsHost(batch * T * dim);
+    uniformFloatInitialization<half>(convStateHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(weightHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(biasHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(newColsHost, -0.5F, 0.5F);
+
+    // CPU reference
+    std::vector<half> convStateRef(convStateHost.size());
+    std::vector<half> outRef(batch * T * dim);
+    std::vector<half> intermRef(batch * T * dim * width);
+    runCausalConv1dDecodeMTPReference(
+        batch, dim, width, T, convStateHost, newColsHost, weightHost, biasHost, convStateRef, outRef, intermRef);
+
+    // GPU
+    auto convStateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto weightDevice = rt::Tensor({dim, 1, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto biasDevice = rt::Tensor({dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto newColsDevice = rt::Tensor({batch, T, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto outDevice = rt::Tensor({batch, T, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto intermDevice = rt::Tensor({batch, T, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    copyHostToDevice(convStateDevice, convStateHost);
+    copyHostToDevice(weightDevice, weightHost);
+    copyHostToDevice(biasDevice, biasHost);
+    copyHostToDevice(newColsDevice, newColsHost);
+
+    trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasDevice));
+    mamba_ssm::invokeCausalConv1dDecodeMTP(
+        convStateDevice, newColsDevice, weightDevice, biasOpt, outDevice, intermDevice, T, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Verify output
+    auto const outHost = copyDeviceToHost<half>(outDevice);
+    for (size_t i = 0; i < outRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(outHost[i], outRef[i], 1e-3F, 1e-3F))
+            << "MTP output mismatch at index " << i << ": got " << __half2float(outHost[i]) << ", expected "
+            << __half2float(outRef[i]);
+    }
+
+    // Verify final state
+    auto const stateHost = copyDeviceToHost<half>(convStateDevice);
+    for (size_t i = 0; i < convStateRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(stateHost[i], convStateRef[i], 1e-3F, 1e-3F))
+            << "MTP final state mismatch at index " << i << ": got " << __half2float(stateHost[i]) << ", expected "
+            << __half2float(convStateRef[i]);
+    }
+
+    // Verify intermediate states
+    auto const intermHost = copyDeviceToHost<half>(intermDevice);
+    for (size_t i = 0; i < intermRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(intermHost[i], intermRef[i], 1e-3F, 1e-3F))
+            << "MTP intermediate state mismatch at index " << i << ": got " << __half2float(intermHost[i])
+            << ", expected " << __half2float(intermRef[i]);
+    }
+}
+
+TEST(MambaCausalConv1dDecodeMTP, Width4_T4)
+{
+    runCausalConv1dDecodeMTPTest(/*batch=*/4, /*dim=*/256, /*width=*/4, /*T=*/4);
+}
+
+TEST(MambaCausalConv1dDecodeMTP, Width2_T8)
+{
+    runCausalConv1dDecodeMTPTest(/*batch=*/2, /*dim=*/128, /*width=*/2, /*T=*/8);
+}
+
+TEST(MambaCausalConv1dDecodeMTP, LargeDim)
+{
+    runCausalConv1dDecodeMTPTest(/*batch=*/4, /*dim=*/512, /*width=*/4, /*T=*/4);
+}

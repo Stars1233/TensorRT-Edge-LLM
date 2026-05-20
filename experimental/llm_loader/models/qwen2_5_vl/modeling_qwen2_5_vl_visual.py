@@ -32,15 +32,19 @@ imported from the ``qwen3_vl`` module.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..linear import make_linear
 from ..ops import vit_attention_plugin
 from ..qwen3_vl.modeling_qwen3_vl_visual import (RMSNorm, _load_weights,
                                                  apply_rotary_pos_emb_vision)
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Qwen2.5-VL Visual Model
@@ -80,11 +84,30 @@ class Qwen2_5VLMLP(nn.Module):
                      ``up_proj.*``, ``down_proj.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=True)
+        self.gate_proj = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.gate_proj" if name_prefix else "")
+        self.up_proj = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.up_proj" if name_prefix else "")
+        self.down_proj = make_linear(
+            model_config,
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.down_proj" if name_prefix else "")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -97,12 +120,26 @@ class Qwen2_5VLVisionAttention(nn.Module):
     the distinction is in which cu_seqlens / max_seqlen_carrier is passed.
     """
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.qkv = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size * 3,
+            bias=True,
+            module_name=f"{name_prefix}.qkv" if name_prefix else "")
+        self.proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.proj" if name_prefix else "")
 
     def forward(
         self,
@@ -137,13 +174,25 @@ class Qwen2_5VLVisionBlock(nn.Module):
     Checkpoint keys: ``visual.blocks.N.norm1.*``, ``norm2.*``, ``attn.*``, ``mlp.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = Qwen2_5VLVisionAttention(hidden_size, num_heads)
-        self.mlp = Qwen2_5VLMLP(hidden_size, intermediate_size)
+        self.attn = Qwen2_5VLVisionAttention(
+            hidden_size,
+            num_heads,
+            model_config,
+            name_prefix=f"{name_prefix}.attn" if name_prefix else "")
+        self.mlp = Qwen2_5VLMLP(
+            hidden_size,
+            intermediate_size,
+            model_config,
+            name_prefix=f"{name_prefix}.mlp" if name_prefix else "")
 
     def forward(
         self,
@@ -166,17 +215,31 @@ class Qwen2_5VLPatchMerger(nn.Module):
                      ``merger.mlp.0.*``, ``merger.mlp.2.*``
     """
 
-    def __init__(self, hidden_size: int, out_hidden_size: int,
-                 spatial_merge_size: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 out_hidden_size: int,
+                 spatial_merge_size: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.merge_unit = spatial_merge_size * spatial_merge_size
         self.merged_size = hidden_size * self.merge_unit
         self.ln_q = RMSNorm(hidden_size, eps=1e-6)
         # nn.Sequential indices 0 and 2 match checkpoint keys mlp.0.*, mlp.2.*
         self.mlp = nn.Sequential(
-            nn.Linear(self.merged_size, self.merged_size),
+            make_linear(
+                model_config,
+                self.merged_size,
+                self.merged_size,
+                bias=True,
+                module_name=f"{name_prefix}.mlp.0" if name_prefix else ""),
             nn.GELU(),
-            nn.Linear(self.merged_size, out_hidden_size),
+            make_linear(
+                model_config,
+                self.merged_size,
+                out_hidden_size,
+                bias=True,
+                module_name=f"{name_prefix}.mlp.2" if name_prefix else ""),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -195,7 +258,7 @@ class Qwen2_5VLVisualModel(nn.Module):
     All parameters are loaded from the checkpoint under the ``visual.*`` prefix.
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         self.hidden_size: int = config["hidden_size"]
         self.num_heads: int = config["num_heads"]
@@ -223,12 +286,18 @@ class Qwen2_5VLVisualModel(nn.Module):
                                                self.patch_size,
                                                self.temporal_patch_size)
         self.blocks = nn.ModuleList([
-            Qwen2_5VLVisionBlock(self.hidden_size, intermediate_size,
-                                 self.num_heads) for _ in range(depth)
+            Qwen2_5VLVisionBlock(self.hidden_size,
+                                 intermediate_size,
+                                 self.num_heads,
+                                 model_config,
+                                 name_prefix=f"visual.blocks.{i}")
+            for i in range(depth)
         ])
         self.merger = Qwen2_5VLPatchMerger(self.hidden_size,
                                            self.out_hidden_size,
-                                           self.spatial_merge_size)
+                                           self.spatial_merge_size,
+                                           model_config,
+                                           name_prefix="visual.merger")
 
         # Rotary embedding
         theta = float(config.get("rope_theta", 10000.0))
@@ -388,15 +457,17 @@ class Qwen2_5VLVisualModel(nn.Module):
 def build_qwen25_vl_visual(
         config: dict,
         weights: dict,
+        model_config: "ModelConfig",
         dtype: torch.dtype = torch.float16) -> Qwen2_5VLVisualModel:
     """Instantiate and load weights for a Qwen2.5-VL (or Qwen2-VL) visual encoder.
 
     Args:
-        config:  Parsed ``vision_config`` dict from ``config.json``.
-        weights: Safetensors weight dict (all model weights).
-        dtype:   Target dtype (default float16).
+        config:       Parsed ``vision_config`` dict from ``config.json``.
+        weights:      Safetensors weight dict (all model weights).
+        model_config: Top-level ``ModelConfig`` for quantized Linear dispatch.
+        dtype:        Target dtype (default float16).
     """
-    model = Qwen2_5VLVisualModel(config)
+    model = Qwen2_5VLVisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_weights(model, weights, prefix="visual")
     model.eval()

@@ -45,6 +45,7 @@ struct LLMEngineRunnerConfig
     RopeConfig ropeConfig{};             //!< Type of rotary positional encoding
     bool useContextDependentRope{false}; //!< Use context-dependent RoPE
     bool enableEagleSpecDecode{false};   //!< Enable Eagle speculative decoding
+    bool mtpBase{false};                 //!< MTP base model (gates intermediate-state allocation/binding)
     bool useTrtNativeOps{false};         //!< Use TensorRT native operations instead of custom plugin
     int32_t numDecoderLayers{};          //!< Number of decoder layers
     int32_t numKVHeads{};                //!< Number of key-value heads
@@ -131,20 +132,16 @@ public:
     //! @return Engine configuration structure
     LLMEngineRunnerConfig getEngineConfig() const noexcept;
 
-    //! @brief Set an extra input tensor for the engine
+    //! @brief Bind a dynamic lm_head weight tensor to the engine
     //!
-    //! This is a temporary API for binding additional input tensors that are not part of
-    //! the standard LLM input set.
-    //! @note This is not a good design but we put it here temporarily to support TTS inference.
-    //! @note The API will be replaced soon with a better design. Please don't follow this schema.
+    //! Used by CodePredictor to select which lm_head to use for each RVQ layer.
+    //! The CodePredictor ONNX model has `lm_head_weight` as a dynamic input tensor,
+    //! bound before each decode step to switch between the 15 per-layer lm_heads.
     //!
-    //! Example use case: CodePredictor's lm_head_weight input for dynamic lm_head selection.
-    //!
-    //! @param name The name of the LMHead input weights in the ONNX/TRT model
-    //! @param tensor The tensor to bind (must be on GPU, shape must match engine expectation)
+    //! @param lmHeadWeight The lm_head weight tensor [vocabSize, hiddenSize] on GPU
     //! @return True if the binding was successful
     //! @note Must be called before executePrefillStep/executeVanillaDecodingStep
-    bool setLMHeadWeights(std::string const& name, rt::Tensor const& tensor);
+    bool setLmHeadWeight(rt::Tensor const& lmHeadWeight);
 
     //! API entry to execute one prefill engine action for a batched request. The API will clear existing KVCache for
     //! last
@@ -418,6 +415,20 @@ private:
      * @return True on success, false on failure
      */
     bool bindConvStateToEngine(int32_t activeBatchSize);
+
+    /*!
+     * @brief Bind MTP intermediate recurrent state output tensors to engine
+     *
+     * @return True on success, false on failure
+     */
+    bool bindIntermediateRecurrentStateToEngine();
+
+    /*!
+     * @brief Bind MTP intermediate conv state output tensors to engine
+     *
+     * @return True on success, false on failure
+     */
+    bool bindIntermediateConvStateToEngine();
 };
 
 } // namespace rt

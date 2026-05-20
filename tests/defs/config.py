@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from typing import Optional, Set
 
 from conftest import EnvironmentConfig
-from valid_precisions import (VALID_LLM_PRECISIONS, VALID_LM_HEAD_PRECISIONS,
+from valid_precisions import (VALID_AUDIO_PRECISIONS, VALID_LLM_PRECISIONS,
+                              VALID_LM_HEAD_PRECISIONS,
                               VALID_VISUAL_PRECISIONS)
 
 # Global configuration constants
@@ -38,22 +39,52 @@ PRE_QUANTIZED_MODELS: frozenset = frozenset({
 })
 
 
-def _find_directory(root_dir: str,
-                    target_name: str,
-                    max_depth: Optional[int] = None) -> Optional[str]:
-    """
-    Search for a directory with the given name or path 
-    
+def _find_directory(
+    root_dir: str,
+    target_name: str,
+    max_depth: Optional[int] = None,
+    require_files: Optional[list] = None,
+) -> Optional[str]:
+    """Search for a directory with the given name or path.
+
     Args:
-        root_dir: Root directory to start searching from
-        target_name: Target directory name or relative path to find (e.g., "model" or "parent/model")
-        max_depth: Maximum search depth (None for unlimited, 1 for immediate children only)
-    
+        root_dir: Root directory to start searching from.
+        target_name: Target directory name or relative path to find
+            (e.g. ``"model"`` or ``"parent/model"``).
+        max_depth: Maximum search depth (``None`` for unlimited, ``1`` for
+            immediate children only).
+        require_files: Optional list of file requirements. Each entry may
+            be either a single glob (``"config.json"``) — that pattern
+            must match at least one file — or a list of globs
+            (``["model*.safetensors", "pytorch_model*.bin"]``) — at least
+            one of those globs must match. All outer entries must be
+            satisfied. Used to disambiguate HF checkpoint dirs from
+            same-named engine cache / ONNX output dirs that happen to be
+            deeper in the tree.
+
     Returns:
-        Full path to the first matching directory found, or None if not found
+        Full path to the first matching directory found, or None if not
+        found.
     """
-    if not os.path.exists(root_dir):
+    if root_dir is None or not os.path.exists(root_dir):
         return None
+
+    import glob
+
+    def _is_valid_match(candidate: str) -> bool:
+        if not require_files:
+            return True
+        for pattern in require_files:
+            if isinstance(pattern, (list, tuple)):
+                # OR: at least one of these globs must match.
+                if not any(
+                        glob.glob(os.path.join(candidate, p))
+                        for p in pattern):
+                    return False
+            else:
+                if not glob.glob(os.path.join(candidate, pattern)):
+                    return False
+        return True
 
     def _search(current_dir: str, current_depth: int) -> Optional[str]:
         if max_depth is not None and current_depth > max_depth:
@@ -65,7 +96,7 @@ def _find_directory(root_dir: str,
             return None
 
         candidate_path = os.path.join(current_dir, target_name)
-        if os.path.isdir(candidate_path):
+        if os.path.isdir(candidate_path) and _is_valid_match(candidate_path):
             return candidate_path
 
         if max_depth is None or current_depth < max_depth:
@@ -84,10 +115,22 @@ def _find_directory(root_dir: str,
     return _search(root_dir, 0)
 
 
+# A real HF checkpoint dir has config.json plus at least one weight file
+# (any *.safetensors or *.bin). Used by _find_directory.require_files to
+# distinguish HF checkpoints from engine-cache dirs (no config.json).
+_HF_CHECKPOINT_FILES = [
+    "config.json",
+    ["*.safetensors", "*.bin"],
+]
+
+
 class ModelType(enum.Enum):
     """Supported model types"""
     LLM = "llm"
     VLM = "vlm"
+    TTS = "tts"
+    ASR = "asr"
+    OMNI = "omni"
 
 
 class TaskType(enum.Enum):
@@ -135,6 +178,7 @@ class TestConfig:
     llm_precision: str
     lm_head_precision: Optional[str] = None
     visual_precision: Optional[str] = None
+    audio_precision: Optional[str] = None
 
     # EAGLE draft model settings
     draft_model_name: Optional[str] = None
@@ -142,8 +186,9 @@ class TestConfig:
     draft_llm_precision: Optional[str] = None
     draft_lm_head_precision: Optional[str] = None
 
-    # EAGLE model flag
+    # Speculative decoding flags
     is_eagle: Optional[bool] = None
+    is_mtp: Optional[bool] = None
 
     # Directory paths
     llm_models_dir: Optional[str] = None
@@ -175,12 +220,28 @@ class TestConfig:
     max_image_tokens: Optional[int] = None
     max_image_tokens_per_image: Optional[int] = None
 
+    # ASR specific build parameters
+    min_time_steps: Optional[int] = None
+    max_time_steps: Optional[int] = None
+
     # Inference parameters
     test_case: Optional[str] = None
+
+    # Path of a per-config preprocessed copy of the test case JSON. Set by
+    # tests/defs/utils/command_execution.py helpers when they need to rewrite
+    # audio paths or substitute LoRA placeholders without mutating the
+    # version-controlled source under tests/test_cases/. ``get_test_case_file``
+    # returns this when populated so downstream command generation
+    # transparently picks up the rewritten document.
+    _test_case_file_override: Optional[str] = None
 
     # KV cache options
     fp8_kv_cache: Optional[
         bool] = None  # If true, export ONNX/config with FP8 KV cache enabled
+
+    # Embedding options
+    fp8_embedding: Optional[
+        bool] = None  # If true, write embedding.safetensors in FP8 E4M3 format
 
     # Benchmark parameters
     batch_size: Optional[int] = None
@@ -217,21 +278,33 @@ class TestConfig:
             "max_batch_size", "mxbs", {
                 TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
                 TaskType.KERNEL_BENCH
-            }, {ModelType.LLM, ModelType.VLM}),
+            }, {
+                ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR,
+                ModelType.OMNI
+            }),
         ParameterSpec(
             "max_input_len", "mxil", {
                 TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
                 TaskType.KERNEL_BENCH
-            }, {ModelType.LLM, ModelType.VLM}),
+            }, {
+                ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR,
+                ModelType.OMNI
+            }),
         ParameterSpec(
             "max_seq_len", "mxsl", {
                 TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
                 TaskType.KERNEL_BENCH
-            }, {ModelType.LLM, ModelType.VLM}),
+            }, {
+                ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR,
+                ModelType.OMNI
+            }),
         ParameterSpec("max_lora_rank",
                       "mxlr",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      {
+                          ModelType.LLM, ModelType.VLM, ModelType.TTS,
+                          ModelType.ASR, ModelType.OMNI
+                      },
                       is_required=False),
 
         # Export-specific parameters
@@ -241,14 +314,30 @@ class TestConfig:
         ParameterSpec("merge_lora",
                       "", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
-        ParameterSpec("fp8_kv_cache",
-                      "fp8kv", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
-                          TaskType.INFERENCE
-                      }, {ModelType.LLM, ModelType.VLM},
-                      is_required=False),
-        ParameterSpec("is_eagle",
-                      "eagle", {
+        ParameterSpec(
+            "fp8_kv_cache",
+            "fp8kv", {
+                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                TaskType.INFERENCE
+            }, {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
+            is_required=False),
+        ParameterSpec(
+            "fp8_embedding",
+            "fp8emb",
+            {
+                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                TaskType.INFERENCE
+            }, {ModelType.LLM, ModelType.VLM, ModelType.ASR, ModelType.OMNI},
+            is_required=False),
+        ParameterSpec(
+            "is_eagle",
+            "eagle", {
+                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                TaskType.INFERENCE
+            }, {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
+            is_required=False),
+        ParameterSpec("is_mtp",
+                      "mtp", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
@@ -290,52 +379,80 @@ class TestConfig:
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
+        # ASR-specific parameters
+        ParameterSpec("min_time_steps", "mnts",
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.ASR, ModelType.OMNI}),
+        ParameterSpec("max_time_steps", "mxts",
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
+                      {ModelType.ASR, ModelType.OMNI}),
+
         # VLM-specific parameters
         ParameterSpec("min_image_tokens", "mnit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM}),
+                      {ModelType.VLM, ModelType.OMNI}),
         ParameterSpec("max_image_tokens", "mxit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM}),
-        ParameterSpec("max_image_tokens_per_image", "mxpiit",
+                      {ModelType.VLM, ModelType.OMNI}),
+        # mxpiit is optional — most VLM/OMNI test cases use the same value
+        # (512), so set_defaults() falls back to 512 when not in the param
+        # string. Override per-test by including ``-mxpiit<N>``.
+        ParameterSpec("max_image_tokens_per_image",
+                      "mxpiit",
                       {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.VLM}),
+                      {ModelType.VLM, ModelType.OMNI},
+                      is_required=False),
         ParameterSpec("visual_precision",
                       "vit", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
-                      }, {ModelType.VLM},
+                      }, {ModelType.VLM, ModelType.OMNI},
+                      is_required=False),
+        ParameterSpec("audio_precision",
+                      "aud", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.TTS, ModelType.ASR, ModelType.OMNI},
                       is_required=False),
 
         # Inference/Benchmark parameters
         ParameterSpec("test_case", "",
-                      {TaskType.INFERENCE, TaskType.E2E_BENCH},
-                      {ModelType.LLM, ModelType.VLM}),
+                      {TaskType.INFERENCE, TaskType.E2E_BENCH}, {
+                          ModelType.LLM, ModelType.VLM, ModelType.TTS,
+                          ModelType.ASR, ModelType.OMNI
+                      }),
         ParameterSpec("batch_size",
-                      "bs", {TaskType.E2E_BENCH, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM},
+                      "bs", {TaskType.E2E_BENCH, TaskType.INFERENCE}, {
+                          ModelType.LLM, ModelType.VLM, ModelType.TTS,
+                          ModelType.ASR, ModelType.OMNI
+                      },
                       is_required=False),
 
         # Vocabulary reduction parameters
-        ParameterSpec("reduced_vocab_size",
-                      "rvs", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
-                          TaskType.INFERENCE
-                      }, {ModelType.LLM, ModelType.VLM},
-                      is_required=False),
-        ParameterSpec("vocab_reduction_method",
-                      "vrm", {TaskType.EXPORT}, {ModelType.LLM, ModelType.VLM},
-                      is_required=False),
-        ParameterSpec("vocab_reduction_max_samples",
-                      "vrms", {TaskType.EXPORT},
-                      {ModelType.LLM, ModelType.VLM},
-                      is_required=False),
-        ParameterSpec("trt_native_ops",
-                      "ootb", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
-                          TaskType.INFERENCE
-                      }, {ModelType.LLM, ModelType.VLM},
-                      is_required=False),
+        ParameterSpec(
+            "reduced_vocab_size",
+            "rvs", {
+                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                TaskType.INFERENCE
+            }, {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
+            is_required=False),
+        ParameterSpec(
+            "vocab_reduction_method",
+            "vrm", {TaskType.EXPORT},
+            {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
+            is_required=False),
+        ParameterSpec(
+            "vocab_reduction_max_samples",
+            "vrms", {TaskType.EXPORT},
+            {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
+            is_required=False),
+        ParameterSpec(
+            "trt_native_ops",
+            "ootb", {
+                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                TaskType.INFERENCE
+            }, {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
+            is_required=False),
 
         # kernel_bench parameters
         ParameterSpec("bench_mode",
@@ -420,6 +537,11 @@ class TestConfig:
                 parsed_params['merge_lora'] = True
             elif part == "fp8kv":
                 parsed_params['fp8_kv_cache'] = True
+            elif part == "fp8emb":
+                parsed_params['fp8_embedding'] = True
+            elif part == "mtp":
+                parsed_params['is_mtp'] = True
+                parsed_params['is_eagle'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -460,6 +582,10 @@ class TestConfig:
                 parsed_params['max_batch_size'] = int(part[4:])
             elif part.startswith('mxil'):
                 parsed_params['max_input_len'] = int(part[4:])
+            elif part.startswith('mnts'):
+                parsed_params['min_time_steps'] = int(part[4:])
+            elif part.startswith('mxts'):
+                parsed_params['max_time_steps'] = int(part[4:])
             elif part.startswith('mnit'):
                 parsed_params['min_image_tokens'] = int(part[4:])
             elif part.startswith('mxit'):
@@ -486,6 +612,13 @@ class TestConfig:
                 else:
                     raise ValueError(
                         f"Invalid visual precision: {visual_precision}")
+            elif part.startswith('aud'):
+                audio_precision = part[3:]
+                if audio_precision in VALID_AUDIO_PRECISIONS:
+                    parsed_params['audio_precision'] = audio_precision
+                else:
+                    raise ValueError(
+                        f"Invalid audio precision: {audio_precision}")
             # For EAGLE parameters
             elif part.startswith('mvts'):
                 parsed_params['max_verify_tree_size'] = int(part[4:])
@@ -517,8 +650,12 @@ class TestConfig:
 
             i += 1
 
-        if not visual_precision and model_type == ModelType.VLM:
+        if not visual_precision and model_type in (ModelType.VLM,
+                                                   ModelType.OMNI):
             parsed_params['visual_precision'] = "fp16"
+        if model_type in (ModelType.TTS, ModelType.ASR, ModelType.OMNI
+                          ) and 'audio_precision' not in parsed_params:
+            parsed_params['audio_precision'] = "fp16"
 
         # Create base config object
         config = cls(param_str=param_str,
@@ -558,6 +695,8 @@ class TestConfig:
                     self.fp8_kv_cache = False
                 if self.is_eagle is None:
                     self.is_eagle = False
+                if self.is_mtp is None:
+                    self.is_mtp = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.reduced_vocab_size is not None:
@@ -572,18 +711,25 @@ class TestConfig:
                     self.lora = self.max_lora_rank > 0
                 if self.fp8_kv_cache is None:
                     self.fp8_kv_cache = False
+                # max_image_tokens_per_image: VLM/OMNI default. Most test
+                # cases use 512; override via ``-mxpiit<N>`` in the param.
+                if (self.model_type in (ModelType.VLM, ModelType.OMNI)) and (
+                        self.max_image_tokens_per_image is None):
+                    self.max_image_tokens_per_image = 512
                 if self.is_eagle is None:
                     self.is_eagle = False
+                if self.is_mtp is None:
+                    self.is_mtp = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
-                    self.eagle_draft_top_k = 10
+                    self.eagle_draft_top_k = 1 if self.is_mtp else 10
                 if self.eagle_draft_step is None:
-                    self.eagle_draft_step = 6
+                    self.eagle_draft_step = 3 if self.is_mtp else 6
                 if self.max_verify_tree_size is None:
-                    self.max_verify_tree_size = 60
+                    self.max_verify_tree_size = 4 if self.is_mtp else 60
                 if self.max_draft_tree_size is None:
-                    self.max_draft_tree_size = 60
+                    self.max_draft_tree_size = 4 if self.is_mtp else 60
 
         warmup_env = os.environ.get('WARMUP')
         if warmup_env is not None and self.warmup is None:
@@ -652,9 +798,14 @@ class TestConfig:
 
     def get_engine_id(self) -> str:
         """Generate unique engine identifier"""
-        llm_engine_id = f"{self.get_onnx_model_id()}-mxil{self.max_input_len}-mxbs{self.max_batch_size}-mxlr{self.max_lora_rank}"
+        mxlr = self.max_lora_rank if self.max_lora_rank is not None else 0
+        llm_engine_id = f"{self.get_onnx_model_id()}-mxil{self.max_input_len}-mxbs{self.max_batch_size}-mxlr{mxlr}"
         if self.model_type == ModelType.VLM:
             llm_engine_id += f"-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}"
+        if self.model_type == ModelType.OMNI:
+            llm_engine_id += (
+                f"-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}"
+                f"-mnts{self.min_time_steps}-mxts{self.max_time_steps}")
         if self.is_eagle:
             if self.max_verify_tree_size is not None:
                 llm_engine_id += f"-mvts{self.max_verify_tree_size}"
@@ -742,16 +893,45 @@ class TestConfig:
             # Pre-quantized NVFP4 model: exported directly without quantize-llm step
             "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":
             "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+            "NVIDIA-Nemotron-3-Nano-4B-BF16":
+            "NVIDIA-Nemotron-3-Nano-4B-BF16",
+            "NVIDIA-Nemotron-3-Nano-4B-FP8":
+            "NVIDIA-Nemotron-3-Nano-4B-FP8",
+            # Nemotron-Nano 9B v2 family (BF16 base + FP8/NVFP4 pre-quantized
+            # variants all live under llm_models_dir/, not edge_llm_cache/).
+            "NVIDIA-Nemotron-Nano-9B-v2":
+            "NVIDIA-Nemotron-Nano-9B-v2",
+            "NVIDIA-Nemotron-Nano-9B-v2-FP8":
+            "NVIDIA-Nemotron-Nano-9B-v2-FP8",
+            "NVIDIA-Nemotron-Nano-9B-v2-NVFP4":
+            "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
+            # Cosmos VLM
+            "Cosmos-Reason2-8B":
+            "Cosmos-Reason2-8B",
+            # Qwen3.5 35B-A3B (BF16 base; GPTQ-Int4 variant lives in GPTQ map)
+            "Qwen3.5-35B-A3B":
+            "Qwen3.5-35B-A3B",
+            # ASR / TTS larger variants (1.7B family)
+            "Qwen3-ASR-1.7B":
+            "Qwen3/Qwen3-ASR-1.7B",
+            "Qwen3-TTS-12Hz-1.7B-CustomVoice":
+            "Qwen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         }
 
         # GPTQ and pre-quantized models in edgellm_data_dir (/scratch.edge_llm_cache)
         GPTQ_MODELS_DIR_MAP = {
             "Qwen2.5-7B-Instruct-GPTQ-Int4": "Qwen2.5-7B-Instruct-GPTQ-Int4",
             "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
-            # Pre-quantized models (edge_llm_cache/models/)
+            # GPTQ-Int4 large MoE variants
+            "Qwen3-30B-A3B-GPTQ-Int4": "Qwen3-30B-A3B-GPTQ-Int4",
+            "Qwen3.5-35B-A3B-GPTQ-Int4": "Qwen3.5-35B-A3B-GPTQ-Int4",
+            # Multimodal pre-quantized NVFP4 (LLM + visual + audio).  Test list
+            # uses ``Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`` as the
+            # canonical name; verify the on-disk dir matches before running.
+            "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4":
+            "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
             "NVIDIA-Nemotron-3-Nano-4B-NVFP4":
             "NVIDIA-Nemotron-3-Nano-4B-NVFP4",
-            "NVIDIA-Nemotron-3-Nano-4B-FP8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
             # Pre-quantized unified checkpoints (edge_llm_cache/quantized_models/)
             "Qwen2.5-0.5B-Instruct-FP8": "Qwen2.5-0.5B-Instruct-FP8",
             "Qwen2.5-0.5B-Instruct-FP8-KV": "Qwen2.5-0.5B-Instruct-FP8-KV",
@@ -764,26 +944,50 @@ class TestConfig:
             "Qwen3-VL-2B-Instruct-INT4-AWQ": "Qwen3-VL-2B-Instruct-INT4-AWQ",
         }
 
-        # Determine search directory and model path
+        # Determine search directory and model path. A map entry may be either
+        # a single directory name (str) or a list of candidates — useful when
+        # the same model ships under multiple folder names (e.g. ``InternVL3-1B``
+        # as ``InternVL3-1B-hf`` or ``InternVL3-1B``).
         if self.model_name in GPTQ_MODELS_DIR_MAP:
             search_dir = self.edgellm_data_dir
-            model_dir_name = GPTQ_MODELS_DIR_MAP[self.model_name]
+            entry = GPTQ_MODELS_DIR_MAP[self.model_name]
         elif self.model_name in LLM_MODELS_DIR_MAP:
             search_dir = self.llm_models_dir
-            model_dir_name = LLM_MODELS_DIR_MAP[self.model_name]
+            entry = LLM_MODELS_DIR_MAP[self.model_name]
         else:
             all_models = list(LLM_MODELS_DIR_MAP.keys()) + list(
                 GPTQ_MODELS_DIR_MAP.keys())
             raise ValueError(f"Unsupported model name: '{self.model_name}'. "
                              f"Supported models: {', '.join(all_models)}")
 
-        model_dir = _find_directory(search_dir, model_dir_name,
-                                    DEFAULT_SEARCH_DEPTH)
-        if not model_dir:
-            raise ValueError(
-                f"Model directory not found: '{model_dir_name}' under {search_dir} with search depth {DEFAULT_SEARCH_DEPTH}"
-            )
-        return model_dir
+        candidates = [entry] if isinstance(entry, str) else list(entry)
+        for model_dir_name in candidates:
+            model_dir = _find_directory(search_dir,
+                                        model_dir_name,
+                                        DEFAULT_SEARCH_DEPTH,
+                                        require_files=_HF_CHECKPOINT_FILES)
+            if model_dir:
+                return model_dir
+        raise ValueError(
+            f"Model directory not found: none of {candidates} under "
+            f"{search_dir} (search depth {DEFAULT_SEARCH_DEPTH}, "
+            f"requiring config.json + *.safetensors)")
+
+    def is_prequantized(self) -> bool:
+        """Model is pre-quantized if its name already contains the precision identifier."""
+        if self.llm_precision == "fp16":
+            return False
+        if self.llm_precision == "int4_gptq":
+            return True
+        if self.model_name in PRE_QUANTIZED_MODELS:
+            return True
+        return self.llm_precision.upper() in self.model_name.upper()
+
+    def get_audio_engine_dir(self) -> str:
+        suffix = f"audio-{self.audio_precision}"
+        if self.min_time_steps is not None and self.max_time_steps is not None:
+            suffix += f"-mnts{self.min_time_steps}-mxts{self.max_time_steps}"
+        return os.path.join(self.get_engine_base_dir(), suffix)
 
     def get_draft_model_dir(self) -> str:
         """
@@ -846,16 +1050,23 @@ class TestConfig:
                 f"Available: {', '.join(draft_models.keys())}")
 
         model_dir_name = draft_models[self.draft_model_id]
-        # Search in llm_models_dir first, then fallback to edgellm_data_dir
-        model_dir = _find_directory(self.llm_models_dir, model_dir_name, 5)
+        # Search in llm_models_dir first, then fallback to edgellm_data_dir.
+        # Require HF checkpoint markers so we don't match same-named engine
+        # cache or ONNX output dirs at deeper levels.
+        model_dir = _find_directory(self.llm_models_dir,
+                                    model_dir_name,
+                                    5,
+                                    require_files=_HF_CHECKPOINT_FILES)
         if not model_dir:
-            model_dir = _find_directory(self.edgellm_data_dir, model_dir_name,
-                                        5)
+            model_dir = _find_directory(self.edgellm_data_dir,
+                                        model_dir_name,
+                                        5,
+                                        require_files=_HF_CHECKPOINT_FILES)
         if not model_dir:
             raise ValueError(
                 f"Draft model directory not found: '{model_dir_name}' under "
-                f"{self.llm_models_dir} or {self.edgellm_data_dir} with search depth 5"
-            )
+                f"{self.llm_models_dir} or {self.edgellm_data_dir} with search depth 5 "
+                f"(requiring config.json + *.safetensors)")
         return model_dir
 
     def get_onnx_base_dir(self) -> str:
@@ -871,10 +1082,53 @@ class TestConfig:
         return os.path.join(self.engine_dir, self.model_name)
 
     def get_llm_onnx_dir(self) -> str:
-        """Get LLM ONNX model directory"""
-        prefix = "llm-base" if self.is_eagle else "llm"
+        """Get LLM ONNX model directory. For TTS this contains talker/ and code_predictor/."""
+        if self.is_mtp:
+            prefix = "llm-base-mtp"
+        elif self.is_eagle:
+            prefix = "llm-base"
+        else:
+            prefix = "llm"
         return os.path.join(self.get_onnx_base_dir(),
                             f"{prefix}-{self.get_onnx_model_id()}")
+
+    def get_tts_tokenizer_dir(self) -> str:
+        """
+        Get tokenizer directory for TTS benchmark/inference.
+
+        Prefer ONNX export output, where ``tokenizer.json`` is written: the
+        llm_loader-based export drops it under ``llm-<prec>/talker/`` (since
+        the talker submodel is what carries the language modeling head), so
+        check there first; older legacy exports placed it directly at
+        ``llm-<prec>/``. Fall back to the torch model dir
+        (``vocab.json`` + ``tokenizer_config.json``) when neither has it.
+        """
+        onnx_llm_dir = self.get_llm_onnx_dir()
+        candidates = [
+            os.path.join(onnx_llm_dir, "talker"),
+            onnx_llm_dir,
+        ]
+        for candidate in candidates:
+            if os.path.isfile(os.path.join(candidate, "tokenizer.json")):
+                return candidate
+        return self.get_torch_model_dir()
+
+    def get_audio_onnx_dir(self, precision: Optional[str] = None) -> str:
+        """Audio encoder ONNX directory.
+
+        ``precision=None`` uses ``self.audio_precision`` (back-compat). Pass
+        an explicit precision (``"fp16"`` / ``"fp8"``) when the test path
+        needs to refer to a specific variant — llm_loader always emits the
+        fp16 audio encoder, while the legacy ``tensorrt-edgellm-export-audio
+        --quantization=fp8`` post-export step writes the fp8 variant.
+        """
+        p = precision or self.audio_precision
+        return os.path.join(self.get_onnx_base_dir(), f"audio-{p}")
+
+    def get_code2wav_onnx_dir(self, precision: Optional[str] = None) -> str:
+        """Code2Wav ONNX directory for TTS models."""
+        p = precision or self.audio_precision
+        return os.path.join(self.get_onnx_base_dir(), f"code2wav-{p}")
 
     def get_draft_onnx_model_id(self) -> str:
         """Generate unique draft model identifier including draft_model_id"""
@@ -889,6 +1143,11 @@ class TestConfig:
 
     def get_draft_onnx_dir(self) -> str:
         """Get draft model ONNX directory"""
+        if self.is_mtp:
+            # MTP draft shares the base checkpoint precision; use the same
+            # onnx_model_id suffix so different precisions don't collide.
+            return os.path.join(self.get_onnx_base_dir(),
+                                f"mtp-draft-{self.get_onnx_model_id()}")
         return os.path.join(self.get_onnx_base_dir(),
                             f"draft-{self.get_draft_onnx_model_id()}")
 
@@ -915,7 +1174,11 @@ class TestConfig:
             raise ValueError(
                 "LLM engine directory not available for export tasks")
 
-        if self.is_eagle:
+        if self.is_mtp:
+            # MTP shares the base checkpoint; no separate draft_model_id.  Precision
+            # info comes from get_engine_id() (already includes llm/lm_head precision).
+            prefix = "llm-mtp"
+        elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")
             if self.draft_llm_precision is None:
@@ -928,6 +1191,18 @@ class TestConfig:
         return os.path.join(self.get_engine_base_dir(),
                             f"{prefix}-{self.get_engine_id()}")
 
+    def get_talker_engine_dir(self) -> str:
+        """Get Talker engine directory (TTS only). Subdir under LLM engine dir."""
+        return os.path.join(self.get_llm_engine_dir(), "talker")
+
+    def get_code_predictor_engine_dir(self) -> str:
+        """Get CodePredictor engine directory (TTS only). Subdir under LLM engine dir."""
+        return os.path.join(self.get_llm_engine_dir(), "code_predictor")
+
+    def get_code2wav_engine_dir(self) -> str:
+        """Get Code2Wav engine directory (TTS only). Subdir under LLM engine dir."""
+        return os.path.join(self.get_llm_engine_dir(), "code2wav")
+
     def get_visual_engine_dir(self) -> str:
         """Get visual engine directory"""
         return os.path.join(
@@ -935,16 +1210,40 @@ class TestConfig:
             f"visual-{self.visual_precision}-mnit{self.min_image_tokens}-mxit{self.max_image_tokens}-mxpiit{self.max_image_tokens_per_image}"
         )
 
+    def get_multimodal_engine_dir(self) -> str:
+        """OMNI multimodal engine parent dir.
+
+        visual_build writes to <this>/visual/ and audio_build writes to
+        <this>/audio/, so inference / e2e_bench pass
+        --multimodalEngineDir=<this> and runtime auto-locates both encoders.
+        """
+        suffix = (f"multimodal-mnit{self.min_image_tokens}"
+                  f"-mxit{self.max_image_tokens}"
+                  f"-mxpiit{self.max_image_tokens_per_image}"
+                  f"-mnts{self.min_time_steps}"
+                  f"-mxts{self.max_time_steps}")
+        return os.path.join(self.get_engine_base_dir(), suffix)
+
     def get_test_case_file(self) -> str:
         """
         Get test case file path using test case name mapping.
-        
+
+        When ``_test_case_file_override`` is set (by helpers that have
+        rewritten the test case JSON for this config, e.g. audio
+        preprocessing or LoRA placeholder substitution), that path is
+        returned so downstream command generation operates on the
+        per-config preprocessed copy and never mutates the
+        version-controlled source.
+
         Returns:
             Full path to the test case JSON file
-            
+
         Raises:
             ValueError: If test_case is not set or not supported
         """
+        if self._test_case_file_override:
+            return self._test_case_file_override
+
         if not self.test_case:
             raise ValueError("test_case not set - required for this operation")
 
@@ -961,6 +1260,10 @@ class TestConfig:
             "tests/test_cases/llm_basic.json",
             "llm_lora":
             "tests/test_cases/llm_lora.json",
+            "asr_basic":
+            "tests/test_cases/asr_basic.json",
+            "tts_basic":
+            "tests/test_cases/tts_basic.json",
             "vlm_basic":
             "tests/test_cases/vlm_basic.json",
             "vlm_lora":
@@ -1015,6 +1318,22 @@ class TestConfig:
         Returns:
             Path to chat template JSON file, or None if no custom template for this model
         """
+        try:
+            from tensorrt_edgellm.chat_templates import get_template_path
+        except ImportError:
+            return None
+
+        MODEL_TO_TEMPLATE = {
+            "NVIDIA-Nemotron-Nano-9B-v2": "nemotron_nano_v2",
+            "NVIDIA-Nemotron-Nano-9B-v2-FP8": "nemotron_nano_v2",
+            "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": "nemotron_nano_v2",
+            "Qwen3-TTS-12Hz-0.6B-CustomVoice": "qwen3tts",
+            "Qwen3-TTS-12Hz-1.7B-CustomVoice": "qwen3tts",
+        }
+
+        template_id = MODEL_TO_TEMPLATE.get(self.model_name)
+        if template_id:
+            return get_template_path(template_id)
         return None
 
     def get_output_json_file(self) -> str:
@@ -1023,6 +1342,14 @@ class TestConfig:
         Always stored on host in log directory for subsequent processing.
         """
         return os.path.join(self.test_log_dir, f"{self.param_str}.json")
+
+    def get_output_audio_dir(self) -> str:
+        """
+        Get directory for TTS-generated wav files. Uses a subdir per test case
+        (param_str) so that different datasets (e.g. SeedTTS_en_meta vs SeedTTS_zh_meta)
+        do not overwrite each other's audio_req*.wav.
+        """
+        return os.path.join(self.test_log_dir, self.param_str)
 
     def get_lora_weights_dir(self) -> str:
         """Get LoRA weights directory"""
@@ -1051,7 +1378,10 @@ class TestConfig:
         """Get quantized model directory (for export)"""
         if self.llm_precision == "fp16":
             return self.get_torch_model_dir()
-        prefix = "quantized-base" if self.is_eagle else "quantized"
+        if self.is_eagle and not self.is_mtp:
+            prefix = "quantized-base"
+        else:
+            prefix = "quantized"
         quantized_name = f"{self.llm_precision}-{self.lm_head_precision}"
         if self.fp8_kv_cache:
             quantized_name += "-fp8kv"

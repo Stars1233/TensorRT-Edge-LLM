@@ -18,6 +18,7 @@
 #include "audioRunner.h"
 #include "audioUtils.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/mmapReader.h"
@@ -41,10 +42,8 @@ namespace rt
 Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner()
 {
-    if (!validateAndFillConfig(engineDir))
-    {
-        throw std::runtime_error("Failed to validate and fill config");
-    }
+    bool const configValid = validateAndFillConfig(engineDir);
+    ELLM_CHECK(configValid, "Failed to validate and fill config");
 
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
@@ -58,21 +57,13 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
             auto mmapReader = std::make_unique<file_io::MmapReader>(audioEnginePath);
             mAudioEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
                 mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
-            if (!mAudioEngine)
-            {
-                throw std::runtime_error("Failed to deserialize audio encoder engine");
-            }
+            ELLM_CHECK(mAudioEngine, "Failed to deserialize audio encoder engine");
 
             mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(mAudioEngine->createExecutionContext());
-            if (!mAudioContext)
-            {
-                throw std::runtime_error("Failed to create audio encoder context");
-            }
+            ELLM_CHECK(mAudioContext, "Failed to create audio encoder context");
 
-            if (!mAudioContext->setOptimizationProfileAsync(0, stream))
-            {
-                throw std::runtime_error("Failed to set optimization profile for audio encoder");
-            }
+            bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);
+            ELLM_CHECK(profileSet, "Failed to set optimization profile for audio encoder");
         }
         catch (std::exception const& e)
         {
@@ -85,10 +76,8 @@ Qwen3OmniAudioRunner::Qwen3OmniAudioRunner(std::string const& engineDir, cudaStr
         throw std::runtime_error("Audio encoder not found at " + audioEnginePath);
     }
 
-    if (!allocateBuffer(stream))
-    {
-        throw std::runtime_error("Failed to allocate buffers");
-    }
+    bool const bufferAllocated = allocateBuffer(stream);
+    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
 
     LOG_INFO("Qwen3OmniAudioRunner initialized successfully");
 }
@@ -244,11 +233,9 @@ void Qwen3OmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& reques
     std::vector<std::vector<int32_t>>& batchInputIds, std::vector<int64_t> const& audioTokenLengths,
     tokenizer::Tokenizer const* tokenizer)
 {
-    if (audioTokenLengths.size() != request.requests.size())
-    {
-        throw std::runtime_error("audioTokenLengths.size() != request.requests.size(), "
-            + std::to_string(audioTokenLengths.size()) + " != " + std::to_string(request.requests.size()));
-    }
+    ELLM_CHECK(audioTokenLengths.size() == request.requests.size(),
+        "audioTokenLengths.size() != request.requests.size(), " + std::to_string(audioTokenLengths.size())
+            + " != " + std::to_string(request.requests.size()));
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -492,6 +479,7 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
         LOG_DEBUG("Audio encoder inference completed");
 
         audioTokenLengths.push_back(totalAudioTokens);
+        mMultimodalMetrics.recordRun(0, 0, 1, totalAudioTokens);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));

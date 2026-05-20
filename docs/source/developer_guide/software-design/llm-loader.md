@@ -20,6 +20,7 @@ This page describes the software design. For commands and workflows, see the [Qu
 | Model dispatch | `experimental/llm_loader/model.py`, `experimental/llm_loader/__init__.py` | Dispatch `model_type` to a registered model class, with a default decoder implementation for compatible dense models. |
 | Model implementations | `experimental/llm_loader/models/` | Define TensorRT Edge-LLM-native text, visual, audio, TTS, MoE, hybrid, and EAGLE modules. |
 | Checkpoint loading | `experimental/llm_loader/checkpoint/loader.py`, `experimental/llm_loader/checkpoint/repacking.py` | Load safetensors, remap keys when needed, and repack quantized tensors into runtime/export formats. |
+| Vocabulary reduction | `experimental/llm_loader/vocab_reduction/selection.py`, `experimental/llm_loader/vocab_reduction/onnx_export.py` | Generate `vocab_map.safetensors` separately from applying an existing map to supported LM-head tensors during ONNX export. |
 | ONNX graph export | `experimental/llm_loader/onnx/export.py`, `experimental/llm_loader/onnx/export_encoder.py`, `experimental/llm_loader/onnx/dynamo_translations.py` | Export text and encoder graphs, register custom ONNX schemas, and translate PyTorch custom ops to TensorRT Edge-LLM ONNX nodes. |
 | Component orchestration | `experimental/llm_loader/export_all_cli.py` | Classify model components and coordinate text, visual, audio, TTS, code2wav, EAGLE, and sidecar exports. |
 | Runtime artifacts | `experimental/llm_loader/checkpoint/checkpoint_utils.py`, `experimental/llm_loader/chat_template.py` | Write tokenizer/config/chat-template/embedding sidecars expected by the C++ runtime and Python server. |
@@ -33,8 +34,9 @@ The loader follows a checkpoint-driven flow:
 3. Build `ModelConfig`, including quantization, KV cache, layer-type, RoPE, and model-family fields.
 4. Dispatch to the correct TensorRT Edge-LLM-native model implementation.
 5. Load and repack weights from checkpoint tensors.
-6. Export ONNX graphs with TensorRT Edge-LLM custom-op schemas and dynamo translations.
-7. Write runtime sidecars that the engine builder and runtime consume.
+6. Optionally apply vocabulary reduction from `vocab_map.safetensors`.
+7. Export ONNX graphs with TensorRT Edge-LLM custom-op schemas and dynamo translations.
+8. Write runtime sidecars that the engine builder and runtime consume.
 
 The design boundary is deliberate: `llm_loader` owns checkpoint parsing, model construction, weight loading, and ONNX/runtime artifact export. TensorRT engine build and inference remain owned by the existing C++ tools and the Python HLAPI/server wrapper.
 
@@ -75,7 +77,7 @@ Multimodal and audio checkpoints have additional component dispatch:
 
 - Visual encoders are selected by `_VISUAL_REGISTRY` and family build functions in `experimental/llm_loader/onnx/export_encoder.py`.
 - Audio encoders are selected by audio model-type registries and component-specific key prefixes.
-- TTS exports reuse the LLM export path for talker and code-predictor decoder components, with model-specific key remapping.
+- TTS exports reuse the LLM export path for talker and code-predictor decoder components, with model-specific key remapping. Qwen3-TTS Code2Wav is exported from the checkpoint's `speech_tokenizer/` directory.
 - Omni checkpoints may combine text, visual, audio, and vocoder/code2wav exports under one checkpoint-level orchestration.
 
 This keeps component-specific model code separate while preserving one checkpoint-level export frontend.
@@ -92,13 +94,13 @@ LoRA support is implemented as a graph and weight sidecar transformation after b
 
 - Graph insertion augments supported linear projections with LoRA inputs and runtime hooks.
 - Adapter processing converts LoRA checkpoint tensors into the layout expected by the runtime.
+- Static merge uses `llm_loader.lora.merge_lora_cli` before quantization for models such as Phi-4-Multimodal that ship required LoRA adapters.
 - The base model export remains checkpoint-driven and does not depend on the legacy FX export pipeline.
 
 Runtime usage is documented in [LoRA](../../user_guide/features/lora.md).
 
 ## Limitations
 
-- Vocabulary reduction is not supported by `llm_loader`. Use full-vocabulary exports.
 - FP8 visual encoder export is not supported by `llm_loader`; use the legacy `tensorrt_edgellm` visual quantization/export tools when FP8 visual encoders are required.
 - FP8 embedding sidecars are not supported for TTS talker/code_predictor exports.
 - TensorRT native-ops export mode is not supported at this time.
@@ -113,6 +115,6 @@ The legacy `tensorrt_edgellm` FX-tracing export path is deprecated for new workf
 | HuggingFace FX tracing for ONNX export | `experimental/llm_loader` builds native TensorRT Edge-LLM modules and loads checkpoint tensors directly. |
 | Separate LLM, visual, and audio export frontends | Checkpoint-level component orchestration in `experimental/llm_loader/export_all_cli.py`. |
 | Legacy LoRA export hooks | `experimental/llm_loader/lora/` graph insertion and adapter processing. |
-| Vocabulary reduction frontend | No replacement in `llm_loader`; full-vocabulary export is required. |
+| Vocabulary reduction export | `llm_loader.export_all_cli --reduced-vocab-dir`; reference vocabulary-map generation uses `python -m llm_loader.vocab_reduction`. |
 
 The `tensorrt_edgellm/` folder will be removed in 0.8.0, with full feature parity provided by the `experimental/quantization` -> `experimental/llm_loader` workflow for all models and features.

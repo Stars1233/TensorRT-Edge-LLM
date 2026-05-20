@@ -52,6 +52,8 @@
 #include <string>
 #include <utility>
 
+#include "common/checkMacros.h"
+
 namespace mamba_ssm
 {
 
@@ -190,25 +192,25 @@ void check_ptr_alignment_input_vars(ParamsType const& params)
 {
     using load_input_t = PackedAligned<input_t>;
     auto const align = std::to_string(sizeof(load_input_t));
-    if (reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) != 0)
-        throw std::runtime_error("x pointer must be aligned to " + align + " bytes");
-    if ((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) != 0)
-        throw std::runtime_error("x batch stride must be aligned to " + align + " bytes");
+    ELLM_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
+        "x pointer must be aligned to " + align + " bytes");
+    ELLM_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+        "x batch stride must be aligned to " + align + " bytes");
     if (params.z)
     {
-        if (reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) != 0)
-            throw std::runtime_error("z pointer must be aligned to " + align + " bytes");
-        if ((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) != 0)
-            throw std::runtime_error("z batch stride must be aligned to " + align + " bytes");
+        ELLM_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
+            "z pointer must be aligned to " + align + " bytes");
+        ELLM_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+            "z batch stride must be aligned to " + align + " bytes");
     }
-    if (reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) != 0)
-        throw std::runtime_error("B pointer must be aligned to " + align + " bytes");
-    if (reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) != 0)
-        throw std::runtime_error("C pointer must be aligned to " + align + " bytes");
-    if ((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) != 0)
-        throw std::runtime_error("B batch stride must be aligned to " + align + " bytes");
-    if ((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) != 0)
-        throw std::runtime_error("C batch stride must be aligned to " + align + " bytes");
+    ELLM_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
+        "B pointer must be aligned to " + align + " bytes");
+    ELLM_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
+        "C pointer must be aligned to " + align + " bytes");
+    ELLM_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+        "B batch stride must be aligned to " + align + " bytes");
+    ELLM_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+        "C batch stride must be aligned to " + align + " bytes");
 }
 
 } // namespace mamba_ssm

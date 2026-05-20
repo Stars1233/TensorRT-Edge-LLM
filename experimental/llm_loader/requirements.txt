@@ -7,3 +7,6 @@ numpy==2.4.4
 huggingface_hub==1.11.0
 torchvision==0.25.0
 onnx_graphsurgeon==0.6.1
+peft==0.18.1
+datasets==4.4.2
+tqdm~=4.67.1

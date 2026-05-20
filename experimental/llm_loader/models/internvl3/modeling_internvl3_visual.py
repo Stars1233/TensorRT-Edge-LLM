@@ -32,9 +32,16 @@ Checkpoint weight key prefixes:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..linear import make_linear
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Normalization helpers
@@ -115,14 +122,28 @@ class InternVL3VisionAttention(nn.Module):
         ``proj.weight``, ``proj.bias`` [hidden, hidden]
     """
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
         self.embed_dim = hidden_size
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.qkv = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size * 3,
+            bias=True,
+            module_name=f"{name_prefix}.qkv" if name_prefix else "")
+        self.proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.proj" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         B, N, _ = hidden_states.shape
@@ -148,11 +169,25 @@ class InternVL3VisionMLP(nn.Module):
     Checkpoint keys: ``mlp.fc1.*``, ``mlp.fc2.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 hidden_act: str) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 hidden_act: str,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size)
+        self.fc1 = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc1" if name_prefix else "")
+        self.fc2 = make_linear(
+            model_config,
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc2" if name_prefix else "")
         act_map = {
             "gelu": F.gelu,
             "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
@@ -178,16 +213,30 @@ class InternVL3VisionLayer(nn.Module):
         ``norm2.*``, ``mlp.*``, ``ls2``
     """
 
-    def __init__(self, hidden_size: int, num_heads: int,
-                 intermediate_size: int, hidden_act: str, norm_type: str,
-                 layer_norm_eps: float) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 hidden_act: str,
+                 norm_type: str,
+                 layer_norm_eps: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.norm1 = _make_norm(norm_type, hidden_size, layer_norm_eps)
-        self.attn = InternVL3VisionAttention(hidden_size, num_heads)
+        self.attn = InternVL3VisionAttention(
+            hidden_size,
+            num_heads,
+            model_config,
+            name_prefix=f"{name_prefix}.attn" if name_prefix else "")
         self.ls1 = nn.Parameter(torch.ones(hidden_size))
         self.norm2 = _make_norm(norm_type, hidden_size, layer_norm_eps)
-        self.mlp = InternVL3VisionMLP(hidden_size, intermediate_size,
-                                      hidden_act)
+        self.mlp = InternVL3VisionMLP(
+            hidden_size,
+            intermediate_size,
+            hidden_act,
+            model_config,
+            name_prefix=f"{name_prefix}.mlp" if name_prefix else "")
         self.ls2 = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -209,14 +258,28 @@ class InternVL3VisionEncoder(nn.Module):
     Checkpoint keys: ``vision_model.encoder.layers.N.*``
     """
 
-    def __init__(self, num_hidden_layers: int, hidden_size: int,
-                 num_heads: int, intermediate_size: int, hidden_act: str,
-                 norm_type: str, layer_norm_eps: float) -> None:
+    def __init__(self,
+                 num_hidden_layers: int,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 hidden_act: str,
+                 norm_type: str,
+                 layer_norm_eps: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.layers = nn.ModuleList([
-            InternVL3VisionLayer(hidden_size, num_heads, intermediate_size,
-                                 hidden_act, norm_type, layer_norm_eps)
-            for _ in range(num_hidden_layers)
+            InternVL3VisionLayer(
+                hidden_size,
+                num_heads,
+                intermediate_size,
+                hidden_act,
+                norm_type,
+                layer_norm_eps,
+                model_config,
+                name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
+            for i in range(num_hidden_layers)
         ])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -256,7 +319,7 @@ class InternVL3VisualModel(nn.Module):
     Output: ``[total_patches * tokens_per_patch, llm_hidden_size]``
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         vc = config["vision_config"]
         # LLM hidden size lives under llm_config for internvl_chat
@@ -282,15 +345,30 @@ class InternVL3VisualModel(nn.Module):
             hidden_act=vc.get("hidden_act", "gelu"),
             norm_type=vc.get("norm_type", "layer_norm"),
             layer_norm_eps=vc.get("layer_norm_eps", 1e-6),
+            model_config=model_config,
+            name_prefix="vision_model.encoder",
         )
 
         scale = int(1.0 / self.downsample_ratio)
         in_dim = hidden_size * scale * scale
+        # Keep nn.Sequential so checkpoint keys (mlp1.0.* / mlp1.1.* / mlp1.3.*)
+        # still resolve; ``make_linear`` returns ``FP16Linear`` or a quantised
+        # subclass and ``_set_tensor`` handles both buffer and parameter writes.
+        # Pass the index-qualified name so MIXED_PRECISION ``layer_overrides``
+        # entries (``mlp1.1`` / ``mlp1.3``) resolve.
         self.mlp1 = nn.Sequential(
             nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, llm_hidden_size),
+            make_linear(model_config,
+                        in_dim,
+                        llm_hidden_size,
+                        bias=True,
+                        module_name="mlp1.1"),
             nn.GELU(),
-            nn.Linear(llm_hidden_size, llm_hidden_size),
+            make_linear(model_config,
+                        llm_hidden_size,
+                        llm_hidden_size,
+                        bias=True,
+                        module_name="mlp1.3"),
         )
         self._llm_hidden_size = llm_hidden_size
         # Precomputed to avoid int(math.isqrt(N)) on a runtime SymInt in forward,
@@ -357,43 +435,26 @@ class InternVL3VisualModel(nn.Module):
 
 def _load_internvl3_weights(model: InternVL3VisualModel,
                             weights: dict) -> None:
-    """Load vision_model and mlp1 weights from full checkpoint."""
-    import logging
-    logger = logging.getLogger(__name__)
+    """Load vision_model and mlp1 weights into *model*.
 
-    # Vision tower: strip 'vision_model.'
-    vt_prefix = "vision_model."
-    vt_state: dict = {}
-    for k, v in weights.items():
-        if k.startswith(vt_prefix):
-            vt_state[k[len(vt_prefix):]] = v
+    Checkpoint key → model attribute path:
+      ``vision_model.embeddings.*`` / ``vision_model.encoder.*`` →
+        attribute path is ``embeddings.*`` / ``encoder.*``
+      ``mlp1.*`` is already at the right path
+    """
+    from ...checkpoint.loader import load_submodule_weights
 
-    # Projector: 'mlp1.' at top level
-    mlp1_prefix = "mlp1."
-    mlp1_state: dict = {}
-    for k, v in weights.items():
-        if k.startswith(mlp1_prefix):
-            mlp1_state[k[len(mlp1_prefix):]] = v
+    def _remap(k: str) -> "str | None":
+        if k.startswith("vision_model."):
+            return k[len("vision_model."):]
+        if k.startswith("mlp1."):
+            return k
+        return None
 
-    missing_vt, _ = model.embeddings.load_state_dict(
-        {
-            k.removeprefix("embeddings."): v
-            for k, v in vt_state.items() if k.startswith("embeddings.")
-        },
-        strict=False)
-    missing_enc, _ = model.encoder.load_state_dict(
-        {
-            k.removeprefix("encoder."): v
-            for k, v in vt_state.items() if k.startswith("encoder.")
-        },
-        strict=False)
-    missing_mlp, _ = model.mlp1.load_state_dict(mlp1_state, strict=False)
-
-    for label, missing in [("embeddings", missing_vt),
-                           ("encoder", missing_enc), ("mlp1", missing_mlp)]:
-        if missing:
-            logger.warning("InternVL3VisualModel: missing %s keys: %s", label,
-                           missing[:10])
+    load_submodule_weights(model,
+                           weights,
+                           _remap,
+                           label="InternVL3VisualModel")
 
 
 # ---------------------------------------------------------------------------
@@ -404,16 +465,20 @@ def _load_internvl3_weights(model: InternVL3VisualModel,
 def build_internvl_visual(
         config: dict,
         weights: dict,
+        model_config: "ModelConfig",
         dtype: torch.dtype = torch.float16) -> InternVL3VisualModel:
     """Build and return an :class:`InternVL3VisualModel` with loaded weights.
 
     Args:
-        config:  Full parsed ``config.json`` dict (contains ``vision_config``,
-                 ``llm_config``, ``downsample_ratio``).
-        weights: Flat ``{key: tensor}`` dict from safetensors.
-        dtype:   Target dtype (default ``float16``).
+        config:       Full parsed ``config.json`` dict (contains
+                      ``vision_config``, ``llm_config``, ``downsample_ratio``).
+        weights:      Flat ``{key: tensor}`` dict from safetensors.
+        model_config: Top-level ``ModelConfig``.  Visual layers dispatch
+                      through ``make_linear`` so quantized checkpoints are
+                      honoured; an FP16 checkpoint yields ``FP16Linear``.
+        dtype:        Target dtype (default ``float16``).
     """
-    model = InternVL3VisualModel(config)
+    model = InternVL3VisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_internvl3_weights(model, weights)
     model.eval()

@@ -164,6 +164,9 @@ def executable_files(env_config):
         'llm_inference': f"{build_dir}/examples/llm/llm_inference",
         'llm_bench': f"{build_dir}/examples/llm/llm_bench",
         'visual_build': f"{build_dir}/examples/multimodal/visual_build",
+        'audio_build': f"{build_dir}/examples/multimodal/audio_build",
+        'qwen3_tts_inference':
+        f"{build_dir}/examples/omni/qwen3_tts_inference",
         'unit_test': f"{build_dir}/unitTest"
     }
 

@@ -2,7 +2,7 @@
 
 This guide covers the full pipeline for running Qwen3-TTS: export on x86 host, engine build on device, and inference.
 
-**Supported model:** [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
+**Supported models:** [Qwen3-TTS-12Hz-0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) and [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice).
 
 > **Note:** Unlike Qwen3-Omni, Qwen3-TTS has no Thinker or visual encoder. The text embedding is self-contained in the Talker and exported as `text_embedding.safetensors`.
 
@@ -10,50 +10,35 @@ This guide covers the full pipeline for running Qwen3-TTS: export on x86 host, e
 
 ---
 
-## Part 0: Install TTS Dependency (x86 Host)
+## Part 0: Install Export Dependencies (x86 Host)
 
-The export pipeline loads the Qwen3-TTS model via the `qwen-tts` package. Install it before exporting:
-
-> **Warning:** Installing `qwen-tts` may break package versions in your current environment (e.g. `transformers`, `torch`). **Use a dedicated virtual environment for Qwen3-TTS export only** — do not share it with other model workflows. We need this special workflow until Qwen3-TTS gets merged into HuggingFace transformers.
+Qwen3-TTS export is handled by `llm_loader` directly. No external Qwen3-TTS
+Python package is required for export.
 
 ```bash
 cd TensorRT-Edge-LLM
-python3 -m venv venv-qwen3-tts
-source venv-qwen3-tts/bin/activate
-pip3 install .              # install TensorRT Edge-LLM export dependencies
-pip3 install qwen-tts       # install qwen3-tts and its required dependencies.
+python3 -m venv venv
+source venv/bin/activate
+pip3 install -r requirements.txt
+pip3 install -r experimental/llm_loader/requirements.txt
 ```
 
 ---
 
 ## Part 1: Export on x86 Host
 
-Qwen3-TTS has three components. Export them separately.
-
-### Export Talker and CodePredictor (LLM components)
+Qwen3-TTS has three components: Talker, CodePredictor, and Code2Wav. Export all of them with `llm_loader.export_all_cli`.
 
 ```bash
+cd TensorRT-Edge-LLM
+export PYTHONPATH=$PWD/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export TTS_MODEL=Qwen3-TTS-12Hz-1.7B-CustomVoice
 export ONNX_OUTPUT_DIR=$WORKSPACE_DIR/$TTS_MODEL/onnx
-export TTS_CHAT_TEMPLATE=./tensorrt_edgellm/chat_templates/templates/qwen3tts.json
 
-# Exports talker/ and code_predictor/ subdirectories
-tensorrt-edgellm-export-llm \
-    --model_dir Qwen/$TTS_MODEL \
-    --output_dir $ONNX_OUTPUT_DIR \
-    --chat_template $TTS_CHAT_TEMPLATE \
-    --export_models talker,code_predictor
-```
-
-### Export Code2Wav vocoder
-
-```bash
-# Exports tokenizer_decoder/ subdirectory
-tensorrt-edgellm-export-audio \
-    --model_dir Qwen/$TTS_MODEL \
-    --output_dir $ONNX_OUTPUT_DIR \
-    --export_models tokenizer_decoder
+python3 -m llm_loader.export_all_cli \
+    Qwen/$TTS_MODEL \
+    $ONNX_OUTPUT_DIR
 ```
 
 ### Expected Export Output
@@ -61,28 +46,23 @@ tensorrt-edgellm-export-audio \
 ```
 $ONNX_OUTPUT_DIR/
 ├── llm/
-│   ├── talker/
-│   │   ├── model.onnx + onnx_model.data   # Talker ONNX
-│   │   ├── config.json                     # model_type: qwen3_tts_talker
-│   │   ├── embedding.safetensors           # codec embedding
-│   │   ├── text_embedding.safetensors      # TTS-only (no Thinker)
-│   │   └── text_projection.safetensors
-│   ├── code_predictor/
-│   │   ├── model.onnx + onnx_model.data   # CodePredictor ONNX
-│   │   ├── config.json
-│   │   ├── codec_embeddings.safetensors    # 15 embeddings
-│   │   ├── lm_heads.safetensors           # 15 lm_heads
-│   │   └── small_to_mtp_projection.safetensors  # if not Identity
-│   ├── tokenizer_config.json              # at top level (no thinker/)
-│   ├── processed_chat_template.json       # chat template for runtime
-│   └── tokenizer files                    # tokenizer vocab/merges copied from model
-└── audio/
-    ├── tokenizer_decoder/
-    │   ├── model.onnx + onnx_model.data   # Code2Wav vocoder
-    │   └── config.json
-    └── speaker_encoder/                    # Base models only
-        ├── model.onnx + onnx_model.data
-        └── config.json
+│   ├── model.onnx + model.onnx.data       # Talker ONNX
+│   ├── config.json                        # model_type: qwen3_tts_talker
+│   ├── embedding.safetensors              # codec embedding
+│   ├── text_embedding.safetensors         # TTS-only (no Thinker)
+│   ├── text_projection.safetensors
+│   ├── tokenizer_config.json
+│   ├── processed_chat_template.json
+│   └── tokenizer files
+├── code_predictor/
+│   ├── model.onnx + model.onnx.data       # CodePredictor ONNX
+│   ├── config.json
+│   ├── codec_embeddings.safetensors
+│   ├── lm_heads.safetensors
+│   └── small_to_mtp_projection.safetensors  # if not Identity
+└── code2wav/
+    ├── model.onnx + model.onnx.data       # Code2Wav vocoder
+    └── config.json
 ```
 
 ### Transfer to Device
@@ -106,7 +86,7 @@ export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
 
 # 1. Build Talker LLM engine
 ./build/examples/llm/llm_build \
-    --onnxDir $ONNX/llm/talker \
+    --onnxDir $ONNX/llm \
     --engineDir $ENG/talker \
     --maxInputLen 4096 \
     --maxKVCacheCapacity 4096 \
@@ -114,7 +94,7 @@ export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
 
 # 2. Build CodePredictor LLM engine
 ./build/examples/llm/llm_build \
-    --onnxDir $ONNX/llm/code_predictor \
+    --onnxDir $ONNX/code_predictor \
     --engineDir $ENG/code_predictor \
     --maxInputLen 4096 \
     --maxKVCacheCapacity 4096 \
@@ -122,21 +102,15 @@ export ENG=$WORKSPACE_DIR/$TTS_MODEL/engines
 
 # 3. Build Code2Wav engine
 ./build/examples/multimodal/audio_build \
-    --onnxDir $ONNX/audio/tokenizer_decoder \
-    --engineDir $ENG/code2wav
+    --onnxDir $ONNX/code2wav \
+    --engineDir $ENG
 ```
 
-> **Note:** `--maxBatchSize` must be set to **1**. The Qwen3-TTS ONNX export uses a fixed batch size of 1; larger values are not supported.
+`audio_build` writes the Code2Wav engine to `$ENG/code2wav`. Use `--engineDir $ENG`; passing `$ENG/code2wav` would create an extra nested directory.
+
+> **Note:** Use `--maxBatchSize 1` for the current Qwen3-TTS runtime.
 
 Build time: < 5 minutes
-
-### Copy Tokenizer and Chat Template Files to Engine Folder
-
-The runtime loads the tokenizer and chat template from the engine directory. Copy the required files from the ONNX export output:
-
-```bash
-cp $ONNX/llm/*.json $ENG/   # includes tokenizer_config.json, processed_chat_template.json, etc.
-```
 
 ---
 
@@ -185,7 +159,7 @@ cd /path/to/TensorRT-Edge-LLM
 ./build/examples/omni/qwen3_tts_inference \
     --talkerEngineDir   $ENG/talker \
     --code2wavEngineDir $ENG/code2wav \
-    --tokenizerDir      $ENG \
+    --tokenizerDir      $ENG/talker \
     --inputFile         input.json \
     --outputFile        output.json \
     --outputAudioDir    ./audio_output

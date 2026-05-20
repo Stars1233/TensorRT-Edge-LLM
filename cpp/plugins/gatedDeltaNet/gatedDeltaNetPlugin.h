@@ -30,8 +30,9 @@ namespace plugins
 
 //! \brief TensorRT plugin for Gated Delta Net (V2 — IPluginV2DynamicExt).
 //!
-//! Registered as "gated_delta_net". Dispatches to decode (seq_len==1) or
-//! prefill (seq_len>1) CuTe DSL kernels. Requires SM80+ and K=V=128.
+//! Registered as "gated_delta_net". Dispatches to decode (seq_len==1),
+//! prefill (seq_len>1), or MTP verify (use_mtp=true) CuTe DSL kernels.
+//! Requires SM80+ and K=V=128.
 //!
 //! \par Dimension notation
 //!   n   = batch size
@@ -54,13 +55,17 @@ namespace plugins
 //! \par Outputs
 //!   [0]  o               [n, seq_len, hv, v]   FP16  output
 //!   [1]  h0_out          [n, hv, k, v]         FP32  recurrent state out
+//!   [2]  intermediate_states [n, seq_len, hv, k, v] FP32  (MTP only, optional)
+//!        Per-step recurrent state cache for speculative-decoding rollback.
+//!        Only populated when use_mtp=true (plugin attribute) and seq_len>1.
+//!        When use_mtp=false this output is a 1-element dummy.
 class GatedDeltaNetPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
     //! \param name         Plugin instance name
     //! \param kDim         Head dimension K (must be 128 for CuTe DSL kernel)
     //! \param vDim         Head dimension V (must be 128 for CuTe DSL kernel)
-    GatedDeltaNetPlugin(std::string const& name, int32_t kDim = 128, int32_t vDim = 128);
+    GatedDeltaNetPlugin(std::string const& name, int32_t kDim = 128, int32_t vDim = 128, bool useMTP = false);
 
     //! \brief Deserialization constructor
     GatedDeltaNetPlugin(std::string const& name, void const* data, size_t length);
@@ -101,6 +106,7 @@ private:
     std::string mNamespace;
     int32_t mKDim{128};    //!< Head dimension K (kernel supports 128 only)
     int32_t mVDim{128};    //!< Head dimension V (kernel supports 128 only)
+    bool mUseMTP{false};   //!< Enable MTP output (intermediate_states as 3rd output)
     int32_t mSMVersion{0}; //!< Captured device SM version used for build-time capability checks
 };
 

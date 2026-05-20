@@ -15,11 +15,30 @@
 import os
 import shlex
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from conftest import RemoteConfig
+
+
+def _tee_line_to_process_stdout(text: str) -> None:
+    """Send one line to the real OS stdout (fd 1) so the outer edge-llm-qa
+    runner (run_cmd_direct) sees it. Pytest's output capture replaces sys.stdout;
+    writing fd 1 still reaches the parent pipe.
+    """
+    if not text:
+        return
+    line = text if text.endswith("\n") else text + "\n"
+    data = line.encode("utf-8", errors="replace")
+    try:
+        os.write(1, data)
+    except OSError:
+        try:
+            sys.__stdout__.write(line)
+        except (OSError, TypeError, AttributeError):
+            pass
 
 
 def run_command(cmd: List[str],
@@ -32,7 +51,8 @@ def run_command(cmd: List[str],
         remote_host = f"{remote_config.user}@{remote_config.host}"
         ssh_cmd = [
             'sshpass', '-p', remote_config.password, 'ssh', '-o',
-            'StrictHostKeyChecking=no', remote_host
+            'StrictHostKeyChecking=no', '-o', 'ServerAliveInterval=30', '-o',
+            'ServerAliveCountMax=10', '-o', 'TCPKeepAlive=yes', remote_host
         ]
 
         # Build the command string with environment variables if provided
@@ -77,6 +97,7 @@ def run_command(cmd: List[str],
             output_lines.append(line)
             if logger:
                 logger.info(f"  {line}")
+            _tee_line_to_process_stdout(line)
 
         try:
             returncode = process.wait(timeout=timeout)

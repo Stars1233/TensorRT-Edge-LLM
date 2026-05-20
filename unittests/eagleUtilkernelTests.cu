@@ -915,71 +915,97 @@ static rt::Tensor uploadLayerInfos(std::vector<KVLayerInfo> const& hostInfos, cu
 // ============================================================================
 TEST(EagleKernels, EagleBaseAssembleHiddenState)
 {
-    cudaStream_t stream = nullptr;
-    int32_t maxDepth = 6;       // After compaction, stride will be maxDepth
-    int32_t draftTreeSize = 10; // Input stride is draftTreeSize
-    int32_t baseHiddenDim = 512;
+    // Test with multiple headDim values (64, 128 for EAGLE; 256 for Qwen3.5 MTP)
+    std::vector<int32_t> headDims = {128, 256};
 
-    // Test with 2 batches to verify compaction with stride change
-    int32_t batchSize = 2;
-
-    // Batch 0: accept positions [0, 3, 7] (length=3)
-    // Batch 1: accept positions [0, 2, 5] (length=3)
-    std::vector<int32_t> inputAcceptedIndices = {
-        0, 3, 7, -1, -1, -1, // Batch 0
-        0, 2, 5, -1, -1, -1  // Batch 1
-    };
-    std::vector<int32_t> inputAcceptLengths = {3, 3};
-
-    // Setup input hidden states with unique markers for each batch and position
-    // Use simple pattern: batch_id * 1000 + position_id * 100
-    std::vector<half> inputHiddenState(batchSize * draftTreeSize * baseHiddenDim, __float2half(0.0f));
-
-    for (int d = 0; d < baseHiddenDim; d++)
+    for (int32_t const headDim : headDims)
     {
-        inputHiddenState[0 * draftTreeSize * baseHiddenDim + 0 * baseHiddenDim + d] = __float2half(0.0f);
-        inputHiddenState[0 * draftTreeSize * baseHiddenDim + 3 * baseHiddenDim + d] = __float2half(300.0f);
-        inputHiddenState[0 * draftTreeSize * baseHiddenDim + 7 * baseHiddenDim + d] = __float2half(700.0f);
-    }
+        SCOPED_TRACE("headDim=" + std::to_string(headDim));
 
-    for (int d = 0; d < baseHiddenDim; d++)
-    {
-        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 0 * baseHiddenDim + d] = __float2half(1000.0f);
-        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 2 * baseHiddenDim + d] = __float2half(1200.0f);
-        inputHiddenState[1 * draftTreeSize * baseHiddenDim + 5 * baseHiddenDim + d] = __float2half(1500.0f);
-    }
+        cudaStream_t stream = nullptr;
+        int32_t numLayers = 2;
+        int32_t numKVHead = 4;
+        int32_t maxSeqLen = 2048;
+        int32_t maxDepth = 6;       // After compaction, stride will be maxDepth
+        int32_t draftTreeSize = 10; // Input stride is draftTreeSize
+        int32_t baseHiddenDim = 512;
 
-    auto acceptedIndicesDevice = rt::Tensor({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
-    auto hiddenStateDevice
-        = rt::Tensor({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
+        // Test with 2 batches to verify compaction with stride change
+        int32_t batchSize = 2;
+        int32_t maxBatchSize = 2;
 
-    copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
-    copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
-    copyHostToDevice<half>(hiddenStateDevice, inputHiddenState);
+        // Batch 0: accept positions [0, 3, 7] (length=3)
+        // Batch 1: accept positions [0, 2, 5] (length=3)
+        std::vector<int32_t> inputAcceptedIndices = {
+            0, 3, 7, -1, -1, -1, // Batch 0
+            0, 2, 5, -1, -1, -1  // Batch 1
+        };
+        std::vector<int32_t> inputAcceptLengths = {3, 3};
+        std::vector<int32_t> inputKvCacheLengths = {256, 256};
 
-    eagleBaseAssembleHiddenState(acceptedIndicesDevice, acceptLengthsDevice, hiddenStateDevice, stream);
+        // Setup input hidden states with unique markers for each batch and position
+        // Use simple pattern: batch_id * 1000 + position_id * 100
+        std::vector<half> inputHiddenState(batchSize * draftTreeSize * baseHiddenDim, __float2half(0.0f));
 
-    auto actualHiddenState = copyDeviceToHost<half>(hiddenStateDevice);
+        for (int d = 0; d < baseHiddenDim; d++)
+        {
+            inputHiddenState[0 * draftTreeSize * baseHiddenDim + 0 * baseHiddenDim + d] = __float2half(0.0f);
+            inputHiddenState[0 * draftTreeSize * baseHiddenDim + 3 * baseHiddenDim + d] = __float2half(300.0f);
+            inputHiddenState[0 * draftTreeSize * baseHiddenDim + 7 * baseHiddenDim + d] = __float2half(700.0f);
+        }
 
-    // Batch 0: compacted to [0.0, 300.0, 700.0] at positions [0, 1, 2] (stride=maxDepth)
-    std::vector<float> expectedBatch0 = {0.0f, 300.0f, 700.0f};
-    for (int i = 0; i < 3; i++)
-    {
-        float actual = __half2float(actualHiddenState[0 * draftTreeSize * baseHiddenDim + i * baseHiddenDim]);
-        EXPECT_TRUE(isclose(actual, expectedBatch0[i], 1e-3f, 1e-3f))
-            << "Batch 0, position " << i << ": expected " << expectedBatch0[i] << ", got " << actual;
-    }
+        for (int d = 0; d < baseHiddenDim; d++)
+        {
+            inputHiddenState[1 * draftTreeSize * baseHiddenDim + 0 * baseHiddenDim + d] = __float2half(1000.0f);
+            inputHiddenState[1 * draftTreeSize * baseHiddenDim + 2 * baseHiddenDim + d] = __float2half(1200.0f);
+            inputHiddenState[1 * draftTreeSize * baseHiddenDim + 5 * baseHiddenDim + d] = __float2half(1500.0f);
+        }
 
-    // Batch 1: compacted from offset draftTreeSize*dim to maxDepth*dim (CRITICAL — covers
-    // moving position 0 along with the rest).
-    std::vector<float> expectedBatch1 = {1000.0f, 1200.0f, 1500.0f};
-    int32_t batch1OutputOffset = maxDepth * baseHiddenDim;
-    for (int i = 0; i < 3; i++)
-    {
-        float actual = __half2float(actualHiddenState[batch1OutputOffset + i * baseHiddenDim]);
-        EXPECT_TRUE(isclose(actual, expectedBatch1[i], 1e-3f, 1e-3f))
-            << "Batch 1, position " << i << ": expected " << expectedBatch1[i] << ", got " << actual;
+        // Create device tensors
+        auto acceptedIndicesDevice = rt::Tensor({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+        auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        auto kvCacheLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+        auto kvCacheDevice = rt::Tensor(
+            {numLayers, maxBatchSize, 2, numKVHead, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+        auto hiddenStateDevice
+            = rt::Tensor({batchSize, draftTreeSize, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+        std::vector<half> kvCache(numLayers * maxBatchSize * 2 * numKVHead * maxSeqLen * headDim, __float2half(1.0f));
+
+        // Copy data to device
+        copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
+        copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
+        copyHostToDevice<int32_t>(kvCacheLengthsDevice, inputKvCacheLengths);
+        copyHostToDevice<half>(kvCacheDevice, kvCache);
+        copyHostToDevice<half>(hiddenStateDevice, inputHiddenState);
+
+        // Execute kernels (split API: KV cache commit + hidden state assembly)
+        eagleBaseAssembleHiddenState(acceptedIndicesDevice, acceptLengthsDevice, hiddenStateDevice, stream);
+
+        // Read back results
+        auto actualHiddenState = copyDeviceToHost<half>(hiddenStateDevice);
+
+        // Verify Batch 0: compacted to positions [0, 1, 2]
+        std::vector<float> expectedBatch0 = {0.0f, 300.0f, 700.0f};
+        for (int i = 0; i < 3; i++)
+        {
+            float actual = __half2float(actualHiddenState[0 * draftTreeSize * baseHiddenDim + i * baseHiddenDim]);
+            EXPECT_TRUE(isclose(actual, expectedBatch0[i], 1e-3f, 1e-3f))
+                << "Batch 0, position " << i << ": expected " << expectedBatch0[i] << ", got " << actual;
+        }
+
+        // Verify Batch 1: compacted from offset draftTreeSize*dim to maxDepth*dim
+        std::vector<float> expectedBatch1 = {1000.0f, 1200.0f, 1500.0f};
+        int32_t batch1OutputOffset = maxDepth * baseHiddenDim;
+
+        for (int i = 0; i < 3; i++)
+        {
+            float actual = __half2float(actualHiddenState[batch1OutputOffset + i * baseHiddenDim]);
+            EXPECT_TRUE(isclose(actual, expectedBatch1[i], 1e-3f, 1e-3f))
+                << "Batch 1, position " << i << ": expected " << expectedBatch1[i] << ", got " << actual;
+        }
+
+        std::cout << "✓ headDim=" << headDim << " passed\n";
     }
 }
 

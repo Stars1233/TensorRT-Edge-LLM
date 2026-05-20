@@ -33,11 +33,17 @@ Checkpoint weight key prefixes:
 
 from __future__ import annotations
 
-import logging
+import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..linear import make_linear
+
+if TYPE_CHECKING:
+    from ...config import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Normalization
@@ -123,14 +129,28 @@ class RADIOAttention(nn.Module):
         ``proj.weight``, ``proj.bias`` [hidden, hidden]
     """
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scale = self.head_dim**-0.5
         self.embed_dim = hidden_size
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.qkv = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size * 3,
+            bias=True,
+            module_name=f"{name_prefix}.qkv" if name_prefix else "")
+        self.proj = make_linear(
+            model_config,
+            hidden_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.proj" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         B, N, _ = hidden_states.shape
@@ -156,10 +176,24 @@ class RADIOMLP(nn.Module):
     Checkpoint keys: ``mlp.fc1.*``, ``mlp.fc2.*``
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=True)
+        self.fc1 = make_linear(
+            model_config,
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc1" if name_prefix else "")
+        self.fc2 = make_linear(
+            model_config,
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            module_name=f"{name_prefix}.fc2" if name_prefix else "")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(x)))
@@ -177,13 +211,26 @@ class RADIOBlock(nn.Module):
         ``norm1.*``, ``attn.*``, ``norm2.*``, ``mlp.*``
     """
 
-    def __init__(self, hidden_size: int, num_heads: int,
-                 intermediate_size: int, layer_norm_eps: float) -> None:
+    def __init__(self,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 layer_norm_eps: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.attn = RADIOAttention(hidden_size, num_heads)
+        self.attn = RADIOAttention(
+            hidden_size,
+            num_heads,
+            model_config,
+            name_prefix=f"{name_prefix}.attn" if name_prefix else "")
         self.norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.mlp = RADIOMLP(hidden_size, intermediate_size)
+        self.mlp = RADIOMLP(
+            hidden_size,
+            intermediate_size,
+            model_config,
+            name_prefix=f"{name_prefix}.mlp" if name_prefix else "")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
@@ -202,12 +249,24 @@ class RADIOEncoder(nn.Module):
     Checkpoint keys: ``blocks.N.*``
     """
 
-    def __init__(self, num_layers: int, hidden_size: int, num_heads: int,
-                 intermediate_size: int, layer_norm_eps: float) -> None:
+    def __init__(self,
+                 num_layers: int,
+                 hidden_size: int,
+                 num_heads: int,
+                 intermediate_size: int,
+                 layer_norm_eps: float,
+                 model_config: "ModelConfig",
+                 name_prefix: str = "") -> None:
         super().__init__()
         self.blocks = nn.ModuleList([
-            RADIOBlock(hidden_size, num_heads, intermediate_size,
-                       layer_norm_eps) for _ in range(num_layers)
+            RADIOBlock(
+                hidden_size,
+                num_heads,
+                intermediate_size,
+                layer_norm_eps,
+                model_config,
+                name_prefix=f"{name_prefix}.blocks.{i}" if name_prefix else "")
+            for i in range(num_layers)
         ])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -261,7 +320,7 @@ class NemotronOmniVisualModel(nn.Module):
     Output: ``[total_patches * tokens_per_patch, llm_hidden_size]``
     """
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
         super().__init__()
         llm_cfg = config.get("llm_config", config.get("text_config", {}))
         llm_hidden_size: int = llm_cfg["hidden_size"]
@@ -281,17 +340,35 @@ class NemotronOmniVisualModel(nn.Module):
 
         self.patch_generator = RADIOEmbeddings(hidden_size, patch_size,
                                                image_size)
-        self.encoder = RADIOEncoder(num_layers, hidden_size, num_heads,
-                                    intermediate_size, layer_norm_eps)
+        # Vision blocks live under ``vision_model.radio_model.model.blocks.N.*``
+        # in the HF checkpoint; thread that prefix so MIXED_PRECISION
+        # ``layer_overrides`` resolve and ``*vision_model*`` wildcards match.
+        self.encoder = RADIOEncoder(
+            num_layers,
+            hidden_size,
+            num_heads,
+            intermediate_size,
+            layer_norm_eps,
+            model_config,
+            name_prefix="vision_model.radio_model.model")
 
         # Projector: RMSNorm → Linear → SquaredReLU → Linear
         scale = int(1.0 / self.downsample_ratio)
         in_dim = hidden_size * scale * scale
+        # mlp1.0 = RMSNorm, mlp1.1 = Linear, mlp1.2 = SquaredReLU, mlp1.3 = Linear
         self.mlp1 = nn.Sequential(
             _RMSNorm(in_dim),
-            nn.Linear(in_dim, projector_hidden_size, bias=False),
+            make_linear(model_config,
+                        in_dim,
+                        projector_hidden_size,
+                        bias=False,
+                        module_name="mlp1.1"),
             _SquaredReLU(),
-            nn.Linear(projector_hidden_size, llm_hidden_size, bias=False),
+            make_linear(model_config,
+                        projector_hidden_size,
+                        llm_hidden_size,
+                        bias=False,
+                        module_name="mlp1.3"),
         )
         self._llm_hidden_size = llm_hidden_size
         self._feat_side: int = image_size // patch_size
@@ -347,71 +424,68 @@ class NemotronOmniVisualModel(nn.Module):
 
 
 def _load_weights(model: NemotronOmniVisualModel, weights: dict) -> None:
-    """Load RADIO vision encoder and mlp1 projector weights."""
-    logger = logging.getLogger(__name__)
+    """Load RADIO vision encoder and mlp1 projector weights.
+
+    Checkpoint key → model attribute path:
+      ``vision_model.radio_model.model.patch_generator.*`` → ``patch_generator.*``
+      ``vision_model.radio_model.model.blocks.*``          → ``encoder.blocks.*``
+      ``mlp1.*``                                           → ``mlp1.*``
+
+    Two patch_generator tensors need a per-tensor transform before assignment:
+
+    * ``patch_generator.embedder.weight``: stored flat as ``[hidden, 3*P*P]``;
+      reshape to Conv2d ``[hidden, 3, P, P]``.
+    * ``patch_generator.pos_embed``: stored at max resolution (e.g. 128*128
+      patches); bilinearly interpolate to the model's target resolution.
+      RADIO pos_embed covers patches only (registers have no positional
+      embedding).
+    """
+    from ...checkpoint.loader import load_submodule_weights
+
     vt_prefix = "vision_model.radio_model.model."
-    vt_state: dict = {}
-    for k, v in weights.items():
+
+    def _remap(k: str) -> "str | None":
         if k.startswith(vt_prefix):
-            vt_state[k[len(vt_prefix):]] = v
+            inner = k[len(vt_prefix):]
+            if inner.startswith("patch_generator.") or inner.startswith(
+                    "blocks."):
+                # blocks.* lives under encoder.* in our module tree.
+                return ("encoder." +
+                        inner) if inner.startswith("blocks.") else inner
+            return None
+        if k.startswith("mlp1."):
+            return k
+        return None
 
-    mlp1_prefix = "mlp1."
-    mlp1_state: dict = {}
-    for k, v in weights.items():
-        if k.startswith(mlp1_prefix):
-            mlp1_state[k[len(mlp1_prefix):]] = v
+    def _transform(remapped_key: str, v: torch.Tensor) -> torch.Tensor:
+        if remapped_key == "patch_generator.embedder.weight" and v.dim() == 2:
+            ps = model.patch_generator.embedder.kernel_size[0]
+            return v.reshape(v.shape[0], 3, ps, ps)
+        if remapped_key == "patch_generator.pos_embed":
+            full_pos = v  # [1, max_patches, hidden]
+            target_patches = model.patch_generator.num_patches
+            stored_patches = full_pos.shape[1]
+            if stored_patches != target_patches:
+                hidden = full_pos.shape[2]
+                stored_side = int(math.sqrt(stored_patches))
+                target_side = int(math.sqrt(target_patches))
+                patch_pos = full_pos.reshape(1, stored_side, stored_side,
+                                             hidden)
+                patch_pos = patch_pos.permute(0, 3, 1, 2).float()
+                patch_pos = F.interpolate(patch_pos,
+                                          size=(target_side, target_side),
+                                          mode="bilinear",
+                                          align_corners=True).to(
+                                              full_pos.dtype)
+                patch_pos = patch_pos.permute(0, 2, 3, 1)
+                return patch_pos.reshape(1, target_patches, hidden)
+        return v
 
-    # Patch generator: reshape flat embedder weight to Conv2d format
-    pg_state = {
-        k.removeprefix("patch_generator."): v
-        for k, v in vt_state.items() if k.startswith("patch_generator.")
-    }
-    emb_key = "embedder.weight"
-    if emb_key in pg_state and pg_state[emb_key].dim() == 2:
-        # [hidden_size, 3*P*P] → [hidden_size, 3, P, P]
-        w = pg_state[emb_key]
-        ps = model.patch_generator.embedder.kernel_size[0]
-        pg_state[emb_key] = w.reshape(w.shape[0], 3, ps, ps)
-
-    # Interpolate pos_embed from stored resolution to target resolution.
-    # RADIO pos_embed covers patches only (registers have no positional embedding).
-    # Stored at max resolution (128x128 = 16384), interpolated to target (e.g. 32x32 = 1024).
-    pos_key = "pos_embed"
-    if pos_key in pg_state:
-        full_pos = pg_state[pos_key]  # [1, max_patches, hidden]
-        target_patches = model.patch_generator.num_patches
-        stored_patches = full_pos.shape[1]
-
-        if stored_patches != target_patches:
-            import math
-            hidden = full_pos.shape[2]
-            stored_side = int(math.sqrt(stored_patches))
-            target_side = int(math.sqrt(target_patches))
-
-            patch_pos = full_pos.reshape(1, stored_side, stored_side, hidden)
-            patch_pos = patch_pos.permute(0, 3, 1, 2).float()
-            patch_pos = F.interpolate(patch_pos,
-                                      size=(target_side, target_side),
-                                      mode="bilinear",
-                                      align_corners=True).to(full_pos.dtype)
-            patch_pos = patch_pos.permute(0, 2, 3, 1)
-            pg_state[pos_key] = patch_pos.reshape(1, target_patches, hidden)
-
-    missing_pg, _ = model.patch_generator.load_state_dict(pg_state,
-                                                          strict=False)
-
-    # Encoder
-    enc_state = {k: v for k, v in vt_state.items() if k.startswith("blocks.")}
-    missing_enc, _ = model.encoder.load_state_dict(enc_state, strict=False)
-
-    # mlp1
-    missing_mlp, _ = model.mlp1.load_state_dict(mlp1_state, strict=False)
-
-    for label, missing in [("patch_generator", missing_pg),
-                           ("encoder", missing_enc), ("mlp1", missing_mlp)]:
-        if missing:
-            logger.warning("NemotronOmniVisualModel: missing %s keys: %s",
-                           label, missing[:10])
+    load_submodule_weights(model,
+                           weights,
+                           _remap,
+                           transform=_transform,
+                           label="NemotronOmniVisualModel")
 
 
 # ---------------------------------------------------------------------------
@@ -422,15 +496,17 @@ def _load_weights(model: NemotronOmniVisualModel, weights: dict) -> None:
 def build_nemotron_omni_visual(
         config: dict,
         weights: dict,
+        model_config: "ModelConfig",
         dtype: torch.dtype = torch.float16) -> NemotronOmniVisualModel:
     """Build and return a :class:`NemotronOmniVisualModel` with loaded weights.
 
     Args:
-        config:  Full parsed ``config.json`` dict.
-        weights: Flat ``{key: tensor}`` dict from safetensors.
-        dtype:   Target dtype (default ``float16``).
+        config:       Full parsed ``config.json`` dict.
+        weights:      Flat ``{key: tensor}`` dict from safetensors.
+        model_config: Top-level ``ModelConfig`` for quantized Linear dispatch.
+        dtype:        Target dtype (default ``float16``).
     """
-    model = NemotronOmniVisualModel(config)
+    model = NemotronOmniVisualModel(config, model_config=model_config)
     model.to(dtype)
     _load_weights(model, weights)
     model.eval()

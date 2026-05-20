@@ -76,8 +76,17 @@ void addJsonEagleGenerationSummary(
 void addJsonMultimodalSummary(
     nlohmann::json& summary, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
 
-//! Add JSON for Talker audio generation to existing json object
+//! Add JSON for Talker audio generation to existing json object (legacy, backward compat)
 void addJsonTalkerSummary(nlohmann::json& summary, trt_edgellm::metrics::MultimodalMetrics const& talkerMetrics);
+
+//! Extend talker_generation stage in stages[] with Omni latency/metadata (TTFA, RTF, audio frames, etc.)
+//! Must be called AFTER addJsonTimingStages.
+void addJsonOmniStageExtensions(nlohmann::json& summary, trt_edgellm::metrics::OmniTalkerMetrics const& talkerMetrics,
+    trt_edgellm::metrics::OmniLatencyMetrics const& latencyMetrics);
+
+//! Output audio latency summary to ostream
+void outputOmniProfile(std::ostream& output, trt_edgellm::metrics::OmniTalkerMetrics const& talkerMetrics,
+    trt_edgellm::metrics::OmniLatencyMetrics const& latencyMetrics);
 
 //! Add JSON for all timing stages to existing json object
 void addJsonTimingStages(nlohmann::json& summary);

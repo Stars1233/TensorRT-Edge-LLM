@@ -1,0 +1,23 @@
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+    "max_generate_length": 256,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "audio",
+                            "audio": "examples/multimodal/audio/6930-75918-0000.flac"
+                        }
+                    ]
+                }
+            ],
+            "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
+        }
+    ]
+}

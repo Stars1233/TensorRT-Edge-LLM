@@ -336,7 +336,7 @@ bool EagleDraftEngineRunner::initializeConfigFromJson(Json const& configJson) no
         mConfig.numDecoderLayers = configJson["num_hidden_layers"].get<int32_t>();
         mConfig.numKVHeads = configJson["num_key_value_heads"].get<int32_t>();
         mConfig.headDim = configJson["head_dim"].get<int32_t>();
-        mConfig.rotaryDim = mConfig.headDim;
+        mConfig.rotaryDim = static_cast<int32_t>(mConfig.headDim * configJson.value("partial_rotary_factor", 1.0f));
         mConfig.draftModelHiddenDim = configJson["hidden_size"].get<int32_t>();
         mConfig.baseModelHiddenDim = configJson["base_model_hidden_size"].get<int32_t>();
         mConfig.draftModelVocabSize = configJson["draft_vocab_size"].get<int32_t>();

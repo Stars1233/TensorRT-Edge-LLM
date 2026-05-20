@@ -45,18 +45,22 @@ from .repacking import apply_all_repacking
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["load_weights"]
+__all__ = ["load_weights", "load_submodule_weights"]
+
+_FUSED_INPUT_CHANNEL_ATTRS = {"pre_quant_scale"}
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-def load_weights(model: nn.Module,
-                 model_dir: str,
-                 device: str = "cpu",
-                 key_remap: "Optional[Callable[[str], Optional[str]]]" = None,
-                 key_prefix: Optional[str] = None) -> None:
+def load_weights(
+        model: nn.Module,
+        model_dir: str,
+        device: str = "cpu",
+        key_remap: "Optional[Callable[[str], Optional[str]]]" = None,
+        key_prefix: Optional[str] = None,
+        pre_repack_hook: Optional[Callable[[nn.Module], None]] = None) -> None:
     """Load all safetensors weights from *model_dir* into *model* in-place.
 
     Args:
@@ -73,6 +77,9 @@ def load_weights(model: nn.Module,
                     When provided, only keys starting with this prefix are
                     loaded and auto-detection via :func:`_detect_key_prefix`
                     is skipped.
+        pre_repack_hook:
+                    Optional callback invoked after raw checkpoint tensors are
+                    loaded and before quantized weights are repacked.
     """
     shard_map = _build_shard_map(model_dir)
     # Group keys by shard path to open each shard only once
@@ -153,15 +160,23 @@ def load_weights(model: nn.Module,
     logger.info("Loaded %d tensors, skipped %d from %s", loaded, skipped,
                 model_dir)
 
+    if pre_repack_hook is not None:
+        pre_repack_hook(model)
+
     apply_all_repacking(model)
     # Post-process: apply tied embeddings (HF tie_word_embeddings=True models
     # omit lm_head.weight from the checkpoint; tie_weights() restores the share).
-    if hasattr(model, "tie_weights"):
-        model.tie_weights()
-        config = getattr(model, "config", None)
-        if config is not None and getattr(config, "tie_word_embeddings",
-                                          False):
+    config = getattr(model, "config", None)
+    if (hasattr(model, "tie_weights") and config is not None
+            and getattr(config, "tie_word_embeddings", False)):
+        from ..models.linear import FP16Linear
+        if isinstance(getattr(model, "lm_head", None), FP16Linear):
+            model.tie_weights()
             logger.info("Tied lm_head.weight to embed_tokens.weight")
+        else:
+            logger.debug(
+                "Skipping tied lm_head.weight for non-FP16 lm_head type %s",
+                type(getattr(model, "lm_head", None)).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +214,10 @@ def _detect_key_prefix(keys: list) -> Tuple[str, str]:
     if (any(k.startswith("model.language_model.") for k in keys)
             and "model.embed_tokens.weight" not in key_set):
         return "model.language_model.", "model."
+    # Alpamayo-R1: LLM text decoder is under "vlm.model.language_model.*".
+    # lm_head at "vlm.lm_head.*" falls through and requires key_remap.
+    if any(k.startswith("vlm.model.language_model.") for k in keys):
+        return "vlm.model.language_model.", "model."
     # Qwen3-ASR / Qwen3-Omni: LLM weights are under thinker.model.*
     if (any(k.startswith("thinker.model.layers.0.") for k in keys)
             and not any(k.startswith("model.layers.0.") for k in keys)):
@@ -356,9 +375,10 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
         num_q = config.num_attention_heads * config.head_dim
         num_kv = config.num_key_value_heads * config.head_dim
 
-        # Scalar or per-tensor attributes (input_scale, weight_scale_2):
+        # Scalar, per-tensor, or per-input-channel attributes:
         # copy the same value to all three projections.
-        if tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1):
+        if (tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1)
+                or attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS):
             ok = _set_tensor(model, f"{prefix}.self_attn.q_proj.{attr_suffix}",
                              tensor)
             ok |= _set_tensor(model,
@@ -373,13 +393,19 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
             return ok
 
         # Per-output-channel attributes (weight, weight_scale): split dim 0.
-        if tensor.shape[0] != num_q + 2 * num_kv:
+        split_sizes = [num_q, num_kv, num_kv]
+        expected = num_q + 2 * num_kv
+        if attr_suffix == "weight" and tensor.dim(
+        ) >= 2 and tensor.shape[0] * 2 == expected:
+            # ModelOpt W4A16 stores packed int4 weights as [out/2, in].
+            split_sizes = [s // 2 for s in split_sizes]
+            expected //= 2
+        if tensor.shape[0] != expected:
             logger.warning(
                 "qkv_proj.%s shape %s doesn't match expected (%d, %d, %d) "
-                "— skipping split", attr_suffix, tensor.shape, num_q, num_kv,
-                num_kv)
+                "— skipping split", attr_suffix, tensor.shape, *split_sizes)
             return False
-        q, k, v = tensor.split([num_q, num_kv, num_kv], dim=0)
+        q, k, v = tensor.split(split_sizes, dim=0)
         ok = _set_tensor(model, f"{prefix}.self_attn.q_proj.{attr_suffix}", q)
         ok |= _set_tensor(model, f"{prefix}.self_attn.k_proj.{attr_suffix}", k)
         ok |= _set_tensor(model, f"{prefix}.self_attn.v_proj.{attr_suffix}", v)
@@ -394,8 +420,9 @@ def _try_split_fused_tensor(model: nn.Module, key: str,
         prefix = key[:gate_up_idx]
         attr_suffix = key[gate_up_idx + len(".mlp.gate_up_proj."):]
 
-        # Scalar or per-tensor attributes: copy to both.
-        if tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1):
+        # Scalar, per-tensor, or per-input-channel attributes: copy to both.
+        if (tensor.dim() == 0 or (tensor.dim() == 1 and tensor.shape[0] <= 1)
+                or attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS):
             ok = _set_tensor(model, f"{prefix}.mlp.gate_proj.{attr_suffix}",
                              tensor)
             ok |= _set_tensor(model, f"{prefix}.mlp.up_proj.{attr_suffix}",
@@ -423,3 +450,62 @@ def iter_checkpoint_keys(model_dir: str) -> Iterator[str]:
     """Yield all weight keys present in a checkpoint directory (no data)."""
     shard_map = _build_shard_map(model_dir)
     yield from shard_map.keys()
+
+
+def load_submodule_weights(
+    model: nn.Module,
+    weights: Dict[str, torch.Tensor],
+    key_remap: Callable[[str], Optional[str]],
+    *,
+    transform: Optional[Callable[[str, torch.Tensor], torch.Tensor]] = None,
+    label: str = "model",
+    log: Optional[logging.Logger] = None,
+    do_repack: bool = True,
+) -> None:
+    """Load a sliced ``{key: tensor}`` dict into a sub-encoder via ``_set_tensor``.
+
+    Used by visual / audio modeling files that receive a flat weights dict
+    (already loaded from safetensors by the orchestrator) and need to filter
+    and rename keys before assignment.  Sharing this helper avoids duplicating
+    the iterate-remap-set-tensor-track-missing-log pattern across families.
+
+    ``_set_tensor`` is used (not ``load_state_dict``) so that:
+      - ``bfloat16 -> float16`` cast happens automatically;
+      - quantized weights (``float8_e4m3fn`` / packed int8 / ...) keep their
+        original dtype rather than being silently cast.
+
+    :param model: Target sub-encoder module.
+    :param weights: Flat ``{key: tensor}`` dict from safetensors.
+    :param key_remap: Called per checkpoint key. Return the new path inside
+        ``model`` (e.g. ``"encoder.blocks.0.attn.weight"``), or ``None`` to
+        skip the key. Use this to strip / rewrite checkpoint prefixes.
+    :param transform: Optional ``(remapped_key, tensor) -> tensor`` hook for
+        per-tensor reshaping (e.g. flat → conv2d) or interpolation.
+    :param label: Used in the missing-keys warning ("<label>: keys not loaded").
+    :param log: Logger used for the missing-keys warning. Defaults to this
+        module's logger.
+    :param do_repack: When ``True`` (default), call ``apply_all_repacking``
+        after assignment so type-aware fixups (FP8 scale cast, NVFP4 view-cast,
+        AWQ/GPTQ swizzle, ...) run.  Safe to leave on for non-quantized
+        sub-encoders — each fixup is gated by an ``isinstance`` check.
+    """
+    if log is None:
+        log = logger
+    missing: list[str] = []
+    for k, v in weights.items():
+        new_key = key_remap(k)
+        if new_key is None:
+            continue
+        if transform is not None:
+            v = transform(new_key, v)
+        if not _set_tensor(model, new_key, v):
+            missing.append(new_key)
+    if do_repack:
+        apply_all_repacking(model)
+    if missing:
+        log.warning(
+            "%s: keys not loaded: %s%s",
+            label,
+            missing[:10],
+            " ..." if len(missing) > 10 else "",
+        )

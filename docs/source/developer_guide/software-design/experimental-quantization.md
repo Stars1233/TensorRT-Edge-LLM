@@ -51,11 +51,14 @@ The output directory must contain:
 | Backbone | `fp8`, `int4_awq`, `nvfp4`, `mxfp8`, `int8_sq` |
 | LM head | `fp8`, `int4_awq`, `nvfp4`, `mxfp8` |
 | KV cache | `fp8` |
+| Visual tower | `fp8` |
 
 Backbone and LM-head methods can be combined for mixed-precision checkpoints.
+Visual FP8 requires multimodal calibration data so visual quantizers observe
+image activations.
 
 ## Limitations
 
-- Audio and visual calibration are not implemented.
-- Some model-specific legacy export workarounds are intentionally not included.
+- Audio calibration is not implemented.
+- Model-specific export workarounds that belong to ONNX export are intentionally not included.
 - This package produces checkpoints only. It does not build ONNX or TensorRT engines.

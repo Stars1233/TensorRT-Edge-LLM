@@ -515,6 +515,8 @@ def export_code2wav_onnx(model: Code2WavModel, output_path: str,
     export_program = torch.onnx.export(model, (codes, ),
                                        dynamo=True,
                                        opset_version=22,
+                                       input_names=["codes"],
+                                       output_names=["waveform"],
                                        dynamic_shapes=({
                                            0: batch_dim,
                                            2: code_len_dim

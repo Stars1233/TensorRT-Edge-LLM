@@ -45,19 +45,13 @@ NemotronOmniAudioRunner::NemotronOmniAudioRunner(std::string const& engineDir, c
 
     mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mAudioEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    if (!mAudioContext->setOptimizationProfileAsync(0, stream))
-    {
-        throw std::runtime_error("Failed to set optimization profile for audio engine");
-    }
+    bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);
+    ELLM_CHECK(profileSet, "Failed to set optimization profile for audio engine");
 
-    if (!validateAndFillConfig(engineDir))
-    {
-        throw std::runtime_error("NemotronOmniAudioRunner: Failed to validate config");
-    }
-    if (!allocateBuffer(stream))
-    {
-        throw std::runtime_error("NemotronOmniAudioRunner: Failed to allocate buffer");
-    }
+    bool const configValid = validateAndFillConfig(engineDir);
+    ELLM_CHECK(configValid, "NemotronOmniAudioRunner: Failed to validate config");
+    bool const bufferAllocated = allocateBuffer(stream);
+    ELLM_CHECK(bufferAllocated, "NemotronOmniAudioRunner: Failed to allocate buffer");
 }
 
 bool NemotronOmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
@@ -143,7 +137,7 @@ bool NemotronOmniAudioRunner::validateAndFillConfig(std::string const& engineDir
     return true;
 }
 
-bool NemotronOmniAudioRunner::allocateBuffer(cudaStream_t stream)
+bool NemotronOmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
 {
     bool status{true};
 
@@ -151,14 +145,13 @@ bool NemotronOmniAudioRunner::allocateBuffer(cudaStream_t stream)
         "NemotronOmniAudioRunner::mInputFeatures");
     status &= mAudioContext->setTensorAddress("input_features", mInputFeatures.rawPointer());
 
-    mAttentionMask = rt::Tensor(
-        {1, mMaxSeqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64, "NemotronOmniAudioRunner::mAttentionMask");
-    status &= mAudioContext->setTensorAddress("attention_mask", mAttentionMask.rawPointer());
-
+    // Initial output buffer is sized for one full-length clip. preprocess()
+    // grows it via resizeEmbeddingForRows() when a batch packs more clips.
+    // last_hidden_state is rebound per clip with the row offset, so no
+    // setTensorAddress here.
     int64_t const maxEncodedSeqLen = mMaxSeqLen / mConfig.subsamplingFactor;
-    mAudioEmbedding = rt::Tensor({1, maxEncodedSeqLen, mConfig.audioFeatureDim}, rt::DeviceType::kGPU,
-        nvinfer1::DataType::kHALF, "NemotronOmniAudioRunner::mAudioEmbedding");
-    status &= mAudioContext->setTensorAddress("last_hidden_state", mAudioEmbedding.rawPointer());
+    mAudioEmbedding = rt::Tensor({maxEncodedSeqLen, static_cast<int64_t>(mConfig.audioFeatureDim)},
+        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "NemotronOmniAudioRunner::mAudioEmbedding");
 
     if (!status)
     {
@@ -166,6 +159,22 @@ bool NemotronOmniAudioRunner::allocateBuffer(cudaStream_t stream)
         return false;
     }
 
+    return true;
+}
+
+bool NemotronOmniAudioRunner::resizeEmbeddingForRows(int64_t rows)
+{
+    int64_t const hidden = mConfig.audioFeatureDim;
+    int64_t const requiredBytes = rows * hidden * static_cast<int64_t>(sizeof(__half));
+    if (requiredBytes <= mAudioEmbedding.getMemoryCapacity())
+    {
+        return mAudioEmbedding.reshape({rows, hidden});
+    }
+    // Existing capacity isn't enough — reallocate. Encoded rows haven't been
+    // written yet at this point in preprocess(), so dropping the old buffer
+    // is safe.
+    mAudioEmbedding = rt::Tensor(
+        {rows, hidden}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "NemotronOmniAudioRunner::mAudioEmbedding");
     return true;
 }
 
@@ -192,66 +201,109 @@ bool NemotronOmniAudioRunner::loadMelSpectrogramFromFile(
     return true;
 }
 
-bool NemotronOmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
-    std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
+bool NemotronOmniAudioRunner::encodeSingleClip(
+    rt::Tensor const& mel, int64_t destRowOffset, int64_t& encodedRowsOut, cudaStream_t stream)
 {
-    if (audioBuffers.empty())
-    {
-        return true;
-    }
-
-    if (audioBuffers.size() > 1)
-    {
-        LOG_WARNING(
-            "Nemotron-Omni audio: only single audio clip supported, ignoring %zu extra clips", audioBuffers.size() - 1);
-    }
-    auto const& audio = audioBuffers[0];
-
-    // Load pre-computed mel-spectrogram from file
-    if (audio.melSpectrogramPath.empty())
-    {
-        LOG_ERROR("Nemotron-Omni audio runner requires mel-spectrogram input (melSpectrogramPath)");
-        return false;
-    }
-
-    rt::Tensor melSpectrogram;
-    if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpectrogram, stream))
-    {
-        LOG_ERROR("Failed to load mel-spectrogram from %s", audio.melSpectrogramPath.c_str());
-        return false;
-    }
-
-    // melSpectrogram shape: [1, time_steps, mel_bins] for Parakeet
-    int64_t const rawSeqLen = melSpectrogram.getShape()[1];
-
-    // Pad to a multiple of subsamplingFactor (3× stride-2 CNN requires divisible input)
+    // Mel shape: [1, rawSeqLen, mel_bins]. Pad rawSeqLen up to a multiple of
+    // subsamplingFactor so the 3× stride-2 subsampling produces an integer
+    // number of output rows.
+    int64_t const rawSeqLen = mel.getShape()[1];
     auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
-    int64_t const seqLen = alignUp(rawSeqLen, mConfig.subsamplingFactor);
-    int64_t const encodedSeqLen = seqLen / mConfig.subsamplingFactor;
-    audioTokenLengths.push_back(encodedSeqLen);
+    int64_t const paddedSeqLen = alignUp(rawSeqLen, mConfig.subsamplingFactor);
+    int64_t const encodedSeqLen = paddedSeqLen / mConfig.subsamplingFactor;
 
-    // Copy mel-spectrogram to input tensor (zero-padded if needed)
-    check::check(mInputFeatures.reshape({1, seqLen, static_cast<int64_t>(mConfig.melBins)}), "Tensor reshape failed");
-    if (seqLen > rawSeqLen)
+    check::check(
+        mInputFeatures.reshape({1, paddedSeqLen, static_cast<int64_t>(mConfig.melBins)}), "Tensor reshape failed");
+    if (paddedSeqLen > rawSeqLen)
     {
         CUDA_CHECK(cudaMemsetAsync(mInputFeatures.rawPointer(), 0, mInputFeatures.getMemoryCapacity(), stream));
     }
-    CUDA_CHECK(cudaMemcpyAsync(mInputFeatures.rawPointer(), melSpectrogram.rawPointer(),
-        melSpectrogram.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
-
-    // Attention mask: 1 for valid frames, 0 for padding
-    std::vector<int64_t> maskHost(seqLen, 0);
-    std::fill_n(maskHost.begin(), rawSeqLen, 1);
-    check::check(mAttentionMask.reshape({1, seqLen}), "Tensor reshape failed");
     CUDA_CHECK(cudaMemcpyAsync(
-        mAttentionMask.rawPointer(), maskHost.data(), seqLen * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+        mInputFeatures.rawPointer(), mel.rawPointer(), mel.getMemoryCapacity(), cudaMemcpyDeviceToDevice, stream));
 
-    // Reshape output
-    check::check(mAudioEmbedding.reshape({1, encodedSeqLen, static_cast<int64_t>(mConfig.audioFeatureDim)}),
-        "Tensor reshape failed");
+    // Bind the encoder output to this clip's slot in mAudioEmbedding so each
+    // enqueueV3 writes directly to its destination — no scatter step needed.
+    auto* const embeddingBase = static_cast<std::byte*>(mAudioEmbedding.rawPointer());
+    int64_t const destByteOffset
+        = destRowOffset * static_cast<int64_t>(mConfig.audioFeatureDim) * static_cast<int64_t>(sizeof(__half));
+
+    bool status{true};
+    status &= mAudioContext->setInputShape("input_features", mInputFeatures.getShape().getTRTDims());
+    status &= mAudioContext->setTensorAddress("last_hidden_state", embeddingBase + destByteOffset);
+    if (!status)
+    {
+        LOG_ERROR("encodeSingleClip: Failed to set encoder bindings");
+        return false;
+    }
+
+    if (!mAudioContext->enqueueV3(stream))
+    {
+        LOG_ERROR("encodeSingleClip: Failed to enqueue encoder");
+        return false;
+    }
 
     mMultimodalMetrics.recordRun(1, encodedSeqLen);
+    encodedRowsOut = encodedSeqLen;
+    return true;
+}
 
+bool NemotronOmniAudioRunner::encodeAllClips(
+    rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
+{
+    // Two-pass: load every clip's mel spectrogram first so we can size
+    // mAudioEmbedding once before any enqueueV3 binds an output address.
+    // Mid-loop reallocation would invalidate addresses set on prior clips
+    // whose enqueueV3 may not yet have run on the stream.
+    std::vector<rt::Tensor> mels;
+    int64_t totalEncodedRows = 0;
+    auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
+
+    for (auto const& req : request.requests)
+    {
+        for (auto const& audio : req.audioBuffers)
+        {
+            if (audio.melSpectrogramPath.empty())
+            {
+                LOG_ERROR("Nemotron-Omni audio runner requires mel-spectrogram input (melSpectrogramPath)");
+                return false;
+            }
+            rt::Tensor mel;
+            if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, mel, stream))
+            {
+                LOG_ERROR("Failed to load mel-spectrogram from %s", audio.melSpectrogramPath.c_str());
+                return false;
+            }
+            int64_t const encodedSeqLen
+                = alignUp(mel.getShape()[1], mConfig.subsamplingFactor) / mConfig.subsamplingFactor;
+            audioTokenLengths.push_back(encodedSeqLen);
+            totalEncodedRows += encodedSeqLen;
+            mels.emplace_back(std::move(mel));
+        }
+    }
+
+    if (totalEncodedRows == 0)
+    {
+        // No audio in the batch: leave a 0-row view so downstream multimodal
+        // scatter has nothing to inject.
+        return mAudioEmbedding.reshape({0, static_cast<int64_t>(mConfig.audioFeatureDim)});
+    }
+
+    if (!resizeEmbeddingForRows(totalEncodedRows))
+    {
+        LOG_ERROR("Failed to size mAudioEmbedding for %ld rows", totalEncodedRows);
+        return false;
+    }
+
+    int64_t rowOffset = 0;
+    for (auto const& mel : mels)
+    {
+        int64_t encodedRows = 0;
+        if (!encodeSingleClip(mel, rowOffset, encodedRows, stream))
+        {
+            return false;
+        }
+        rowOffset += encodedRows;
+    }
     return true;
 }
 
@@ -310,12 +362,10 @@ bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request
 
     try
     {
-        if (!request.requests.empty() && !request.requests[0].audioBuffers.empty())
+        TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
+        if (!encodeAllClips(request, audioTokenLengths, stream))
         {
-            if (!preprocessAudio(request.requests[0].audioBuffers, audioTokenLengths, stream))
-            {
-                return false;
-            }
+            return false;
         }
         textPreprocess(request, batchedInputIds, audioTokenLengths, tokenizer);
     }
@@ -328,40 +378,11 @@ bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request
     return true;
 }
 
-bool NemotronOmniAudioRunner::infer(cudaStream_t stream)
+bool NemotronOmniAudioRunner::infer([[maybe_unused]] cudaStream_t stream)
 {
-    // Skip if no audio input
-    if (mInputFeatures.getShape()[1] == 0)
-    {
-        return true;
-    }
-
-    {
-        TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
-
-        bool status{true};
-        status &= mAudioContext->setInputShape("input_features", mInputFeatures.getShape().getTRTDims());
-        status &= mAudioContext->setInputShape("attention_mask", mAttentionMask.getShape().getTRTDims());
-
-        if (!status)
-        {
-            LOG_ERROR("NemotronOmniAudioRunner::infer(): Failed to set input shapes");
-            return false;
-        }
-
-        bool const enqueueStatus = mAudioContext->enqueueV3(stream);
-        if (!enqueueStatus)
-        {
-            LOG_ERROR("NemotronOmniAudioRunner::infer(): Failed to enqueue engine");
-            return false;
-        }
-    }
-
-    auto const shape = mAudioEmbedding.getShape();
-    check::check(shape.getNumDims() == 3 && shape[0] == 1,
-        "NemotronOmniAudioRunner: mAudioEmbedding must be [1, seq, hidden] before reshape");
-    check::check(mAudioEmbedding.reshape({shape[1], shape[2]}), "Tensor reshape failed");
-
+    // Encoder is invoked per-clip from preprocess() above; nothing left to
+    // do here. The base interface still requires this method, so keep it
+    // as an explicit no-op rather than removing the override.
     return true;
 }
 

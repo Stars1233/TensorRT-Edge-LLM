@@ -19,6 +19,7 @@ import os
 import shutil
 import time
 from collections import namedtuple
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -27,6 +28,8 @@ import onnx_graphsurgeon as gs
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+from .phi4mm_utils import load_phi4mm_model
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,13 @@ def _find_matmul_node(quantize_linear_node: gs.Node) -> gs.Node:
     return node
 
 
+_WEIGHT_DQ_OPS = {
+    "DequantizeLinear",
+    "TRT_FP8DequantizeLinear",
+    "TRT_MXFP8DequantizeLinear",
+}
+
+
 def _find_weight_shape(gemm_node: gs.Node) -> tuple:
     """
     Find the weight shape of the GEMM node. The weight shape is not intuitive because of the quantization and transpose nodes.
@@ -59,7 +69,7 @@ def _find_weight_shape(gemm_node: gs.Node) -> tuple:
     max_depth = 5
     depth = 0
     num_transpose = 0
-    while node.op != "DequantizeLinear" and node.op != "TRT_MXFP8DequantizeLinear" and depth < max_depth:
+    while node.op not in _WEIGHT_DQ_OPS and depth < max_depth:
         if node.op == "Transpose":
             num_transpose += 1
         node = node.inputs[0].inputs[0]
@@ -76,32 +86,144 @@ def _find_weight_shape(gemm_node: gs.Node) -> tuple:
     return tuple(weight_shape)
 
 
+# ONNX FP8 dtype codes: FLOAT8E4M3FN=17, FLOAT8E5M2=18 (TensorProto enum).
+_FP8_OUTPUT_DTYPES = {17, 18}
+
+
+def _is_fp8_quantize_node(node: gs.Node) -> bool:
+    """Producers of FP8 values: legacy ``TRT_FP8QuantizeLinear`` or standard
+    ``QuantizeLinear`` with ``output_dtype`` set to an FP8 code."""
+    if node.op == "TRT_FP8QuantizeLinear":
+        return True
+    if node.op == "QuantizeLinear":
+        out_dtype = node.attrs.get("output_dtype") if node.attrs else None
+        return isinstance(out_dtype, int) and out_dtype in _FP8_OUTPUT_DTYPES
+    return False
+
+
+_TRANSPARENT_OPS = {"Cast", "Reshape", "Identity"}
+
+
+def _matmul_consumers_after_dq(quantize_node: gs.Node, max_hops: int = 3):
+    """Yield every MatMul reached through Q → DQ → ... → MatMul. The DQ may
+    fan out to several MatMul consumers (Q/K/V share one dequantized hidden
+    state). Walks through ``max_hops`` levels of transparent ops
+    (``Cast``/``Reshape``/``Identity``) between DQ and MatMul so a future
+    modelopt emit pattern with intermediate ops keeps binding correctly
+    instead of silently dropping the LoRA slot (Greptile P2)."""
+    for dq in list(quantize_node.outputs[0].outputs):
+        if dq.op != "DequantizeLinear":
+            continue
+        frontier = list(dq.outputs[0].outputs)
+        seen = set()
+        for _ in range(max_hops + 1):
+            next_frontier = []
+            for cons in frontier:
+                cons_id = id(cons)
+                if cons_id in seen:
+                    continue
+                seen.add(cons_id)
+                if cons.op == "MatMul":
+                    yield cons
+                elif cons.op in _TRANSPARENT_OPS and cons.outputs:
+                    next_frontier.extend(cons.outputs[0].outputs)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+
+
+def _stem_from_init_name(name: str) -> str:
+    """Convert an initializer name like ``_model.<...>.weight`` into the
+    module-path stem used by the adapter safetensors (``model.<...>``).
+    Returns ``""`` when the name is not in the expected
+    ``_model.<...>.weight`` form so the caller refuses to synthesize a
+    LoRA binding (silent garbage names produce dummy bindings at runtime)."""
+    if not (name.startswith("_model.") and name.endswith(".weight")):
+        return ""
+    return name[len("_model."):-len(".weight")]
+
+
+def _synth_gemm_name(stem: str, fallback: str) -> str:
+    """Encode ``stem`` as a path so the downstream
+    ``gemm_name.replace("/", ".").rsplit(".",1)[0][1:]`` in
+    ``insert_lora_and_save`` collapses back to ``stem``. Fall back to the
+    raw MatMul/plugin node name when the stem is unrecoverable — the
+    runtime will then drop the binding by name mismatch rather than wire
+    a silent garbage tensor."""
+    return ("/" + stem.replace(".", "/") + "/MatMul") if stem else fallback
+
+
+def _stem_from_weight_init(matmul_node: gs.Node) -> str:
+    """Walk up the MatMul weight side to its originating ``_model.…weight``
+    initializer and return its module-path stem. Returns ``""`` when the walk
+    does not terminate at an initializer named ``_model.<...>.weight`` — the
+    caller must then refuse to synthesize a LoRA binding name (silent garbage
+    names produce dummy bindings at runtime)."""
+    if not matmul_node.inputs[1].inputs:
+        return ""
+    node = matmul_node.inputs[1].inputs[0]
+    depth = 0
+    while node is not None and node.op not in _WEIGHT_DQ_OPS and depth < 5:
+        if not node.inputs or not node.inputs[0].inputs:
+            return ""
+        node = node.inputs[0].inputs[0]
+        depth += 1
+    if node is None or not node.inputs:
+        return ""
+    return _stem_from_init_name(getattr(node.inputs[0], "name", "") or "")
+
+
 def _match_fp8_gemm(graph: gs.Graph):
     """
     Match FP8 GEMM nodes in the graph.
+
+    Handles both the legacy ``TRT_FP8QuantizeLinear`` producer and the
+    standard ``QuantizeLinear`` with FP8 ``output_dtype``. For the standard
+    path, a single Quantize may fan out to multiple MatMuls through one
+    DequantizeLinear; each MatMul becomes its own GEMM, and ``name`` is
+    rewritten to a path-style stem derived from the weight initializer so
+    the downstream LoRA input names match the adapter safetensors (which
+    ``LLMEngineRunner::switchLoraWeights`` binds by strict equality).
     """
     fp8_gemm_infos = []
-    fp8_quantize_linear_nodes = [
-        node for node in graph.nodes if node.op == "TRT_FP8QuantizeLinear"
-    ]
-    for node in fp8_quantize_linear_nodes:
-        if node.inputs[0].inputs[0].op == "Cast":
-            input_node = node.inputs[0].inputs[0].inputs[0]
+    seen_matmul_ids = set()
+    for node in graph.nodes:
+        if not _is_fp8_quantize_node(node):
+            continue
+        if node.op == "TRT_FP8QuantizeLinear":
+            # Legacy modelopt-0.39 path: 1:1 Q → ... → MatMul, with a stray
+            # Cast on the activation side. Strip the Cast so the LoRA branch
+            # sees the same upstream tensor the GEMM does.
+            if node.inputs[0].inputs and node.inputs[0].inputs[0].op == "Cast":
+                input_node = node.inputs[0].inputs[0].inputs[0]
+            else:
+                input_node = node.inputs[0]
+            matmuls = [_find_matmul_node(node)]
         else:
+            # Standard ONNX FP8 Q → DQ → MatMul (DQ may fan out to Q/K/V).
             input_node = node.inputs[0]
-        matmul_node = _find_matmul_node(node)
-        weight_shape = _find_weight_shape(matmul_node)
-        gemm_info = GEMMInfo(input=input_node,
-                             output=matmul_node.outputs[0],
-                             name=matmul_node.name,
-                             weight_shape=weight_shape)
-        fp8_gemm_infos.append(gemm_info)
+            matmuls = list(_matmul_consumers_after_dq(node))
+
+        for matmul_node in matmuls:
+            if id(matmul_node) in seen_matmul_ids:
+                continue
+            seen_matmul_ids.add(id(matmul_node))
+            stem = _stem_from_weight_init(matmul_node)
+            fp8_gemm_infos.append(
+                GEMMInfo(input=input_node,
+                         output=matmul_node.outputs[0],
+                         name=_synth_gemm_name(stem, matmul_node.name),
+                         weight_shape=_find_weight_shape(matmul_node)))
     return fp8_gemm_infos
 
 
 def _match_nvfp4_gemm(graph: gs.Graph):
     """
     Match NVFP4 GEMM nodes in the graph.
+
+    Same dynamo-naming hazard as the FP8 path: the downstream MatMul node
+    is named ``node_MatMul_N`` by the dynamo exporter, so derive the GEMM
+    name from the weight initializer instead.
     """
     nvfp4_gemm_infos = []
     nvfp4_quantize_linear_nodes = [
@@ -111,17 +233,22 @@ def _match_nvfp4_gemm(graph: gs.Graph):
         input_node = node.inputs[0]
         matmul_node = _find_matmul_node(node)
         weight_shape = _find_weight_shape(matmul_node)
-        gemm_info = GEMMInfo(input=input_node,
-                             output=matmul_node.outputs[0],
-                             name=matmul_node.name,
-                             weight_shape=weight_shape)
-        nvfp4_gemm_infos.append(gemm_info)
+        stem = _stem_from_weight_init(matmul_node)
+        nvfp4_gemm_infos.append(
+            GEMMInfo(input=input_node,
+                     output=matmul_node.outputs[0],
+                     name=_synth_gemm_name(stem, matmul_node.name),
+                     weight_shape=weight_shape))
     return nvfp4_gemm_infos
 
 
 def _match_int4_gemm(graph: gs.Graph):
     """
     Match INT4 GEMM nodes in the graph.
+
+    The ``Int4GroupwiseGemmPlugin`` carries its weight initializer
+    directly as ``node.inputs[1]`` (no DequantizeLinear chain), so the
+    stem can be derived in one step.
     """
     int4_gemm_infos = []
     int4_gemm_nodes = [
@@ -139,11 +266,13 @@ def _match_int4_gemm(graph: gs.Graph):
         else:
             input_node = node.inputs[0]
         weight_shape = (node.attrs["gemm_k"], node.attrs["gemm_n"])
-        gemm_info = GEMMInfo(input=input_node,
-                             output=node.outputs[0],
-                             name=node.name,
-                             weight_shape=weight_shape)
-        int4_gemm_infos.append(gemm_info)
+        weight_init_name = getattr(node.inputs[1], "name", "") or ""
+        stem = _stem_from_init_name(weight_init_name)
+        int4_gemm_infos.append(
+            GEMMInfo(input=input_node,
+                     output=node.outputs[0],
+                     name=_synth_gemm_name(stem, node.name),
+                     weight_shape=weight_shape))
     return int4_gemm_infos
 
 
@@ -375,6 +504,120 @@ def insert_lora_and_save(onnx_dir: str):
     end_time = time.time()
     logger.info("LoRA model saved to %s", output_model_path)
     logger.info("LoRA insertion completed in %.2fs", end_time - start_time)
+
+
+def _model_type_from_config(model_dir: str) -> str:
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return ""
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        return config.get("model_type", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    return parent == child or parent in child.parents
+
+
+def _prepare_merge_output_dir(output_dir: str, model_dir: str,
+                              lora_dir: str) -> None:
+    output_path = Path(output_dir).expanduser().resolve()
+    model_path = Path(model_dir).expanduser().resolve()
+    lora_path = Path(lora_dir).expanduser().resolve()
+    protected_paths = {Path("/").resolve(), Path.home().resolve()}
+    try:
+        protected_paths.add(Path.cwd().resolve())
+    except OSError:
+        pass
+
+    if output_path in protected_paths:
+        raise ValueError(f"Refusing to remove protected output_dir: "
+                         f"{output_path}")
+    if _path_contains(output_path, model_path) or _path_contains(
+            output_path, lora_path):
+        raise ValueError("Refusing to use an output_dir that contains the "
+                         "input model or LoRA adapter directory")
+
+    if output_path.exists():
+        if not output_path.is_dir():
+            raise ValueError(f"output_dir exists and is not a directory: "
+                             f"{output_path}")
+        logger.warning("Removing existing LoRA merge output directory: %s",
+                       output_path)
+        shutil.rmtree(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+
+def merge_lora_and_save(model_dir: str,
+                        lora_dir: str,
+                        output_dir: str,
+                        device: str = "cuda",
+                        torch_dtype: str = "float16") -> None:
+    """Merge a PEFT LoRA adapter into a HuggingFace checkpoint."""
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+
+    dtype_map = {
+        "auto": "auto",
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    if torch_dtype not in dtype_map:
+        raise ValueError(f"Unsupported torch_dtype={torch_dtype!r}")
+
+    _prepare_merge_output_dir(output_dir, model_dir, lora_dir)
+
+    model_type = _model_type_from_config(model_dir)
+    is_phi4mm = model_type in ("phi4mm", "phi4_multimodal")
+    if is_phi4mm:
+        model = load_phi4mm_model(model_dir,
+                                  dtype_map[torch_dtype],
+                                  patch_peft_generation=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype=dtype_map[torch_dtype],
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager",
+        )
+    if device:
+        model.to(device)
+
+    lora_model = PeftModel.from_pretrained(model, lora_dir)
+    merged_model = lora_model.merge_and_unload()
+    if is_phi4mm:
+        merged_model.config.vision_lora = None
+        merged_model.config.speech_lora = None
+    merged_model.save_pretrained(output_dir, safe_serialization=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                              trust_remote_code=True)
+    tokenizer.save_pretrained(output_dir)
+
+    try:
+        processor = AutoProcessor.from_pretrained(model_dir,
+                                                  trust_remote_code=True)
+    except (OSError, ValueError):
+        processor = None
+    if processor is not None:
+        if model_type in ("phi4mm", "phi4_multimodal"):
+            for name in ("preprocessor_config.json", "processor_config.json",
+                         "processing_phi4mm.py"):
+                src = os.path.join(model_dir, name)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(output_dir, name))
+        else:
+            processor.save_pretrained(output_dir)
+
+    logger.info("Merged LoRA adapter %s into %s", lora_dir, output_dir)
 
 
 def process_lora_weights_and_save(input_dir: str, output_dir: str):

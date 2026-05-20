@@ -62,6 +62,7 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
 
     std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
     std::filesystem::path configFile = modelDir / "tokenizer_config.json";
+    std::filesystem::path modelConfigFile = modelDir / "config.json";
 
     // Determine encoder type and load vocabulary
     TokenToRanks vocab;
@@ -878,6 +879,25 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
             if (contentItem.type == "text")
             {
                 formattedMessage += contentItem.content;
+            }
+            else if (contentItem.type == "trajectory")
+            {
+                if (request.pastTrajectory)
+                {
+                    formattedMessage += rt::kTrajHistoryStartStr;
+                    // One <|traj_history|> pad per binned axis value; Alpamayo1ActionRunner::preprocess replaces these
+                    // with discrete trajectory tokens after encode().
+                    size_t const numPadTokens = 3 * request.pastTrajectory->size();
+                    for (size_t k = 0; k < numPadTokens; ++k)
+                    {
+                        formattedMessage += rt::kTrajHistoryPadStr;
+                    }
+                    formattedMessage += rt::kTrajHistoryEndStr;
+                }
+                else
+                {
+                    LOG_WARNING("Content type 'trajectory' has no request.pastTrajectory; skipping.");
+                }
             }
             else
             {

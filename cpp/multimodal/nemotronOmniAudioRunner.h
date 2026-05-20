@@ -41,11 +41,15 @@ struct NemotronOmniAudioConfig
     int32_t vocabSize{0};           //!< Vocabulary size (audio token ID offset)
 };
 
-//! \brief Runner for Nemotron-Omni Parakeet audio encoder
+//! \brief Runner for Nemotron-Omni Parakeet audio encoder.
 //!
-//! Handles audio preprocessing and encoder inference for Nemotron-Omni's
-//! Parakeet-based audio encoder. The encoder takes mel-spectrogram features
-//! and an attention mask, producing audio embeddings projected to LLM hidden size.
+//! The encoder is exported and built at fixed batch=1: the Conformer's
+//! depthwise convolution is a local operator that ignores attention masks,
+//! so cross-clip batching with padding silently corrupts short-clip outputs
+//! at their right edge. ``preprocess()`` walks every audio clip in the
+//! request batch and invokes the encoder once per clip, writing the encoded
+//! rows directly into ``mAudioEmbedding`` at sequential offsets. ``infer()``
+//! is a no-op.
 class NemotronOmniAudioRunner : public MultimodalRunner
 {
 public:
@@ -97,13 +101,24 @@ private:
     bool loadMelSpectrogramFromFile(
         std::string const& filePath, std::string const& format, rt::Tensor& melSpectrogram, cudaStream_t stream);
 
-    //! \brief Preprocess audio buffers and prepare engine inputs
-    //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
-    //! \param[out] audioTokenLengths Output token lengths for each audio clip
-    //! \param[in] stream CUDA stream for execution
-    //! \return True if preprocessing succeeded, false otherwise
-    bool preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
-        std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
+    //! \brief Encode all audio clips in the request batch into mAudioEmbedding.
+    //!
+    //! Iterates ``request.requests`` (and each request's audioBuffers) in
+    //! placeholder order, runs the bs=1 encoder once per clip, and packs the
+    //! valid rows of every clip into a contiguous ``[totalRows, hidden]``
+    //! buffer. ``audioTokenLengths`` is filled in the same order so
+    //! ``textPreprocess`` can replace each ``<so_embedding>`` placeholder
+    //! with the right number of audio tokens.
+    bool encodeAllClips(
+        rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
+
+    //! \brief Encode a single mel-spectrogram clip into mAudioEmbedding at
+    //!        the specified row offset. Returns the number of encoded rows.
+    bool encodeSingleClip(rt::Tensor const& mel, int64_t destRowOffset, int64_t& encodedRowsOut, cudaStream_t stream);
+
+    //! \brief Resize mAudioEmbedding to ``[rows, hiddenDim]``, reallocating
+    //!        if the existing buffer cannot hold that many rows.
+    bool resizeEmbeddingForRows(int64_t rows);
 
     //! \brief Tokenize text and insert audio placeholder tokens
     //! \param[in] request LLM generation request
@@ -114,10 +129,9 @@ private:
         std::vector<int64_t> const& audioTokenLengths, tokenizer::Tokenizer const* tokenizer);
 
     NemotronOmniAudioConfig mConfig{}; //!< Nemotron-Omni Parakeet audio configuration
-    rt::Tensor mInputFeatures{};       //!< [batch, seq_len, mel_bins] Mel-spectrogram encoder input
-    rt::Tensor mAttentionMask{};       //!< [batch, seq_len] Attention mask for variable-length sequences
-    rt::Tensor mAudioEmbedding{};      //!< [batch, encoded_seq_len, hidden_dim] Audio encoder output
-    int64_t mMaxSeqLen{0};             //!< Maximum mel-spectrogram sequence length
+    rt::Tensor mInputFeatures{};       //!< [1, paddedSeqLen, mel_bins] encoder input (rebound per clip)
+    rt::Tensor mAudioEmbedding{};      //!< [totalEncodedRows, hidden_dim] flat output for all clips in batch
+    int64_t mMaxSeqLen{0};             //!< Max raw mel-spectrogram time steps from engine profile
 };
 
 } // namespace rt

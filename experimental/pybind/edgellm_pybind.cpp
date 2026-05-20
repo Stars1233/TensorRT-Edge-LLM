@@ -122,10 +122,7 @@ public:
     {
         LLMGenerationResponse response;
         bool const success = mRuntime->handleRequest(request, response, mStream.get());
-        if (!success)
-        {
-            throw std::runtime_error("Failed to handle generation request");
-        }
+        ELLM_CHECK(success, "Failed to handle generation request");
         return response;
     }
 

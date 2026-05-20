@@ -117,9 +117,14 @@ class FP8Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.register_buffer("weight", torch.empty(out_features, in_features))
-        self.register_buffer("weight_scale", torch.ones(1,
+        # Per-tensor scales declared as 0-dim scalars to match ModelOpt's
+        # unified-checkpoint layout (``shape=[]``).  Avoids the rank mismatch
+        # that previously forced visual ``_load_weights`` callers to reshape
+        # source tensors with ``view(1)`` before assignment.
+        self.register_buffer("weight_scale", torch.ones((),
                                                         dtype=torch.float16))
-        self.register_buffer("input_scale", torch.ones(1, dtype=torch.float16))
+        self.register_buffer("input_scale", torch.ones((),
+                                                       dtype=torch.float16))
         if bias:
             self.register_buffer("bias", torch.empty(out_features))
         else:

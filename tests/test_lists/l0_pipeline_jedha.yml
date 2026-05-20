@@ -45,6 +45,10 @@ tests:
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-eagle-eagle3-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-4B-Instruct-nvfp4-mxsl8192-eagle-eagle3-nvfp4-mxbs1-mxil8192-mnit128-mxit8192-mxpiit512-mmmu-bs1]
 
+  # === Qwen3.5-0.8B MTP speculative decoding (FP16 base + MTP draft) ===
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3.5-0.8B-fp16-mxsl4096-mtp-mxbs1-mxil2048]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3.5-0.8B-fp16-mxsl4096-mtp-mxbs1-mxil2048-llm_basic]
+
   # === Experimental Python Server (pybind E2E) ===
   - tests/defs/test_server_pipeline.py::test_build_pybind
   # Low-level pybind runtime tests (LLM + VLM + streaming)

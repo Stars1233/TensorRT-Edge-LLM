@@ -13,27 +13,27 @@ Complete workflow for vision-language models with image understanding capabiliti
 ## Step 1: Quantize and Export (x86 Host)
 
 ```bash
+export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
+export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-3B-Instruct
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
-# Quantize language model
-tensorrt-edgellm-quantize-llm \
+# Quantize the LLM weights to a unified checkpoint
+python -m experimental.quantization llm \
   --model_dir Qwen/Qwen2.5-VL-3B-Instruct \
   --quantization fp8 \
   --output_dir $MODEL_NAME/quantized
 
-# Export language model
-tensorrt-edgellm-export-llm \
-  --model_dir $MODEL_NAME/quantized \
-  --output_dir $MODEL_NAME/onnx/llm
-
-# Export visual encoder
-tensorrt-edgellm-export-visual \
-  --model_dir Qwen/Qwen2.5-VL-3B-Instruct \
-  --output_dir $MODEL_NAME/onnx/visual
+# Export the language model and FP16 visual encoder
+python -m llm_loader.export_all_cli \
+  $MODEL_NAME/quantized \
+  $MODEL_NAME/onnx
 ```
+
+To also quantize the visual tower to FP8, add `--visual_quantization fp8` and
+use a multimodal calibration dataset such as `--dataset lmms-lab/MMMU`.
 
 ## Step 2: Transfer to Device
 
@@ -62,7 +62,7 @@ cd ~/TensorRT-Edge-LLM
 # Build visual encoder engine
 ./build/examples/multimodal/visual_build \
   --onnxDir $WORKSPACE_DIR/$MODEL_NAME/onnx/visual \
-  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/visual \
+  --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
   --minImageTokens 128 \
   --maxImageTokens 512 \
   --maxImageTokensPerImage 512

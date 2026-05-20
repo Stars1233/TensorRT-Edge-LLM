@@ -62,7 +62,7 @@ def test_build_project(env_config: EnvironmentConfig,
     # Enable CuteDSL kernels for Blackwell aarch64 targets.
     if device_config.target in ['auto-thor', 'jetson-thor', 'gb10']:
         # Prebuilt tarballs are committed in kernelSrcs/cuteDSLPrebuilt/.
-        # CMake auto-extracts them — no on-device build needed.
+        # CMake auto-extracts them -- no on-device build needed.
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
         test_logger.info(
             "CuTe DSL: using prebuilt tarball (CMake auto-extracts)")
@@ -87,12 +87,14 @@ def test_build_project(env_config: EnvironmentConfig,
         'examples/llm/llm_build',
         'examples/llm/llm_inference',
         'examples/multimodal/visual_build',
+        'examples/multimodal/audio_build',
     ]
     # Executables that support --help smoke test
     help_check_files = [
         'examples/llm/llm_build',
         'examples/llm/llm_inference',
         'examples/multimodal/visual_build',
+        'examples/multimodal/audio_build',
     ]
 
     env_vars = _get_trt_env_vars(env_config)

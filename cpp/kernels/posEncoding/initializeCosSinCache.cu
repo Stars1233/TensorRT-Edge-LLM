@@ -321,12 +321,9 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     {
         int64_t const halfDim = rotaryDim / 2;
         int64_t const numTemporalPairs = halfDim - sectionH - sectionW;
-        if (numTemporalPairs % 8 != 0 || sectionH % 8 != 0 || sectionW % 8 != 0)
-        {
-            throw std::runtime_error(
-                "Non-interleaved MRoPE sections must be divisible by 8, got T=" + std::to_string(numTemporalPairs)
+        ELLM_CHECK(numTemporalPairs % 8 == 0 && sectionH % 8 == 0 && sectionW % 8 == 0,
+            "Non-interleaved MRoPE sections must be divisible by 8, got T=" + std::to_string(numTemporalPairs)
                 + " H=" + std::to_string(sectionH) + " W=" + std::to_string(sectionW));
-        }
     }
 
     // Each CTA get assigned 128 threads.

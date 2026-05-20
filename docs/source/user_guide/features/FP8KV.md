@@ -16,15 +16,16 @@ FP8 KV cache reduces memory usage by quantizing the key-value cache from FP16 to
 
 ## Workflow
 
-### Checkpoint-Based Loader
-
-For `llm_loader`, FP8 KV cache is checkpoint-driven. If the checkpoint metadata marks KV cache quantization as `fp8`, `llm_loader` enables FP8 KV cache in the exported ONNX automatically. There is no `--fp8_kv_cache` export flag in this path.
+FP8 KV cache is checkpoint-driven in the `experimental.quantization` ->
+`llm_loader` workflow. If checkpoint metadata marks KV cache quantization as
+`fp8`, `llm_loader` enables FP8 KV cache in the exported ONNX automatically.
+There is no FP8 KV export flag in this path.
 
 ```bash
 export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
 
-python -m experimental.quantization.cli llm \
-  --model_dir /path/to/Qwen3-8B \
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-8B \
   --output_dir /tmp/qwen3_nvfp4_fp8kv \
   --quantization nvfp4 \
   --kv_cache_quantization fp8
@@ -34,55 +35,17 @@ python -m llm_loader.export_all_cli \
   /tmp/qwen3_nvfp4_fp8kv_onnx
 ```
 
-Engine build and runtime detect FP8 KV cache from the exported ONNX model configuration.
-
-### Legacy Export Tools
-
-The commands below use the legacy `tensorrt_edgellm` export tools, where FP8 KV cache requires an explicit export flag.
-
-### Vanilla Decode
-
-#### Step 1: Quantize Attention
-
-Quantize the attention using `tensorrt-edgellm-quantize-llm` with the `--kv_cache_quantization fp8` flag. This enables FP8 KV cache and FP8 FMHA compute (Q/K/V BMM quantizers). This can be done independently or combined with weight quantization.
-
-```bash
-tensorrt-edgellm-quantize-llm \
-  --model_dir Qwen/Qwen3-8B \
-  --output_dir quantized/qwen3-8b-nvfp4-fp8kv \
-  --quantization nvfp4 \
-  --kv_cache_quantization fp8
-```
-
-#### Step 2: Export to ONNX
-
-Export the quantized model to ONNX format with the `--fp8_kv_cache` flag:
-
-```bash
-tensorrt-edgellm-export-llm \
-  --model_dir quantized/qwen3-8b-nvfp4-fp8kv \
-  --output_dir onnx_models/qwen3-8b-nvfp4-fp8kv \
-  --fp8_kv_cache
-```
-
-**Note**: The `--fp8_kv_cache` flag is required during export to enable FP8 KV cache support in the ONNX model. This flag configures the attention plugin nodes to use FP8 KV cache format.
-
-#### Step 3: Build Engine
-
-Build the TensorRT engine as usual. The build process automatically detects FP8 KV cache configuration from the ONNX model:
+Build the TensorRT engine as usual. Engine build and runtime detect FP8 KV
+cache from the exported ONNX model configuration:
 
 ```bash
 ./build/examples/llm/llm_build \
-  --onnxDir onnx_models/qwen3-8b-nvfp4-fp8kv \
+  --onnxDir /tmp/qwen3_nvfp4_fp8kv_onnx/llm \
   --engineDir engines/qwen3-8b-nvfp4-fp8kv \
   --maxBatchSize=1
 ```
 
-No special build flags are required — FP8 KV cache is automatically enabled based on the ONNX model configuration.
-
-#### Step 4: Run Inference
-
-Run inference with the built engine. No special flags are needed:
+Run inference with the built engine. No special runtime flags are needed:
 
 ```bash
 ./build/examples/llm/llm_inference \
@@ -91,78 +54,31 @@ Run inference with the built engine. No special flags are needed:
   --outputFile output.json
 ```
 
----
+### EAGLE Speculative Decoding
 
-### Spec Decode EAGLE
-
-FP8 KV cache is fully supported with EAGLE speculative decoding. Both base and draft models can use FP8 KV cache to reduce memory usage.
-
-#### Step 1: Quantize Base Model KV Cache
+For EAGLE, quantize the base checkpoint with `--kv_cache_quantization fp8`,
+export it with `--eagle-base`, and export the draft checkpoint separately.
 
 ```bash
-export MODEL_NAME=Qwen3-8B
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-8B \
+  --output_dir Qwen3-8B/quantized-base-nvfp4-fp8kv \
+  --quantization nvfp4 \
+  --kv_cache_quantization fp8
 
-tensorrt-edgellm-quantize-llm \
-    --model_dir Qwen/${MODEL_NAME} \
-    --output_dir ${MODEL_NAME}/quantized-base-nvfp4-fp8kv \
-    --quantization nvfp4 \
-    --kv_cache_quantization fp8
+python -m llm_loader.export_all_cli \
+  Qwen3-8B/quantized-base-nvfp4-fp8kv \
+  Qwen3-8B/onnx/base \
+  --eagle-base
+
+python -m llm_loader.export_all_cli \
+  /path/to/eagle3_draft \
+  Qwen3-8B/onnx/draft
 ```
 
-#### Step 2: Export Base Model
-
-Export base model with FP8 KV cache and EAGLE base flag:
-
-```bash
-tensorrt-edgellm-export-llm \
-    --model_dir ${MODEL_NAME}/quantized-base-nvfp4-fp8kv \
-    --output_dir ${MODEL_NAME}/onnx/base-nvfp4-fp8kv \
-    --is_eagle_base \
-    --fp8_kv_cache
-```
-
-#### Step 3: Export Draft Model
-
-Export draft model (references quantized base model):
-
-```bash
-tensorrt-edgellm-export-draft \
-    --draft_model_dir EAGLE3-Qwen3-8B \
-    --output_dir ${MODEL_NAME}/onnx/draft \
-    --base_model_dir ${MODEL_NAME}/quantized-base-nvfp4-fp8kv
-```
-
-**Note**: The draft model does not use FP8 KV cache. Since the KV cache used for the draft model is small, FP8 quantization is not applied to avoid accuracy loss. Only the base model uses FP8 KV cache.
-
-#### Step 4: Build Base Engine
-
-```bash
-./build/examples/llm/llm_build \
-    --onnxDir=${MODEL_NAME}/onnx/base-nvfp4-fp8kv \
-    --engineDir=${MODEL_NAME}/engines/eagle-nvfp4-fp8kv/ \
-    --maxBatchSize=1 \
-    --eagleBase
-```
-
-#### Step 5: Build Draft Engine
-
-```bash
-./build/examples/llm/llm_build \
-    --onnxDir=${MODEL_NAME}/onnx/draft \
-    --engineDir=${MODEL_NAME}/engines/eagle-nvfp4-fp8kv/ \
-    --maxBatchSize=1 \
-    --eagleDraft
-```
-
-#### Step 6: Run Inference with EAGLE
-
-```bash
-./build/examples/llm/llm_inference \
-    --inputFile=tests/test_cases/llm_basic.json \
-    --engineDir=${MODEL_NAME}/engines/eagle-nvfp4-fp8kv/ \
-    --outputFile=output.json \
-    --eagle
-```
+Build the base with `--specBase`, build the draft with `--specDraft`, and run
+inference with `--specDecode` as described in
+[Speculative Decoding](../examples/speculative-decoding.md).
 
 ---
 
@@ -254,9 +170,9 @@ Benchmarks were collected on a Blackwell (Thor / SM100) GPU: causal masking, per
 
 ## Notes
 
-- **Calibration Required**: FP8 KV cache quantization requires calibration data. Use `--dataset_dir` to specify a calibration dataset (default: `cnn_dailymail`).
+- **Calibration Required**: FP8 KV cache quantization requires calibration data. Use `--dataset` to select a calibration dataset (default: `cnn_dailymail`).
 - **Independent of Weight Quantization**: FP8 KV cache can be enabled independently of weight quantization. You can use NVFP4 weights (or FP8 weights) with FP8 KV cache.
 - **Automatic Detection**: Engine build automatically detects FP8 KV cache from ONNX model configuration — no special build flags needed.
-- **Compatibility**: Works with all supported models and features including LoRA, EAGLE speculative decoding, and tree attention.
+- **Compatibility**: Works with the supported LLM and EAGLE flows, but accuracy should be validated per checkpoint.
 - **Memory Benefits**: Most beneficial for long-context models and high batch sizes where KV cache memory dominates.
-- **Platform Requirements**: Requires CUDA 11.8+ for FP8 support (`cuda_fp8.h`). And FP8 KV cache also works on GPUs with compute capability <SM89.
+- **Platform Requirements**: Requires CUDA 11.8+ for FP8 support (`cuda_fp8.h`). FP8 KV cache is supported on GPUs with compute capability SM89 and above (Ada Lovelace and newer).

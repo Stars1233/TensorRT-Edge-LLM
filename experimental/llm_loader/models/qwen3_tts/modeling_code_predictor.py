@@ -58,25 +58,59 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-class _MLPFloat32WAR(nn.Module):
-    """MLP wrapper that casts act*up to FP32 to prevent FP16 overflow.
+class _DownProjFP32(nn.Module):
+    """FP32-weight linear for CodePredictor's ``down_proj``.
 
-    The CodePredictor's hidden states can have large ranges ([-39.5, 72.4])
-    which cause overflow in layer 2+ when act(gate_proj) * up_proj is computed
-    in FP16.  This WAR casts to FP32 before the multiply.
+    The reference ``tensorrt_edgellm`` CP ONNX stores the five down_proj
+    weights as **FP32** initializers, so that the full matmul happens in
+    FP32 — necessary because CP's silu*up intermediate reaches [-39, 72]
+    which loses precision when cast back to FP16.
+
+    Replicate that here by pre-casting the FP16 weight to an FP32
+    ``nn.Parameter`` at WAR-apply time, so ONNX export bakes the FP32
+    values directly into the initializer (no in-graph Cast, no lossy
+    FP16 roundtrip).
+    """
+
+    def __init__(self, original_down_proj: nn.Module) -> None:
+        super().__init__()
+        w = original_down_proj.weight.detach().to(torch.float32)
+        self.weight = nn.Parameter(w, requires_grad=False)
+        b = getattr(original_down_proj, "bias", None)
+        if b is not None:
+            self.bias = nn.Parameter(b.detach().to(torch.float32),
+                                     requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, intermediate_fp32: torch.Tensor) -> torch.Tensor:
+        return F.linear(intermediate_fp32, self.weight, self.bias)
+
+
+class _MLPFloat32WAR(nn.Module):
+    """MLP wrapper that runs the full ``silu(gate) * up → down_proj`` path
+    in FP32 to prevent FP16 overflow.
+
+    The CodePredictor's intermediate activations can reach [-39.5, 72.4]
+    in later layers, which overflows FP16 in the ``silu(gate) * up``
+    multiply and loses precision in the subsequent ``down_proj``.  We
+    cast gate/up outputs to FP32 for the multiply and keep the down_proj
+    matmul in FP32 (see :class:`_DownProjFP32`).  The final result is
+    cast back to the input dtype for the layer residual.
     """
 
     def __init__(self, original_mlp: nn.Module) -> None:
         super().__init__()
         self.gate_proj = original_mlp.gate_proj
         self.up_proj = original_mlp.up_proj
-        self.down_proj = original_mlp.down_proj
+        self.down_proj = _DownProjFP32(original_mlp.down_proj)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_output = self.gate_proj(hidden_states).to(torch.float32)
         up_output = self.up_proj(hidden_states).to(torch.float32)
         intermediate = F.silu(gate_output) * up_output
-        return self.down_proj(intermediate.to(hidden_states.dtype))
+        result = self.down_proj(intermediate)
+        return result.to(hidden_states.dtype)
 
 
 def apply_code_predictor_mlp_war(model: nn.Module) -> None:
@@ -143,6 +177,14 @@ class CodePredictorCausalLM(CausalLM):
     each inference step (one of 15 different heads selected by the runtime).
     The forward pass also returns hidden_states for residual connections.
     """
+
+    # CodePredictor's ``down_proj`` is wired as FP32 (see :class:`_DownProjFP32`)
+    # because silu*up intermediates reach ~[-39, 72] and lose precision if
+    # cast back to FP16.  Opt the exported initializer names out of the
+    # generic FP32→FP16 downgrade in ``_fix_initializer_dtypes`` — without
+    # this, the FP16 round-trip silently re-appears and breaks codec-EOS.
+    preserve_fp32_initializer_patterns = ("down_proj.weight", )
+    match_fp32_matmul_initializers = True
 
     def forward(
         self,

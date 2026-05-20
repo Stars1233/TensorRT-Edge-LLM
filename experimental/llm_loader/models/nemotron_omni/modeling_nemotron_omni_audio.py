@@ -33,7 +33,6 @@ Checkpoint weight key prefixes:
 
 from __future__ import annotations
 
-import logging
 import math
 
 import torch
@@ -87,9 +86,7 @@ class Subsampling(nn.Module):
         freq_out = mel_bins // 8
         self.linear = nn.Linear(conv_channels * freq_out, hidden_size)
 
-    def forward(self,
-                x: torch.Tensor,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """[B, T, mel_bins] → [B, T//8, hidden_size]"""
         x = x.unsqueeze(1)  # [B, 1, T, mel]
         x = self.layers(x)  # [B, C, T//8, mel//8]
@@ -325,11 +322,9 @@ class ParakeetEncoder(nn.Module):
                            conv_kernel_size) for _ in range(num_layers)
         ])
 
-    def forward(self,
-                input_features: torch.Tensor,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """[B, T, mel_bins] → [B, T//8, hidden_size]"""
-        x = self.subsampling(input_features, attention_mask)
+        x = self.subsampling(input_features)
         pos_emb = self.encode_positions(x)
         for layer in self.layers:
             x = layer(x, pos_emb)
@@ -416,18 +411,20 @@ class NemotronOmniAudioModel(nn.Module):
             bias=sc.get("projection_bias", False),
         )
 
-    def forward(self,
-                input_features: torch.Tensor,
-                attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input_features: [batch, seq_len, mel_bins]
-            attention_mask:  [batch, seq_len]
+            input_features: [1, seq_len, mel_bins]
 
         Returns:
-            [batch, encoded_seq_len, llm_hidden_size]
+            [1, encoded_seq_len, llm_hidden_size]
+
+        The encoder runs at batch=1; the C++ runtime loops over audio clips
+        sequentially. The Conformer's depthwise conv is a local operator that
+        ignores attention masks, so true cross-clip batching with padding
+        causes numerical drift.  Single-clip-per-enqueue avoids that drift.
         """
-        x = self.encoder(input_features, attention_mask)
+        x = self.encoder(input_features)
         return self.projection(x)
 
     def get_onnx_export_args(self, config: dict, device: str):
@@ -439,22 +436,11 @@ class NemotronOmniAudioModel(nn.Module):
                                      mel_bins,
                                      dtype=torch.float16,
                                      device=device)
-        attention_mask = torch.ones(1,
-                                    seq_len,
-                                    dtype=torch.int64,
-                                    device=device)
-        args = (input_features, attention_mask)
-        input_names = ["input_features", "attention_mask"]
+        args = (input_features, )
+        input_names = ["input_features"]
         output_names = ["last_hidden_state"]
         S = torch.export.Dim("seq_len", min=8, max=16384)
-        dynamic_shapes = {
-            "input_features": {
-                1: S
-            },
-            "attention_mask": {
-                1: S
-            },
-        }
+        dynamic_shapes = {"input_features": {1: S}}
         return args, input_names, output_names, dynamic_shapes
 
 
@@ -464,31 +450,31 @@ class NemotronOmniAudioModel(nn.Module):
 
 
 def _load_weights(model: NemotronOmniAudioModel, weights: dict) -> None:
-    """Load Parakeet encoder and sound projection weights."""
-    logger = logging.getLogger(__name__)
+    """Load Parakeet encoder and sound projection weights.
+
+    Checkpoint key → model attribute path:
+      ``sound_encoder.encoder.*`` → ``encoder.*``
+      ``sound_projection.*``      → ``projection.*``
+
+    Uses ``_set_tensor`` (via ``load_submodule_weights``) so bf16 weights are
+    automatically cast to fp16 — ``load_state_dict`` would skip that cast.
+    """
+    from ...checkpoint.loader import load_submodule_weights
 
     enc_prefix = "sound_encoder.encoder."
-    enc_state = {
-        k[len(enc_prefix):]: v
-        for k, v in weights.items() if k.startswith(enc_prefix)
-    }
-
     proj_prefix = "sound_projection."
-    proj_state = {
-        k[len(proj_prefix):]: v
-        for k, v in weights.items() if k.startswith(proj_prefix)
-    }
 
-    missing_enc, unexpected_enc = model.encoder.load_state_dict(enc_state,
-                                                                strict=False)
-    missing_proj, _ = model.projection.load_state_dict(proj_state,
-                                                       strict=False)
+    def _remap(k: str) -> "str | None":
+        if k.startswith(enc_prefix):
+            return "encoder." + k[len(enc_prefix):]
+        if k.startswith(proj_prefix):
+            return "projection." + k[len(proj_prefix):]
+        return None
 
-    if missing_enc:
-        logger.warning("Audio encoder: %d missing keys (first 5: %s)",
-                       len(missing_enc), missing_enc[:5])
-    if missing_proj:
-        logger.warning("Audio projection: missing keys: %s", missing_proj)
+    load_submodule_weights(model,
+                           weights,
+                           _remap,
+                           label="NemotronOmniAudioModel")
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,10 @@
 # Vocabulary Reduction
 
-> **Scope:** Vocabulary reduction is supported by the legacy `tensorrt_edgellm` export tools. It is not supported by the checkpoint-based `llm_loader` export path.
-
 ## Overview
 
-Vocabulary reduction optimizes LM head computation by reducing the vocabulary size to a subset of relevant tokens. This feature **only speeds up the LM head layer** — the rest of the model remains unchanged.
+Vocabulary reduction restricts generation logits to a task-specific subset of token IDs. The transformer layers and input embedding table keep the original tokenizer vocabulary; only the exported logits and runtime sampling vocabulary are reduced.
 
-**Important**: The user is responsible for creating the vocabulary mapping. Since the optimal reduced vocabulary is directly tied to your specific task and output distribution, we only provide a simple reference script (`tensorrt-edgellm-reduce-vocab`). You should customize the vocabulary selection based on your use case.
+**Important**: The user is responsible for creating the vocabulary mapping. Since the optimal reduced vocabulary is directly tied to your specific task and output distribution, we only provide a simple reference script (`python -m llm_loader.vocab_reduction`). You should customize the vocabulary selection based on your use case.
 
 ---
 
@@ -17,8 +15,17 @@ Vocabulary reduction optimizes LM head computation by reducing the vocabulary si
 Using Qwen3-0.6B as an example — smaller models benefit most from vocabulary reduction since LM head represents a larger fraction of total compute:
 
 ```bash
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+
+# Optional: quantize the source checkpoint first
+python -m experimental.quantization llm \
+  --model_dir Qwen/Qwen3-0.6B \
+  --output_dir qwen3_0_6b_nvfp4 \
+  --quantization nvfp4 \
+  --lm_head_quantization nvfp4
+
 # Step 1: Generate vocabulary mapping
-tensorrt-edgellm-reduce-vocab \
+python -m llm_loader.vocab_reduction \
   --model_dir Qwen/Qwen3-0.6B \
   --output_dir reduced_vocab \
   --reduced_vocab_size 16384 \
@@ -26,14 +33,14 @@ tensorrt-edgellm-reduce-vocab \
   --max_samples 50000
 
 # Step 2: Export model with reduced vocabulary
-tensorrt-edgellm-export-llm \
-  --model_dir Qwen/Qwen3-0.6B \
-  --output_dir llm_onnx \
-  --reduced_vocab_dir reduced_vocab/
+python -m llm_loader.export_all_cli \
+  qwen3_0_6b_nvfp4 \
+  qwen3_0_6b_onnx \
+  --reduced-vocab-dir reduced_vocab/
 
 # Step 3: Build TensorRT engine (unchanged)
 ./build/examples/llm/llm_build \
-  --onnxDir llm_onnx \
+  --onnxDir qwen3_0_6b_onnx/llm \
   --engineDir engines/qwen3-0.6b \
   --maxBatchSize 1
 
@@ -44,7 +51,7 @@ tensorrt-edgellm-export-llm \
   --outputFile output.json
 ```
 
-The runtime automatically applies vocabulary reduction when `vocab_map.safetensors` is present in the engine directory.
+The runtime automatically applies vocabulary reduction when `config.json` has `reduced_vocab_size` and `vocab_map.safetensors` is present. `llm_loader` reduces the LM-head weights during export, including FP16, FP8, NVFP4, MXFP8, INT8 SmoothQuant, and packed INT4 LM heads. Packed INT4 LM heads require `group_size=128` and a `reduced_vocab_size` that is a multiple of 128.
 
 ---
 
@@ -52,29 +59,28 @@ The runtime automatically applies vocabulary reduction when `vocab_map.safetenso
 
 When using vocabulary reduction for EAGLE base models, you must include all tokens referenced in the draft's `d2t.safetensors` mapping.
 
-**Prerequisite**: Export the draft model first using `tensorrt-edgellm-export-draft` to generate `d2t.safetensors`, then use the `--d2t_path` flag:
+**Prerequisite**: Export the draft model first to generate `d2t.safetensors`, then use the `--d2t_path` flag:
 
 ```bash
 # Step 0: Export EAGLE draft model first (generates d2t.safetensors)
-tensorrt-edgellm-export-draft \
-  --draft_model_dir EAGLE3-Qwen3-4B-Instruct-2507 \
-  --base_model_dir Qwen/Qwen3-4B-Instruct-2507 \
-  --output_dir draft_onnx
+python -m llm_loader.export_all_cli \
+  AngelSlim/Qwen3-4B_eagle3 \
+  draft_onnx
 
 # Step 1: Generate vocabulary mapping with d2t constraint
-tensorrt-edgellm-reduce-vocab \
-  --model_dir Qwen/Qwen3-4B-Instruct-2507 \
+python -m llm_loader.vocab_reduction \
+  --model_dir Qwen/Qwen3-4B \
   --output_dir reduced_vocab \
   --reduced_vocab_size 16384 \
   --method input_aware \
-  --d2t_path draft_onnx/d2t.safetensors
+  --d2t_path draft_onnx/llm/d2t.safetensors
 
 # Step 2: Export base model with reduced vocabulary
-tensorrt-edgellm-export-llm \
-  --model_dir Qwen/Qwen3-4B-Instruct-2507 \
-  --output_dir llm_onnx \
-  --reduced_vocab_dir reduced_vocab/ \
-  --is_eagle_base
+python -m llm_loader.export_all_cli \
+  Qwen/Qwen3-4B \
+  base_onnx \
+  --eagle-base \
+  --reduced-vocab-dir reduced_vocab/
 
 # Step 3-4: Build and run as usual...
 ```
@@ -134,7 +140,7 @@ save_file({"vocab_map": vocab_map}, "vocab_map.safetensors")
 
 ## Notes
 
-- Vocabulary reduction only affects LM head computation; other layers are unchanged
-- The `vocab_map.safetensors` is automatically copied to the engine directory during export
+- Vocabulary reduction only affects output logits and sampling; other layers are unchanged
+- The `vocab_map.safetensors` file is automatically copied during export and engine build
 - Runtime transparently handles the mapping — no inference code changes required
 - Ensure your reduced vocabulary covers all tokens your model needs to generate
