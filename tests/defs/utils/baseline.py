@@ -31,7 +31,8 @@ from typing import Dict, List, Optional, Tuple
 # TODO: Restore thresholds after baselines stabilize
 # Original values: CORRECTNESS=0.01, ROUGE=0.20, PERF=0.20
 CORRECTNESS_ACCURACY_THRESHOLD = 0.05
-ROUGE_ACCURACY_THRESHOLD = 0.50
+ROUGE_ACCURACY_THRESHOLD = float(
+    os.environ.get('BASELINE_ROUGE_ACCURACY_THRESHOLD', '0.50'))
 PERF_THRESHOLD = 0.50
 
 ACCURACY_COLUMNS = (
@@ -48,9 +49,9 @@ PERF_LOWER_IS_BETTER = {
     'llm_generation_excluding_sampling_after_prefill_avg_time_per_token (ms)',
     'memory_usage_peak_gpu_memory (MB)',
     'memory_usage_peak_cpu_memory (MB)',
-    'eagle_draft_model_prefill_avg_time (ms)',
-    'eagle_construct_draft_tree_avg_time (ms)',
-    'eagle_base_model_verification_avg_time (ms)',
+    'spec_decode_draft_model_prefill_avg_time (ms)',
+    'spec_decode_draft_proposal_avg_time (ms)',
+    'spec_decode_base_model_verification_avg_time (ms)',
     'multimodal_avg_time_per_token (ms)',
     'accuracy_wer',
 }
@@ -58,9 +59,9 @@ PERF_LOWER_IS_BETTER = {
 PERF_HIGHER_IS_BETTER = {
     'llm_prefill_tokens_per_second (tokens/s)',
     'llm_generation_excluding_sampling_after_prefill_tokens_per_second (tokens/s)',
-    'eagle_avg_acceptance_rate',
-    'eagle_avg_tokens_per_run',
-    'eagle_overall_tokens_per_second (tokens/s)',
+    'spec_decode_avg_acceptance_rate',
+    'spec_decode_avg_tokens_per_run',
+    'spec_decode_overall_tokens_per_second (tokens/s)',
 }
 
 # Maps stdout profile output patterns to CSV column names
@@ -79,18 +80,18 @@ _STDOUT_PERF_PATTERNS = [
      ),
     (r'Peak GPU Memory:\s+([\d.]+)\s+MB', 'memory_usage_peak_gpu_memory (MB)'),
     (r'Peak CPU Memory:\s+([\d.]+)\s+MB', 'memory_usage_peak_cpu_memory (MB)'),
-    (r'=== Eagle Generation ===.*?Average Acceptance Rate:\s+([\d.]+)',
-     'eagle_avg_acceptance_rate'),
-    (r'=== Eagle Generation ===.*?Average Tokens per Run:\s+([\d.]+)',
-     'eagle_avg_tokens_per_run'),
-    (r'=== Eagle Generation ===.*?Overall Tokens/Second \(excluding base prefill\):\s+([\d.]+)',
-     'eagle_overall_tokens_per_second (tokens/s)'),
+    (r'=== (?:Eagle|MTP|SpecDecode) Generation ===.*?Average Acceptance Rate:\s+([\d.]+)',
+     'spec_decode_avg_acceptance_rate'),
+    (r'=== (?:Eagle|MTP|SpecDecode) Generation ===.*?Average Tokens per Run:\s+([\d.]+)',
+     'spec_decode_avg_tokens_per_run'),
+    (r'=== (?:Eagle|MTP|SpecDecode) Generation ===.*?Overall Tokens/Second \(excluding base prefill\):\s+([\d.]+)',
+     'spec_decode_overall_tokens_per_second (tokens/s)'),
     (r'Draft Model Prefill - Total Runs:.*?Average:\s+([\d.]+)\s+ms',
-     'eagle_draft_model_prefill_avg_time (ms)'),
-    (r'Construct Draft Tree - Total Runs:.*?Average:\s+([\d.]+)\s+ms',
-     'eagle_construct_draft_tree_avg_time (ms)'),
+     'spec_decode_draft_model_prefill_avg_time (ms)'),
+    (r'Construct Draft Proposal - Total Runs:.*?Average:\s+([\d.]+)\s+ms',
+     'spec_decode_draft_proposal_avg_time (ms)'),
     (r'Base Model Verification - Total Runs:.*?Average:\s+([\d.]+)\s+ms',
-     'eagle_base_model_verification_avg_time (ms)'),
+     'spec_decode_base_model_verification_avg_time (ms)'),
     (r'=== Multimodal Processing ===.*?Average Time per Token:\s+([\d.]+)\s+ms',
      'multimodal_avg_time_per_token (ms)'),
 ]
@@ -171,7 +172,7 @@ class BaselineData:
             case_name = _build_case_name(model_type_value, test_func,
                                          param_str)
             return self._data.get(case_name)
-        # fallback: substring search (legacy / direct lookups)
+        # Fallback: substring search for callers that do not pass model type.
         key = f"[{param_str}]"
         for name, data in self._data.items():
             if key in name:

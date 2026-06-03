@@ -21,6 +21,9 @@
 #include "kernels/moe/NvFP4MoEContiguousGemmRunner.h"
 #include "kernels/moe/NvFP4MoEFC2FinalizeRunner.h"
 #include "kernels/moe/fp4SupportKernels/nvfp4MoeTypes.h"
+#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
+#include "kernels/moe/nvfp4_cutedsl/cuteDslDecodeGemvRunner.h"
+#endif
 
 #include <NvInferRuntime.h>
 #include <cstddef>
@@ -126,7 +129,7 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 private:
-    //! Router (softmax-topk or sigmoid-group-topk) then W4A16 decode GEMVs (FP16 hidden; NVFP4 expert weights).
+    //! Router + CuTe DSL decode GEMV kernels (N-major NVFP4 weights + FP8 block scales + FP32 global scales).
     int32_t enqueueDecoding(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept;
 
@@ -160,6 +163,11 @@ private:
     //! \c mMaxTokens / shape parameters are known.
     std::unique_ptr<trt_edgellm::kernel::nvfp4_moe::NvFP4MoEContiguousGemmRunner> mFC1Runner;
     std::unique_ptr<trt_edgellm::kernel::nvfp4_moe::NvFP4MoEFC2FinalizeRunner> mFC2Runner;
+
+    //! Runner for the CuTe DSL decode GEMV path.
+#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
+    trt_edgellm::CuteDslDecodeGemvRunner mDecodeGemvRunner{};
+#endif
 
     //! Pre-allocated GPU layout buffers (non-owning \c rt::Tensor views over
     //! \c IGpuAllocator -allocated memory).

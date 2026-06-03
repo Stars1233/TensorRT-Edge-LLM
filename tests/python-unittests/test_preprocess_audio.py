@@ -31,7 +31,7 @@ def test_extract_mel_spectrogram_default():
         extract_mel_spectrogram
 
     audio = np.random.randn(16000).astype(np.float32)
-    mel = extract_mel_spectrogram(audio, sample_rate=16000)
+    mel, _ = extract_mel_spectrogram(audio, sample_rate=16000)
 
     assert mel.ndim == 2
     assert mel.shape[0] == 128

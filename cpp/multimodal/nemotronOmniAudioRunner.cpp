@@ -356,7 +356,7 @@ void NemotronOmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& req
 
 bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
 {
     std::vector<int64_t> audioTokenLengths;
 
@@ -371,7 +371,7 @@ bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("NemotronOmniAudioRunner::preprocess() failed: %s", e.what());
+        LOG_ERROR("Failed: %s", e.what());
         return false;
     }
 

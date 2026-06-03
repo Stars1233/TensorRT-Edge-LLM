@@ -26,6 +26,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <string>
 
 using namespace trt_edgellm;
 
@@ -33,6 +34,52 @@ namespace trt_edgellm
 {
 namespace builder
 {
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
+namespace
+{
+
+void appendLunowudFlag(std::string& flags, std::string const& flag)
+{
+    if (flags.find(flag) != std::string::npos)
+    {
+        return;
+    }
+    if (!flags.empty())
+    {
+        flags += ' ';
+    }
+    flags += flag;
+}
+
+std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
+{
+    std::string lunowudFlags;
+    char const* existingLunowud = std::getenv("__LUNOWUD");
+    if (existingLunowud)
+    {
+        lunowudFlags = existingLunowud;
+    }
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
+    appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
+    appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
+    appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
+    if (maxBatchSize == 1)
+    {
+        appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
+    }
+#endif
+    if (existingLunowud || !lunowudFlags.empty())
+    {
+        setenv("__LUNOWUD", lunowudFlags.c_str(), 1);
+    }
+    return lunowudFlags;
+}
+
+} // namespace
+#endif
 
 LLMBuilder::LLMBuilder(
     std::filesystem::path const& onnxDir, std::filesystem::path const& engineDir, LLMBuilderConfig const& config)
@@ -44,6 +91,14 @@ LLMBuilder::LLMBuilder(
 
 bool LLMBuilder::build()
 {
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
+    std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
+    if (!lunowudFlags.empty())
+    {
+        LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
+    }
+#endif
+
     // Load plugin library
     auto pluginHandles = loadEdgellmPluginLib();
 
@@ -135,11 +190,6 @@ bool LLMBuilder::build()
 
     // Build and save engine
     std::string const engineFilePath = (mEngineDir / engineFileName).string();
-#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
-    setenv("__LUNOWUD", "-peep:match_dual_gemm=off", 1);
-#elif NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15
-    setenv("__LUNOWUD", "-mlir:autotune:num_threads=1 -mlir:collective:fp4=off -cask_fusion:async_policy=1", 1);
-#endif
     if (!buildAndSerializeEngine(builder.get(), network.get(), config.get(), engineFilePath))
     {
         return false;
@@ -182,6 +232,11 @@ bool LLMBuilder::build()
     }
 
     if (!copyEmbeddingFile())
+    {
+        return false;
+    }
+
+    if (!copyExternalWeightFiles())
     {
         return false;
     }
@@ -376,6 +431,29 @@ bool LLMBuilder::setupVanillaProfiles(
 bool LLMBuilder::setupEagleProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
+    // TRT-native-ops + EAGLE is a partially-wired path: the Python export
+    // emits a 4D bool `attention_mask` [batch, 1, seq_len, seq_len + past_len]
+    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and the
+    // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
+    // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
+    // builder's EAGLE profile setup below and the runtime dispatch in
+    // `EagleDecoder::runBaseModelVerification` both
+    // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
+    // build this combination produces a cryptic TRT error:
+    //
+    //   "Dynamic-shaped input tensor attention_mask has 4 dimensions but
+    //    profile 0 has 3 dimensions"
+    //
+    // Fail fast with an actionable message until the full TRT-native+EAGLE
+    // path (builder profile + registry + runtime dispatch) is completed.
+    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.eagleBase || mBuilderConfig.eagleDraft))
+    {
+        LOG_ERROR(
+            "TRT-native-ops + EAGLE speculative decoding is not yet supported. "
+            "Re-export the engine ONNX with trt_native_ops=False (plugin attention path).");
+        return false;
+    }
+
     bool result = true;
 
     int const maxTokens
@@ -796,6 +874,23 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
     return result;
 }
 
+namespace
+{
+// EAGLE base and draft engines share one engineDir, so their external weight
+// files (e.g. external_int4_ffn_weights.safetensors) would otherwise overwrite
+// each other. Prefix only the draft files; the base keeps the original names
+// (matching the standalone non-EAGLE case), which is enough to avoid the
+// collision. copyConfig() and copyExternalWeightFiles() must agree on this name.
+std::string externalWeightDstName(std::string const& filename, bool eagleDraft)
+{
+    if (eagleDraft)
+    {
+        return "draft_" + filename;
+    }
+    return filename;
+}
+} // namespace
+
 bool LLMBuilder::copyConfig()
 {
     // Determine config file name based on model type
@@ -818,6 +913,20 @@ bool LLMBuilder::copyConfig()
     // Create a copy of mModelConfig and add builder config
     Json configWithBuilder = mModelConfig;
     configWithBuilder["builder_config"] = mBuilderConfig.toJson();
+
+    // Keep external weight file references in sync with the names written by
+    // copyExternalWeightFiles() (draft files get the "draft_" prefix) so the runtime loads the right file.
+    if (configWithBuilder.contains("external_weight_files") && configWithBuilder["external_weight_files"].is_array())
+    {
+        for (auto& fileEntry : configWithBuilder["external_weight_files"])
+        {
+            if (fileEntry.is_object() && fileEntry.contains("file") && fileEntry["file"].is_string())
+            {
+                fileEntry["file"]
+                    = externalWeightDstName(fileEntry["file"].get<std::string>(), mBuilderConfig.eagleDraft);
+            }
+        }
+    }
 
     // Add detected num_deepstack_features if present (Qwen3VL models)
     configWithBuilder["num_deepstack_features"] = mNumDeepstackFeatures;
@@ -1027,6 +1136,46 @@ bool LLMBuilder::copyEmbeddingFile()
     }
 
     return true;
+}
+
+bool LLMBuilder::copyExternalWeightFiles()
+{
+    Json const externalWeightFiles = mModelConfig.value("external_weight_files", Json::array());
+    if (!externalWeightFiles.is_array())
+    {
+        LOG_ERROR("external_weight_files must be an array when present in config.json");
+        return false;
+    }
+    if (externalWeightFiles.empty())
+    {
+        return true;
+    }
+
+    bool allSuccess = true;
+    for (auto const& fileEntry : externalWeightFiles)
+    {
+        if (!fileEntry.is_object() || !fileEntry.contains("file") || !fileEntry["file"].is_string())
+        {
+            LOG_ERROR("Malformed external weight file entry: %s", fileEntry.dump().c_str());
+            return false;
+        }
+        std::string const filename = fileEntry["file"].get<std::string>();
+        std::string const dstFilename = externalWeightDstName(filename, mBuilderConfig.eagleDraft);
+        std::filesystem::path const srcPath = mOnnxDir / filename;
+        std::filesystem::path const dstPath = mEngineDir / dstFilename;
+
+        if (file_io::copyFile(srcPath.string(), dstPath.string()))
+        {
+            LOG_INFO("Copied external weight file: %s -> %s", filename.c_str(), dstFilename.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to copy external weight file %s from %s to %s", filename.c_str(),
+                srcPath.string().c_str(), dstPath.string().c_str());
+            allSuccess = false;
+        }
+    }
+    return allSuccess;
 }
 
 } // namespace builder

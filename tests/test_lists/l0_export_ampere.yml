@@ -1,6 +1,0 @@
-# L0 Export Tests - Ampere model export (OOTB via old pipeline)
-tests:
-  - tests/defs/test_package.py::test_package_import
-  - tests/defs/test_package.py::test_command_line_tools
-  # FP16 LLM with TRT native attention (old pipeline - OOTB export)
-  - tests/defs/test_model_export.py::test_llm_model_export[Qwen2.5-0.5B-Instruct-fp16-ootb]

@@ -62,13 +62,11 @@ for large language models and vision-language models on edge devices.
    :maxdepth: 2
    :caption: Software Design
 
-   developer_guide/software-design/llm-loader.md
-   developer_guide/software-design/experimental-quantization.md
-   developer_guide/software-design/python-export-pipeline.md
+   developer_guide/software-design/checkpoint-export.md
+   developer_guide/software-design/quantization-design.md
    developer_guide/software-design/engine-builder.md
    developer_guide/software-design/cpp-runtime-overview.md
    developer_guide/software-design/llm-inference-runtime.md
-   developer_guide/software-design/llm-inference-specdecode-runtime.md
    developer_guide/software-design/llm-streaming.md
 
 .. toctree::

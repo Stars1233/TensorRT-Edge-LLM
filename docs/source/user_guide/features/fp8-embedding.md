@@ -20,9 +20,9 @@ Export with `--fp8-embedding` to write the runtime embedding sidecar in FP8:
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
 cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   /path/to/Qwen3-8B \
   /tmp/qwen3_onnx_fp8emb \
   --fp8-embedding
@@ -63,16 +63,16 @@ FP8 embedding can be combined with weight quantization for maximum memory saving
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
 cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 
 # Step 1: Quantize weights to a checkpoint
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir /path/to/Qwen3-8B \
   --output_dir /tmp/qwen3_nvfp4 \
   --quantization nvfp4
 
 # Step 2: Export with both NVFP4 weights and FP8 embedding
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   /tmp/qwen3_nvfp4 \
   /tmp/qwen3_nvfp4_fp8emb_onnx \
   --fp8-embedding
@@ -91,7 +91,7 @@ python -m llm_loader.export_all_cli \
 
 ### Quantization Process
 
-During export with `--fp8-embedding` in `llm_loader`:
+During export with `--fp8-embedding` in `tensorrt_edgellm`:
 1. The embedding table is divided into blocks of 128 elements along the hidden dimension
 2. For each block, the maximum absolute value is computed
 3. Quantization scale is computed: `scale = amax / FP8_E4M3_MAX` (where `FP8_E4M3_MAX = 448.0`)

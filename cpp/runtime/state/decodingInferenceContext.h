@@ -1,0 +1,104 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "runtime/llmRuntimeUtils.h"
+#include "runtime/streaming.h"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace trt_edgellm
+{
+namespace rt
+{
+
+/*!
+ * @brief Batch result data for a single sequence.
+ *
+ * Encapsulates all data needed to track a batch's execution results, whether
+ * the sequence is still active or has already been evicted.
+ */
+struct BatchResult
+{
+    std::vector<int32_t> tokenIds;           //!< Generated token IDs
+    std::vector<int32_t> rawBatchedInputIds; //!< Original input token IDs
+    int32_t generateLength{0};               //!< Number of tokens generated
+    int32_t actualIterations{0};             //!< Number of iterations executed
+    int32_t effectivePrefillLength{0};       //!< Effective prefill length after system prompt cache reuse
+    FinishReason terminalReason{
+        FinishReason::kNotFinished}; //!< Why this batch terminated (EOS, length, stop string, cancel, error)
+};
+
+/*!
+ * @brief Per-request execution context shared by runtime and decoding strategies.
+ *
+ * Holds request-local sequence metadata, sampling parameters, multimodal
+ * embedding references, streaming state, and batch-eviction bookkeeping.
+ */
+struct DecodingInferenceContext
+{
+    std::vector<std::string> systemPrompts;               //!< System prompts for each sequence in batch
+    std::vector<std::vector<int32_t>> rawBatchedInputIds; //!< Original token IDs before preprocessing
+    std::vector<std::vector<int32_t>> tokenIds;           //!< Token IDs for each sequence: [batch_size][seq_length]
+    std::vector<int32_t> currentGenerateLengths;          //!< Current generation length for each sequence
+    std::vector<int32_t> effectivePrefillLengths;         //!< Prefill length after system prompt cache reuse
+    std::vector<int8_t> finishedStates;                   //!< Finished state for each sequence
+
+    std::unordered_map<int32_t, BatchResult> completedBatches; //!< Results of completed batches
+    std::vector<int32_t> batchIndexMapping;                    //!< Maps current batch index to original index
+    std::vector<SlotStreamState> slotStreams;                  //!< Per-slot streaming state
+    rt::OptionalInputTensor visualEmbeddings;                  //!< Optional visual embeddings
+    rt::OptionalInputTensor audioEmbeddings;                   //!< Optional audio embeddings
+    rt::OptionalInputTensors deepstackFeatures;                //!< Optional Deepstack features
+    int32_t generationRound{};                                 //!< Current generation round
+    int32_t maxGenerateLength{};                               //!< Maximum generation length
+    int32_t activeBatchSize{};                                 //!< Current active batch size
+    std::string loraWeightsName{""};                           //!< LoRA adapter name used by this request
+    cudaStream_t stream{};                                     //!< CUDA stream
+
+    float temperature{1.0f}; //!< Temperature for sampling
+    float topP{1.0f};        //!< Top-P sampling parameter
+    int64_t topK{0};         //!< Top-K sampling parameter
+
+    // Per-slot stop strings; empty list disables stop-string termination for that slot.
+    std::vector<std::vector<std::string>> stopStringsPerSlot;
+
+    bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for the Talker pipeline
+
+    //! Optional per-token callback invoked after each accepted token update.
+    std::optional<TokenCallback> onTokenGenerated;
+
+    /*!
+     * @brief Initialize request-local vectors and scalar fields.
+     * @param batchSize Active batch size
+     * @param maxGenLength Maximum generation length
+     * @param visual Optional visual embeddings
+     * @param deepstackFeatures Deepstack features for Qwen3-VL
+     * @param loraName LoRA weights name used by this request
+     * @param cudaStream CUDA stream for operations
+     */
+    void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
+        rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
+};
+
+} // namespace rt
+} // namespace trt_edgellm

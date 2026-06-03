@@ -155,7 +155,7 @@ class GemmBlackwellFP16:
         else:
             self.epi_tile = self.cta_tile_shape_mnk[:2]
 
-        # cuTe DSL 4.4.1 does not reliably auto-detect Thor's Blackwell family
+        # cuTe DSL 4.5.1 does not reliably auto-detect Thor's Blackwell family
         # SMs (e.g. SM101/SM110) in get_smem_capacity_in_bytes(). Like the FMHA
         # Blackwell path, request the Blackwell-family capacity explicitly.
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")

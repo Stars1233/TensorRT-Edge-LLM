@@ -12,8 +12,8 @@ Complete workflow for running [nvidia/Alpamayo-R1-10B](https://huggingface.co/nv
 
 Alpamayo-R1-10B runs as a chained VLM + action pipeline:
 
-1. **VLM backbone** — exported through `llm_loader` as `onnx/llm` and `onnx/visual`; it processes image, text, and trajectory-history tokens and generates language output.
-2. **Action expert** — exported through `llm_loader` as `onnx/action`; it consumes the VLM KV cache and produces future action waypoints.
+1. **VLM backbone** — exported through `tensorrt_edgellm` as `onnx/llm` and `onnx/visual`; it processes image, text, and trajectory-history tokens and generates language output.
+2. **Action expert** — exported through `tensorrt_edgellm` as `onnx/action`; it consumes the VLM KV cache and produces future action waypoints.
 
 Both stages are run with a single `action_inference` invocation. The engines are built separately and loaded together at runtime.
 
@@ -26,8 +26,6 @@ trajectory history points as `[x, y, z]`. The action output is written as
 ## Step 1: Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Alpamayo-R1-10B
 mkdir -p $WORKSPACE_DIR
@@ -38,7 +36,7 @@ hf auth login
 hf download nvidia/Alpamayo-R1-10B --local-dir $MODEL_NAME
 
 # Export language model backbone, visual encoder, and action expert
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_NAME \
   $MODEL_NAME/onnx \
   --max-kv-cache-capacity 4096
@@ -60,7 +58,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Alpamayo-R1-10B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build language model engine
 ./build/examples/llm/llm_build \
@@ -171,7 +169,7 @@ images as an ordered list of image content items.
 Run inference:
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/multimodal/action_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \

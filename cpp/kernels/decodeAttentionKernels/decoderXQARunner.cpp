@@ -263,13 +263,8 @@ public:
 
     static XQAKernelLoader& Get()
     {
-        static std::unique_ptr<XQAKernelLoader> kernelLoader = nullptr;
-        if (kernelLoader == nullptr)
-        {
-            kernelLoader = std::make_unique<XQAKernelLoader>(XQAKernelLoader());
-        }
-
-        return *kernelLoader;
+        static XQAKernelLoader instance;
+        return instance;
     }
 
 private:
@@ -312,8 +307,8 @@ XQALaunchParams DecoderXQARunner::initXQAParams() noexcept
     return params;
 }
 
-bool DecoderXQARunner::canImplement(
-    int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, DataType dataType, DataType kvDataType) noexcept
+bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
+    DataType dataType, DataType kvDataType) noexcept
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
@@ -322,10 +317,15 @@ bool DecoderXQARunner::canImplement(
     bool const checkSMVersion
         = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
 
-    // Current kernel list supports head ratio 1-8 for head_dim {32, 64, 128}
-    // and head ratio 16 for head_dim 128 only (NemotronH).
+    // Current kernel list supports
+    // (1) Head ratio 1-8 for head_dim {32, 64, 128}
+    // (2) Head ratio 16 for head_dim 128 only (NemotronH).
+    // (3) Head ratio 4, 6, 8 for head_dim 256 only (Qwen3.5-MoE).
     int32_t const headRatio = numQHeads / numKVHeads;
-    bool const checkQHeadPerKV = (headRatio >= 1 && headRatio <= 8) || headRatio == 16;
+    bool const checkQHeadPerKV
+        = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
+        || (headSize == 128 && headRatio == 16)
+        || (headSize == 256 && (headRatio == 4 || headRatio == 6 || headRatio == 8));
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }

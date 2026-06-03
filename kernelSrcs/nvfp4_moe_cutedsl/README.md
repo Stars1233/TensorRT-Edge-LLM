@@ -26,7 +26,7 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.4.1
+pip install nvidia-cutlass-dsl==4.5.1
 ```
 
 **2. Compile all kernel variants into a static library**
@@ -116,7 +116,7 @@ python kernelSrcs/build_cutedsl.py --kernels nvfp4_moe --gpu_arch sm_100 [--clea
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | 4.4.1 | |
+| `nvidia-cutlass-dsl` | 4.5.1 | |
 | `cuda-python` | 12.8.* for CUDA 12.x | Install before `nvidia-cutlass-dsl`; use the CUDA 13.x resolved version for CUDA 13.x |
 | `cupy-cuda12x` | 12.3.0 | CUDA 12.x |
 | `cupy-cuda13x` | 13.6.0 | CUDA 13.x |
@@ -215,7 +215,7 @@ below are only about CuteDSL's internal arch allowlists.
 
 ### Thor (SM110): Required CuteDSL Patches
 
-Thor requires two CuteDSL patches (tested on 4.4.1 and 4.4.2) before GEMM
+Thor requires two CuteDSL patches (tested on 4.4.1, 4.4.2, 4.5.0, and 4.5.1) before GEMM
 kernels can compile. Non-MMA kernels (FP4 quantize, MoE gather) work without
 patches.
 

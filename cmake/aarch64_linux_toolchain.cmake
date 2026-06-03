@@ -71,9 +71,15 @@ elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-thor")
 elseif("${EMBEDDED_TARGET}" STREQUAL "jetson-orin")
   set_ifndef(CUDA_CTK_VERSION 12.6)
   set(CMAKE_CUDA_ARCHITECTURES 87)
-  set(CUDA_DIR
-      /usr/local/cuda/targets/aarch64-linux
-      CACHE STRING "CUDA toolkit dir")
+  if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 13.0)
+    set(CUDA_DIR
+        /usr/local/cuda/targets/sbsa-linux
+        CACHE STRING "CUDA toolkit dir")
+  else()
+    set(CUDA_DIR
+        /usr/local/cuda/targets/aarch64-linux
+        CACHE STRING "CUDA toolkit dir")
+  endif()
 elseif("${EMBEDDED_TARGET}" STREQUAL "gb10")
   set_ifndef(CUDA_CTK_VERSION 13.0)
   set(CMAKE_CUDA_ARCHITECTURES 121a)

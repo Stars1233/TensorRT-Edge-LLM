@@ -217,7 +217,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
             batchSize * qSequenceLength * numQHeads * headSize, __float2half(0.0F));
 
         EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-            numQHeads, numKVHeads, smVersion, DataType::kHALF, DataType::kFP8));
+            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8));
         trt_edgellm::DecoderXQARunner runnerFp8(
             DataType::kHALF, DataType::kFP8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
         auto paramsFp8 = runnerFp8.initXQAParams();

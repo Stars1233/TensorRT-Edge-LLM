@@ -1,0 +1,5 @@
+# L1 Checkpoint Export Tests - model export and Python package smoke tests
+tests:
+  - tests/defs/test_package.py::test_package_import
+  - tests/defs/test_package.py::test_command_line_tools
+  - tests/defs/test_model_export.py::test_vlm_model_export[Qwen3-VL-2B-Instruct-int4_awq]

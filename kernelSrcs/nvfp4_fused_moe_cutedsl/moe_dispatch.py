@@ -485,7 +485,7 @@ def launch_sm120_decode_moe(
     input_gs = _expand_to_experts(input_gs, num_experts)
     down_input_scale = _expand_to_experts(down_input_scale, num_experts)
 
-    compiled, mac = _get_decode_kernel(
+    compiled, _ = _get_decode_kernel(
         workspace.state_E,
         num_experts,
         num_tokens,
@@ -527,7 +527,6 @@ def launch_sm120_decode_moe(
         scatter_output,
         workspace.token_map,
         workspace.token_weights,
-        mac,
     )
 
     return scatter_output
@@ -1072,7 +1071,7 @@ def launch_sm120_prefill_moe(
     input_gs = _expand_to_experts(input_gs, num_experts)
     down_input_scale = _expand_to_experts(down_input_scale, num_experts)
 
-    compiled, mac = _get_prefill_kernel(
+    compiled, _ = _get_prefill_kernel(
         num_experts,
         num_tokens,
         k,
@@ -1129,7 +1128,6 @@ def launch_sm120_prefill_moe(
         workspace.physical_tiles_capacity * _LEVEL_TILE_M,
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
-        mac,
     )
 
     return scatter_output

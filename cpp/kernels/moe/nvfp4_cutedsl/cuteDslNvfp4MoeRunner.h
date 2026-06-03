@@ -129,9 +129,10 @@ struct CuteDslNvfp4MoeParams
 //! Mirrors the load/unload + dispatch pattern of CuteDslFMHARunner /
 //! CuteDslGDNRunner: a mutex-guarded loadKernelModules() populates static
 //! Kernel_Module_t instances once per process, and run() dispatches to one of
-//! the (activation x backend x N-tile) wrappers. Shape axes I / E / top_k and
-//! the batch / sequence dims are runtime; hidden_size K is currently fixed at
-//! kSupportedHiddenSize and enforced by canImplement().
+//! the (activation x backend x N-tile) wrappers. Shape axes H / I / E / top_k
+//! and the batch / sequence dims are runtime; H must be a positive multiple
+//! of kHiddenSizeAlignment (= kCuteDslTileK * kStaticAbStage) so the K-tile
+//! pipeline drains cleanly. canImplement() enforces this contract.
 class CuteDslNvfp4MoeRunner
 {
 public:
@@ -156,17 +157,21 @@ public:
     //! the kernel-side n256 indexing issue is fixed.
     static constexpr int32_t kLevelTileNLarge = 256;
 
-    //! Compile-time hidden_size (K) baked into the AOT binary. Unlike N/E/top_k
-    //! (runtime), K is compile-time because _setup_attributes() in
-    //! moe_{decode,prefill}_kernel.py runs a Python-level ``while`` loop
-    //! (``ab_stage`` divisibility search) over ``k_tile_cnt = K //
-    //! tile_shape_mnk[2]`` at JIT trace time. That loop cannot trace with a
-    //! symbolic K, so ``hidden_size`` is threaded as a ``cutlass.Constexpr``
-    //! into the kernel and fixed at export time (see the ``--hidden_size``
-    //! flag on ``export_{decode,prefill}_kernel.py``). Supporting additional
-    //! K values requires emitting additional AOT variants from
-    //! ``build_cutedsl.py`` and adding a hidden-size dispatch axis here.
-    static constexpr int32_t kSupportedHiddenSize = 2048;
+    //! MMA tile-K (compile-time, bolted to NVFP4 block-scale geometry).
+    //! Mirrors ``tile_k = sf_vec_size * 8`` in moe_{decode,prefill}_kernel.py.
+    static constexpr int32_t kCuteDslTileK = kNvfp4SfVecSize * 8;
+
+    //! AOT-baked mainloop pipeline depth (number of A/B operand smem buffers).
+    //! MUST mirror ``_AB_STAGE_DEFAULT`` in moe_{decode,prefill}_kernel.py;
+    //! changing it requires a kernel rebuild AND updating kHiddenSizeAlignment.
+    static constexpr int32_t kStaticAbStage = 2;
+
+    //! Hidden-size divisibility contract: ensures ``(H / kCuteDslTileK)`` is
+    //! divisible by ``kStaticAbStage`` so the K-tile pipeline drains cleanly
+    //! (no phase mismatch). Equivalent to ``H % 256 == 0`` with the current
+    //! constants. Validated for H in {1024, 2048}; other multiples of
+    //! kHiddenSizeAlignment are expected to work by shape polymorphism.
+    static constexpr int32_t kHiddenSizeAlignment = kCuteDslTileK * kStaticAbStage;
 
     CuteDslNvfp4MoeRunner() = default;
     ~CuteDslNvfp4MoeRunner() = default;
@@ -174,11 +179,11 @@ public:
     CuteDslNvfp4MoeRunner& operator=(CuteDslNvfp4MoeRunner const&) = delete;
 
     //! True if the given dimensions and hardware can use this runner. The AOT
-    //! kernels are shape-polymorphic in N / E / top_k (wrappers build
-    //! cute.Tensor layouts from runtime Int32 extents). hiddenSize is
-    //! compile-time (see kSupportedHiddenSize) and enforced by equality;
-    //! other dims must meet alignment / divisibility rules compatible with
-    //! the compile-time MMA tile and the NVFP4 block-scale vector size.
+    //! kernels are shape-polymorphic in H / N / E / top_k (wrappers build
+    //! cute.Tensor layouts from runtime Int32 extents). hiddenSize must be a
+    //! positive multiple of kHiddenSizeAlignment; other dims must meet the
+    //! alignment / divisibility rules compatible with the compile-time MMA
+    //! tile and the NVFP4 block-scale vector size.
     static bool canImplement(int32_t hiddenSize, int32_t moeInterSize, int32_t numExperts, int32_t topK,
         int32_t smVersion, CuteDslMoeActivation activation, CuteDslMoeIoDtype ioDtype, CuteDslMoeBackend backend);
 

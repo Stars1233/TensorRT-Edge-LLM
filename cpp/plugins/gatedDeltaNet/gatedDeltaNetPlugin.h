@@ -28,7 +28,7 @@ namespace trt_edgellm
 namespace plugins
 {
 
-//! \brief TensorRT plugin for Gated Delta Net (V2 — IPluginV2DynamicExt).
+//! \brief TensorRT plugin for Gated Delta Net (V3 — IPluginV3).
 //!
 //! Registered as "gated_delta_net". Dispatches to decode (seq_len==1),
 //! prefill (seq_len>1), or MTP verify (use_mtp=true) CuTe DSL kernels.
@@ -59,47 +59,55 @@ namespace plugins
 //!        Per-step recurrent state cache for speculative-decoding rollback.
 //!        Only populated when use_mtp=true (plugin attribute) and seq_len>1.
 //!        When use_mtp=false this output is a 1-element dummy.
-class GatedDeltaNetPlugin : public nvinfer1::IPluginV2DynamicExt
+class GatedDeltaNetPlugin : public nvinfer1::IPluginV3,
+                            public nvinfer1::IPluginV3OneCore,
+                            public nvinfer1::IPluginV3OneBuildV2,
+                            public nvinfer1::IPluginV3OneRuntime
 {
 public:
     //! \param name         Plugin instance name
     //! \param kDim         Head dimension K (must be 128 for CuTe DSL kernel)
     //! \param vDim         Head dimension V (must be 128 for CuTe DSL kernel)
     GatedDeltaNetPlugin(std::string const& name, int32_t kDim = 128, int32_t vDim = 128, bool useMTP = false);
-
-    //! \brief Deserialization constructor
-    GatedDeltaNetPlugin(std::string const& name, void const* data, size_t length);
+    GatedDeltaNetPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     GatedDeltaNetPlugin() = delete;
     GatedDeltaNetPlugin(GatedDeltaNetPlugin const&) = delete;
     ~GatedDeltaNetPlugin() override;
 
-    // IPluginV2DynamicExt
-    nvinfer1::IPluginV2DynamicExt* clone() const noexcept override;
+    // IPluginV3
+    nvinfer1::IPluginCapability* getCapabilityInterface(nvinfer1::PluginCapabilityType type) noexcept override;
+    nvinfer1::IPluginV3* clone() noexcept override;
+
+    // IPluginV3OneCore
+    char const* getPluginName() const noexcept override;
+    char const* getPluginVersion() const noexcept override;
+    char const* getPluginNamespace() const noexcept override;
+
+    // IPluginV3OneBuild
     int32_t getNbOutputs() const noexcept override;
-    nvinfer1::DataType getOutputDataType(
-        int32_t index, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept override;
-    nvinfer1::DimsExprs getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs, int32_t nbInputs,
+    int32_t getOutputDataTypes(nvinfer1::DataType* outputTypes, int32_t nbOutputs, nvinfer1::DataType const* inputTypes,
+        int32_t nbInputs) const noexcept override;
+    int32_t getOutputShapes(nvinfer1::DimsExprs const* inputs, int32_t nbInputs, nvinfer1::DimsExprs const* shapeInputs,
+        int32_t nbShapeInputs, nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
         nvinfer1::IExprBuilder& exprBuilder) noexcept override;
-    bool supportsFormatCombination(
-        int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept override;
-    void configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    bool supportsFormatCombination(int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut, int32_t nbInputs,
+        int32_t nbOutputs) noexcept override;
+    int32_t configurePlugin(nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
         nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept override;
-    size_t getWorkspaceSize(nvinfer1::PluginTensorDesc const* inputs, int32_t nbInputs,
-        nvinfer1::PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
+    size_t getWorkspaceSize(nvinfer1::DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
+        nvinfer1::DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept override;
+    int32_t getAliasedInput(int32_t outputIndex) noexcept override;
+
+    // IPluginV3OneRuntime
     int32_t enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
         void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept override;
+    int32_t onShapeChange(nvinfer1::PluginTensorDesc const* in, int32_t nbInputs, nvinfer1::PluginTensorDesc const* out,
+        int32_t nbOutputs) noexcept override;
+    nvinfer1::IPluginV3* attachToContext(nvinfer1::IPluginResourceContext* context) noexcept override;
+    nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override;
 
-    // IPluginV2Ext
-    size_t getSerializationSize() const noexcept override;
-    void serialize(void* buffer) const noexcept override;
-    char const* getPluginType() const noexcept override;
-    char const* getPluginNamespace() const noexcept override;
-    void setPluginNamespace(char const* pluginNamespace) noexcept override;
-    char const* getPluginVersion() const noexcept override;
-    int32_t initialize() noexcept override;
-    void terminate() noexcept override;
-    void destroy() noexcept override;
+    void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 private:
     std::string mLayerName;
@@ -108,9 +116,13 @@ private:
     int32_t mVDim{128};    //!< Head dimension V (kernel supports 128 only)
     bool mUseMTP{false};   //!< Enable MTP output (intermediate_states as 3rd output)
     int32_t mSMVersion{0}; //!< Captured device SM version used for build-time capability checks
+    int32_t mUseMTPField{0};
+
+    std::vector<nvinfer1::PluginField> mDataToSerialize;
+    nvinfer1::PluginFieldCollection mFCToSerialize{};
 };
 
-class GatedDeltaNetPluginCreator : public nvinfer1::IPluginCreator
+class GatedDeltaNetPluginCreator : public nvinfer1::IPluginCreatorV3One
 {
 public:
     GatedDeltaNetPluginCreator();
@@ -120,10 +132,9 @@ public:
     char const* getPluginVersion() const noexcept override;
     nvinfer1::PluginFieldCollection const* getFieldNames() noexcept override;
     char const* getPluginNamespace() const noexcept override;
-    void setPluginNamespace(char const* pluginNamespace) noexcept override;
-    nvinfer1::IPluginV2* createPlugin(char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept override;
-    nvinfer1::IPluginV2* deserializePlugin(
-        char const* name, void const* serialData, size_t serialLength) noexcept override;
+    void setPluginNamespace(char const* pluginNamespace) noexcept;
+    nvinfer1::IPluginV3* createPlugin(
+        char const* name, nvinfer1::PluginFieldCollection const* fc, nvinfer1::TensorRTPhase phase) noexcept override;
 
 private:
     static nvinfer1::PluginFieldCollection mFieldCollection;

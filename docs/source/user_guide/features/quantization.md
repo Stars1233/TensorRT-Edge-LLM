@@ -1,45 +1,45 @@
 # Quantization
 
-Use `experimental.quantization` when you start from an FP16/BF16 checkpoint and need to create a unified quantized checkpoint for `llm_loader`.
+Use `tensorrt-edgellm-quantize` when you start from an FP16/BF16 checkpoint and need to create a unified quantized checkpoint for `tensorrt_edgellm`.
 
-The quantization CLI writes a unified HuggingFace-style checkpoint directory that `llm_loader` can export directly.
+The quantization CLI writes a unified HuggingFace-style checkpoint directory that `tensorrt_edgellm` can export directly.
 
 Skip this step when you already have a supported pre-quantized HuggingFace checkpoint.
 
 ## Setup
 
-Install `experimental/quantization/requirements.txt` from the Installation Guide before running the quantization CLI.
+Install `requirements.txt` and the `tools` extra from the Installation Guide before running the quantization CLI.
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
 cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
-python -m experimental.quantization --help
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
+tensorrt-edgellm-quantize --help
 ```
 
 ## Quantize An LLM
 
 ```bash
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-0.6B \
   --output_dir /tmp/qwen3_0_6b_nvfp4 \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 ```
 
-The output directory is a HuggingFace-style checkpoint that `llm_loader` can export directly. See [Quick Start Guide](../getting_started/quick-start-guide.md) for the full export-build-inference workflow.
+The output directory is a HuggingFace-style checkpoint that `tensorrt_edgellm` can export directly. See [Quick Start Guide](../getting_started/quick-start-guide.md) for the full export-build-inference workflow.
 
 ## Enable FP8 KV Cache
 
 ```bash
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-8B \
   --output_dir /tmp/qwen3_nvfp4_fp8kv \
   --quantization nvfp4 \
   --kv_cache_quantization fp8
 ```
 
-When this checkpoint is exported with `llm_loader`, FP8 KV cache is detected from the checkpoint metadata automatically. See [FP8 KV Cache](FP8KV.md) for details on FP8 KV cache behavior and platform requirements.
+When this checkpoint is exported with `tensorrt_edgellm`, FP8 KV cache is detected from the checkpoint metadata automatically. See [FP8 KV Cache](FP8KV.md) for details on FP8 KV cache behavior and platform requirements.
 
 ## Quantize A Visual Tower To FP8
 
@@ -48,7 +48,7 @@ visual tower to FP8. Use a multimodal calibration dataset so the visual path see
 real image activations:
 
 ```bash
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-VL-2B-Instruct \
   --output_dir /tmp/qwen3_vl_fp8_visual \
   --quantization nvfp4 \
@@ -60,7 +60,7 @@ python -m experimental.quantization llm \
 ## Quantize An EAGLE3 Draft
 
 ```bash
-python -m experimental.quantization draft \
+tensorrt-edgellm-quantize draft \
   --base_model_dir /path/to/base_model \
   --draft_model_dir /path/to/eagle3_draft \
   --output_dir /tmp/eagle3_draft_fp8 \
@@ -69,7 +69,27 @@ python -m experimental.quantization draft \
 
 ## Quantize Embedding Table To FP8
 
-FP8 embedding quantization is applied at export time via `llm_loader`, not during the quantization step. Pass `--fp8-embedding` when exporting the quantized checkpoint. See [FP8 Embedding](fp8-embedding.md) for details and usage examples.
+FP8 embedding quantization is applied at export time via `tensorrt_edgellm`, not during the quantization step. Pass `--fp8-embedding` when exporting the quantized checkpoint. See [FP8 Embedding](fp8-embedding.md) for details and usage examples. Export the runtime embedding table in FP8:
+
+```bash
+tensorrt-edgellm-export \
+  /tmp/qwen35_nvfp4 \
+  /tmp/qwen35_onnx \
+  --fp8-embedding
+```
+
+For NVFP4 MoE models (e.g. Qwen3-MoE), use `--nvfp4-moe-backend` to select the plugin backend:
+
+```bash
+tensorrt-edgellm-export \
+  /path/to/Qwen3-MoE-NVFP4 \
+  /tmp/qwen3_moe_onnx \
+  --nvfp4-moe-backend thor
+```
+
+Choices: `thor` (Nvfp4MoePlugin, SM100/101/110) or `geforce` (NvFP4MoEPluginGeforce, SM120/121). Defaults to checkpoint config, then `thor`.
+
+Build engines and run inference with the normal C++ tools. See [Quick Start Guide](../getting_started/quick-start-guide.md).
 
 ## Supported Methods
 

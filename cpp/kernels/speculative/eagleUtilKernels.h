@@ -211,7 +211,7 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
 void eagleBaseAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
     rt::Tensor& hiddenState, cudaStream_t stream);
 
-//! The kernel will initialize the draft table for a new round of drafting. 
+//! The kernel will initialize the draft table for a new round of drafting.
 //! Draft token ids will be translated towards full vocab size. During eagle spec-decode draft tree construction,
 //! we will build multiple full data tables to record the complete description of a draft tree. The full table will contain
 //! the root node so the full-table size is (1 + draft-topK + total-draft-round x draft-topK x draft-topK).

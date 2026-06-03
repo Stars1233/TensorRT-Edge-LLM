@@ -142,6 +142,15 @@ from dense_gemm_sm120 import (
 _SF_VEC_SIZE = 16
 _COMPACT_STATIC_TILE_M = 128
 
+# AOT-baked mainloop pipeline depth (number of A/B operand smem buffers).
+# MUST mirror ``CuteDslNvfp4MoeRunner::kStaticAbStage`` in the C++ runner:
+# the runner's ``canImplement`` enforces
+# ``H % (tile_k * _AB_STAGE_DEFAULT) == 0`` so the K-tile pipeline drains
+# cleanly without a Python-side divisor search (which could not trace with
+# a symbolic K anyway). Changing this value requires updating the C++ side
+# AND rebuilding the AOT pack.
+_AB_STAGE_DEFAULT = 2
+
 # DEBUG: opt-in smem dump. When the env var is set at import time the MMA
 # warp writes sSFB[0..15] (stage 0) into scatter_output[0, 0..15] as bf16
 # byte values after the first FC1 TMA load. Used to verify whether the TMA
@@ -527,10 +536,8 @@ class MoEDecodeKernel:
                 offset = _align_up(offset, self.buffer_align_bytes)
         return offset
 
-    def _setup_attributes(self, hidden_size: int):
+    def _setup_attributes(self):
         import cutlass.utils.blackwell_helpers as sm120_utils
-
-        self._hidden_size = hidden_size
 
         mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
             self.a_dtype,
@@ -579,13 +586,14 @@ class MoEDecodeKernel:
             self.smem_capacity,
             self.occupancy,
         )
-        self.ab_stage = max(1, min(self.ab_stage, 2))
-        # ab_stage must divide k_tile_cnt evenly to avoid pipeline phase mismatch.
-        # _compute_stages returns the max that fits in smem, but it may not
-        # divide k_tile_cnt. Round down to the nearest divisor.
-        k_tile_cnt = self._hidden_size // self.tile_shape_mnk[2]
-        while self.ab_stage > 1 and k_tile_cnt % self.ab_stage != 0:
-            self.ab_stage -= 1
+        # ab_stage is fixed at AOT trace time. The C++ runner's canImplement
+        # enforces H % (tile_k * _AB_STAGE_DEFAULT) == 0 so the K-tile pipeline
+        # always drains cleanly; no Python-side divisor search is needed.
+        self.ab_stage = _AB_STAGE_DEFAULT
+        # MoE epilogue is scatter-add / FC1-to-FC2 quant handoff (not a TMA
+        # store), so there is no async output I/O to overlap with the next
+        # MMA tile. A single epi buffer is sufficient; the smem budget freed
+        # by epi_stage = 1 stays available for ab_stage operand buffers.
         self.epi_stage = 1
         while True:
             (
@@ -662,7 +670,6 @@ class MoEDecodeKernel:
         token_weights: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        hidden_size_static: cutlass.Constexpr = None,
     ):
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
@@ -672,17 +679,7 @@ class MoEDecodeKernel:
         # Compact decode always scatters into token-major row-major output.
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
 
-        # AOT export passes hidden_size_static as a Python int so the
-        # compile-time ab_stage divisor loop in _setup_attributes stays
-        # traceable; runtime path leaves it None and falls back to the tensor
-        # shape (always a Python int there). The branch is resolved at Python
-        # trace time (Constexpr None check), not in DSL control flow.
-        hidden_size = (
-            hidden_size_static
-            if hidden_size_static is not None
-            else a_input.shape[1]
-        )
-        self._setup_attributes(hidden_size=hidden_size)
+        self._setup_attributes()
 
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             packed_a.shape, self.sf_vec_size

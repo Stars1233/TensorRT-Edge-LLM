@@ -66,7 +66,7 @@ Attention kernels are compiled into CUDA binaries. We provide the methods to pro
 
 The AttentionPlugin integrates into the TensorRT Edge-LLM inference pipeline through the following stages:
 
-1. **Export Phase**: During ONNX model export, `llm_loader` emits attention custom-op nodes through TensorRT Edge-LLM ONNX translations.
+1. **Export Phase**: During ONNX model export, `tensorrt_edgellm` emits attention custom-op nodes through TensorRT Edge-LLM ONNX translations.
 2. **Engine Construction**: The TensorRT engine builder identifies plugin operations via registered plugin creators and integrates them into the optimized computation graph.
 3. **Runtime Execution**: During inference, the AttentionPlugin executes as a node within the TensorRT engine's execution graph, with memory management handled by the TensorRT runtime.
 
@@ -100,7 +100,7 @@ A simplified kernel implementation is provided for this plugin. Evaluation indic
 
 The Int4GroupwiseGemmPlugin integrates into the TensorRT Edge-LLM inference pipeline through the following stages:
 
-1. **Quantization Phase**: `experimental.quantization` or a supported pre-quantized checkpoint stores linear layers in INT4 weights-only groupwise format with group size 128.
-2. **Export Phase**: During ONNX model export, `llm_loader` emits quantized matrix multiplication custom-op nodes for Int4GroupwiseGemmPlugin.
+1. **Quantization Phase**: `tensorrt-edgellm-quantize` or a supported pre-quantized checkpoint stores linear layers in INT4 weights-only groupwise format with group size 128.
+2. **Export Phase**: During ONNX model export, `tensorrt_edgellm` emits quantized matrix multiplication custom-op nodes for Int4GroupwiseGemmPlugin.
 3. **Engine Construction**: The TensorRT engine builder identifies Int4GroupwiseGemmPlugin operations via registered plugin creators and integrates them into the optimized computation graph.
 4. **Runtime Execution**: During inference, the Int4GroupwiseGemmPlugin executes quantized GEMM/GEMV operations as nodes within the TensorRT engine's execution graph.

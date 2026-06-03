@@ -299,13 +299,8 @@ public:
 
     static FMHAKernelLoader& Get()
     {
-        static std::unique_ptr<FMHAKernelLoader> kernelLoader = nullptr;
-        if (kernelLoader == nullptr)
-        {
-            kernelLoader = std::make_unique<FMHAKernelLoader>(FMHAKernelLoader());
-        }
-
-        return *kernelLoader;
+        static FMHAKernelLoader instance;
+        return instance;
     }
 
 private:

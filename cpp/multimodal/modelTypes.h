@@ -46,13 +46,13 @@ enum class ModelType
 //! @return Corresponding ModelType enum value
 inline ModelType stringToModelType(std::string const& modelTypeStr)
 {
-    if (modelTypeStr == "qwen2_vl")
+    if (modelTypeStr == "qwen2_vl" || modelTypeStr == "qwen2_vl_vision")
         return ModelType::QWEN2_VL;
-    if (modelTypeStr == "qwen2_5_vl")
+    if (modelTypeStr == "qwen2_5_vl" || modelTypeStr == "qwen2_5_vl_vision")
         return ModelType::QWEN2_5_VL;
-    if (modelTypeStr == "qwen3_vl")
+    if (modelTypeStr == "qwen3_vl" || modelTypeStr == "qwen3_vl_vision")
         return ModelType::QWEN3_VL;
-    if (modelTypeStr == "qwen3_5")
+    if (modelTypeStr == "qwen3_5" || modelTypeStr == "qwen3_5_vision")
         return ModelType::QWEN3_5;
     if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text"
         || modelTypeStr == "qwen3_asr_thinker" || modelTypeStr == "qwen3_omni_audio_encoder")

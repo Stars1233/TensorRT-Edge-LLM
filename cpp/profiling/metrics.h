@@ -46,11 +46,13 @@ inline std::string const kLLM_LAYER = "llm_layer";                         //!< 
 inline std::string const kMULTIMODAL_PROCESSING = "multimodal_processing"; //!< Multimodal processing stage (legacy)
 inline std::string const kAUDIO_ENCODER = "audio_encoder";                 //!< Audio encoder stage
 inline std::string const kVISION_ENCODER = "vision_encoder";               //!< Vision encoder stage
-inline std::string const kEAGLE_DRAFT_PREFILL = "eagle_draft_prefill";     //!< Eagle draft prefill stage
-inline std::string const kEAGLE_CONSTRUCT_DRAFT_TREE = "eagle_construct_draft_tree"; //!< Eagle draft tree construction
-inline std::string const kEAGLE_BASE_VERIFICATION = "eagle_base_verification";       //!< Eagle base verification stage
-inline std::string const kCODE2WAV = "code2wav";                                     //!< Code2Wav vocoder stage
-inline std::string const kTALKER_GENERATION = "talker_generation";                   //!< Talker audio frame generation
+inline std::string const kSPEC_DECODE_DRAFT_PREFILL = "spec_decode_draft_prefill"; //!< Speculative decode draft prefill
+inline std::string const kSPEC_DECODE_DRAFT_PROPOSAL
+    = "spec_decode_draft_proposal"; //!< Speculative decode draft proposal
+inline std::string const kSPEC_DECODE_BASE_VERIFICATION
+    = "spec_decode_base_verification";                             //!< Speculative decode base verification
+inline std::string const kCODE2WAV = "code2wav";                   //!< Code2Wav vocoder stage
+inline std::string const kTALKER_GENERATION = "talker_generation"; //!< Talker audio frame generation
 inline std::string const kCODE_PREDICTOR
     = "code_predictor"; //!< CodePredictor RVQ code generation (legacy aggregate; superseded by
                         //!< kCODEPREDICTOR_PREFILL/kCODEPREDICTOR_GENERATION)
@@ -165,17 +167,17 @@ public:
 };
 
 /*!
- * @brief Eagle speculative decoding generation metrics
+ * @brief Speculative decoding generation metrics
  *
- * Tracks iterations and tokens generated during Eagle spec-decode.
+ * Tracks iterations and tokens generated during speculative decoding.
  */
-class EagleGenerationMetrics : public BaseMetrics
+class SpecDecodeGenerationMetrics : public BaseMetrics
 {
 public:
-    int64_t totalIterations{0};      //!< Total number of Eagle iterations
+    int64_t totalIterations{0};      //!< Total number of speculative decoding iterations
     int64_t totalGeneratedTokens{0}; //!< Total number of generated tokens
 
-    //! @brief Record an Eagle generation run
+    //! @brief Record a speculative decoding generation run
     //! @param iterations Number of iterations
     //! @param generatedTokens Number of generated tokens
     void recordRun(int64_t iterations, int64_t generatedTokens) noexcept

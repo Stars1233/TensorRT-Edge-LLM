@@ -19,8 +19,8 @@
 
 #include "common/tensor.h"
 #include "profiling/metrics.h"
-#include "runtime/llmEngineRunner.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/legacy/llmEngineRunner.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
 #include <memory>
@@ -77,7 +77,7 @@ constexpr int32_t kVideoTokenId = 151656;   //!< Video placeholder token
  *
  * Architecture Philosophy:
  *   - Talker is an LLM decoder, NOT a multimodal input encoder
- *   - Similar to LLMInferenceSpecDecodeRuntime, manages multiple LLM engines
+ *   - Similar to LLMInferenceRuntime, manages multiple LLM engines
  *   - Standalone runtime, not dependent on MultimodalRunner hierarchy
  *   - Code2Wav vocoding is separated for better modularity
  */
@@ -162,11 +162,11 @@ public:
      * - Sampling at Runtime Layer (batched)
      *
      * This is the main entry point for audio generation, analogous to
-     * LLMInferenceSpecDecodeRuntime::handleRequest() for standard LLM inference.
+     * LLMInferenceRuntime::handleRequest() for standard LLM inference.
      *
      * @note Sampling parameters (temperature, topK, topP, repetitionPenalty) are taken
      *       from requests[0] and applied uniformly to all batches. This matches
-     *       LLMInferenceSpecDecodeRuntime's design where SamplingParams is shared across the batch.
+     *       LLMInferenceRuntime's design where SamplingParams is shared across the batch.
      *
      * @param requests Batch of requests, each containing per-batch input data
      * @param response Response containing generated RVQ codes [batchSize][frames][codes]
@@ -225,7 +225,7 @@ public:
      *
      * @note Sampling parameters (temperature, topK, topP, repetitionPenalty) are taken
      *       from requests[0] and applied uniformly to all batches. This matches
-     *       LLMInferenceSpecDecodeRuntime's design where SamplingParams is shared across the batch.
+     *       LLMInferenceRuntime's design where SamplingParams is shared across the batch.
      *
      * @param requests Batch of requests, each containing per-batch thinker embeddings
      * @param response Response containing generated RVQ codes [batchSize][frames][codes]
@@ -271,7 +271,7 @@ public:
      * @param stream  CUDA stream (shared by Thinker and Talker)
      * @return True if the full pipeline succeeded
      */
-    bool handleStreamingGeneration(LLMInferenceSpecDecodeRuntime& thinkerRuntime, LLMGenerationRequest& thinkerRequest,
+    bool handleStreamingGeneration(LLMInferenceRuntime& thinkerRuntime, LLMGenerationRequest& thinkerRequest,
         LLMGenerationResponse& thinkerResponse, ThinkerTalkerStreamingConfig const& streamingConfig,
         OmniGenerationRequest const& omniBaseRequest, TalkerGenerationResponse& talkerResponse, cudaStream_t stream);
 
@@ -309,7 +309,7 @@ public:
     }
 
     /*!
-     * @brief Capture CUDA graphs for decoding steps (same pattern as LLMInferenceSpecDecodeRuntime).
+     * @brief Capture CUDA graphs for decoding steps (same pattern as LLMInferenceRuntime).
      * @param stream CUDA stream for capture
      * @return True if all graphs captured successfully
      */

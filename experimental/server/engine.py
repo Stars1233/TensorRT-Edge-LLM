@@ -43,7 +43,12 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Sequence, Union
+
+from .tool_calling import (ToolConfig, parse_assistant_output,
+                           validate_tool_request)
+from .tool_chat_template import (ToolChatTemplateFormatter,
+                                 needs_tool_chat_template)
 
 logger = logging.getLogger("edgellm.server")
 
@@ -75,6 +80,7 @@ class SamplingParams:
     max_tokens: int = 2048
     enable_thinking: bool = False
     disable_spec_decode: bool = False
+    stop: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -84,6 +90,8 @@ class CompletionOutput:
     text: str = ""
     token_ids: List[int] = field(default_factory=list)
     finish_reason: Optional[str] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    reasoning: Optional[str] = None
 
 
 @dataclass
@@ -225,16 +233,15 @@ def _import_runtime():
     )
 
 
-def _llm_loader_dir() -> Path:
-    """Return path to the llm_loader package, adding it to sys.path."""
-    loader_dir = Path(__file__).resolve().parent.parent / "llm_loader"
-    if not loader_dir.is_dir():
-        raise RuntimeError(f"llm_loader not found at {loader_dir}. "
-                           "Ensure experimental/llm_loader/ exists.")
-    experimental_dir = str(loader_dir.parent)
-    if experimental_dir not in sys.path:
-        sys.path.insert(0, experimental_dir)
-    return loader_dir
+def _ensure_export_package() -> None:
+    """Ensure the installed checkpoint export package is importable."""
+    try:
+        import tensorrt_edgellm  # noqa: F401
+        return
+    except ImportError:
+        project_root = str(Path(__file__).resolve().parent.parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +283,6 @@ class LLM:
         max_input_len: int = 4096,
         max_batch_size: int = 1,
         max_kv_cache_capacity: int = 8192,
-        use_trt_native_ops: bool = False,
         eagle_engine_dir: str = "",
         draft_top_k: int = 10,
         draft_step: int = 6,
@@ -294,6 +300,8 @@ class LLM:
         self._draft_top_k = draft_top_k
         self._draft_step = draft_step
         self._verify_tree_size = verify_tree_size
+        self._tool_template_formatter: Optional[
+            ToolChatTemplateFormatter] = None
 
         if engine_dir:
             self._init_from_engine(engine_dir, visual_engine_dir)
@@ -304,7 +312,6 @@ class LLM:
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
-                use_trt_native_ops=use_trt_native_ops,
             )
         else:
             self._init_from_model(
@@ -312,7 +319,6 @@ class LLM:
                 max_input_len=max_input_len,
                 max_batch_size=max_batch_size,
                 max_kv_cache_capacity=max_kv_cache_capacity,
-                use_trt_native_ops=use_trt_native_ops,
             )
 
         self._load_runtime()
@@ -357,13 +363,11 @@ class LLM:
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
-        use_trt_native_ops: bool,
     ) -> None:
         """Build engine from ONNX directories (no export)."""
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
-        self._use_trt_native_ops = use_trt_native_ops
         self._onnx_dir = onnx_dir
         self._visual_onnx_dir = visual_onnx_dir
         self._model_dir = onnx_dir
@@ -400,13 +404,11 @@ class LLM:
         max_input_len: int,
         max_batch_size: int,
         max_kv_cache_capacity: int,
-        use_trt_native_ops: bool,
     ) -> None:
         """Export ONNX + build engine from HuggingFace checkpoint."""
         self._max_input_len = max_input_len
         self._max_batch_size = max_batch_size
         self._max_kv_cache_capacity = max_kv_cache_capacity
-        self._use_trt_native_ops = use_trt_native_ops
 
         logger.info("Resolving model: %s", model)
         self._model_dir = _resolve_model_dir(model)
@@ -439,7 +441,6 @@ class LLM:
             max_input_len=max_input_len,
             max_batch_size=max_batch_size,
             max_kv_cache_capacity=max_kv_cache_capacity,
-            use_trt_native_ops=use_trt_native_ops,
         )
 
     def _load_runtime(self) -> None:
@@ -479,12 +480,12 @@ class LLM:
     # ------------------------------------------------------------------
 
     def _export_onnx(self) -> None:
-        """Export the model checkpoint to ONNX via llm_loader."""
+        """Export the model checkpoint to ONNX via tensorrt_edgellm."""
         logger.info("Exporting ONNX to %s ...", self._onnx_dir)
         os.makedirs(self._onnx_dir, exist_ok=True)
 
-        _llm_loader_dir()
-        from llm_loader import AutoModel, export_onnx
+        _ensure_export_package()
+        from tensorrt_edgellm import AutoModel, export_onnx
 
         model = AutoModel.from_pretrained(self._model_dir, device="cpu")
         output_path = os.path.join(self._onnx_dir, "model.onnx")
@@ -492,8 +493,8 @@ class LLM:
 
         # Patch image_token_id for VLM models
         if self._is_vlm:
-            _llm_loader_dir()
-            from llm_loader.export_all_cli import _find_token_id
+            _ensure_export_package()
+            from tensorrt_edgellm.scripts.export import _find_token_id
             image_token_id = _find_token_id(self._model_dir, "<|image_pad|>")
             if image_token_id is not None:
                 cfg_path = os.path.join(self._onnx_dir, "config.json")
@@ -511,7 +512,7 @@ class LLM:
         logger.info("ONNX export complete: %s", output_path)
 
     def _export_visual_onnx(self) -> None:
-        """Export the visual encoder to ONNX via llm_loader."""
+        """Export the visual encoder to ONNX via tensorrt_edgellm."""
         logger.info(
             "Exporting visual ONNX to %s ...",
             self._visual_onnx_dir,
@@ -520,9 +521,10 @@ class LLM:
 
         import torch
 
-        _llm_loader_dir()
-        from llm_loader.export_all_cli import (_export_visual,
-                                               _load_all_weights, _load_config)
+        _ensure_export_package()
+        from tensorrt_edgellm.scripts.export import (_export_visual,
+                                                     _load_all_weights,
+                                                     _load_config)
 
         config = _load_config(self._model_dir)
         weights = _load_all_weights(self._model_dir)
@@ -553,7 +555,6 @@ class LLM:
         config.max_input_len = self._max_input_len
         config.max_batch_size = self._max_batch_size
         config.max_kv_cache_capacity = self._max_kv_cache_capacity
-        config.use_trt_native_ops = self._use_trt_native_ops
 
         builder = rt.LLMBuilder(self._onnx_dir, self._engine_dir, config)
         if not builder.build():
@@ -602,6 +603,130 @@ class LLM:
             self._visual_engine_dir,
         )
 
+    def _tool_template_dirs(self) -> List[str]:
+        dirs = [self._model_dir, self._engine_dir]
+        if hasattr(self, "_onnx_dir"):
+            dirs.append(self._onnx_dir)
+        return dirs
+
+    def _get_tool_template_formatter(self) -> ToolChatTemplateFormatter:
+        if self._tool_template_formatter is None:
+            self._tool_template_formatter = ToolChatTemplateFormatter(
+                self._tool_template_dirs())
+        return self._tool_template_formatter
+
+    def _tool_choice_for_template(
+            self, tool_config: ToolConfig) -> Union[str, Dict[str, Any]]:
+        if tool_config.forced_name:
+            return {
+                "type": "function",
+                "function": {
+                    "name": tool_config.forced_name
+                },
+            }
+        return tool_config.tool_choice
+
+    def _prepare_messages_for_runtime(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
+        enable_thinking: bool = False,
+    ):
+        """Prepare messages for the C++ runtime."""
+        tool_config = tool_config or validate_tool_request(
+            messages, tools, tool_choice)
+        template_tools = (tool_config.tools
+                          if tool_config.tool_choice != "none" else [])
+        image_buffers = _load_image_buffers(self._rt, messages)
+
+        if needs_tool_chat_template(messages, template_tools,
+                                    tool_config.tool_choice):
+            template_tool_choice = None
+            if tool_config.tool_choice != "none":
+                template_tool_choice = self._tool_choice_for_template(
+                    tool_config)
+            prompt = self._get_tool_template_formatter().format(
+                messages,
+                tools=template_tools,
+                tool_choice=template_tool_choice,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            cpp_messages = _convert_messages_to_cpp(
+                self._rt,
+                [{
+                    "role": "user",
+                    "content": prompt,
+                }],
+            )
+            return cpp_messages, image_buffers, False, False
+
+        cpp_messages = _convert_messages_to_cpp(self._rt, messages)
+        return cpp_messages, image_buffers, True, True
+
+    def _make_generation_request(
+        self,
+        messages: List[Dict[str, Any]],
+        params: SamplingParams,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        tool_config: Optional[ToolConfig] = None,
+        stream_channel: Optional[Any] = None,
+    ):
+        tool_config = tool_config or validate_tool_request(
+            messages, tools, tool_choice)
+        cpp_messages, image_buffers, apply_template, add_prompt = (
+            self._prepare_messages_for_runtime(
+                messages,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
+                enable_thinking=params.enable_thinking,
+            ))
+
+        request = self._rt.LLMGenerationRequest()
+        req = self._rt.Request(messages=cpp_messages)
+        req.image_buffers = image_buffers
+        req.stop_strings = params.stop
+        request.requests = [req]
+        if stream_channel is not None:
+            request.stream_channels = [stream_channel]
+        request.temperature = params.temperature
+        request.top_p = params.top_p
+        request.top_k = params.top_k
+        request.max_generate_length = params.max_tokens
+        request.apply_chat_template = apply_template
+        request.add_generation_prompt = add_prompt
+        request.enable_thinking = params.enable_thinking
+        request.disable_spec_decode = params.disable_spec_decode
+        return request
+
+    def _parse_generation_output(
+        self,
+        text: str,
+        token_ids: List[int],
+        finish_reason: Optional[str],
+        tool_config: ToolConfig,
+    ) -> CompletionOutput:
+        if not tool_config.parse_output:
+            return CompletionOutput(text=text,
+                                    token_ids=token_ids,
+                                    finish_reason=finish_reason)
+
+        parsed = parse_assistant_output(text, tool_config, self._model_dir)
+        tool_calls = [call.to_openai() for call in parsed.tool_calls]
+        return CompletionOutput(
+            text=parsed.content,
+            token_ids=token_ids,
+            finish_reason="tool_calls" if tool_calls else finish_reason,
+            tool_calls=tool_calls,
+            reasoning=parsed.reasoning or None,
+        )
+
     # ------------------------------------------------------------------
     # Inference API (vLLM-style)
     # ------------------------------------------------------------------
@@ -610,6 +735,9 @@ class LLM:
         self,
         prompts: Union[str, List[str], List[List[Dict[str, Any]]]],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> List[CompletionOutput]:
         """Generate completions for the given prompts.
 
@@ -618,6 +746,8 @@ class LLM:
                 a list of OpenAI-style message lists.
             sampling_params: Sampling configuration. Defaults to
                 ``SamplingParams()``.
+            tools: Optional OpenAI-compatible tool definitions.
+            tool_choice: Optional OpenAI-compatible tool choice.
 
         Returns:
             List of ``CompletionOutput`` objects, one per prompt.
@@ -637,29 +767,22 @@ class LLM:
 
         outputs = []
         for messages in message_batches:
-            cpp_messages = _convert_messages_to_cpp(self._rt, messages)
-            image_buffers = _load_image_buffers(self._rt, messages)
-            request = self._rt.LLMGenerationRequest()
-            req = self._rt.Request(messages=cpp_messages)
-            req.image_buffers = image_buffers
-            request.requests = [req]
-            request.temperature = params.temperature
-            request.top_p = params.top_p
-            request.top_k = params.top_k
-            request.max_generate_length = params.max_tokens
-            request.apply_chat_template = True
-            request.add_generation_prompt = True
-            request.enable_thinking = params.enable_thinking
-            request.disable_spec_decode = params.disable_spec_decode
+            tool_config = validate_tool_request(messages, tools, tool_choice)
+            request = self._make_generation_request(
+                messages,
+                params,
+                tools=tool_config.tools,
+                tool_choice=tool_config.tool_choice,
+                tool_config=tool_config,
+            )
 
             response = self._runtime.handle_request(request)
             text = response.output_texts[0] if response.output_texts else ""
             ids = response.output_ids[0] if response.output_ids else []
-            reason = ("length" if len(ids) >= params.max_tokens else "stop")
+            reason = finish_reason_name(self._rt, response.finish_reasons[0]) \
+                if response.finish_reasons else "stop"
             outputs.append(
-                CompletionOutput(text=text,
-                                 token_ids=ids,
-                                 finish_reason=reason))
+                self._parse_generation_output(text, ids, reason, tool_config))
 
         return outputs
 
@@ -667,22 +790,33 @@ class LLM:
         self,
         messages: List[Dict[str, Any]],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> CompletionOutput:
         """Single-turn chat completion (convenience wrapper).
 
         Args:
             messages: OpenAI-style message list.
             sampling_params: Sampling configuration.
+            tools: Optional OpenAI-compatible tool definitions.
+            tool_choice: Optional OpenAI-compatible tool choice.
 
         Returns:
             A single ``CompletionOutput``.
         """
-        return self.generate([messages], sampling_params)[0]
+        return self.generate([messages],
+                             sampling_params,
+                             tools=tools,
+                             tool_choice=tool_choice)[0]
 
     def generate_stream(
         self,
         messages: List[Dict[str, Any]],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> Generator[StreamDelta, None, None]:
         """Stream generation deltas for a single message list.
 
@@ -691,32 +825,17 @@ class LLM:
         tokens are produced.
         """
         params = sampling_params or SamplingParams()
-        cpp_messages = _convert_messages_to_cpp(self._rt, messages)
-        image_buffers = _load_image_buffers(self._rt, messages)
 
         channel = self._rt.StreamChannel.create()
         channel.set_skip_special_tokens(True)
 
-        request = self._rt.LLMGenerationRequest()
-        req = self._rt.Request(messages=cpp_messages)
-        req.image_buffers = image_buffers
-        request.requests = [req]
-        request.stream_channels = [channel]
-        request.temperature = params.temperature
-        request.top_p = params.top_p
-        request.top_k = params.top_k
-        request.max_generate_length = params.max_tokens
-        request.apply_chat_template = True
-        request.add_generation_prompt = True
-        request.enable_thinking = params.enable_thinking
-        request.disable_spec_decode = params.disable_spec_decode
-
-        _FINISH_REASON_MAP = {
-            self._rt.FinishReason.END_ID: "stop",
-            self._rt.FinishReason.LENGTH: "length",
-            self._rt.FinishReason.CANCELLED: "cancelled",
-            self._rt.FinishReason.ERROR: "error",
-        }
+        request = self._make_generation_request(
+            messages,
+            params,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream_channel=channel,
+        )
 
         error_holder = [None]
 
@@ -737,7 +856,8 @@ class LLM:
                     if channel.is_finished() or channel.is_cancelled():
                         break
                     continue
-                reason = _FINISH_REASON_MAP.get(chunk.reason)
+                reason = finish_reason_name(
+                    self._rt, chunk.reason) if chunk.finished else None
                 yield StreamDelta(
                     text=chunk.text,
                     token_ids=list(chunk.token_ids),
@@ -790,6 +910,25 @@ class LLM:
 # ---------------------------------------------------------------------------
 # Message conversion & image loading
 # ---------------------------------------------------------------------------
+
+
+def finish_reason_name(rt_module, reason) -> Optional[str]:
+    """Map a C++ FinishReason enum value to its OpenAI-compatible string.
+
+    NOT_FINISHED maps to None — reaching this function with a non-terminal
+    reason indicates a bug; surfacing None instead of silently returning "stop"
+    makes it visible. The fallback "stop" catches truly-unknown enum values
+    (e.g. future C++ enum additions). STOP_WORDS and END_ID both map to "stop"
+    since OpenAI does not distinguish them.
+    """
+    return {
+        rt_module.FinishReason.NOT_FINISHED: None,
+        rt_module.FinishReason.END_ID: "stop",
+        rt_module.FinishReason.LENGTH: "length",
+        rt_module.FinishReason.CANCELLED: "cancelled",
+        rt_module.FinishReason.ERROR: "error",
+        rt_module.FinishReason.STOP_WORDS: "stop",
+    }.get(reason, "stop")
 
 
 def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):

@@ -19,8 +19,8 @@
 
 #include "common/logger.h"
 #include "common/utf8.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/decodingInferenceContext.h"
 #include "tokenizer/tokenizer.h"
 
 #include <algorithm>
@@ -200,7 +200,80 @@ bool validateStreamingSubmission(LLMGenerationRequest const& request)
     return true;
 }
 
-void applyCancellationToFinishStates(SpecDecodeInferenceContext& context)
+char const* finishReasonName(FinishReason r) noexcept
+{
+    switch (r)
+    {
+    case FinishReason::kNotFinished: return "not-finished";
+    case FinishReason::kEndId: return "end-of-sequence";
+    case FinishReason::kLength: return "max-length";
+    case FinishReason::kCancelled: return "cancelled";
+    case FinishReason::kError: return "error";
+    case FinishReason::kStopWords: return "stop-words";
+    }
+    return "?";
+}
+
+StopMatchOutcome applyStopStringMatch(
+    std::string& buffer, std::vector<std::string> const& stops, size_t maxStopLen, bool isFinal)
+{
+    StopMatchOutcome out;
+
+    // maxStopLen == 0 ⇒ no stops or all-empty entries — pass-through.
+    if (maxStopLen == 0)
+    {
+        out.emitted = std::move(buffer);
+        buffer.clear();
+        return out;
+    }
+
+    // Earliest-position-wins across all non-empty stops.
+    size_t earliest = std::string::npos;
+    for (auto const& stop : stops)
+    {
+        if (stop.empty())
+        {
+            continue;
+        }
+        size_t const pos = buffer.find(stop);
+        if (pos < earliest)
+        {
+            earliest = pos;
+        }
+    }
+
+    if (earliest != std::string::npos)
+    {
+        // Matched — emit everything before the match, drop the rest.
+        out.emitted = buffer.substr(0, earliest);
+        buffer.clear();
+        out.stopMatched = true;
+        return out;
+    }
+
+    if (isFinal)
+    {
+        // Final flush: nothing held back.
+        out.emitted = std::move(buffer);
+        buffer.clear();
+        return out;
+    }
+
+    // No match yet: hold back the last (maxStopLen - 1) bytes so a stop string
+    // straddling the emit/buffer boundary is detected on the next iteration.
+    size_t const holdBack = maxStopLen - 1;
+    if (buffer.size() <= holdBack)
+    {
+        // Whole buffer must be retained — nothing safe to emit.
+        return out; // out.emitted stays empty
+    }
+    size_t const safeLen = buffer.size() - holdBack;
+    out.emitted = buffer.substr(0, safeLen);
+    buffer.erase(0, safeLen);
+    return out;
+}
+
+void applyCancellationToFinishStates(DecodingInferenceContext& context)
 {
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
@@ -222,55 +295,99 @@ void applyCancellationToFinishStates(SpecDecodeInferenceContext& context)
     }
 }
 
-void emitChunks(SpecDecodeInferenceContext& context, tokenizer::Tokenizer const& tok)
+void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const& tok)
 {
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
         auto& s = context.slotStreams[i];
-        if (!s.channel)
+        auto const& slotStops = context.stopStringsPerSlot[i];
+        bool const hasChannel = (s.channel != nullptr);
+        bool const slotStopsEnabled = !slotStops.empty();
+
+        s.stopMatchedThisIter = false;
+        s.pendingEmitText.clear();
+
+        // Fast path: slot needs neither chunk emission nor stop detection.
+        if (!hasChannel && !slotStopsEnabled)
         {
             continue;
         }
 
         bool const isFinal = context.finishedStates[i] != 0;
-        int32_t const streamInterval = s.channel->getStreamInterval();
-        size_t const newlyAvailable = context.tokenIds[i].size() - s.sentTokenCount;
-        bool const intervalMet = static_cast<int32_t>(newlyAvailable) >= streamInterval;
 
-        if (!isFinal && !intervalMet)
+        // Stream-interval gating; non-streaming slots run detection every iter.
+        if (hasChannel)
         {
-            continue;
+            int32_t const streamInterval = s.channel->getStreamInterval();
+            size_t const newlyAvailable = context.tokenIds[i].size() - s.sentTokenCount;
+            bool const intervalMet = static_cast<int32_t>(newlyAvailable) >= streamInterval;
+            if (!isFinal && !intervalMet)
+            {
+                continue;
+            }
         }
 
-        size_t const snapLastEmitted = s.lastEmittedTokenCount;
-        bool const skipSpecial = s.channel->getSkipSpecialTokens();
+        // For non-streaming slots there is no channel to read skipSpecial from;
+        // default to true (matches Tokenizer::decode(..., true) used in finalization).
+        bool const skipSpecial = hasChannel ? s.channel->getSkipSpecialTokens() : true;
         std::string delta = tokenizer::emitDelta(s, tok, context.tokenIds[i], skipSpecial);
         if (isFinal && !s.pendingBytes.empty())
         {
             delta.append(tokenizer::emitDeltaFlush(s));
         }
 
-        if (!delta.empty() || isFinal)
+        // Stop match overrides kEndId/kLength but not kCancelled/kError. The
+        // override itself is applied by updateFinishStates based on stopMatchedThisIter.
+        bool const stopActive = slotStopsEnabled && s.terminalReason != FinishReason::kCancelled
+            && s.terminalReason != FinishReason::kError;
+        if (stopActive)
         {
-            StreamChunk chunk;
-            // Delta tokens span [lastEmittedTokenCount, sentTokenCount) — correctly
-            // accumulates across prior holds where delta was empty.
-            chunk.tokenIds.assign(context.tokenIds[i].begin() + static_cast<std::ptrdiff_t>(snapLastEmitted),
-                context.tokenIds[i].begin() + static_cast<std::ptrdiff_t>(s.sentTokenCount));
-            chunk.text = std::move(delta);
-            chunk.finished = isFinal;
-            if (isFinal)
-            {
-                chunk.reason = s.terminalReason;
-            }
+            s.stopMatchBuffer.append(delta);
+            auto outcome = applyStopStringMatch(s.stopMatchBuffer, slotStops, s.maxStopLen, isFinal);
+            s.pendingEmitText = std::move(outcome.emitted);
+            s.stopMatchedThisIter = outcome.stopMatched;
+        }
+        else
+        {
+            s.pendingEmitText = std::move(delta);
+        }
+    }
+}
 
-            s.channel->push(std::move(chunk));
-            s.lastEmittedTokenCount = s.sentTokenCount;
+void emitChunks(DecodingInferenceContext& context)
+{
+    for (int32_t i = 0; i < context.activeBatchSize; ++i)
+    {
+        auto& s = context.slotStreams[i];
+        if (!s.channel)
+        {
+            continue; // non-streaming: output assembled at handleRequest finalization
+        }
 
-            if (isFinal)
-            {
-                s.channel->finish(s.terminalReason);
-            }
+        bool const isFinal = context.finishedStates[i] != 0;
+        if (s.pendingEmitText.empty() && !isFinal)
+        {
+            continue;
+        }
+
+        StreamChunk chunk;
+        // Delta tokens span [lastEmittedTokenCount, sentTokenCount) — accumulates
+        // across prior iterations where pendingEmitText was held back.
+        size_t const snapLastEmitted = s.lastEmittedTokenCount;
+        chunk.tokenIds.assign(context.tokenIds[i].begin() + static_cast<std::ptrdiff_t>(snapLastEmitted),
+            context.tokenIds[i].begin() + static_cast<std::ptrdiff_t>(s.sentTokenCount));
+        chunk.text = std::move(s.pendingEmitText);
+        chunk.finished = isFinal;
+        if (isFinal)
+        {
+            chunk.reason = s.terminalReason;
+        }
+
+        s.channel->push(std::move(chunk));
+        s.lastEmittedTokenCount = s.sentTokenCount;
+        if (isFinal)
+        {
+            s.channel->finish(s.terminalReason);
         }
     }
 }
@@ -279,8 +396,7 @@ void emitChunks(SpecDecodeInferenceContext& context, tokenizer::Tokenizer const&
 // StreamChannelFinalizer — RAII terminal-chunk guarantee
 //=============================================================================
 
-StreamChannelFinalizer::StreamChannelFinalizer(
-    SpecDecodeInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept
+StreamChannelFinalizer::StreamChannelFinalizer(DecodingInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept
     : mCtx(ctx)
     , mTok(tok)
 {

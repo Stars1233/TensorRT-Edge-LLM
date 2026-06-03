@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,123 +13,62 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-TensorRT Edge-LLM - A Python package for quantizing and exporting LLMs for edge deployment.
+Checkpoint loader and ONNX exporter for causal LMs.
 
-This package provides utilities for quantizing large language models using NVIDIA ModelOpt
-and preparing them for ONNX export and edge deployment. It supports various quantization
-schemes including FP8, INT4 AWQ, and NVFP4 for efficient inference on edge devices.
+Supports common HF architectures and FP8, NVFP4, INT4 (AWQ / GPTQ), INT8 SmoothQuant,
+and mixed-precision checkpoints when described by ``config.json`` / ``hf_quant_config.json``.
 
-Key Features:
-    - LLM quantization with calibration support
-    - Multiple quantization schemes (FP8, INT4 AWQ, NVFP4)
-    - Automatic model type detection
-    - HuggingFace model compatibility
-    - Quantization configuration management
-    - ONNX export for LLM and visual models
-    - LoRA pattern insertion and weight processing
+Quick start::
 
-Example Usage:
-    .. code-block:: python
+    from tensorrt_edgellm import AutoModel, export_onnx
 
-        from tensorrt_edgellm import (
-            quantize_and_save_llm,
-            quantize_and_save_draft,
-            export_llm_model,
-            export_draft_model,
-            visual_export,
-            insert_lora_and_save,
-            process_lora_weights_and_save
-        )
-        
-        # Quantize and save a standard LLM model
-        quantize_and_save_llm(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            quantization="fp8",
-            dtype="fp16",
-            dataset_dir="cnn_dailymail"
-        )
+    model = AutoModel.from_pretrained("/path/to/checkpoint")
+    export_onnx(model, "output/model.onnx", model_dir="/path/to/checkpoint")
 
-        # Quantize and save an EAGLE draft model
-        quantize_and_save_draft(
-            base_model_dir="path/to/base_model",
-            draft_model_dir="path/to/draft_model",
-            output_dir="path/to/output",
-            quantization="fp8",
-            dtype="fp16",
-            dataset_dir="cnn_dailymail"
-        )
-        
-        # Export standard LLM to ONNX
-        export_llm_model(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            device="cuda"
-        )
-        
-        # Export EAGLE base model to ONNX
-        export_llm_model(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            is_eagle_base=True
-        )
-        
-        # Export EAGLE draft model to ONNX
-        export_draft_model(
-            draft_model_dir="path/to/draft_model",
-            output_dir="path/to/output",
-            base_model_dir="path/to/base_model",
-        )
-        
-        # Export visual model to ONNX
-        visual_export(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            dtype="fp16"
-        )
-        
-        # Insert LoRA patterns into ONNX models
-        insert_lora_and_save(
-            onnx_dir="path/to/onnx_model"
-        )
-        
-        # Process LoRA weights
-        process_lora_weights_and_save(
-            input_dir="path/to/adapter",
-            output_dir="path/to/output"
-        )
-        # Reduce vocabulary
-        reduce_vocab_size(
-            model_dir="path/to/model",
-            output_dir="path/to/output",
-            reduced_vocab_size=30000
-        )
+Config: :func:`checkpoint.checkpoint_utils.load_checkpoint_config_dicts` /
+:func:`checkpoint.checkpoint_utils.load_config_dict`. Weights: :func:`checkpoint.loader.load_weights`.
+Export sidecars: :func:`checkpoint.checkpoint_utils.write_runtime_artifacts`.
 """
 
-from .onnx_export.action_export import action_export
-from .onnx_export.audio_export import audio_export
-from .onnx_export.llm_export import export_draft_model, export_llm_model
-from .onnx_export.lora import (insert_lora_and_save,
-                               process_lora_weights_and_save)
-from .onnx_export.visual_export import visual_export
-from .quantization.llm_quantization import (quantize_and_save_draft,
-                                            quantize_and_save_llm)
-from .vocab_reduction.vocab_reduction import reduce_vocab_size
+from ._version import __version__
+from .checkpoint.checkpoint_utils import (load_checkpoint_config_dicts,
+                                          load_config_dict)
+from .checkpoint.loader import load_weights
+from .config import ModelConfig, QuantConfig
+from .model import AutoModel, register_model
+# Register model-type-specific implementations
+from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
+from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
+from .models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeCausalLM
+from .models.qwen3_asr.modeling_qwen3_asr_text import Qwen3ASRLanguageModel
+from .models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeCausalLM
+from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
+from .onnx.export import export_onnx
 
-try:
-    from .version import __version__
-except ImportError:
-    __version__ = "unknown"
+register_model("nemotron_h", NemotronHCausalLM)
+register_model("qwen3_5_text", Qwen3_5CausalLM)
+register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM)
+register_model("qwen3_5_moe", Qwen3_5MoeCausalLM)
+register_model("qwen3_moe", Qwen3MoeCausalLM)
+register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM)
+register_model("NemotronH_Nano_Omni_Reasoning_V3", NemotronHCausalLM)
+# Qwen3-Omni thinker needs an extra ``hidden_states`` ONNX output for the
+# Talker handoff. Cover every model_type string that can appear in the
+# thinker's config.json across HF / exported variants.
+register_model("qwen3_omni", Qwen3OmniLanguageModel)
+register_model("qwen3_omni_thinker", Qwen3OmniLanguageModel)
+register_model("qwen3_omni_text", Qwen3OmniLanguageModel)
+register_model("qwen3_asr", Qwen3ASRLanguageModel)
+register_model("qwen3_asr_thinker", Qwen3ASRLanguageModel)
 
 __all__ = [
-    "quantize_and_save_llm",
-    "quantize_and_save_draft",
-    "export_draft_model",
-    "export_llm_model",
-    "action_export",
-    "visual_export",
-    "audio_export",
-    "insert_lora_and_save",
-    "process_lora_weights_and_save",
-    "reduce_vocab_size",
+    "__version__",
+    "AutoModel",
+    "export_onnx",
+    "load_checkpoint_config_dicts",
+    "load_config_dict",
+    "load_weights",
+    "ModelConfig",
+    "QuantConfig",
+    "register_model",
 ]

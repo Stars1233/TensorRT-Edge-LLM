@@ -39,7 +39,7 @@
 #include "common/checkMacros.h"
 #include "common/trtUtils.h"
 #include "requestFileParser.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
@@ -76,10 +76,10 @@ struct Args
     int32_t maxGenerateLength = -1; // Uses value from JSON if < 0.
     int32_t streamInterval = 1;
     bool showSpecialTokens = false; // StreamChannel::setSkipSpecialTokens(!this)
-    bool eagle = false;
-    int32_t eagleDraftTopK = 8;
-    int32_t eagleDraftStep = 4;
-    int32_t eagleVerifyTreeSize = 24;
+    bool specDecode = false;
+    int32_t specDraftTopK = 8;
+    int32_t specDraftStep = 4;
+    int32_t specVerifySize = 24;
 };
 
 void printUsage(char const* argv0)
@@ -89,7 +89,7 @@ void printUsage(char const* argv0)
                  "           [--multimodalEngineDir DIR] [--maxGenerateLength N]\n"
                  "           [--streamInterval N] [--specDecode [--specDraftTopK K]\n"
                  "                                             [--specDraftStep S]\n"
-                 "                                             [--specVerifyTreeSize V]]\n\n"
+                 "                                             [--specVerifySize V]]\n\n"
                  "Hotkeys while streaming:\n"
                  "   s         skip the current request\n"
                  "   q         quit (cancel current + stop)\n"
@@ -169,25 +169,25 @@ bool parseArgs(int argc, char** argv, Args& args)
         }
         else if (a == "--specDecode" || a == "--eagle")
         {
-            args.eagle = true;
+            args.specDecode = true;
         }
         else if (a == "--specDraftTopK" || a == "--eagleDraftTopK")
         {
-            if (!takeInt(i, a, args.eagleDraftTopK))
+            if (!takeInt(i, a, args.specDraftTopK))
             {
                 return false;
             }
         }
         else if (a == "--specDraftStep" || a == "--eagleDraftStep")
         {
-            if (!takeInt(i, a, args.eagleDraftStep))
+            if (!takeInt(i, a, args.specDraftStep))
             {
                 return false;
             }
         }
-        else if (a == "--specVerifyTreeSize" || a == "--eagleVerifyTreeSize")
+        else if (a == "--specVerifySize" || a == "--specVerifyTreeSize" || a == "--eagleVerifyTreeSize")
         {
-            if (!takeInt(i, a, args.eagleVerifyTreeSize))
+            if (!takeInt(i, a, args.specVerifySize))
             {
                 return false;
             }
@@ -317,20 +317,6 @@ void inputWatcherLoop(std::atomic<bool> const& stopSignal)
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-char const* finishReasonName(rt::FinishReason r)
-{
-    switch (r)
-    {
-    case rt::FinishReason::kNotFinished: return "not-finished";
-    case rt::FinishReason::kEndId: return "end-of-sequence";
-    case rt::FinishReason::kLength: return "max-length";
-    case rt::FinishReason::kCancelled: return "cancelled";
-    case rt::FinishReason::kError: return "error";
-    case rt::FinishReason::kStopWords: return "stop-words";
-    }
-    return "?";
-}
-
 //! Extract a short preview of the prompt (last user message).
 std::string promptPreview(rt::LLMGenerationRequest::Request const& req, size_t maxChars = 80)
 {
@@ -383,7 +369,7 @@ struct RequestResult
     double totalMs{0.0};
 };
 
-RequestResult runOneRequest(rt::LLMInferenceSpecDecodeRuntime& runtime, cudaStream_t stream,
+RequestResult runOneRequest(rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
     rt::LLMGenerationRequest batchRequest, int32_t streamInterval, bool showSpecialTokens)
 {
     RequestResult result;
@@ -452,7 +438,8 @@ void printRequestFooter(RequestResult const& r)
 {
     std::printf("\n  ↳ %zu tokens, TTFT %.1fms, total %.1fms (%.1f tok/s), finish=%s%s\n", r.tokensOut, r.ttftMs,
         r.totalMs, r.totalMs > 0 ? static_cast<double>(r.tokensOut) * 1000.0 / r.totalMs : 0.0,
-        finishReasonName(r.finishReason), r.cancelledBySkip ? " [SKIPPED]" : (r.quitMidGeneration ? " [QUIT]" : ""));
+        rt::finishReasonName(r.finishReason),
+        r.cancelledBySkip ? " [SKIPPED]" : (r.quitMidGeneration ? " [QUIT]" : ""));
     std::fflush(stdout);
 }
 
@@ -523,19 +510,19 @@ int main(int argc, char** argv)
     cudaStream_t stream{};
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime;
+    std::unique_ptr<rt::LLMInferenceRuntime> runtime;
     try
     {
-        if (args.eagle)
+        if (args.specDecode)
         {
-            rt::EagleDraftingConfig draft{args.eagleDraftTopK, args.eagleDraftStep, args.eagleVerifyTreeSize};
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            rt::SpecDecodeDraftingConfig draft{args.specDraftTopK, args.specDraftStep, args.specVerifySize};
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraMap, draft, stream);
         }
         else
         {
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraMap, stream);
+            runtime
+                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraMap, stream);
         }
     }
     catch (std::exception const& e)

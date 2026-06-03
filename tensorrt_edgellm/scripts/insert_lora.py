@@ -15,23 +15,26 @@
 """
 Command-line script for inserting LoRA patterns into ONNX models.
 
-This script provides a command-line interface for inserting LoRA patterns into ONNX models in-place. A lora_model.onnx will be created in the same directory as the original model.onnx. The LoRA model will share the same data as the original model.
+This script provides a command-line interface for inserting LoRA patterns into
+ONNX models in-place. A lora_model.onnx will be created in the same directory
+as the original model.onnx. The LoRA model will share the same data as the
+original model.
 
 Usage:
-    python insert_lora.py --onnx_dir /path/to/onnx_model
+    tensorrt-edgellm-insert-lora --onnx_dir /path/to/onnx_model
 """
 
 import argparse
 import sys
 import traceback
 
-from tensorrt_edgellm.onnx_export.lora import insert_lora_and_save
+from tensorrt_edgellm.lora.lora import insert_lora_and_save
 
 
 def main() -> None:
     """
     Main function that parses command line arguments and inserts LoRA patterns.
-    
+
     This function sets up argument parsing for the LoRA insertion script and calls
     the insert_lora_and_save function with the provided parameters.
     """

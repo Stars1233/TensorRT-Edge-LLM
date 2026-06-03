@@ -1,7 +1,0 @@
-torch==2.10.0
-transformers==5.3.0
-nvidia-modelopt==0.42.0
-datasets==4.4.2
-safetensors==0.7.0
-tqdm==4.67.3
-huggingface_hub==1.11.0

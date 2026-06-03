@@ -7,18 +7,16 @@ the host-side FC1/FC2 handoff of the decomposed `nvfp4_moe` pipeline.
 
 ## Shape support
 
-The kernel wrappers are **shape-polymorphic** in `I` (moeInterSize),
-`E` (numExperts), and `top_k`: these are passed as runtime `Int32`
-arguments and the TMA descriptors are rebuilt at each launch.
-
-The `hidden_size` (K) is a **compile-time variant axis** baked into
-each AOT binary via the `--hidden_size` flag on the export scripts.
-This is required because `_setup_attributes()` computes the pipeline
-stage count (`ab_stage`) with a Python-level divisibility loop that
-cannot trace with a symbolic K. The currently supported value is
-`H = 2048`; see `CuteDslNvfp4MoeRunner::kSupportedHiddenSize` in the
-C++ runner. Supporting additional K values requires rebuilding with a
-different `--hidden_size` and adding a dispatch entry to the runner.
+The kernel wrappers are **shape-polymorphic** in `H` (hidden_size),
+`I` (moeInterSize), `E` (numExperts), and `top_k`: these are passed as
+runtime `Int32` arguments and the TMA descriptors are rebuilt at each
+launch. Hidden size must satisfy `H > 0 && H % (tile_k * ab_stage) == 0`
+(currently 256, with `tile_k = sf_vec_size * 8 = 128` and the AOT-baked
+static `ab_stage = _AB_STAGE_DEFAULT = 2`). The C++ runner's
+`CuteDslNvfp4MoeRunner::canImplement` (via `kHiddenSizeAlignment`) is the
+single point of enforcement so the K-tile pipeline always drains cleanly.
+Validated for H in `{1024, 2048}`; other multiples of 256 are expected to
+work by shape polymorphism but should be accuracy-checked.
 
 ## Backends
 
@@ -68,45 +66,12 @@ Artifacts land in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/`:
 - `include/nvfp4_fused_moe_*.h` (per-variant headers)
 - `include/cutedsl_nvfp4_fused_moe_all.h` (group umbrella header)
 
-## CuTeDSL SM121 Source Patch
+## CuTeDSL SM121 Support
 
-`nvidia-cutlass-dsl==4.4.1` has an SM120-only admissible-architecture check
-in the block-scaled warp MMA ops used by these fused MoE kernels. The SM121
-fused MoE artifact build sets `CUTE_DSL_ARCH=sm_121a` to generate a real SM121
-image, so the unpatched package rejects the compatible SM120/SM121 op path
-before AOT export starts.
-
-SM120 builds do not need this patch. SM121 fused MoE artifact generation does.
-The build script skips this group for `sm_121` when building `--kernels ALL`.
-To build `nvfp4_fused_moe` explicitly on SM121, apply the source patch below
-manually to the installed `nvidia_cutlass_dsl/python_packages` directory. It
-extends the specific SM120 block-scaled warp MMA admissible-architecture list to
-include `sm_121a`, `sm_120f`, and `sm_121f`, and fixes the
-`MmaSM120BlockScaledOp.__post_init__` check to honor that list.
-
-<!-- cutedsl-sm121-patch-begin -->
-```diff
---- a/cutlass/cute/nvgpu/warp/mma.py
-+++ b/cutlass/cute/nvgpu/warp/mma.py
-@@ -131,3 +131,6 @@ class MmaSM120BlockScaledOp(MmaOp):
-     admissible_archs = [
-         "sm_120a",
-+        "sm_121a",
-+        "sm_120f",
-+        "sm_121f",
-     ]
-@@ -135,7 +138,8 @@ class MmaSM120BlockScaledOp(MmaOp):
-     def __post_init__(self) -> None:
-         # Verify arch
-         arch = CuTeDSL._get_dsl().get_arch_enum()
--        if not arch == Arch.sm_120a:
-+        arch_name = getattr(arch, "name", str(arch).rsplit(".", 1)[-1])
-+        if arch_name not in self.admissible_archs:
-             raise OpError(
-                 self,
-                 f"expects arch to be one of {self.admissible_archs}, but got {arch}",
-```
-<!-- cutedsl-sm121-patch-end -->
+`nvidia-cutlass-dsl==4.5.1` supports the `sm_121a` architecture used by
+DIGITS/GB10. For SM121 fused MoE builds, `build_cutedsl.py` sets
+`CUTE_DSL_ARCH=sm_121a` for this group so the generated image targets SM121
+directly instead of relying on an SM120-compatible cubin.
 
 ## Manual export (single variant)
 
@@ -115,7 +80,6 @@ cd kernelSrcs
 python nvfp4_fused_moe_cutedsl/export_decode_kernel.py \
     --activation swiglu \
     --mma_tiler_n 128 \
-    --hidden_size 2048 \
     --output_dir /tmp/staging \
     --file_name nvfp4_fused_moe_decode_swiglu_n128 \
     --function_prefix nvfp4_fused_moe_decode_swiglu_n128 \
@@ -148,12 +112,12 @@ The two kernel backends are ported from the
 The core compute body (FC1 → activation → quant → FC2 → scatter), the
 queue-driven producer/consumer model, and the resident-grid barrier scheme
 are derived from that work. Local changes include: additional activation
-variants (`identity`, `gelu`, `swiglu`), explicit SM121 patch workflow, and
+variants (`identity`, `gelu`, `swiglu`), SM121 artifact generation, and
 integration with the TRT Edge-LLM plugin system.
 
 ## Dependencies
 
-- `nvidia-cutlass-dsl == 4.4.1`
+- `nvidia-cutlass-dsl == 4.5.1`
 - `cuda-python` (provides `cuda.bindings.driver`)
 - `cupy-cuda13x` (GPU memory allocation during AOT compilation)
 
@@ -165,7 +129,7 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 # or
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
-pip install nvidia-cutlass-dsl==4.4.1
+pip install nvidia-cutlass-dsl==4.5.1
 ```
 
 ## TensorRT plugin

@@ -190,8 +190,14 @@ bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
 
 bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
+    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
 {
+    if (!mropeCosSinOut.has_value())
+    {
+        LOG_ERROR("mropeCosSinOut is required (this runner is MRope-only).");
+        return false;
+    }
+
     std::vector<int64_t> audioTokenLengths;
 
     // Step 1: Process audio inputs to get embeddings and token lengths
@@ -220,7 +226,7 @@ bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     // When a vision runner is also present, QwenViTRunner::preprocess will overwrite the MRope cache
     // with vision-aware position IDs, so this initialization is harmlessly overwritten.
     int64_t const activeBatchSize = static_cast<int64_t>(request.requests.size());
-    if (!initializeSequentialMRopeCache(activeBatchSize, ropeRotaryCosSinDevice, stream))
+    if (!initializeSequentialMRopeCache(activeBatchSize, mropeCosSinOut.value().get(), stream))
     {
         LOG_ERROR("Failed to initialize sequential MRope cache for audio input.");
         return false;
@@ -498,17 +504,24 @@ rt::Tensor& Qwen3OmniAudioRunner::getOutputEmbedding()
 }
 
 bool Qwen3OmniAudioRunner::preprocessSystemPrompt(std::string const& systemPrompt,
-    [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, rt::OptionalOutputTensor mropeCosSinOut,
+    cudaStream_t stream)
 {
     if (systemPrompt.empty())
     {
         return true;
     }
 
+    if (!mropeCosSinOut.has_value())
+    {
+        LOG_ERROR("mropeCosSinOut is required for non-empty system prompts.");
+        return false;
+    }
+
     // For audio-only MRope models (e.g. Qwen3-ASR), initialize sequential MRope cache
     // for system prompt since no vision runner will fill it.
     // Batch size is always 1 for system prompt KVCache generation.
-    return initializeSequentialMRopeCache(1, ropeRotaryCosSinDevice, stream);
+    return initializeSequentialMRopeCache(1, mropeCosSinOut.value().get(), stream);
 }
 
 bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(

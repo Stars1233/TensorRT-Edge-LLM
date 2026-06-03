@@ -32,10 +32,11 @@ from valid_precisions import (VALID_AUDIO_PRECISIONS, VALID_LLM_PRECISIONS,
 # Global configuration constants
 DEFAULT_SEARCH_DEPTH = 3
 
-# Models that ship pre-quantized (skip tensorrt-edgellm-quantize-llm step).
-# These are exported directly from the HF checkpoint without a quantize-llm step.
+# Models that ship pre-quantized (skip tensorrt-edgellm-quantize step).
+# These are exported directly from the HF checkpoint without a quantization step.
 PRE_QUANTIZED_MODELS: frozenset = frozenset({
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "Qwen3-30B-A3B-NVFP4",
 })
 
 
@@ -265,9 +266,6 @@ class TestConfig:
     input_len: Optional[int] = None
     past_kv_len: Optional[int] = None
 
-    # Add TensorRT native operations flag
-    trt_native_ops: Optional[bool] = None
-
     # Debug flag for verbose output
     debug: Optional[bool] = None
 
@@ -446,14 +444,6 @@ class TestConfig:
             "vrms", {TaskType.EXPORT},
             {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
             is_required=False),
-        ParameterSpec(
-            "trt_native_ops",
-            "ootb", {
-                TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
-                TaskType.INFERENCE
-            }, {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
-            is_required=False),
-
         # kernel_bench parameters
         ParameterSpec("bench_mode",
                       "mode", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
@@ -642,9 +632,6 @@ class TestConfig:
                 parsed_params['input_len'] = int(part[2:])
             elif part.startswith('pkv') and part[3:].isdigit():
                 parsed_params['past_kv_len'] = int(part[3:])
-            # For inference parameters
-            elif part.startswith('ootb'):
-                parsed_params['trt_native_ops'] = True
             else:
                 parsed_params['test_case'] = part
 
@@ -792,8 +779,6 @@ class TestConfig:
             model_id += "-fp8kv"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
-        if self.trt_native_ops:
-            model_id += "-ootb"
         return model_id
 
     def get_engine_id(self) -> str:
@@ -890,7 +875,7 @@ class TestConfig:
             # Nemotron-H 30B (BF16 base + pre-quantized NVFP4)
             "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
             "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-            # Pre-quantized NVFP4 model: exported directly without quantize-llm step
+            # Pre-quantized NVFP4 model: exported directly without quantization step
             "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":
             "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
             "NVIDIA-Nemotron-3-Nano-4B-BF16":
@@ -924,6 +909,8 @@ class TestConfig:
             "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
             # GPTQ-Int4 large MoE variants
             "Qwen3-30B-A3B-GPTQ-Int4": "Qwen3-30B-A3B-GPTQ-Int4",
+            # NVFP4 MoE (pre-quantized, no quantization step needed)
+            "Qwen3-30B-A3B-NVFP4": "Qwen3-30B-A3B-NVFP4",
             "Qwen3.5-35B-A3B-GPTQ-Int4": "Qwen3.5-35B-A3B-GPTQ-Int4",
             # Multimodal pre-quantized NVFP4 (LLM + visual + audio).  Test list
             # uses ``Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`` as the
@@ -1097,9 +1084,9 @@ class TestConfig:
         Get tokenizer directory for TTS benchmark/inference.
 
         Prefer ONNX export output, where ``tokenizer.json`` is written: the
-        llm_loader-based export drops it under ``llm-<prec>/talker/`` (since
+        tensorrt_edgellm-based export drops it under ``llm-<prec>/talker/`` (since
         the talker submodel is what carries the language modeling head), so
-        check there first; older legacy exports placed it directly at
+        check there first; older exports placed it directly at
         ``llm-<prec>/``. Fall back to the torch model dir
         (``vocab.json`` + ``tokenizer_config.json``) when neither has it.
         """
@@ -1116,11 +1103,9 @@ class TestConfig:
     def get_audio_onnx_dir(self, precision: Optional[str] = None) -> str:
         """Audio encoder ONNX directory.
 
-        ``precision=None`` uses ``self.audio_precision`` (back-compat). Pass
-        an explicit precision (``"fp16"`` / ``"fp8"``) when the test path
-        needs to refer to a specific variant — llm_loader always emits the
-        fp16 audio encoder, while the legacy ``tensorrt-edgellm-export-audio
-        --quantization=fp8`` post-export step writes the fp8 variant.
+        ``precision=None`` uses ``self.audio_precision``. Pass an explicit
+        precision (``"fp16"`` / ``"fp8"``) when the test path needs to refer to
+        a specific variant.
         """
         p = precision or self.audio_precision
         return os.path.join(self.get_onnx_base_dir(), f"audio-{p}")
@@ -1393,7 +1378,7 @@ class TestConfig:
         Get a derived model directory for KV-cache-only quantization.
 
         Used when llm_precision == fp16 but fp8_kv_cache is enabled, so we need a distinct
-        output directory for `tensorrt-edgellm-quantize-llm --kv_cache_quantization fp8`.
+        output directory for `tensorrt-edgellm-quantize --kv_cache_quantization fp8`.
         """
         return os.path.join(self.get_onnx_base_dir(), "quantized-kvcache",
                             self.get_onnx_model_id())

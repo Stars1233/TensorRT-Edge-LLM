@@ -93,10 +93,8 @@ constexpr int32_t kNvfp4SfVecSize{16};
 
 //! Keep shape inference compilable when the AOT runner is not linked.
 #ifdef CUTE_DSL_NVFP4_FUSED_MOE_ENABLED
-constexpr int32_t kCuteDslSupportedHiddenSize{CuteDslNvfp4MoeRunner::kSupportedHiddenSize};
 constexpr int32_t kCuteDslLevelTileN{CuteDslNvfp4MoeRunner::kLevelTileN};
 #else
-constexpr int32_t kCuteDslSupportedHiddenSize{2048};
 constexpr int32_t kCuteDslLevelTileN{128};
 #endif
 
@@ -345,7 +343,7 @@ int32_t NvFP4MoEPluginGeforce::getOutputShapes(DimsExprs const* inputs, int32_t 
     outputs[0].nbDims = 3;
     outputs[0].d[0] = inputs[kIN_HIDDEN_STATES].d[0];
     outputs[0].d[1] = inputs[kIN_HIDDEN_STATES].d[1];
-    outputs[0].d[2] = exprBuilder.constant(static_cast<int64_t>(kCuteDslSupportedHiddenSize));
+    outputs[0].d[2] = exprBuilder.constant(static_cast<int64_t>(mHiddenSize));
     return 0;
 }
 
@@ -395,8 +393,8 @@ bool NvFP4MoEPluginGeforce::supportsFormatCombination(
             SFC_REJ("HIDDEN_STATES: type != kHALF");
         if (td.dims.nbDims != 3)
             SFC_REJ("HIDDEN_STATES: nbDims != 3");
-        if (td.dims.d[2] != kCuteDslSupportedHiddenSize)
-            SFC_REJ("HIDDEN_STATES: d[2] != kSupportedHiddenSize");
+        if (td.dims.d[2] != mHiddenSize)
+            SFC_REJ("HIDDEN_STATES: d[2] != mHiddenSize");
         return true;
     }
     case kIN_FC1_QWEIGHTS:
@@ -409,8 +407,8 @@ bool NvFP4MoEPluginGeforce::supportsFormatCombination(
             SFC_REJ("FC1_QWEIGHTS: d[0] != mNumExperts");
         if (td.dims.d[1] != n1)
             SFC_REJ("FC1_QWEIGHTS: d[1] != n1");
-        if (td.dims.d[2] != kCuteDslSupportedHiddenSize / 2)
-            SFC_REJ("FC1_QWEIGHTS: d[2] != kSupportedHiddenSize/2");
+        if (td.dims.d[2] != mHiddenSize / 2)
+            SFC_REJ("FC1_QWEIGHTS: d[2] != mHiddenSize/2");
         return true;
     }
     case kIN_FC1_BLOCKS_SCALE:
@@ -420,7 +418,7 @@ bool NvFP4MoEPluginGeforce::supportsFormatCombination(
         if (td.dims.nbDims != 6)
             SFC_REJ("FC1_BLOCKS_SCALE: nbDims != 6");
         int32_t const mTiles = ceilDivInt(n1, 128);
-        int32_t const kTiles = ceilDivInt(kCuteDslSupportedHiddenSize / kNvfp4SfVecSize, 4);
+        int32_t const kTiles = ceilDivInt(mHiddenSize / kNvfp4SfVecSize, 4);
         if (td.dims.d[0] != mNumExperts)
             SFC_REJ("FC1_BLOCKS_SCALE: d[0] != mNumExperts");
         if (td.dims.d[1] != mTiles)
@@ -449,8 +447,8 @@ bool NvFP4MoEPluginGeforce::supportsFormatCombination(
             SFC_REJ("FC2_QWEIGHTS: nbDims != 3");
         if (td.dims.d[0] != mNumExperts)
             SFC_REJ("FC2_QWEIGHTS: d[0] != mNumExperts");
-        if (td.dims.d[1] != kCuteDslSupportedHiddenSize)
-            SFC_REJ("FC2_QWEIGHTS: d[1] != kSupportedHiddenSize");
+        if (td.dims.d[1] != mHiddenSize)
+            SFC_REJ("FC2_QWEIGHTS: d[1] != mHiddenSize");
         if (td.dims.d[2] != mMoeInterSize / 2)
             SFC_REJ("FC2_QWEIGHTS: d[2] != mMoeInterSize/2");
         return true;
@@ -461,7 +459,7 @@ bool NvFP4MoEPluginGeforce::supportsFormatCombination(
             SFC_REJ("FC2_BLOCKS_SCALE: type != kINT8");
         if (td.dims.nbDims != 6)
             SFC_REJ("FC2_BLOCKS_SCALE: nbDims != 6");
-        int32_t const mTiles = ceilDivInt(kCuteDslSupportedHiddenSize, 128);
+        int32_t const mTiles = ceilDivInt(mHiddenSize, 128);
         int32_t const kTiles = ceilDivInt(mMoeInterSize / kNvfp4SfVecSize, 4);
         if (td.dims.d[0] != mNumExperts)
             SFC_REJ("FC2_BLOCKS_SCALE: d[0] != mNumExperts");
@@ -491,8 +489,8 @@ bool NvFP4MoEPluginGeforce::supportsFormatCombination(
             SFC_REJ("OUT_OUTPUT: type != kHALF");
         if (td.dims.nbDims != 3)
             SFC_REJ("OUT_OUTPUT: nbDims != 3");
-        if (td.dims.d[2] != kCuteDslSupportedHiddenSize)
-            SFC_REJ("OUT_OUTPUT: d[2] != kSupportedHiddenSize");
+        if (td.dims.d[2] != mHiddenSize)
+            SFC_REJ("OUT_OUTPUT: d[2] != mHiddenSize");
         return true;
     }
     default: SFC_REJ("default: unknown pos");
@@ -531,11 +529,9 @@ int32_t NvFP4MoEPluginGeforce::configurePlugin(
 
 #ifdef CUTE_DSL_NVFP4_FUSED_MOE_ENABLED
     // Centralized capability check: defer the (sm version, dtype, activation,
-    // backend, exact hidden size, I / E / top_k divisibility) gate to
+    // backend, bounded hidden size, I / E / top_k divisibility) gate to
     // CuteDslNvfp4MoeRunner::canImplement so the plugin and runner can never
-    // disagree about what the AOT pack supports. Compare hidden_size exactly
-    // (no pad-to-tile) — that matches supportsFormatCombination and the
-    // getOutputShapes constant.
+    // disagree about what the AOT pack supports.
     int32_t const smVersion = trt_edgellm::getSMVersion();
     if (!CuteDslNvfp4MoeRunner::canImplement(mHiddenSize, mMoeInterSize, mNumExperts, mTopK, smVersion,
             toRunnerActivation(mActivationType), toRunnerIoDtype(mIoDtype), toRunnerBackend(mBackend)))
@@ -544,10 +540,10 @@ int32_t NvFP4MoEPluginGeforce::configurePlugin(
             "NvFP4MoEPluginGeforce: shape tuple (H=%d, I=%d, E=%d, top_k=%d, sm=%d, "
             "act=%d, io=%d, backend=%d) is not supported by the CuteDSL runner. "
             "Requirements: SM in [120, 121], io_dtype=FP16, "
-            "activation in {identity, silu, swiglu, gelu, relu2}, H == %d "
-            "(compile-time), I > 0 and I %% %d == 0, E > 0, 0 < top_k <= E.",
+            "activation in {identity, silu, swiglu, gelu, relu2}, "
+            "H > 0 and H %% %d == 0, I > 0 and I %% %d == 0, E > 0, 0 < top_k <= E.",
             mHiddenSize, mMoeInterSize, mNumExperts, mTopK, smVersion, mActivationType, mIoDtype, mBackend,
-            kCuteDslSupportedHiddenSize, kCuteDslLevelTileN);
+            CuteDslNvfp4MoeRunner::kHiddenSizeAlignment, kCuteDslLevelTileN);
         return -1;
     }
 #else

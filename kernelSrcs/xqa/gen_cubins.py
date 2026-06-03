@@ -492,7 +492,7 @@ if __name__ == "__main__":
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
-            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 6]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 6, 8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],

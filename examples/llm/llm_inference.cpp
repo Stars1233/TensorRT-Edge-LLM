@@ -26,9 +26,10 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "requestFileParser.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/qwen3OmniTTSRuntime.h"
+#include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
 #include <filesystem>
@@ -59,10 +60,10 @@ enum LLMInferenceOptionId : int
     PROFILE_OUTPUT_FILE = 907,
     WARMUP = 908,
     DUMP_OUTPUT = 909,
-    EAGLE = 910,
-    EAGLE_DRAFT_TOP_K = 911,
-    EAGLE_DRAFT_STEP = 912,
-    EAGLE_VERIFY_TREE_SIZE = 913,
+    SPEC_DECODE = 910,
+    SPEC_DRAFT_TOP_K = 911,
+    SPEC_DRAFT_STEP = 912,
+    SPEC_VERIFY_SIZE = 913,
     BATCH_SIZE = 914,
     MAX_GENERATE_LENGTH = 915,
     ENABLE_AUDIO_OUTPUT = 916,
@@ -73,22 +74,21 @@ enum LLMInferenceOptionId : int
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
-struct EagleArgs
+struct SpecDecodeArgs
 {
     bool enabled{false};
 
     // Number of tokens selected per drafting step from the draft model's output distribution.
-    // This controls the branching factor at each level of the draft tree.
+    // For tree-based strategies this is the branching factor; for chain-style
+    // strategies it is the number of candidates retained per draft step.
     int32_t draftTopK{10};
 
     // Number of drafting steps to perform with the draft model.
-    // Each step extends the draft tree by one more level.
+    // Each step extends the current draft proposal.
     int32_t draftStep{6};
 
-    // Number of tokens to select from the complete draft tree for base model verification.
-    // The total draft tree size is: 1 + draftTopK + (draftStep - 1) * draftTopK * draftTopK
-    // This parameter should be <= total draft tree size for optimal performance.
-    int32_t verifyTreeSize{60};
+    // Number of proposal tokens to select for base model verification.
+    int32_t verifySize{60};
 };
 
 struct LLMInferenceArgs
@@ -107,7 +107,7 @@ struct LLMInferenceArgs
     // For other sampling parameters (temperature, top_p, top_k), please specify them in the input JSON file
     int32_t batchSize{-1};         // -1 means use value from input file
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
-    EagleArgs eagleArgs;
+    SpecDecodeArgs specDecodeArgs;
 
     // Qwen3-Omni audio output options
     bool enableAudioOutput{false};
@@ -139,7 +139,7 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifyTreeSize=<number>]"
+                 "[--specVerifySize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -158,11 +158,11 @@ void printUsage(char const* programName)
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
     std::cerr << "  --specDecode              Enable speculative decoding (EAGLE or MTP)" << std::endl;
     std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
-    std::cerr << "                            Controls branching factor at each draft tree level" << std::endl;
+    std::cerr << "                            Controls candidate count per draft expansion step" << std::endl;
     std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
-    std::cerr << "                            Each step extends the draft tree by one more level" << std::endl;
-    std::cerr << "  --specVerifyTreeSize      Number of tokens for base model verification (default: 60)" << std::endl;
-    std::cerr << "                            Total draft tree size: 1 + topK + (step-1) * topK^2" << std::endl;
+    std::cerr << "                            Each step extends the current draft proposal" << std::endl;
+    std::cerr << "  --specVerifySize          Number of proposal tokens for base verification (default: 60)"
+              << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
     std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
@@ -182,14 +182,15 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"profileOutputFile", required_argument, 0, LLMInferenceOptionId::PROFILE_OUTPUT_FILE},
         {"warmup", required_argument, 0, LLMInferenceOptionId::WARMUP},
         {"dumpOutput", no_argument, 0, LLMInferenceOptionId::DUMP_OUTPUT},
-        {"specDecode", no_argument, 0, LLMInferenceOptionId::EAGLE},
-        {"eagle", no_argument, 0, LLMInferenceOptionId::EAGLE}, // deprecated alias
-        {"specDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K},
-        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_TOP_K}, // deprecated alias
-        {"specDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP},
-        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::EAGLE_DRAFT_STEP}, // deprecated alias
-        {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE},
-        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE}, // deprecated alias
+        {"specDecode", no_argument, 0, LLMInferenceOptionId::SPEC_DECODE},
+        {"eagle", no_argument, 0, LLMInferenceOptionId::SPEC_DECODE}, // deprecated alias
+        {"specDraftTopK", required_argument, 0, LLMInferenceOptionId::SPEC_DRAFT_TOP_K},
+        {"eagleDraftTopK", required_argument, 0, LLMInferenceOptionId::SPEC_DRAFT_TOP_K}, // deprecated alias
+        {"specDraftStep", required_argument, 0, LLMInferenceOptionId::SPEC_DRAFT_STEP},
+        {"eagleDraftStep", required_argument, 0, LLMInferenceOptionId::SPEC_DRAFT_STEP}, // deprecated alias
+        {"specVerifySize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
+        {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
+        {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE}, // deprecated alias
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
         {"enableAudioOutput", no_argument, 0, LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT},
@@ -229,12 +230,12 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case LLMInferenceOptionId::DUMP_OUTPUT: args.dumpOutput = true; break;
-        case LLMInferenceOptionId::EAGLE: args.eagleArgs.enabled = true; break;
-        case LLMInferenceOptionId::EAGLE_DRAFT_TOP_K:
+        case LLMInferenceOptionId::SPEC_DECODE: args.specDecodeArgs.enabled = true; break;
+        case LLMInferenceOptionId::SPEC_DRAFT_TOP_K:
             try
             {
-                args.eagleArgs.draftTopK = std::stoi(optarg);
-                if (args.eagleArgs.draftTopK <= 0)
+                args.specDecodeArgs.draftTopK = std::stoi(optarg);
+                if (args.specDecodeArgs.draftTopK <= 0)
                 {
                     LOG_ERROR("Invalid specDraftTopK value: %s (must be positive)", optarg);
                     return false;
@@ -246,11 +247,11 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case LLMInferenceOptionId::EAGLE_DRAFT_STEP:
+        case LLMInferenceOptionId::SPEC_DRAFT_STEP:
             try
             {
-                args.eagleArgs.draftStep = std::stoi(optarg);
-                if (args.eagleArgs.draftStep <= 0)
+                args.specDecodeArgs.draftStep = std::stoi(optarg);
+                if (args.specDecodeArgs.draftStep <= 0)
                 {
                     LOG_ERROR("Invalid specDraftStep value: %s (must be positive)", optarg);
                     return false;
@@ -262,19 +263,19 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
-        case LLMInferenceOptionId::EAGLE_VERIFY_TREE_SIZE:
+        case LLMInferenceOptionId::SPEC_VERIFY_SIZE:
             try
             {
-                args.eagleArgs.verifyTreeSize = std::stoi(optarg);
-                if (args.eagleArgs.verifyTreeSize <= 0)
+                args.specDecodeArgs.verifySize = std::stoi(optarg);
+                if (args.specDecodeArgs.verifySize <= 0)
                 {
-                    LOG_ERROR("Invalid specVerifyTreeSize value: %s (must be positive)", optarg);
+                    LOG_ERROR("Invalid specVerifySize value: %s (must be positive)", optarg);
                     return false;
                 }
             }
             catch (std::exception const& e)
             {
-                LOG_ERROR("Invalid specVerifyTreeSize value: %s", optarg);
+                LOG_ERROR("Invalid specVerifySize value: %s", optarg);
                 return false;
             }
             break;
@@ -363,12 +364,12 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Warmup runs: %d", args.warmup);
     }
 
-    if (args.eagleArgs.enabled)
+    if (args.specDecodeArgs.enabled)
     {
         LOG_INFO("Speculative decoding enabled");
-        LOG_INFO("Spec draft topK: %d", args.eagleArgs.draftTopK);
-        LOG_INFO("Spec draft step: %d", args.eagleArgs.draftStep);
-        LOG_INFO("Spec verify tree size: %d", args.eagleArgs.verifyTreeSize);
+        LOG_INFO("Spec draft topK: %d", args.specDecodeArgs.draftTopK);
+        LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
+        LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
     }
 
     if (args.enableAudioOutput)
@@ -505,23 +506,23 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    // Create unified runtime (handles both vanilla and Eagle spec-decode modes)
-    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime{nullptr};
+    // Create unified runtime (handles both vanilla and speculative decoding modes)
+    std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    if (args.eagleArgs.enabled)
+    if (args.specDecodeArgs.enabled)
     {
-        rt::EagleDraftingConfig draftingConfig{
-            args.eagleArgs.draftTopK, args.eagleArgs.draftStep, args.eagleArgs.verifyTreeSize};
+        rt::SpecDecodeDraftingConfig draftingConfig{
+            args.specDecodeArgs.draftTopK, args.specDecodeArgs.draftStep, args.specDecodeArgs.verifySize};
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to initialize runtime with Eagle spec-decode: %s", e.what());
+            LOG_ERROR("Failed to initialize runtime with speculative decoding: %s", e.what());
             return EXIT_FAILURE;
         }
     }
@@ -530,7 +531,7 @@ int main(int argc, char* argv[])
         // Standard vanilla-only mode (no draft model)
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
         }
         catch (std::exception const& e)
@@ -784,7 +785,7 @@ int main(int argc, char* argv[])
 
         // Non-streaming path: build batched Omni requests and call Talker once.
         // Fetch Thinker prefill embeddings / hidden states from the runtime portal
-        // (see LLMInferenceSpecDecodeRuntime::getBaseModelHiddenStates contract).
+        // (see LLMInferenceRuntime::getBaseModelHiddenStates contract).
         rt::Tensor const* prefillEmbedsAll = runtime->getBaseModelHiddenStates(0);
         std::vector<int32_t> const requiredLayers
             = ttsRuntime ? ttsRuntime->getThinkerHiddenLayerIndices() : std::vector<int32_t>{};
@@ -901,7 +902,10 @@ int main(int argc, char* argv[])
             {
                 for (size_t batchIdx = 0; batchIdx < response.outputTexts.size(); ++batchIdx)
                 {
-                    LOG_INFO("Response for request %zu batch %zu: %s", requestIdx, batchIdx,
+                    char const* reasonName = batchIdx < response.finishReasons.size()
+                        ? rt::finishReasonName(response.finishReasons[batchIdx])
+                        : "?";
+                    LOG_INFO("Response for request %zu batch %zu [finish=%s]: %s", requestIdx, batchIdx, reasonName,
                         response.outputTexts[batchIdx].c_str());
                     if (batchIdx < audioOutputs.size() && audioOutputs[batchIdx].waveform
                         && !audioOutputs[batchIdx].waveform->isEmpty())
@@ -934,6 +938,9 @@ int main(int argc, char* argv[])
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
             responseJson["request_idx"] = requestIdx;
             responseJson["batch_idx"] = batchIdx;
+            responseJson["finish_reason"] = (requestStatus && batchIdx < response.finishReasons.size())
+                ? rt::finishReasonName(response.finishReasons[batchIdx])
+                : "error";
             // Store messages for reference
             nlohmann::json messagesJson = nlohmann::json::array();
             for (auto const& msg : request.requests[batchIdx].messages)
@@ -993,10 +1000,11 @@ int main(int argc, char* argv[])
         auto prefillMetrics = runtime->getPrefillMetrics();
         auto multimodalMetrics = runtime->getMultimodalMetrics();
         outputPrefillProfile(profileOutput, prefillMetrics);
-        if (args.eagleArgs.enabled)
+        if (args.specDecodeArgs.enabled)
         {
-            auto eagleGenerationMetrics = runtime->getEagleGenerationMetrics();
-            outputEagleGenerationProfile(profileOutput, eagleGenerationMetrics);
+            auto specDecodeGenerationMetrics = runtime->getSpecDecodeGenerationMetrics();
+            outputSpecDecodeGenerationProfile(
+                profileOutput, specDecodeGenerationMetrics, runtime->getSpeculativeDecodingStrategyName());
         }
         else
         {
@@ -1022,9 +1030,10 @@ int main(int argc, char* argv[])
 
             // Add high-level metrics from unified runtime
             addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
-            if (args.eagleArgs.enabled)
+            if (args.specDecodeArgs.enabled)
             {
-                addJsonEagleGenerationSummary(profileJson, runtime->getEagleGenerationMetrics());
+                addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),
+                    runtime->getSpeculativeDecodingStrategyName());
             }
             else
             {

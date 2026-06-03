@@ -59,6 +59,11 @@ struct Message
 // consumers that actually manipulate channels include `runtime/streaming.h`.
 class StreamChannel;
 
+// Forward-declared as an opaque enum (underlying type fixed in streaming.h
+// via `: uint8_t`) so LLMGenerationResponse::finishReasons can carry per-slot
+// reasons; consumers that inspect the enum values include `runtime/streaming.h`.
+enum class FinishReason : uint8_t;
+
 /*! \brief Per-token callback info delivered during Thinker decode */
 struct TokenCallbackInfo
 {
@@ -95,6 +100,9 @@ struct LLMGenerationRequest
         std::vector<rt::audioUtils::AudioData> audioBuffers; //!< Optional audio data for multimodal inputs (Qwen3-Omni)
         std::optional<std::vector<PastTrajectoryPoint>>
             pastTrajectory; //!< Optional past trajectory for Alpamayo (e.g. ego x,y,z history)
+
+        //! Stop strings; generation halts on the earliest match and trims it from output.
+        std::vector<std::string> stopStrings;
 
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
@@ -149,6 +157,9 @@ struct LLMGenerationResponse
     std::vector<std::vector<FutureTrajectoryPoint>> outputTrajectories;
 
     std::vector<rt::audioUtils::AudioData> outputAudios; //!< Generated audio data (Qwen3-Omni only)
+
+    //! Why each request halted (EOS, length, stop string, cancel, error); see `runtime/streaming.h`.
+    std::vector<FinishReason> finishReasons;
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration

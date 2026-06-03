@@ -43,7 +43,7 @@ The system automatically detects thinking mode support during model export. If n
 
 ## Custom Templates
 
-`llm_loader` extracts the chat template from the checkpoint during export and
+`tensorrt_edgellm` extracts the chat template from the checkpoint during export and
 writes `processed_chat_template.json` next to the exported LLM ONNX graph.
 
 To customize the chat template, first export the model normally, then edit the
@@ -51,7 +51,7 @@ generated file in place:
 
 ```bash
 # 1. Export (generates processed_chat_template.json with auto-detected template)
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
     /path/to/model \
     /path/to/output
 
@@ -80,7 +80,7 @@ following schema (not a raw Jinja template):
 }
 ```
 
-Reference templates are available under `experimental/llm_loader/chat_templates/`
+Reference templates are available under `tensorrt_edgellm/chat_templates/`
 (e.g., `phi4mm.json`, `qwen3asr.json`, `nemotron_nano_v2.json`).
 
 Pre-built templates are automatically used for models with known tokenizer issues (e.g., Phi-4-Multimodal).

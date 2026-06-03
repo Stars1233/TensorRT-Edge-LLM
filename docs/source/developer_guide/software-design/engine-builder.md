@@ -13,7 +13,7 @@ The Engine Builder serves as the **second stage** in the TensorRT Edge-LLM workf
 %%{init: {'theme':'neutral', 'themeVariables': {'primaryColor':'#76B900','primaryTextColor':'#fff','primaryBorderColor':'#5a8f00','lineColor':'#666','edgeLabelBackground':'#ffffff','labelTextColor':'#000','clusterBkg':'#ffffff','clusterBorder':'#999'}}}%%
 graph LR
     HF_MODEL[HuggingFace<br>Model]
-    PYTHON_EXPORT[llm_loader<br>ONNX<br>Export]
+    PYTHON_EXPORT[tensorrt_edgellm<br>ONNX<br>Export]
     ONNX_FILES[ONNX<br>Models]
     TRT_ENGINE[TensorRT<br>Engine]
     CPP_RUNTIME[C++<br>Runtime]

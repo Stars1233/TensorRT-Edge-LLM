@@ -12,8 +12,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Command-line scripts for TensorRT Edge-LLM.
-
-This module contains command-line scripts for quantization and export operations.
-"""

@@ -80,6 +80,47 @@ std::string dimsToString(nvinfer1::Dims const& dims) noexcept
     return oss.str();
 }
 
+bool hasDynamicDims(nvinfer1::Dims const& dims) noexcept
+{
+    for (int32_t i = 0; i < dims.nbDims; ++i)
+    {
+        if (dims.d[i] < 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool dimsEqual(nvinfer1::Dims const& lhs, nvinfer1::Dims const& rhs) noexcept
+{
+    if (lhs.nbDims != rhs.nbDims)
+    {
+        return false;
+    }
+    for (int32_t i = 0; i < lhs.nbDims; ++i)
+    {
+        if (lhs.d[i] != rhs.d[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tensorName) noexcept
+{
+    for (int32_t i = 0; i < engine.getNbIOTensors(); ++i)
+    {
+        std::string const bindingName = engine.getIOTensorName(i);
+        if (bindingName == tensorName)
+        {
+            return engine.getTensorIOMode(bindingName.c_str()) == nvinfer1::TensorIOMode::kINPUT;
+        }
+    }
+    return false;
+}
+
 std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept
 {
     std::stringstream ss;

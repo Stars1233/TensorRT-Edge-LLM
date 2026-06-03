@@ -109,12 +109,13 @@ public:
     //! \brief Check if XQA kernel can be implemented with given configuration
     //! \param[in] numQHeads Number of query heads
     //! \param[in] numKVHeads Number of key-value heads
+    //! \param[in] headSize Head dimension size
     //! \param[in] smVersion CUDA SM version
     //! \param[in] dataType Data type for computation
     //! \param[in] kvDataType KV cache data type
     //! \return True if implementation is supported, false otherwise
-    static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t smVersion, nvinfer1::DataType dataType,
-        nvinfer1::DataType kvDataType) noexcept;
+    static bool canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
+        nvinfer1::DataType dataType, nvinfer1::DataType kvDataType) noexcept;
 
     //! \brief Load decoder XQA kernels for given configuration
     //! \param[in] smVersion CUDA SM version

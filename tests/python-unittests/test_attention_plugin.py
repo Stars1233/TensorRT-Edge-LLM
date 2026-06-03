@@ -106,6 +106,9 @@ class AttentionPluginRunner:
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE,
                                      1 << 30)  # 1GB
+        if hasattr(trt.PreviewFeature, "ALIASED_PLUGIN_IO_10_03"):
+            config.set_preview_feature(
+                trt.PreviewFeature.ALIASED_PLUGIN_IO_10_03, True)
 
         p = self.params
 
@@ -136,22 +139,16 @@ class AttentionPluginRunner:
             position_ids = network.add_input("position_ids", trt.int32,
                                              (-1, -1))
 
-        # Create plugin
+        # Create plugin (V3 API)
         plugin_registry = trt.get_plugin_registry()
-        plugin_creator = plugin_registry.get_plugin_creator(
-            "AttentionPlugin", "1")
+        plugin_creator = plugin_registry.get_creator("AttentionPlugin", "1",
+                                                     "")
 
         if plugin_creator is None:
             raise RuntimeError("AttentionPlugin not found in registry")
 
         # Create plugin fields
         plugin_fields = [
-            trt.PluginField("max_batch_size",
-                            np.array([p.max_batch_size], dtype=np.int32),
-                            trt.PluginFieldType.INT32),
-            trt.PluginField("kv_cache_capacity",
-                            np.array([p.kv_cache_capacity], dtype=np.int32),
-                            trt.PluginFieldType.INT32),
             trt.PluginField("num_q_heads",
                             np.array([p.num_q_heads], dtype=np.int32),
                             trt.PluginFieldType.INT32),
@@ -160,9 +157,6 @@ class AttentionPluginRunner:
                             trt.PluginFieldType.INT32),
             trt.PluginField("head_size", np.array([p.head_size],
                                                   dtype=np.int32),
-                            trt.PluginFieldType.INT32),
-            trt.PluginField("enable_reuse_kv_cache",
-                            np.array([1], dtype=np.int32),
                             trt.PluginFieldType.INT32),
             trt.PluginField(
                 "enable_tree_attention",
@@ -173,7 +167,8 @@ class AttentionPluginRunner:
 
         plugin_field_collection = trt.PluginFieldCollection(plugin_fields)
         plugin = plugin_creator.create_plugin("attention",
-                                              plugin_field_collection)
+                                              plugin_field_collection,
+                                              trt.TensorRTPhase.BUILD)
 
         plugin_inputs = [
             q_input, k_input, v_input, kv_cache_input, context_lengths,
@@ -182,7 +177,7 @@ class AttentionPluginRunner:
         if self.enable_tree_attention:
             plugin_inputs.extend([tree_mask, position_ids])
 
-        plugin_layer = network.add_plugin_v2(plugin_inputs, plugin)
+        plugin_layer = network.add_plugin_v3(plugin_inputs, [], plugin)
 
         # Mark outputs
         plugin_layer.get_output(0).name = "attention_output"
@@ -258,6 +253,8 @@ class AttentionPluginRunner:
 
         # Build engine
         serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
+            raise RuntimeError("Failed to build AttentionPlugin test engine")
         runtime = trt.Runtime(self.logger)
         self.engine = runtime.deserialize_cuda_engine(serialized_engine)
         self.context = self.engine.create_execution_context()

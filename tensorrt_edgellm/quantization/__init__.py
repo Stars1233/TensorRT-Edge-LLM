@@ -12,21 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Standalone quantization for TensorRT Edge-LLM.
+
+Decoupled from the ONNX exporter — runs in a clean venv with only
+torch, transformers, and modelopt.
+
+    tensorrt-edgellm-quantize --help
 """
-Quantization utilities for TensorRT Edge-LLM.
 
-This module provides functions for quantizing LLM and visual models using NVIDIA ModelOpt.
-"""
-
-# FP8 (E4M3) quantization constants
-# Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
-# NOTE: This constant must be defined BEFORE any imports to avoid circular import issues.
-FP8_E4M3_MAX: float = 448.0
-
-from .llm_quantization import quantize_and_save_draft, quantize_and_save_llm
-
-__all__ = [
-    "quantize_and_save_llm",
-    "quantize_and_save_draft",
-    "FP8_E4M3_MAX",
-]
+from .models import Eagle3DraftModel  # noqa: F401
+from .models import quantize_and_export_draft  # noqa: F401
+from .quantization_configs import build_quant_config  # noqa: F401
+from .quantize import quantize_and_export  # noqa: F401

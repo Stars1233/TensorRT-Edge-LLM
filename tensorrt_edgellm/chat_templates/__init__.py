@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,44 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Chat template processing and templates for TensorRT Edge-LLM.
+"""Bundled processed chat-template helpers."""
 
-This module provides:
-- Chat template extraction from HuggingFace tokenizers
-- Chat template validation
-- Chat templates for models that require explicit templates
-"""
-
-import os
+from pathlib import Path
 from typing import Optional
 
-# Re-export main functions from chat_template.py
-from .chat_template import process_chat_template, validate_chat_template
+from tensorrt_edgellm.chat_template import (
+    process_chat_template, write_fallback_processed_chat_template)
 
-# Directory containing templates
-_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "templates")
+_TEMPLATES_DIR = Path(__file__).parent
 
 
 def get_template_path(model_identifier: str) -> Optional[str]:
-    """
-    Get the path to a chat template for a model identifier.
-    
-    Args:
-        model_identifier: Model identifier (e.g., "phi4mm")
-        
-    Returns:
-        Path to the template file, or None if not found
-    """
-    template_path = os.path.join(_TEMPLATES_DIR, f"{model_identifier}.json")
-    if os.path.exists(template_path):
-        return template_path
+    """Return the bundled template path for *model_identifier*, if present."""
+    template_path = _TEMPLATES_DIR / f"{model_identifier}.json"
+    if template_path.exists():
+        return str(template_path)
     return None
 
 
 __all__ = [
-    'process_chat_template',
-    'validate_chat_template',
-    'get_template_path',
+    "get_template_path",
+    "process_chat_template",
+    "write_fallback_processed_chat_template",
 ]

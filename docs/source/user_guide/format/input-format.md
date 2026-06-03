@@ -24,7 +24,8 @@ This guide describes the input JSON format for the LLM inference tool. The forma
             ],
             "lora_name": "optional_lora_name",
             "save_system_prompt_kv_cache": false,
-            "disable_spec_decode": false
+            "disable_spec_decode": false,
+            "stop": ["optional_stop_string"]
         }
     ]
 }
@@ -52,6 +53,7 @@ This guide describes the input JSON format for the LLM inference tool. The forma
 - **`lora_name`** (optional): LoRA adapter name from `available_lora_weights`
 - **`save_system_prompt_kv_cache`** (optional): Cache system prompt KV for reuse
 - **`disable_spec_decode`** (optional, default: false): Disable EAGLE speculative decoding for this request even if draft engine is loaded
+- **`stop`** (optional): String or array of strings that halt generation when produced in the output. The stop string itself is excluded from the returned text. Each request in a batch may declare its own list independently. Defaults to no stop strings.
 
 ### Message Fields
 - **`role`**: `"system"`, `"user"`, or `"assistant"`
@@ -190,6 +192,25 @@ When using EAGLE speculative decoding, you can disable it for specific requests:
 - Debugging: Compare performance with/without speculative decoding
 
 **Note:** If any request in a batch has `disable_spec_decode: true`, speculative decoding will be disabled for the entire batch. Requests within one batch cannot use different decoding strategies simultaneously for now.
+
+### Stop Strings
+
+Generation halts as soon as any of the specified substrings appears in the decoded output; the stop string itself is excluded from the returned text. Accepts a single string or an array. Each request carries its own independent list — requests in the same batch may stop on different strings or none at all.
+
+```json
+{
+    "requests": [
+        {
+            "messages": [
+                {"role": "user", "content": "Write a short answer ending before '###'."}
+            ],
+            "stop": ["###", "\n\nUser:"]
+        }
+    ]
+}
+```
+
+When a stop string triggers termination, the request's finish reason is `stop-words`. Earliest position in the decoded output wins when multiple stop strings could match.
 
 ## Notes
 

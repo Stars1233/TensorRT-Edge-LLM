@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 r"""
-Accuracy tests for TensorRT ``Nvfp4MoePlugin`` (:class:`NemotronHMoEW4A4Plugin`). Compares TRT output to a NumPy
+Accuracy tests for TensorRT ``Nvfp4MoePlugin`` (via new FE :class:`NemotronHMoEMLP`). Compares TRT output to a NumPy
 Marlin-unpacked reference; HF dense refs (NumPy / torch) are cross-checks for the FP16-hidden decode path.
 The plugin accepts FP16 activations only — any NVFP4 quantization needed by the prefill path is computed inside
 the plugin via ``fp4Quantize``. Router logits are explicit engine inputs
@@ -139,10 +139,418 @@ def check_requirements(*, _module_import_guard: bool = False) -> None:
 
 check_requirements(_module_import_guard=True)
 
-from tensorrt_edgellm.llm_models.layers.nvfp4_moe_plugin import \
-    NemotronHMoEW4A4Plugin  # noqa: E402
-from tensorrt_edgellm.llm_models.marlin_converter import \
-    MarlinConverter  # noqa: E402
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from tensorrt_edgellm.config import NVFP4_MOE_BACKEND_THOR  # noqa: E402
+from tensorrt_edgellm.config import QUANT_NVFP4, ModelConfig, QuantConfig
+from tensorrt_edgellm.models.linear import NVFP4Linear  # noqa: E402
+from tensorrt_edgellm.models.nemotron_h.modeling_nemotron_h import \
+    NemotronHMoEMLP  # noqa: E402
+from tensorrt_edgellm.models.qwen3_5_moe.modeling_qwen3_5_moe import \
+    Qwen3_5SparseMoeBlock  # noqa: E402
+from tensorrt_edgellm.models.qwen3_moe.modeling_qwen3_moe import \
+    Qwen3SparseMoeBlock  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Standalone helpers previously on old FE classes
+# ---------------------------------------------------------------------------
+
+_FP8_MAX = 448.0
+_FP4_E2M1_POSITIVE_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_FP4_MIDPOINTS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                          dtype=np.float32)
+
+
+def _moe_activation_numpy(z: np.ndarray, activation_type: int) -> np.ndarray:
+    """FP32 expert nonlinearity: ``0`` = ReLU², ``1`` = SiLU (clipped to [-50, 50])."""
+    z = np.asarray(z, dtype=np.float32)
+    if int(activation_type) == 1:
+        zc = np.clip(z, -50.0, 50.0)
+        return (zc / (1.0 + np.exp(-zc))).astype(np.float32)
+    t = np.maximum(z, 0.0)
+    return (t * t).astype(np.float32)
+
+
+def _f32_to_fp4_e2m1_nibble(x: float) -> int:
+    """Nearest FP4 E2M1 nibble (sign + 3-bit magnitude)."""
+    mag = abs(float(x))
+    sign_bit = 8 if x < 0.0 else 0
+    best_i = 0
+    best_d = mag
+    for i, lv in enumerate(_FP4_E2M1_POSITIVE_LEVELS):
+        d = abs(mag - lv)
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return int((sign_bit | best_i) & 0xF)
+
+
+def _f16x2_in_u32_to_marlin_f8x4(out_u32: int) -> int:
+    """Project one f16x2 uint32 onto Marlin dequant_fp8_scales manifold."""
+    o = np.uint32(int(out_u32) & 0xFFFFFFFF)
+    u = np.uint32((np.uint64(o) << np.uint64(1)) & np.uint64(0xFFFFFFFF))
+    u = u & np.uint32(0xFF00FF00)
+    return int(np.uint32(u >> np.uint32(1)))
+
+
+def _f16x4_in_u32x2_to_marlin_f8x4_block_scale(out1: int, out2: int) -> int:
+    """Merge two half2 words into one f8x4 block-scale int32."""
+    o1 = np.uint32(int(out1) & 0xFFFFFFFF)
+    o2 = np.uint32(int(out2) & 0xFFFFFFFF)
+    u1 = np.uint32((np.uint64(o1) << np.uint64(1)) & np.uint64(0xFFFFFFFF))
+    u2 = np.uint32((np.uint64(o2) << np.uint64(1)) & np.uint64(0xFFFFFFFF))
+    b1 = int((np.uint64(u1) >> 8) & np.uint64(0xFF))
+    b3 = int((np.uint64(u1) >> 24) & np.uint64(0xFF))
+    b0 = int((np.uint64(u2) >> 8) & np.uint64(0xFF))
+    b2 = int((np.uint64(u2) >> 24) & np.uint64(0xFF))
+    return int(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+
+def _fp32x4_to_marlin_f8x4_block_scale(s0: float, s1: float, s2: float,
+                                       s3: float) -> int:
+    """Pack four FP32 scales into one f8x4 block-scale int32."""
+    h16 = np.array([s0, s1, s2, s3], dtype=np.float32).astype(np.float16)
+    out2_raw = int(np.frombuffer(h16[0:2].tobytes(), dtype="<u4", count=1)[0])
+    out1_raw = int(np.frombuffer(h16[2:4].tobytes(), dtype="<u4", count=1)[0])
+    out1 = _f16x2_in_u32_to_marlin_f8x4(out1_raw)
+    out2 = _f16x2_in_u32_to_marlin_f8x4(out2_raw)
+    return _f16x4_in_u32x2_to_marlin_f8x4_block_scale(out1, out2)
+
+
+def _atom_sf_offset(m_idx: int, k_idx: int, num_sf_cols: int) -> int:
+    """Byte offset for atom-layout 128x4 swizzle (``get_sf_out_offset_128x4``)."""
+    inner_k = k_idx % 4
+    inner_m = (m_idx % 128) // 32
+    outer_m = m_idx % 32
+    k_tile = k_idx // 4
+    num_k_tiles = (num_sf_cols + 3) // 4
+    m_tile = m_idx // 128
+    return m_tile * num_k_tiles * 512 + k_tile * 512 + outer_m * 16 + inner_m * 4 + inner_k
+
+
+def _quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
+    vec64: np.ndarray,
+    expert_block_scale_max_fp32: float = 1.0,
+) -> tuple[np.ndarray, int]:
+    """Pack one 64-lane Marlin tile to ``(payload_int32x8, block_scale_packed_int32)``."""
+    v = np.asarray(vec64, dtype=np.float32).reshape(64)
+    s_max = max(float(expert_block_scale_max_fp32), 1e-12)
+    scales = np.zeros(4, dtype=np.float32)
+    for g in range(4):
+        blk = v[g * 16:(g + 1) * 16]
+        am = float(np.max(np.abs(blk)))
+        scales[g] = max(am / 6.0, 1e-12)
+    nib = np.empty(64, dtype=np.int32)
+    for i in range(64):
+        g = i // 16
+        qn = float(v[i] / scales[g])
+        if qn > 6.0:
+            qn = 6.0
+        elif qn < -6.0:
+            qn = -6.0
+        nib[i] = _f32_to_fp4_e2m1_nibble(qn)
+    out = np.zeros(8, dtype=np.uint32)
+    for lane in range(8):
+        w = np.uint32(0)
+        for j in range(4):
+            base = lane * 8 + j * 2
+            lo = int(nib[base]) & 0xF
+            hi = int(nib[base + 1]) & 0xF
+            b = np.uint32(lo | (hi << 4))
+            w |= b << (8 * j)
+        out[lane] = w
+    scale_q = _fp32x4_to_marlin_f8x4_block_scale(
+        float(scales[0]) / s_max * _FP8_MAX,
+        float(scales[1]) / s_max * _FP8_MAX,
+        float(scales[2]) / s_max * _FP8_MAX,
+        float(scales[3]) / s_max * _FP8_MAX,
+    )
+    return out.astype(np.int32), int(scale_q)
+
+
+# ---------------------------------------------------------------------------
+# FP32 → NVFP4 quantization helpers (for populating new-FE NVFP4Linear from test weights)
+# ---------------------------------------------------------------------------
+
+
+def _quantize_fp32_to_nvfp4(
+    weight_fp32: torch.Tensor,
+    group_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize ``[out, in]`` FP32 weight to NVFP4 E2M1 packed format.
+
+    Returns ``(weight_int8 [out, in//2], weight_scale_fp32 [out, in//group_size], weight_scale_2 [1])``.
+    """
+    w = weight_fp32.float()
+    out_features, in_features = w.shape
+    assert in_features % group_size == 0
+    num_groups = in_features // group_size
+
+    # Per-group amax and block scale
+    w_grouped = w.reshape(out_features, num_groups, group_size)
+    amax = w_grouped.abs().amax(dim=-1)  # [out, num_groups]
+    block_scale = (amax / 6.0).clamp(min=1e-12)  # [out, num_groups]
+
+    # Round block_scale to FP8 E4M3 and back to FP32
+    dt8 = getattr(torch, "float8_e4m3fn", None)
+    if dt8 is not None:
+        block_scale_fp8 = block_scale.to(dt8).float()
+        block_scale_fp8 = block_scale_fp8.clamp(min=1e-12)
+    else:
+        block_scale_fp8 = block_scale
+
+    # Quantize each element to nearest FP4 E2M1 nibble
+    levels = torch.tensor(_FP4_E2M1_POSITIVE_LEVELS, dtype=torch.float32)
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                             dtype=torch.float32)
+
+    scaled = w_grouped / block_scale_fp8.unsqueeze(-1)
+    sign = (scaled < 0).int()
+    mag = scaled.abs()
+    # Bucket via midpoints
+    code = torch.zeros_like(mag, dtype=torch.int32)
+    for i, mp in enumerate(midpoints):
+        code = torch.where(mag > mp, i + 1, code)
+    nibble = (sign * 8) | code  # [out, num_groups, group_size]
+    nibble = nibble.reshape(out_features, in_features).to(torch.uint8)
+
+    # Pack two nibbles per byte (lo=even, hi=odd along in-dim)
+    lo = nibble[:, 0::2]
+    hi = nibble[:, 1::2]
+    packed = (lo | (hi << 4)).to(torch.int8)  # [out, in//2]
+
+    weight_scale_2 = torch.ones(1, dtype=torch.float32)
+    return packed, block_scale_fp8, weight_scale_2
+
+
+def _populate_nvfp4_linear(
+    linear: NVFP4Linear,
+    weight_fp32: torch.Tensor,
+    input_scale_value: float = 1e-3,
+) -> None:
+    """Fill an NVFP4Linear's buffers from FP32 weights."""
+    packed, block_scale, ws2 = _quantize_fp32_to_nvfp4(
+        weight_fp32, group_size=linear.group_size)
+    linear.weight.data.copy_(packed)
+    linear.weight_scale.data.copy_(block_scale)
+    linear.weight_scale_2.data.copy_(ws2)
+    linear.input_scale.data.fill_(input_scale_value)
+
+
+# ---------------------------------------------------------------------------
+# New-FE MoE factory functions (replace old FE NemotronHMoEW4A4Plugin / Qwen3MoEW4A4Plugin)
+# ---------------------------------------------------------------------------
+
+
+def _create_toy_nemotron_h_moe_mlp(
+    *,
+    hidden_size: int,
+    moe_inter_size: int,
+    num_experts: int,
+    top_k: int,
+    seed: int,
+    n_group: int = 1,
+    topk_group: int = 1,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 2.5,
+) -> tuple[NemotronHMoEMLP, np.ndarray, np.ndarray]:
+    """Create a toy NemotronHMoEMLP with NVFP4 experts and random weights.
+
+    Returns ``(mlp, w_up_ehi_fp32, w_down_eih_fp32)`` — the MLP module with
+    ``prepare_for_export()`` already called, and the original FP32 expert
+    weights ``[E, H, I]`` / ``[E, I, H]`` for building reference outputs.
+    """
+    h = int(hidden_size)
+    inter = int(moe_inter_size)
+    e_ct = int(num_experts)
+    tk = int(top_k)
+
+    cfg = ModelConfig(
+        model_type="nemotron_h",
+        hidden_size=h,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=inter,
+        head_dim=h,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        n_routed_experts=e_ct,
+        num_experts_per_tok=tk,
+        moe_intermediate_size=inter,
+        moe_shared_expert_intermediate_size=inter,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=float(routed_scaling_factor),
+        quant=QuantConfig(quant_type=QUANT_NVFP4, group_size=16),
+    )
+    mlp = NemotronHMoEMLP(cfg, module_prefix="backbone.layers.0.mixer")
+    mlp.eval()
+
+    # Deterministic random weights
+    torch.manual_seed(seed)
+    std_gate = WeightsGenerator.gate_test_weight_std(h)
+    std_corr = std_gate * 0.3
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    nn.init.normal_(mlp.gate.weight, mean=0.0, std=std_gate, generator=gen)
+    nn.init.normal_(mlp.gate.e_score_correction_bias,
+                    mean=0.0,
+                    std=std_corr,
+                    generator=gen)
+
+    gen_w = torch.Generator()
+    gen_w.manual_seed(seed + 101)
+    std_up = WeightsGenerator.expert_linear_std(h, 0.08)
+    std_dn = WeightsGenerator.expert_linear_std(inter, 0.08)
+    w_up_ehi = torch.randn(e_ct, h, inter, generator=gen_w) * std_up
+    w_down_eih = torch.randn(e_ct, inter, h, generator=gen_w) * std_dn
+
+    # Populate each expert's NVFP4Linear with quantized weights
+    for i, expert in enumerate(mlp.experts):
+        # up_proj: [inter, h] (NVFP4Linear stores [out, in])
+        _populate_nvfp4_linear(expert.up_proj, w_up_ehi[i].T.contiguous())
+        # down_proj: [h, inter]
+        _populate_nvfp4_linear(expert.down_proj, w_down_eih[i].T.contiguous())
+
+    # Shared experts too (not used in tests but prepare_for_export expects them)
+    gen_shared = torch.Generator()
+    gen_shared.manual_seed(seed + 202)
+    w_shared_up = torch.randn(h, inter, generator=gen_shared) * std_up
+    w_shared_dn = torch.randn(inter, h, generator=gen_shared) * std_dn
+    _populate_nvfp4_linear(mlp.shared_experts.up_proj,
+                           w_shared_up.T.contiguous())
+    _populate_nvfp4_linear(mlp.shared_experts.down_proj,
+                           w_shared_dn.T.contiguous())
+
+    mlp.prepare_for_export()
+
+    return mlp, w_up_ehi.numpy(), w_down_eih.numpy()
+
+
+def _create_toy_qwen3_moe_block(
+    *,
+    hidden_size: int,
+    moe_inter_size: int,
+    num_experts: int,
+    top_k: int,
+    seed: int,
+) -> tuple[nn.Module, np.ndarray, np.ndarray, np.ndarray]:
+    """Create a toy gated-MoE wrapper with NVFP4 plugin buffers for Qwen3 tests.
+
+    Returns ``(mod, w_gate_ehi, w_up_ehi, w_down_eih)`` — an ``nn.Module``
+    with the plugin-compatible ``_stacked_*`` buffers, gate, and the scalar
+    attributes ``build_nvfp4_moe_engine_trt_api`` reads. Original FP32 weights
+    ``[E, H, I]`` / ``[E, I, H]`` are returned for building references.
+
+    **Key difference from NemotronH**: the Nvfp4MoePlugin expects
+    ``moe_inter_size = 2*I`` for gated (SiLU) models so that
+    ``nOutFor(SiLU, 2*I) = I`` yields the correct FC2 contraction dim.
+    FC1 (interleaved gate+up) has N-dim = 2*I, but FC2 (down) has contraction
+    dim = I.  NemotronHMoEMLP forces both up and down to use the same
+    ``moe_intermediate_size``, so we repack manually.
+    """
+    from tensorrt_edgellm.checkpoint.repacking import (
+        repack_nvfp4_expert_down_prefill_raw,
+        repack_nvfp4_expert_up_prefill_raw)
+
+    h = int(hidden_size)
+    inter = int(moe_inter_size)
+    e_ct = int(num_experts)
+    tk = int(top_k)
+    plugin_inter = 2 * inter  # moe_inter_size for the plugin (gated: 2*I)
+
+    torch.manual_seed(seed)
+    gate_layer = nn.Linear(h, e_ct, bias=False, dtype=torch.float32)
+    nn.init.normal_(gate_layer.weight, mean=0.0, std=0.1)
+
+    gen = torch.Generator()
+    gen.manual_seed(seed + 201)
+    std_w = max(0.18, 3.0 / math.sqrt(float(h)))
+    w_gate_ehi = torch.randn(e_ct, h, inter, generator=gen) * std_w
+    w_up_ehi = torch.randn(e_ct, h, inter, generator=gen) * std_w
+    w_down_eih = torch.randn(e_ct, inter, h, generator=gen) * std_w
+
+    # Quantize each expert's weights to NVFP4, then repack to plugin layout.
+    # FC1 SwiGLU: per ``kernelSrcs/nvfp4_moe_cutedsl/README.md`` the CuTeDSL
+    # SwiGLU prefill kernel and the patched W4A16 decode GEMV both expect
+    # (up, gate) **interleaved at 32-col granularity** along the N axis —
+    # NOT plain ``[gate | up]`` halves. Per-chunk layout:
+    #   B-N[chunk*64 +  0 : chunk*64 + 32) = up_proj   weights for output [chunk*32, (chunk+1)*32)
+    #   B-N[chunk*64 + 32 : chunk*64 + 64) = gate_proj weights for output [chunk*32, (chunk+1)*32)
+    # FC2: down [E, I, H] → NVFP4Linear-style [H, I] → N-major [I, H/2]
+    _SWIGLU_GS = 32
+    assert inter % _SWIGLU_GS == 0, (
+        f"moe_inter_size ({inter}) must be a multiple of {_SWIGLU_GS} "
+        f"for the SwiGLU prefill kernel's interleave layout")
+    _n_chunks = inter // _SWIGLU_GS
+    # [E, H, I] → [E, H, n_chunks, 32]
+    _up_chunks = w_up_ehi.reshape(e_ct, h, _n_chunks, _SWIGLU_GS)
+    _gate_chunks = w_gate_ehi.reshape(e_ct, h, _n_chunks, _SWIGLU_GS)
+    # Stack: [E, H, n_chunks, 2, 32]  (axis 3: up=0, gate=1)
+    _paired = torch.stack([_up_chunks, _gate_chunks], dim=3)
+    w_interleaved = _paired.reshape(e_ct, h, 2 * inter)  # [E, H, 2*I]
+
+    up_ws, up_scs, up_scs_dec, up_gs = [], [], [], []
+    dn_ws, dn_scs, dn_scs_dec, dn_gs = [], [], [], []
+    for i in range(e_ct):
+        # FC1 (up): [2*I, H] as NVFP4Linear, repack with moe_inter_size=2*I
+        fc1_packed, fc1_scale, fc1_ws2 = _quantize_fp32_to_nvfp4(
+            w_interleaved[i].T.contiguous(), group_size=16)
+        up_w, up_sc, up_sc_dec, up_gl = repack_nvfp4_expert_up_prefill_raw(
+            fc1_packed, fc1_scale.to(torch.float8_e4m3fn), fc1_ws2, h,
+            plugin_inter)
+        up_ws.append(torch.as_tensor(up_w))
+        up_scs.append(torch.as_tensor(up_sc))
+        up_scs_dec.append(torch.as_tensor(up_sc_dec))
+        up_gs.append(up_gl)
+
+        # FC2 (down): [H, I] as NVFP4Linear, repack with moe_inter_size=I
+        fc2_packed, fc2_scale, fc2_ws2 = _quantize_fp32_to_nvfp4(
+            w_down_eih[i].T.contiguous(), group_size=16)
+        dn_w, dn_sc, dn_sc_dec, dn_gl = repack_nvfp4_expert_down_prefill_raw(
+            fc2_packed, fc2_scale.to(torch.float8_e4m3fn), fc2_ws2, h, inter)
+        dn_ws.append(torch.as_tensor(dn_w))
+        dn_scs.append(torch.as_tensor(dn_sc))
+        dn_scs_dec.append(torch.as_tensor(dn_sc_dec))
+        dn_gs.append(dn_gl)
+
+    # Build a simple nn.Module wrapper with the attributes
+    # build_nvfp4_moe_engine_trt_api reads.
+    mod = nn.Module()
+    mod.n_routed_experts = e_ct
+    mod.num_experts_per_tok = tk
+    mod.hidden_size = h
+    mod.moe_intermediate_size = plugin_inter  # 2*I for plugin
+    mod.gate = nn.Module()
+    mod.gate.weight = nn.Parameter(gate_layer.weight.data.clone().to(
+        torch.float16),
+                                   requires_grad=False)
+    mod.gate.n_group = 1
+    mod.gate.topk_group = 1
+    mod.gate.norm_topk_prob = True
+    mod.gate.routed_scaling_factor = 1.0
+
+    mod.register_buffer("_stacked_up_weights", torch.stack(up_ws))
+    mod.register_buffer("_stacked_up_block_scale", torch.stack(up_scs))
+    mod.register_buffer("_stacked_up_block_scale_decode",
+                        torch.stack(up_scs_dec))
+    mod.register_buffer("_stacked_up_global_scale",
+                        torch.tensor(up_gs, dtype=torch.float32))
+    mod.register_buffer("_stacked_down_weights", torch.stack(dn_ws))
+    mod.register_buffer("_stacked_down_block_scale", torch.stack(dn_scs))
+    mod.register_buffer("_stacked_down_block_scale_decode",
+                        torch.stack(dn_scs_dec))
+    mod.register_buffer("_stacked_down_global_scale",
+                        torch.tensor(dn_gs, dtype=torch.float32))
+    mod.register_buffer("_e_score_correction_bias_fp32",
+                        torch.zeros(e_ct, dtype=torch.float32))
+
+    return mod, w_gate_ehi.numpy(), w_up_ehi.numpy(), w_down_eih.numpy()
+
 
 # If True, stderr cross-check stats for TRT vs refs (see :meth:`NemotronHMoEReference.print_cross_check_output_distribution`).
 PRINT_TRT_VS_TORCH_DIST = False
@@ -608,9 +1016,36 @@ class NemotronHMoEReference:
         router_logits: np.ndarray,
         top_k: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Same as :meth:`NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_numpy` (CUDA ``moeTopkSoftmax`` parity)."""
-        return NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_numpy(
-            router_logits, top_k)
+        """NumPy softmax + top-k + renormalize aligned with CUDA ``moeTopkSoftmax``: iterative argmax with
+        masking, **lower expert id wins on equal probability** (same as the fused kernel's warp reduce)."""
+        logits = np.asarray(router_logits, dtype=np.float32)
+        m = np.max(logits, axis=-1, keepdims=True)
+        ex = np.exp(logits - m)
+        probs = (ex / np.sum(ex, axis=-1, keepdims=True)).astype(np.float32)
+        num_tokens, num_experts = probs.shape
+        k = min(int(top_k), int(num_experts))
+        topw = np.zeros((num_tokens, k), dtype=np.float32)
+        topi = np.zeros((num_tokens, k), dtype=np.int32)
+        for t in range(int(num_tokens)):
+            row = probs[t]
+            used = np.zeros(num_experts, dtype=bool)
+            for ki in range(k):
+                best_e = -1
+                best_p = np.float32(-1.0)
+                for e in range(int(num_experts)):
+                    if used[e]:
+                        continue
+                    p = row[e]
+                    if best_e < 0 or p > best_p or (p == best_p
+                                                    and e < best_e):
+                        best_p = p
+                        best_e = e
+                used[best_e] = True
+                topi[t, ki] = np.int32(best_e)
+                topw[t, ki] = best_p
+            denom = float(np.sum(topw[t])) + 1e-20
+            topw[t] = (topw[t] / denom).astype(np.float32)
+        return topw, topi
 
     @staticmethod
     def sort_topk_slots_descending(
@@ -732,6 +1167,7 @@ class NemotronHMoEReference:
         *,
         tol_scale: float = 1.0,
         use_fp16_rounded_baseline: bool = True,
+        max_outlier_frac: float = 0.0,
     ) -> None:
         """Per-element tolerance matching C++ ``trtNvfp4MoeOutputElemAcceptable`` (vectorized)."""
         t = np.asarray(trt_out, dtype=np.float32).reshape(-1)
@@ -875,6 +1311,28 @@ class NemotronHMoEReference:
             tol_scale=tol_scale,
         )
 
+    # Vectorized FP4 nibble → float LUT (indexed by 4-bit value 0..15).
+    _FP4_LUT = np.array(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,  # positive (sign bit 0)
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,  # negative (sign bit 1)
+        ],
+        dtype=np.float32)
+
     @staticmethod
     def _fp4_nibble_to_float(nib: int) -> float:
         nib = int(nib) & 0xF
@@ -928,12 +1386,75 @@ class NemotronHMoEReference:
         """Read 4 raw FP8 bytes from atom-layout positions and return Marlin-packed int32 scale word."""
         raw = np.zeros(4, dtype=np.uint8)
         for g in range(4):
-            off = MarlinConverter.atom_sf_offset(m_idx, k_tile * 4 + g,
-                                                 num_sf_cols)
+            off = _atom_sf_offset(m_idx, k_tile * 4 + g, num_sf_cols)
             raw[g] = buf_u8[off]
         # Atom stores {s0,s1,s2,s3}; Marlin expects {s0,s2,s1,s3}
         marlin = np.array([raw[0], raw[2], raw[1], raw[3]], dtype=np.uint8)
         return int(np.frombuffer(marlin.tobytes(), dtype=np.int32)[0])
+
+    @staticmethod
+    def _unpack_payload_to_nibbles_vectorized(payload_flat: np.ndarray,
+                                              num_tiles: int) -> np.ndarray:
+        """Vectorized: all tiles' int8 payload → uint8 nibble array [num_tiles, 64]."""
+        # payload_flat is int8 with shape [num_tiles * 32]
+        raw = payload_flat.view(np.uint8).reshape(num_tiles, 32)
+        lo = (raw & 0x0F).astype(np.uint8)
+        hi = ((raw >> 4) & 0x0F).astype(np.uint8)
+        # Interleave lo/hi: for each byte → (lo, hi) in output
+        nibs = np.empty((num_tiles, 64), dtype=np.uint8)
+        nibs[:, 0::2] = lo
+        nibs[:, 1::2] = hi
+        return nibs
+
+    @staticmethod
+    def _unpack_scales_vectorized(bs_u8: np.ndarray, m_indices: np.ndarray,
+                                  k_tiles: np.ndarray,
+                                  num_sf_cols: int) -> np.ndarray:
+        """Vectorized atom_sf_offset + FP8→FP16→FP32 scale decode for all tiles. Returns [num_tiles, 4]."""
+        num_tiles = len(m_indices)
+        # Compute atom_sf_offset for all 4 groups per tile
+        # k_idx = k_tile * 4 + g, for g in [0,1,2,3]
+        k_base = (k_tiles * 4).astype(np.int64)  # [num_tiles]
+        g_offsets = np.arange(4, dtype=np.int64)  # [4]
+        k_idx = k_base[:, None] + g_offsets[None, :]  # [num_tiles, 4]
+        m_idx = m_indices[:, None].astype(np.int64)  # [num_tiles, 1] broadcast
+
+        # atom_sf_offset vectorized
+        inner_k = (k_idx % 4).astype(np.int64)
+        inner_m = ((m_idx % 128) // 32).astype(np.int64)
+        outer_m = (m_idx % 32).astype(np.int64)
+        k_tile_div = (k_idx // 4).astype(np.int64)
+        num_k_tiles = int((num_sf_cols + 3) // 4)
+        m_tile = (m_idx // 128).astype(np.int64)
+        offsets = m_tile * num_k_tiles * 512 + k_tile_div * 512 + outer_m * 16 + inner_m * 4 + inner_k
+        # offsets: [num_tiles, 4]
+
+        # Gather raw FP8 bytes
+        raw = bs_u8[offsets.ravel()].reshape(num_tiles,
+                                             4)  # [num_tiles, 4] uint8
+        # Atom stores {s0,s1,s2,s3}; Marlin expects {s0,s2,s1,s3}
+        marlin_bytes = np.stack([raw[:, 0], raw[:, 2], raw[:, 1], raw[:, 3]],
+                                axis=1)  # [num_tiles, 4]
+
+        # Decode marlin int32 → 4 FP32 scales per tile
+        words = marlin_bytes.view(np.uint32).reshape(
+            num_tiles)  # [num_tiles] uint32
+        words64 = words.astype(np.uint64)
+        out1 = ((words64 & 0xFF00FF00) >> 1).astype(np.uint32)
+        qs = ((words64 << 8) & 0xFFFFFFFF).astype(np.uint64)
+        out2 = ((qs & 0xFF00FF00) >> 1).astype(np.uint32)
+        # Each uint32 → 2 float16 → 2 float32
+        f1 = out1.view(np.uint16).reshape(num_tiles, 2).view(
+            np.float16).astype(np.float32)
+        f2 = out2.view(np.uint16).reshape(num_tiles, 2).view(
+            np.float16).astype(np.float32)
+        # Order: [f2[0], f2[1], f1[0], f1[1]] per tile (matches _unpack_fp8_e4m3_int32_word_to_float4)
+        scales = np.empty((num_tiles, 4), dtype=np.float32)
+        scales[:, 0] = f2[:, 0]
+        scales[:, 1] = f2[:, 1]
+        scales[:, 2] = f1[:, 0]
+        scales[:, 3] = f1[:, 1]
+        return scales
 
     @staticmethod
     def dense_weights_from_nvfp4_plugin_buffers(
@@ -946,7 +1467,10 @@ class NemotronHMoEReference:
         hidden_size: int,
         moe_inter_size: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """INT8 plugin buffers → dense ``w_up_ehi`` / ``w_down_eih`` (no global scales; kernel applies those)."""
+        """INT8 plugin buffers → dense ``w_up_ehi`` / ``w_down_eih`` (no global scales; kernel applies those).
+
+        Vectorized: processes all tiles per expert in bulk using numpy ops instead of per-tile Python loops.
+        """
         e = int(num_experts)
         h = int(hidden_size)
         inter = int(moe_inter_size)
@@ -966,34 +1490,158 @@ class NemotronHMoEReference:
 
         num_sf_cols_up = inter // 16
         num_sf_cols_dn = h // 16
+        lut = NemotronHMoEReference._FP4_LUT
+
+        # Pre-compute tile indices for up-proj: tile[jj, c] = jj * nic + c
+        # m_indices = jj for each tile, k_tiles = c for each tile
+        up_num_tiles = h * nic
+        up_m_idx = np.repeat(np.arange(h, dtype=np.int64), nic)
+        up_k_tiles = np.tile(np.arange(nic, dtype=np.int64), h)
+
+        dn_num_tiles = inter * n_h_chunks
+        dn_m_idx = np.repeat(np.arange(inter, dtype=np.int64), n_h_chunks)
+        dn_k_tiles = np.tile(np.arange(n_h_chunks, dtype=np.int64), inter)
 
         w_up = np.zeros((e, h, inter), dtype=np.float32)
         w_down = np.zeros((e, inter, h), dtype=np.float32)
+
         for ex in range(e):
-            up_flat = up_q8[ex].reshape(-1)
+            # --- Up projection ---
+            up_flat = up_q8[ex].reshape(-1)  # [h//2 * inter] int8
             up_bs_u8 = up_bs8[ex].view(np.uint8).reshape(-1)
-            for jj in range(h):
-                for c in range(nic):
-                    tile_u = jj * nic + c
-                    pl = up_flat[tile_u * 32:(tile_u + 1) * 32].view(
-                        np.int32).reshape(8)
-                    bs_i32 = NemotronHMoEReference._read_atom_scale_word(
-                        up_bs_u8, jj, c, num_sf_cols_up)
-                    w_up[ex, jj, c * 64:(c + 1) * 64] = (
-                        NemotronHMoEReference.unpack_nvfp4_marlin_tile_64(
-                            pl, bs_i32))
+
+            # Unpack all payload nibbles: [up_num_tiles, 64]
+            nibs = NemotronHMoEReference._unpack_payload_to_nibbles_vectorized(
+                up_flat, up_num_tiles)
+            # Decode nibbles → float via LUT: [up_num_tiles, 64]
+            vals = lut[nibs]
+            # Decode all scales: [up_num_tiles, 4]
+            scales = NemotronHMoEReference._unpack_scales_vectorized(
+                up_bs_u8, up_m_idx, up_k_tiles, num_sf_cols_up)
+            # Broadcast scales to 64 lanes (each scale covers 16 lanes)
+            scales_64 = np.repeat(scales, 16, axis=1)  # [up_num_tiles, 64]
+            vals *= scales_64
+            # Write to output: tile[jj, c] → w_up[ex, jj, c*64:(c+1)*64]
+            w_up[ex] = vals.reshape(h, nic, 64).reshape(h, inter)
+
+            # --- Down projection ---
+            dn_flat = dn_q8[ex].reshape(-1)
             dn_bs_u8 = dn_bs8[ex].view(np.uint8).reshape(-1)
-            dn_q_flat = dn_q8[ex].reshape(-1)
-            for j in range(inter):
-                for c in range(n_h_chunks):
-                    tile_d_idx = j * n_h_chunks + c
-                    pl_d = dn_q_flat[tile_d_idx * 32:(tile_d_idx + 1) *
-                                     32].view(np.int32).reshape(8)
-                    bs_d_i32 = NemotronHMoEReference._read_atom_scale_word(
-                        dn_bs_u8, j, c, num_sf_cols_dn)
-                    w_down[ex, j, c * 64:(c + 1) * 64] = (
-                        NemotronHMoEReference.unpack_nvfp4_marlin_tile_64(
-                            pl_d, bs_d_i32))
+
+            nibs_dn = NemotronHMoEReference._unpack_payload_to_nibbles_vectorized(
+                dn_flat, dn_num_tiles)
+            vals_dn = lut[nibs_dn]
+            scales_dn = NemotronHMoEReference._unpack_scales_vectorized(
+                dn_bs_u8, dn_m_idx, dn_k_tiles, num_sf_cols_dn)
+            scales_64_dn = np.repeat(scales_dn, 16, axis=1)
+            vals_dn *= scales_64_dn
+            w_down[ex] = vals_dn.reshape(inter, n_h_chunks,
+                                         64).reshape(inter, h)
+
+        return w_up, w_down
+
+    @staticmethod
+    def dense_weights_from_nvfp4_nmajor_buffers(
+        fc_up_qweights: np.ndarray,
+        fc_up_block_scale: np.ndarray,
+        fc_down_qweights: np.ndarray,
+        fc_down_block_scale: np.ndarray,
+        *,
+        num_experts: int,
+        hidden_size: int,
+        moe_inter_size: int,
+        activation_type: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """N-major NVFP4 buffers → dense weights (no global scales applied).
+
+        N-major payload: ``[K, N//2]`` int8 (2 nibbles packed per byte along N);
+        prefill atom-layout SF: ``[padUp(N,128), padUp(K/16,4)]`` raw FP8 E4M3
+        (M=N output dim, K_sf=K/16 input groups).
+        Scale granularity: one per 16 K-elements × 16 N-elements.
+
+        Returns ``w_up [E, H, moe_inter_size]`` and ``w_down [E, nOut, H]`` float32.
+        """
+        import torch as _torch
+
+        def _pad_up(x, align):
+            return ((x + align - 1) // align) * align
+
+        def _atom_sf_byte_offset(m_idx, k_idx, num_sf_cols):
+            inner_k = k_idx % 4
+            inner_m = (m_idx % 128) // 32
+            outer_m = m_idx % 32
+            k_tile = k_idx // 4
+            num_k_tiles = (num_sf_cols + 3) // 4
+            m_tile = m_idx // 128
+            return m_tile * num_k_tiles * 512 + k_tile * 512 + outer_m * 16 + inner_m * 4 + inner_k
+
+        def _read_prefill_sf(sf_buf, k_gemv, n_gemv):
+            """Read prefill atom-layout FP8 E4M3 scales → [K/16, N/16] float32.
+
+            Prefill atom: M=N (output dim), K_sf=K/16 (input groups).
+            """
+            k_groups = k_gemv // 16
+            n_blocks = n_gemv // 16
+            padded_sf_cols = _pad_up(k_groups, 4)
+            sf_flat = sf_buf.view(np.uint8).ravel()
+            raw = np.empty((k_groups, n_blocks), dtype=np.uint8)
+            for g in range(k_groups):
+                for c in range(n_blocks):
+                    off = _atom_sf_byte_offset(c * 16, g, padded_sf_cols)
+                    raw[g, c] = sf_flat[off]
+            # FP8 E4M3 → float32
+            raw_f32 = _torch.from_numpy(raw.ravel()).view(
+                _torch.float8_e4m3fn).float().numpy().reshape(
+                    k_groups, n_blocks)
+            return raw_f32
+
+        e = int(num_experts)
+        h = int(hidden_size)
+        inter = int(moe_inter_size)
+        nOut = inter // 2 if int(activation_type) == 1 else inter
+
+        up_q = np.ascontiguousarray(fc_up_qweights, dtype=np.int8)
+        dn_q = np.ascontiguousarray(fc_down_qweights, dtype=np.int8)
+
+        assert up_q.shape == (e, h, inter // 2), (
+            f"up payload {up_q.shape} != ({e}, {h}, {inter // 2})")
+        assert dn_q.shape == (e, nOut, h // 2), (
+            f"dn payload {dn_q.shape} != ({e}, {nOut}, {h // 2})")
+
+        lut = NemotronHMoEReference._FP4_LUT
+
+        w_up = np.zeros((e, h, inter), dtype=np.float32)
+        w_down = np.zeros((e, nOut, h), dtype=np.float32)
+
+        for ex in range(e):
+            # --- FC1 up: N-major payload [H, inter/2] → [H, inter] ---
+            up_u8 = up_q[ex].view(np.uint8)  # [H, inter/2]
+            nibs_up = np.empty((h, inter), dtype=np.uint8)
+            nibs_up[:, 0::2] = up_u8 & 0x0F
+            nibs_up[:, 1::2] = (up_u8 >> 4) & 0x0F
+            vals_up = lut[nibs_up]  # [H, inter] float32
+
+            # Prefill atom-layout FP8 E4M3: [K_groups, N_blocks] float32
+            sf_up = _read_prefill_sf(fc_up_block_scale[ex], h, inter)
+            # Expand: [H/16, inter/16] → [H, inter] (16 K × 16 N share one scale)
+            sf_expanded = np.repeat(np.repeat(sf_up, 16, axis=0), 16, axis=1)
+            vals_up *= sf_expanded[:h, :inter]
+            w_up[ex] = vals_up
+
+            # --- FC2 down: N-major payload [nOut, H/2] → [nOut, H] ---
+            dn_u8 = dn_q[ex].view(np.uint8)  # [nOut, H/2]
+            nibs_dn = np.empty((nOut, h), dtype=np.uint8)
+            nibs_dn[:, 0::2] = dn_u8 & 0x0F
+            nibs_dn[:, 1::2] = (dn_u8 >> 4) & 0x0F
+            vals_dn = lut[nibs_dn]
+
+            sf_dn = _read_prefill_sf(fc_down_block_scale[ex], nOut, h)
+            sf_dn_expanded = np.repeat(np.repeat(sf_dn, 16, axis=0),
+                                       16,
+                                       axis=1)
+            vals_dn *= sf_dn_expanded[:nOut, :h]
+            w_down[ex] = vals_dn
+
         return w_up, w_down
 
     @staticmethod
@@ -1029,8 +1677,7 @@ class NemotronHMoEReference:
                 if s == 0.0 or ex < 0 or ex >= e:
                     continue
                 z = x_bh[bb] @ w_up_ehi[ex]
-                act = NemotronHMoEW4A4Plugin.moe_activation_numpy(
-                    z, activation_type)
+                act = _moe_activation_numpy(z, activation_type)
                 t = act * s
                 out[bb] += t @ w_down_eih[ex]
         return out.reshape(b, 1, h)
@@ -1038,7 +1685,7 @@ class NemotronHMoEReference:
     @staticmethod
     def _vectorized_atom_sf_offsets(num_sf_rows: int,
                                     num_sf_cols: int) -> np.ndarray:
-        """Vectorized ``MarlinConverter.atom_sf_offset`` over a full grid.
+        """Vectorized ``_atom_sf_offset`` over a full grid.
 
         Returns an ``[num_sf_rows, num_sf_cols]`` array of byte offsets into
         the atom-swizzled SF buffer.
@@ -1261,7 +1908,7 @@ class NemotronHMoEReference:
         for r in range(flat.shape[0]):
             for c_start in range(0, shape[-1], 64):
                 chunk = np.ascontiguousarray(flat[r, c_start:c_start + 64])
-                pl, sw = MarlinConverter.quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
+                pl, sw = _quantize_f32x64_to_fp4x64_with_f8x4_block_scale(
                     chunk, expert_block_scale_max_fp32=s_max_f)
                 dequant_intermediate = (
                     NemotronHMoEReference.unpack_nvfp4_marlin_tile_64(pl, sw))
@@ -1324,8 +1971,9 @@ class NemotronHMoEReference:
                 if s == 0.0 or ex < 0 or ex >= e_ct:
                     continue
                 z = x_bh_q[bb] @ w_up_ehi_sim[ex]
-                act = NemotronHMoEW4A4Plugin.moe_activation_numpy(
-                    z, activation_type).astype(np.float32, copy=False)
+                act = _moe_activation_numpy(z,
+                                            activation_type).astype(np.float32,
+                                                                    copy=False)
                 per_slot.append((bb, ex, s, act))
                 m = float(np.max(np.abs(act))) if act.size > 0 else 0.0
                 if m > running_max:
@@ -1585,9 +2233,9 @@ class NemotronHMoEReference:
         topi_torch: torch.Tensor,
         case: str,
     ) -> None:
-        """Require plugin-parity top-k tensors to match :meth:`NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_numpy`."""
+        """Require plugin-parity top-k tensors to match :meth:`NemotronHMoEReference.moe_topk_softmax_renormalize_numpy`."""
         L = np.ascontiguousarray(router_logits.detach().float().cpu().numpy())
-        nw, ni = NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_numpy(
+        nw, ni = NemotronHMoEReference.moe_topk_softmax_renormalize_numpy(
             L, int(top_k))
         tw = topw_torch.detach().float().cpu().numpy()
         ti = topi_torch.detach().cpu().numpy().astype(np.int32)
@@ -1667,7 +2315,7 @@ class NemotronHMoEReference:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Plugin-parity top-k on CPU float probs (tie-break: lower expert id)."""
         device = router_logits.device
-        # Softmax on CPU float32 matches :meth:`NemotronHMoEW4A4Plugin.moe_topk_softmax_renormalize_numpy`
+        # Softmax on CPU float32 matches :meth:`NemotronHMoEReference.moe_topk_softmax_renormalize_numpy`
         # on the same logits array (GPU softmax can differ in ULPs and change top-k on ties).
         logits_cpu = router_logits.float().detach().cpu()
         probs = torch.nn.functional.softmax(logits_cpu, dim=-1)
@@ -1756,7 +2404,7 @@ class NemotronHMoEReference:
     @staticmethod
     def moe_activation_torch(z: torch.Tensor,
                              activation_type: int) -> torch.Tensor:
-        """FP32 expert nonlinearity matching :meth:`NemotronHMoEW4A4Plugin.moe_activation_numpy`."""
+        """FP32 expert nonlinearity matching :meth:`_moe_activation_numpy`."""
         z = z.float()
         if int(activation_type) == 1:
             zc = z.clamp(-50.0, 50.0)
@@ -1968,7 +2616,9 @@ def _preload_libnvinfer_rtld_global(verbose: bool) -> Path | None:
     return p
 
 
-def _get_nvfp4_moe_plugin_creator(registry) -> object | None:
+def _get_nvfp4_moe_plugin_creator(registry,
+                                  plugin_name: str = "Nvfp4MoePlugin"
+                                  ) -> object | None:
     getters: list[tuple[str, object]] = []
     for gname in ("get_creator", "get_plugin_creator", "getPluginCreator"):
         g = getattr(registry, gname, None)
@@ -1988,7 +2638,7 @@ def _get_nvfp4_moe_plugin_creator(registry) -> object | None:
         for ver in versions:
             for ns in namespaces:
                 try:
-                    c = getter("Nvfp4MoePlugin", ver, ns)
+                    c = getter(plugin_name, ver, ns)
                 except TypeError:
                     c = None
                 except Exception:
@@ -1997,7 +2647,7 @@ def _get_nvfp4_moe_plugin_creator(registry) -> object | None:
                     return c
         for ver in versions:
             try:
-                c = getter("Nvfp4MoePlugin", ver)
+                c = getter(plugin_name, ver)
             except TypeError:
                 c = None
             except Exception:
@@ -2235,16 +2885,20 @@ def build_nvfp4_moe_engine_trt_api(
     """
     Build a serialized TensorRT engine for ``Nvfp4MoePlugin`` using the network API (no ONNX).
 
-    ``module`` must be a :class:`NemotronHMoEW4A4Plugin` on CPU with NVFP4 buffers already filled
-    (or zeroed). ``dummy_hidden_fp16`` defines static ``(batch, seq, hidden)`` layout (used for
-    optimization profile bounds); it must match ``module.hidden_size``. ``hidden_states`` is always
-    FP16; activation NVFP4 quantization (for the prefill path) is computed inside the plugin.
+    ``module`` must be a :class:`NemotronHMoEMLP` on CPU with NVFP4 buffers already filled
+    (after ``prepare_for_export()``). ``dummy_hidden_fp16`` defines static ``(batch, seq, hidden)``
+    layout (used for optimization profile bounds); it must match ``module.hidden_size``.
+    ``hidden_states`` is always FP16; activation NVFP4 quantization (for the prefill path) is
+    computed inside the plugin.
 
     When ``explicit_router_logits`` is True, the graph matches ``experiment/test_nvfp4_moe_trt_plugin_accuracy.cu``:
     ``router_logits`` is a dedicated FP32 input ``(batch * seq, num_experts)`` rather than
     ``cast(hidden_states) @ gate^T + bias``. That avoids routing ``hidden_states`` through an extra
     matmul subgraph (which can interact badly with STRONGLY_TYPED on some GPUs, e.g. spurious ~0 MoE
     output when ``top_k > 1`` despite correct logits at the plugin boundary).
+
+    Accepts an optional ``activation_type`` override (default 0 = ReLU² for NemotronH; 1 = SiLU for
+    Qwen3 gated MoE) and ``routing_mode`` override (default 0 = softmax; 1 = sigmoid group topk).
     """
     import tensorrt as trt
 
@@ -2272,16 +2926,17 @@ def build_nvfp4_moe_engine_trt_api(
             "Nvfp4MoePlugin creator not found (load Edge-LLM plugin DSO first)."
         )
 
-    e_ct = int(getattr(module, "num_experts"))
-    top_k = int(getattr(module, "top_k"))
-    inter = int(getattr(module, "moe_inter_size"))
-    f_act = int(getattr(module, "activation_type", 0))
-    f_qgs = int(getattr(module, "quantization_group_size", 16))
-    f_n_group = int(getattr(module, "n_group", 1))
-    f_topk_group = int(getattr(module, "topk_group", 1))
-    f_norm_topk = int(getattr(module, "norm_topk_prob", 1))
-    f_routed_scaling = float(getattr(module, "routed_scaling_factor", 1.0))
-    f_routing_mode = int(getattr(module, "routing_mode", 0))
+    # Extract plugin attributes from NemotronHMoEMLP (new FE).
+    e_ct = int(module.n_routed_experts)
+    top_k = int(module.num_experts_per_tok)
+    inter = int(module.moe_intermediate_size)
+    f_act = int(getattr(module, "_plugin_activation_type", 0))
+    f_qgs = 16  # NVFP4 always uses group_size=16
+    f_n_group = int(module.gate.n_group)
+    f_topk_group = int(module.gate.topk_group)
+    f_norm_topk = int(module.gate.norm_topk_prob)
+    f_routed_scaling = float(module.gate.routed_scaling_factor)
+    f_routing_mode = int(getattr(module, "_plugin_routing_mode", 0))
     # TRT PluginField keeps a raw pointer into the numpy buffer; bind them to named locals so
     # the arrays outlive ``creator.create_plugin`` below (CPython can free a temporary in a
     # list-literal expression before the call returns).
@@ -2347,7 +3002,7 @@ def build_nvfp4_moe_engine_trt_api(
         # Bake ``W.T`` as a contiguous ``(H, E)`` constant and use ``NONE`` on both operands so the GEMM does not rely
         # on ``MatrixOperation.TRANSPOSE`` for the weight tensor (avoids STRONGLY_TYPED / constant-layer quirks that can
         # corrupt logits and yield NaNs → plugin decode skips all experts, ~0 output).
-        gate_w = getattr(module, "gate").weight.detach().float().cpu().numpy()
+        gate_w = module.gate.weight.detach().float().cpu().numpy()
         if gate_w.shape != (e_ct, h):
             raise ValueError(
                 f"gate.weight shape {gate_w.shape} expected ({e_ct}, {h})")
@@ -2361,7 +3016,8 @@ def build_nvfp4_moe_engine_trt_api(
             trt.MatrixOperation.NONE,
         )
         router_logits = mm.get_output(0)
-        bias = getattr(module, "gate").bias
+        # NemotronHTopkRouter has no bias
+        bias = getattr(module.gate, "bias", None)
         if bias is not None:
             b_np = np.ascontiguousarray(
                 bias.detach().float().cpu().numpy().reshape(1, e_ct).astype(
@@ -2371,31 +3027,32 @@ def build_nvfp4_moe_engine_trt_api(
                 router_logits, bias_const.get_output(0),
                 trt.ElementWiseOperation.SUM).get_output(0)
 
+    # New FE buffer names: _stacked_{up,down}_{weights,block_scale,block_scale_decode,global_scale}
     up_q = np.ascontiguousarray(
-        module.fc_up_qweights.detach().cpu().numpy().astype(np.int8,
-                                                            copy=False))
+        module._stacked_up_weights.detach().cpu().numpy().astype(np.int8,
+                                                                 copy=False))
     up_bs = np.ascontiguousarray(
-        module.fc_up_blocks_scale.detach().cpu().numpy().astype(np.int8,
-                                                                copy=False))
+        module._stacked_up_block_scale.detach().cpu().numpy().astype(
+            np.int8, copy=False))
     up_gs = np.ascontiguousarray(
-        module.fc_up_global_scale.detach().cpu().numpy().astype(np.float32,
-                                                                copy=False))
+        module._stacked_up_global_scale.detach().cpu().numpy().astype(
+            np.float32, copy=False))
     dn_q = np.ascontiguousarray(
-        module.fc_down_qweights.detach().cpu().numpy().astype(np.int8,
-                                                              copy=False))
+        module._stacked_down_weights.detach().cpu().numpy().astype(np.int8,
+                                                                   copy=False))
     dn_bs = np.ascontiguousarray(
-        module.fc_down_blocks_scale.detach().cpu().numpy().astype(np.int8,
-                                                                  copy=False))
+        module._stacked_down_block_scale.detach().cpu().numpy().astype(
+            np.int8, copy=False))
     dn_gs = np.ascontiguousarray(
-        module.fc_down_global_scale.detach().cpu().numpy().astype(np.float32,
-                                                                  copy=False))
+        module._stacked_down_global_scale.detach().cpu().numpy().astype(
+            np.float32, copy=False))
     up_bs_decode = np.ascontiguousarray(
-        module.fc_up_blocks_scale_decode.detach().cpu().numpy().astype(
+        module._stacked_up_block_scale_decode.detach().cpu().numpy().astype(
             np.int8, copy=False))
     dn_bs_decode = np.ascontiguousarray(
-        module.fc_down_blocks_scale_decode.detach().cpu().numpy().astype(
+        module._stacked_down_block_scale_decode.detach().cpu().numpy().astype(
             np.int8, copy=False))
-    correction_bias = getattr(module, "e_score_correction_bias", None)
+    correction_bias = getattr(module, "_e_score_correction_bias_fp32", None)
     if correction_bias is None:
         correction_bias_np = np.zeros(e_ct, dtype=np.float32)
     else:
@@ -2473,7 +3130,7 @@ def build_nvfp4_moe_engine_trt_api(
 
 
 def serialize_nvfp4_moe_engine_with_explicit_router(
-    mod_cpu: NemotronHMoEW4A4Plugin,
+    mod_cpu: NemotronHMoEMLP,
     *,
     batch: int,
     seq: int,
@@ -2484,7 +3141,7 @@ def serialize_nvfp4_moe_engine_with_explicit_router(
 ) -> bytes:
     """Engine blob with router as runtime input (``explicit_router_logits=True``)."""
     num_tokens = int(batch * seq)
-    e_ct = int(mod_cpu.num_experts)
+    e_ct = int(mod_cpu.n_routed_experts)
     r_logits = np.ascontiguousarray(
         np.asarray(router_logits_np, dtype=np.float32))
     if tuple(r_logits.shape) != (num_tokens, e_ct):
@@ -2536,6 +3193,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
     seq = num_tokens // batch
     h, inter, e_ct = _NVFP4_MOE_FAST_HIDDEN, _NVFP4_MOE_FAST_INTER, _NVFP4_MOE_FAST_EXPERTS
 
+    # HF reference model — single source of truth for FP32 weights
     moe = create_toy_moe(
         device,
         hidden_size=h,
@@ -2544,9 +3202,64 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
         top_k=tk,
         seed=moe_seed,
     )
-    mod = NemotronHMoEW4A4Plugin(moe)
-    mod.eval().to(device)
-    mod.pack_experts_weights_to_marlin(moe)
+
+    # New FE: build NemotronHMoEMLP populated from the HF model's actual weights
+    cfg = ModelConfig(
+        model_type="nemotron_h",
+        hidden_size=h,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=inter,
+        head_dim=h,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        n_routed_experts=e_ct,
+        num_experts_per_tok=tk,
+        moe_intermediate_size=inter,
+        moe_shared_expert_intermediate_size=inter,
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        quant=QuantConfig(quant_type=QUANT_NVFP4, group_size=16),
+    )
+    mod = NemotronHMoEMLP(cfg, module_prefix="backbone.layers.0.mixer")
+    mod.eval()
+    # Extract HF expert weights: up_proj [E, I, H], down_proj [E, H, I]
+    w_up_eih = moe.experts.up_proj.data.detach().cpu().float()  # [E, I, H]
+    w_down_ehi = moe.experts.down_proj.data.detach().cpu().float()  # [E, H, I]
+    for i, exp_mod in enumerate(mod.experts):
+        _populate_nvfp4_linear(exp_mod.up_proj, w_up_eih[i].contiguous())
+        _populate_nvfp4_linear(exp_mod.down_proj, w_down_ehi[i].contiguous())
+    # Gate weights — NemotronHTopkRouter stores as fp16
+    std_gate = WeightsGenerator.gate_test_weight_std(h)
+    gen_gate = torch.Generator()
+    gen_gate.manual_seed(moe_seed)
+    nn.init.normal_(mod.gate.weight,
+                    mean=0.0,
+                    std=std_gate,
+                    generator=gen_gate)
+    nn.init.normal_(mod.gate.e_score_correction_bias,
+                    mean=0.0,
+                    std=std_gate * 0.3,
+                    generator=gen_gate)
+    # Shared experts (not used in tests but prepare_for_export expects them)
+    gen_shared = torch.Generator()
+    gen_shared.manual_seed(moe_seed + 202)
+    std_up = WeightsGenerator.expert_linear_std(h, 0.08)
+    std_dn = WeightsGenerator.expert_linear_std(inter, 0.08)
+    w_shared_up = torch.randn(h, inter, generator=gen_shared) * std_up
+    w_shared_dn = torch.randn(inter, h, generator=gen_shared) * std_dn
+    _populate_nvfp4_linear(mod.shared_experts.up_proj,
+                           w_shared_up.T.contiguous())
+    _populate_nvfp4_linear(mod.shared_experts.down_proj,
+                           w_shared_dn.T.contiguous())
+    mod.prepare_for_export()
+    mod._plugin_activation_type = 0
+    mod._plugin_routing_mode = 0
 
     logits_np = NemotronHMoEReference.router_logits_from_desired_topk(
         expert, score, num_tokens=num_tokens, num_experts=e_ct, top_k=tk)
@@ -2563,14 +3276,50 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
     topw_np, topi_np = NemotronHMoEReference.moe_topk_softmax_renormalize_numpy(
         logits_np, tk)
     hidden_np = np.ascontiguousarray(hidden_bsh.cpu().numpy())
-    ref_np = NemotronHMoEReference.reference_dense_from_hf_moe(
-        moe,
-        hidden_np,
-        topw_np,
-        topi_np,
+
+    # Build Q/DQ reference from N-major buffers with prefill atom-layout scales
+    # (quantize→dequantize eliminates FP4 rounding from the comparison).
+    act_type = 0  # ReLU² for NemotronH
+    plugin_inter = int(mod_cpu.moe_intermediate_size)
+    w_up_qdq, w_down_qdq = NemotronHMoEReference.dense_weights_from_nvfp4_nmajor_buffers(
+        mod_cpu._stacked_up_weights.numpy(),
+        mod_cpu._stacked_up_block_scale.numpy(),
+        mod_cpu._stacked_down_weights.numpy(),
+        mod_cpu._stacked_down_block_scale.numpy(),
+        num_experts=e_ct,
         hidden_size=h,
-        activation_type=int(mod_cpu.activation_type),
+        moe_inter_size=plugin_inter,
+        activation_type=act_type,
     )
+    up_gs_np = mod_cpu._stacked_up_global_scale.numpy().reshape(-1)
+    dn_gs_np = mod_cpu._stacked_down_global_scale.numpy().reshape(-1)
+    for ex in range(e_ct):
+        w_up_qdq[ex] *= float(up_gs_np[ex])
+        w_down_qdq[ex] *= float(dn_gs_np[ex])
+
+    # Patch Q/DQ weights into the HF experts module and call its forward().
+    # up_proj: (E, I, H), down_proj: (E, H, I) — transposed from Q/DQ layout.
+    with torch.no_grad():
+        moe.experts.up_proj.data.copy_(
+            torch.from_numpy(np.ascontiguousarray(w_up_qdq.transpose(
+                0, 2, 1))).to(moe.experts.up_proj.data))
+        moe.experts.down_proj.data.copy_(
+            torch.from_numpy(
+                np.ascontiguousarray(w_down_qdq.transpose(0, 2, 1))).to(
+                    moe.experts.down_proj.data))
+
+    expert_dtype = moe.experts.up_proj.dtype  # fp16
+    x_fp16 = torch.from_numpy(
+        np.asarray(hidden_np, dtype=np.float16).reshape(-1, h)).to(
+            device=moe.experts.up_proj.device, dtype=expert_dtype)
+    topi_t = torch.from_numpy(topi_np.astype(np.int64)).to(
+        moe.experts.up_proj.device)
+    topw_t = torch.from_numpy(topw_np).to(device=moe.experts.up_proj.device,
+                                          dtype=torch.float32)
+    with torch.no_grad():
+        ref_torch = moe.experts(x_fp16, topi_t, topw_t)
+    ref_fp32 = ref_torch.detach().cpu().numpy().astype(np.float32).reshape(
+        batch, seq, h)
 
     logger = trt.Logger(trt.Logger.WARNING)
     load_nvfp4_moe_edge_llm_plugins(logger, _PLUGIN_SO, verbose=False)
@@ -2613,35 +3362,18 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
         label=trt_execute_label,
     )
 
-    logits_t = torch.as_tensor(logits_np, device=device, dtype=torch.float32)
-    ref_torch_fp32 = NemotronHMoEReference.routed_experts_from_router_logits_via_hf_experts(
-        moe,
-        hidden_bsh,
-        logits_t,
-        tk,
-        compute_dtype=torch.float32,
-        activation_type=int(mod_cpu.activation_type),
-        case=f"{case}_torch_ref_fp32",
-    )
-
-    # Plugin v3 K-major unified layout: all tokens go through the prefill path (the Marlin
-    # M-major decode kernel is retired in this commit).  The Marlin-unpack reference
-    # functions in NemotronHMoEReference assume the old M-major buffer layout and are not
-    # compatible with the K-major byte order we now emit, so skip them here and rely on
-    # the FP32 HF reference as ground truth at Tier-1 (cosine > 0.95) tolerance — matching
-    # the prefill test's metric.
-    trt_np = np.asarray(trt_out, dtype=np.float32).reshape(*ref_np.shape)
-    ref_np_f32 = np.asarray(ref_np, dtype=np.float32)
-    med_cos, mean_cos, min_cos = _cosine_sim_per_row(trt_np, ref_np_f32)
-    mag = _magnitude_ratio(trt_np, ref_np_f32)
+    # Compare TRT output against Q/DQ reference (FP4 quantize→dequantize weights).
+    trt_np = np.asarray(trt_out, dtype=np.float32).reshape(*ref_fp32.shape)
+    med_cos, mean_cos, min_cos = _cosine_sim_per_row(trt_np, ref_fp32)
+    mag = _magnitude_ratio(trt_np, ref_fp32)
     print(
         f"[w4a16 {case}] numTokens={num_tokens} topK={tk} median_cos={med_cos:.4f} "
         f"mean_cos={mean_cos:.4f} min_cos={min_cos:.4f} mag_ratio={mag:.3f} "
-        f"|trt|={float(np.linalg.norm(trt_np)):.4g} |ref|={float(np.linalg.norm(ref_np_f32)):.4g}"
+        f"|trt|={float(np.linalg.norm(trt_np)):.4g} |ref|={float(np.linalg.norm(ref_fp32)):.4g}"
     )
-    if med_cos < 0.95:
+    if med_cos < 0.99:
         raise AssertionError(
-            f"{case}: median cosine {med_cos:.4f} < 0.95 Tier-1 threshold "
+            f"{case}: median cosine vs Q/DQ ref {med_cos:.4f} < 0.99 "
             f"(min_cos={min_cos:.4f}, mag={mag:.3f})")
     if not (0.5 <= mag <= 2.0):
         raise AssertionError(
@@ -2669,7 +3401,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
             True,
             "nvfp4-moe-realistic-b2s1-tk1",
             "realistic_b2s1_h384_e8_topk1",
-            id="toy_b1_topk1",
+            id="topk1",
         ),
         pytest.param(
             2,
@@ -2680,7 +3412,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
             False,
             "nvfp4-moe-realistic-b2s1-tk2",
             "realistic_b2s1_h384_e8_topk2",
-            id="toy_b1_topk2",
+            id="topk2",
         ),
         pytest.param(
             4,
@@ -2691,7 +3423,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
             True,
             "nvfp4-moe-realistic-b2s1-tk4",
             "realistic_b2s1_h384_e8_topk4",
-            id="realistic_b2s1_topk4",
+            id="topk4",
         ),
         pytest.param(
             2,
@@ -2702,7 +3434,7 @@ def run_nvfp4_w4a16_moe_plugin_accuracy_case(
             False,
             "nvfp4-moe-realistic-b2s2-tk2",
             "realistic_b2s2_h384_e8_topk2",
-            id="realistic_b2s2_topk2",
+            id="b2s2_topk2",
         ),
     ],
 )
@@ -2756,17 +3488,15 @@ def _test_nvfp4_w4a16_moe_plugin_accuracy_sf_padding_non128_aligned() -> None:
     expert = np.array([[0]], dtype=np.int32)
     score = np.array([[1.0]], dtype=np.float32)
 
-    moe = create_toy_moe(
-        dev,
+    mod, _, _ = _create_toy_nemotron_h_moe_mlp(
         hidden_size=h,
         moe_inter_size=inter,
         num_experts=e_ct,
         top_k=tk,
         seed=moe_seed,
     )
-    mod = NemotronHMoEW4A4Plugin(moe)
-    mod.eval().to(dev)
-    mod.pack_experts_weights_to_marlin(moe)
+    mod._plugin_activation_type = 0
+    mod._plugin_routing_mode = 0
 
     logits_np = NemotronHMoEReference.router_logits_from_desired_topk(
         expert, score, num_tokens=batch * seq, num_experts=e_ct, top_k=tk)
@@ -2787,16 +3517,16 @@ def _test_nvfp4_w4a16_moe_plugin_accuracy_sf_padding_non128_aligned() -> None:
         hidden_np,
         topw_np,
         topi_np,
-        mod_cpu.fc_up_qweights.numpy(),
-        mod_cpu.fc_up_blocks_scale.numpy(),
-        mod_cpu.fc_down_qweights.numpy(),
-        mod_cpu.fc_down_blocks_scale.numpy(),
-        mod_cpu.fc_up_global_scale.numpy(),
-        mod_cpu.fc_down_global_scale.numpy(),
+        mod_cpu._stacked_up_weights.numpy(),
+        mod_cpu._stacked_up_block_scale.numpy(),
+        mod_cpu._stacked_down_weights.numpy(),
+        mod_cpu._stacked_down_block_scale.numpy(),
+        mod_cpu._stacked_up_global_scale.numpy(),
+        mod_cpu._stacked_down_global_scale.numpy(),
         hidden_size=h,
         moe_inter_size=inter,
         num_experts=e_ct,
-        activation_type=int(mod_cpu.activation_type),
+        activation_type=0,
     )
 
     logger = trt.Logger(trt.Logger.WARNING)
@@ -2878,20 +3608,19 @@ def test_nvfp4_moe_plugin_decode_routing_mode_1_smoke(
         )
     h, inter, e_ct = _NVFP4_MOE_FAST_HIDDEN, _NVFP4_MOE_FAST_INTER, _NVFP4_MOE_FAST_EXPERTS
 
-    moe = create_toy_moe(dev,
-                         hidden_size=h,
-                         moe_inter_size=inter,
-                         num_experts=e_ct,
-                         top_k=top_k,
-                         seed=20262)
-    mod = NemotronHMoEW4A4Plugin(moe,
-                                 n_group=n_group,
-                                 topk_group=topk_group,
-                                 norm_topk_prob=1,
-                                 routed_scaling_factor=1.0,
-                                 routing_mode=1)
-    mod.eval().to(dev)
-    mod.pack_experts_weights_to_marlin(moe)
+    mod, _, _ = _create_toy_nemotron_h_moe_mlp(
+        hidden_size=h,
+        moe_inter_size=inter,
+        num_experts=e_ct,
+        top_k=top_k,
+        seed=20262,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+    )
+    mod._plugin_activation_type = 0
+    mod._plugin_routing_mode = 1
 
     hidden_bsh = structured_noise_hidden_states_bsh(batch,
                                                     seq,
@@ -3030,9 +3759,67 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
         moe.experts.up_proj.data.mul_(weight_scale)
         moe.experts.down_proj.data.mul_(weight_scale)
 
-    mod = NemotronHMoEW4A4Plugin(moe)
-    mod.eval().to(device)
-    mod.pack_experts_weights_to_marlin(moe)
+    # New FE: build NemotronHMoEMLP populated from the HF moe's (scaled) weights
+    h_sz = int(hidden_size)
+    cfg = ModelConfig(
+        model_type="nemotron_h",
+        hidden_size=h_sz,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=moe_inter_size,
+        head_dim=h_sz,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        n_routed_experts=num_experts,
+        num_experts_per_tok=top_k,
+        moe_intermediate_size=moe_inter_size,
+        moe_shared_expert_intermediate_size=moe_inter_size,
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        quant=QuantConfig(quant_type=QUANT_NVFP4, group_size=16),
+    )
+    mod = NemotronHMoEMLP(cfg, module_prefix="backbone.layers.0.mixer")
+    mod.eval()
+    # Extract HF expert weights: up_proj [E, I, H], down_proj [E, H, I]
+    w_up_eih = moe.experts.up_proj.data.detach().cpu().float()  # [E, I, H]
+    w_down_ehi = moe.experts.down_proj.data.detach().cpu().float()  # [E, H, I]
+    for i, expert in enumerate(mod.experts):
+        _populate_nvfp4_linear(expert.up_proj, w_up_eih[i].contiguous())
+        _populate_nvfp4_linear(expert.down_proj, w_down_ehi[i].contiguous())
+    # Gate weights — NemotronHTopkRouter stores as fp16
+    torch.manual_seed(moe_seed)
+    std_gate = WeightsGenerator.gate_test_weight_std(h_sz)
+    gen_gate = torch.Generator()
+    gen_gate.manual_seed(moe_seed)
+    nn.init.normal_(mod.gate.weight,
+                    mean=0.0,
+                    std=std_gate,
+                    generator=gen_gate)
+    nn.init.normal_(mod.gate.e_score_correction_bias,
+                    mean=0.0,
+                    std=std_gate * 0.3,
+                    generator=gen_gate)
+    # Shared experts (not used in tests but prepare_for_export expects them)
+    gen_shared = torch.Generator()
+    gen_shared.manual_seed(moe_seed + 202)
+    std_up = WeightsGenerator.expert_linear_std(h_sz, 0.08)
+    std_dn = WeightsGenerator.expert_linear_std(moe_inter_size, 0.08)
+    w_shared_up = torch.randn(h_sz, moe_inter_size,
+                              generator=gen_shared) * std_up
+    w_shared_dn = torch.randn(moe_inter_size, h_sz,
+                              generator=gen_shared) * std_dn
+    _populate_nvfp4_linear(mod.shared_experts.up_proj,
+                           w_shared_up.T.contiguous())
+    _populate_nvfp4_linear(mod.shared_experts.down_proj,
+                           w_shared_dn.T.contiguous())
+    mod.prepare_for_export()
+    mod._plugin_activation_type = 0
+    mod._plugin_routing_mode = 0
 
     # Router logits feed one token per row.  We pick uniformly-random distinct experts per
     # token so the layout builder exercises multiple groups, including some zero-hit ones
@@ -3079,8 +3866,8 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
         for slot in range(top_k):
             ex = int(expert_rows[t, slot])
             z = x_flat[t] @ w_up_e[ex]
-            activation_type = int(mod.activation_type)
-            a = NemotronHMoEW4A4Plugin.moe_activation_numpy(z, activation_type)
+            activation_type = 0  # ReLU² for NemotronH
+            a = _moe_activation_numpy(z, activation_type)
             fc1_max = max(fc1_max, float(np.max(np.abs(a))))
     act_gs_fc1 = max(1e-6, float(np.max(np.abs(hidden_np))) / (448.0 * 6.0))
     act_gs_fc2 = max(1e-6, fc1_max / (448.0 * 6.0))
@@ -3095,7 +3882,7 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
         topw_np,
         topi_np,
         hidden_size=hidden_size,
-        activation_type=int(mod_cpu.activation_type))
+        activation_type=0)
 
     logger = trt.Logger(trt.Logger.WARNING)
     load_nvfp4_moe_edge_llm_plugins(logger, _PLUGIN_SO, verbose=False)
@@ -3187,17 +3974,17 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
     # error, so a correctly computing kernel sits above ~0.99 here —
     # analogous to ``test_nemotron_tier2`` in cutedsl-nvfp4-moe.
     w_up_ehi_sim = NemotronHMoEReference.dequant_fp4_prefill_weight_fc1(
-        mod_cpu.fc_up_qweights.numpy(),
-        mod_cpu.fc_up_blocks_scale.numpy(),
-        mod_cpu.fc_up_global_scale.numpy(),
+        mod_cpu._stacked_up_weights.numpy(),
+        mod_cpu._stacked_up_block_scale.numpy(),
+        mod_cpu._stacked_up_global_scale.numpy(),
         num_experts=num_experts,
         hidden_size=hidden_size,
         moe_inter_size=moe_inter_size,
     )
     w_down_eih_sim = NemotronHMoEReference.dequant_fp4_prefill_weight_fc2(
-        mod_cpu.fc_down_qweights.numpy(),
-        mod_cpu.fc_down_blocks_scale.numpy(),
-        mod_cpu.fc_down_global_scale.numpy(),
+        mod_cpu._stacked_down_weights.numpy(),
+        mod_cpu._stacked_down_block_scale.numpy(),
+        mod_cpu._stacked_down_global_scale.numpy(),
         num_experts=num_experts,
         hidden_size=hidden_size,
         moe_inter_size=moe_inter_size,
@@ -3208,7 +3995,7 @@ def _run_nvfp4_moe_plugin_prefill_accuracy_case(
         topi_np,
         w_up_ehi_sim,
         w_down_eih_sim,
-        activation_type=int(mod_cpu.activation_type),
+        activation_type=0,
         sf_scale_fc1=float(hidden_gs_np[0]),
         sf_scale_fc2=None,  # runtime-max from sim's FC1 output (cutedsl-style)
     )
@@ -3308,5 +4095,471 @@ def test_nvfp4_moe_plugin_prefill_accuracy(
         cos_threshold=0.95,
         mag_ratio_lo=0.5,
         mag_ratio_hi=2.0,
+        case=case,
+    )
+
+
+# ============================================================================
+# Qwen3 Gated MoE tests: output = down( SiLU(gate(x)) * up(x) )
+# ============================================================================
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"),
+                    reason="needs torch.float8_e4m3fn")
+def test_qwen3_sparse_moe_block_thor_prepare_contract() -> None:
+    """Real Qwen3SparseMoeBlock Thor path prepares plugin buffers and traces the prefill-sized shape."""
+    hidden_size, moe_inter_size, num_experts, top_k = 64, 64, 4, 2
+    cfg = ModelConfig(
+        model_type="qwen3_moe",
+        hidden_size=hidden_size,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=moe_inter_size,
+        head_dim=hidden_size,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
+        moe_intermediate_size=moe_inter_size,
+        decoder_sparse_step=1,
+        quant=QuantConfig(quant_type=QUANT_NVFP4,
+                          group_size=16,
+                          nvfp4_moe_backend=NVFP4_MOE_BACKEND_THOR),
+    )
+    block = Qwen3SparseMoeBlock(cfg).eval()
+
+    gen = torch.Generator()
+    gen.manual_seed(91531)
+    block.gate.weight.data.copy_(
+        torch.randn(num_experts,
+                    hidden_size,
+                    generator=gen,
+                    dtype=torch.float16))
+    for expert in block.experts:
+        _populate_nvfp4_linear(
+            expert.gate_proj,
+            torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+            input_scale_value=2e-3)
+        _populate_nvfp4_linear(
+            expert.up_proj,
+            torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+            input_scale_value=3e-3)
+        _populate_nvfp4_linear(
+            expert.down_proj,
+            torch.randn(hidden_size, moe_inter_size, generator=gen) * 0.25,
+            input_scale_value=4e-3)
+
+    block._prepare_moe_weights()
+
+    assert tuple(block.fc_up_qweights.shape) == (num_experts, hidden_size,
+                                                 moe_inter_size)
+    assert tuple(block.fc_up_blocks_scale.shape) == (num_experts, 128, 4)
+    assert tuple(block.fc_down_qweights.shape) == (num_experts, moe_inter_size,
+                                                   hidden_size // 2)
+    assert tuple(block.fc_down_blocks_scale.shape) == (num_experts, 128, 4)
+    assert tuple(block.hidden_global_scale.shape) == (2, )
+    assert tuple(block.e_score_correction_bias.shape) == (num_experts, )
+    assert len(block.experts) == 0
+
+    # The custom-op eager stub returns zeros_like, but this still verifies that
+    # the real module path wires all Thor plugin inputs for a prefill-sized
+    # token count (B*S > 16).
+    hidden = torch.randn(1,
+                         17,
+                         hidden_size,
+                         generator=gen,
+                         dtype=torch.float16)
+    out = block(hidden)
+    assert out.shape == hidden.shape
+    assert out.dtype == hidden.dtype
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"),
+                    reason="needs torch.float8_e4m3fn")
+def test_qwen3_5_moe_sparse_block_thor_prepare_contract() -> None:
+    """Qwen3_5SparseMoeBlock Thor path: inherited NVFP4 repack + shared-expert addition.
+
+    Verifies the subclass (used by Qwen3.5 / Qwen3.6 35B-A3B) correctly composes
+    on top of Qwen3SparseMoeBlock: routed-expert NVFP4 buffers come from the
+    inherited ``_prepare_moe_weights``, while shared_expert + shared_expert_gate
+    survive the repack and participate in forward.
+
+    Uses E=8 / top_k=4 (parent test uses E=4 / top_k=2) so the per-expert
+    loop, top-k tile, and shared-expert path are all exercised on a different
+    profile, while keeping H / I small for fast CI. The shape contract is
+    dim-parametric — verified to hold at full Qwen3.6 35B-A3B production dims
+    (H=2048, I=512, E=256, top_k=8) during initial bring-up.
+    """
+    hidden_size, moe_inter_size, num_experts, top_k = 64, 64, 8, 4
+    cfg = ModelConfig(
+        model_type="qwen3_5_moe_text",
+        hidden_size=hidden_size,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        intermediate_size=moe_inter_size,
+        head_dim=hidden_size,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        num_experts=num_experts,
+        num_experts_per_tok=top_k,
+        moe_intermediate_size=moe_inter_size,
+        moe_shared_expert_intermediate_size=moe_inter_size,
+        decoder_sparse_step=1,
+        quant=QuantConfig(
+            quant_type=QUANT_NVFP4,
+            group_size=16,
+            nvfp4_moe_backend=NVFP4_MOE_BACKEND_THOR,
+            # Mirror NVIDIA's NVFP4 recipe: ``shared_expert_gate`` is in the
+            # ignore list, so ``make_linear`` returns an FP16Linear for it.
+            excluded={"model.layers.0.mlp.shared_expert_gate"},
+        ),
+    )
+    block = Qwen3_5SparseMoeBlock(cfg, layer_idx=0).eval()
+
+    gen = torch.Generator()
+    gen.manual_seed(91532)
+    block.gate.weight.data.copy_(
+        torch.randn(num_experts,
+                    hidden_size,
+                    generator=gen,
+                    dtype=torch.float16))
+    for expert in block.experts:
+        _populate_nvfp4_linear(
+            expert.gate_proj,
+            torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+            input_scale_value=2e-3)
+        _populate_nvfp4_linear(
+            expert.up_proj,
+            torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+            input_scale_value=3e-3)
+        _populate_nvfp4_linear(
+            expert.down_proj,
+            torch.randn(hidden_size, moe_inter_size, generator=gen) * 0.25,
+            input_scale_value=4e-3)
+    # Shared expert: same NVFP4Linear shape contract as routed experts.
+    _populate_nvfp4_linear(
+        block.shared_expert.gate_proj,
+        torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+        input_scale_value=2e-3)
+    _populate_nvfp4_linear(
+        block.shared_expert.up_proj,
+        torch.randn(moe_inter_size, hidden_size, generator=gen) * 0.25,
+        input_scale_value=3e-3)
+    _populate_nvfp4_linear(
+        block.shared_expert.down_proj,
+        torch.randn(hidden_size, moe_inter_size, generator=gen) * 0.25,
+        input_scale_value=4e-3)
+    # Shared-expert gate is excluded → FP16Linear with a [1, H] weight.
+    block.shared_expert_gate.weight.data.copy_(
+        torch.randn(1, hidden_size, generator=gen, dtype=torch.float16))
+
+    block._prepare_moe_weights()
+
+    # Inherited Thor plugin buffers — shapes computed dim-parametrically per
+    # the schema in ``tensorrt_edgellm/llm_models/layers/nvfp4_moe_plugin.py``:
+    # FC1 SwiGLU has 2*I along the N axis; SF tensors use the 128x4 atom
+    # padding (padUp(M, 128), padUp(K/16, 4)).
+    def pad_up(x: int, m: int) -> int:
+        return ((x + m - 1) // m) * m
+
+    assert tuple(block.fc_up_qweights.shape) == (num_experts, hidden_size,
+                                                 moe_inter_size)
+    assert tuple(
+        block.fc_up_blocks_scale.shape) == (num_experts,
+                                            pad_up(2 * moe_inter_size, 128),
+                                            pad_up(hidden_size // 16, 4))
+    assert tuple(block.fc_down_qweights.shape) == (num_experts, moe_inter_size,
+                                                   hidden_size // 2)
+    assert tuple(
+        block.fc_down_blocks_scale.shape) == (num_experts,
+                                              pad_up(hidden_size, 128),
+                                              pad_up(moe_inter_size // 16, 4))
+    assert tuple(block.hidden_global_scale.shape) == (2, )
+    assert tuple(block.e_score_correction_bias.shape) == (num_experts, )
+    assert len(block.experts) == 0  # parent clears per-expert ModuleList
+
+    # Shared-expert sub-modules survive the repack.
+    for proj_name in ("gate_proj", "up_proj", "down_proj"):
+        assert hasattr(block.shared_expert, proj_name), \
+            f"shared_expert.{proj_name} lost during repack"
+    assert hasattr(block, "shared_expert_gate")
+
+    # Forward: ``routed + shared * sigmoid(shared_expert_gate)`` returns
+    # FP16 hidden states with the input shape. The custom-op stub yields zeros,
+    # so this just verifies all op signatures wire correctly and dtypes match.
+    hidden = torch.randn(1,
+                         17,
+                         hidden_size,
+                         generator=gen,
+                         dtype=torch.float16)
+    out = block(hidden)
+    assert out.shape == hidden.shape
+    assert out.dtype == hidden.dtype
+
+
+def _qwen3_dense_forward_from_topk_torch(
+    x_fp32: torch.Tensor,
+    topw: torch.Tensor,
+    topi: torch.Tensor,
+    w_gate_ehi: torch.Tensor,
+    w_up_ehi: torch.Tensor,
+    w_down_eih: torch.Tensor,
+    activation_type: int = 1,
+) -> torch.Tensor:
+    """CUDA torch reference for gated MoE: output = sum_k[ w_k * down(SiLU(gate(x)) * up(x)) ].
+
+    Args:
+        x_fp32: (num_tokens, H) FP32
+        topw: (num_tokens, top_k) FP32 routing weights
+        topi: (num_tokens, top_k) INT64 expert indices
+        w_gate_ehi: (E, H, I) FP32 gate weights
+        w_up_ehi: (E, H, I) FP32 up weights
+        w_down_eih: (E, I, H) FP32 down weights
+        activation_type: 1 = SiLU (only SiLU supported for gated)
+    """
+    assert activation_type == 1, "Gated MoE only supports SiLU activation"
+    num_tokens, h = x_fp32.shape
+    top_k = topw.shape[1]
+    out = torch.zeros(num_tokens, h, dtype=torch.float32)
+    x_dev = x_fp32.cuda()
+    for t in range(num_tokens):
+        for ki in range(top_k):
+            expert_idx = int(topi[t, ki].item())
+            weight = float(topw[t, ki].item())
+            # gate_out = x @ gate_proj^T -> (H,) @ (H, I)^T -> (I,)
+            gate_out = torch.mm(x_dev[t:t + 1],
+                                w_gate_ehi[expert_idx].cuda())  # (1, I)
+            up_out = torch.mm(x_dev[t:t + 1],
+                              w_up_ehi[expert_idx].cuda())  # (1, I)
+            # SiLU activation on gate output
+            gate_act = torch.nn.functional.silu(gate_out)
+            # Element-wise multiply
+            inter = gate_act * up_out  # (1, I)
+            # down projection
+            down_out = torch.mm(inter, w_down_eih[expert_idx].cuda())  # (1, H)
+            out[t] += weight * down_out.cpu().squeeze(0)
+    return out
+
+
+def _build_qwen3_gated_moe_engine_trt_api(
+    module: nn.Module,
+    *,
+    batch: int,
+    seq: int,
+    logger,
+    verbose: bool = False,
+) -> bytes:
+    """Build a serialized TensorRT engine for gated MoE using the unified ``Nvfp4MoePlugin``."""
+    dummy_hidden = torch.zeros(batch,
+                               seq,
+                               int(module.hidden_size),
+                               dtype=torch.float16)
+    return build_nvfp4_moe_engine_trt_api(
+        module,
+        dummy_hidden,
+        logger,
+        verbose=verbose,
+        label="qwen3-gated",
+        explicit_router_logits=True,
+    )
+
+
+def _create_qwen3_moe_plugin(
+    *,
+    hidden_size: int,
+    moe_inter_size: int,
+    num_experts: int,
+    top_k: int,
+    seed: int,
+) -> tuple[nn.Module, np.ndarray, np.ndarray, np.ndarray]:
+    """Create a Qwen3-style gated MoE wrapper with activation_type=1 (SiLU).
+
+    Returns ``(mod, w_gate_ehi, w_up_ehi, w_down_eih)`` — the module with
+    interleaved gate+up as FC1 (``moe_inter_size=2*I``), and the original FP32
+    weights for building reference outputs.
+    """
+    mod, w_gate_ehi, w_up_ehi, w_down_eih = _create_toy_qwen3_moe_block(
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        seed=seed,
+    )
+    mod._plugin_activation_type = 1  # SiLU for gated MoE
+    mod._plugin_routing_mode = 0
+    return mod, w_gate_ehi, w_up_ehi, w_down_eih
+
+
+def _run_qwen3_w4a16_case(
+    *,
+    device: torch.device,
+    top_k: int,
+    moe_seed: int,
+    expert: np.ndarray,
+    score: np.ndarray,
+    hidden_seed: int,
+    case: str,
+) -> None:
+    """One Qwen3 gated MoE accuracy scenario: TRT plugin vs torch reference with Q/DQ'd weights."""
+    check_requirements()
+    assert trt is not None
+    batch = 2
+    expert = np.asarray(expert, dtype=np.int32)
+    score = np.asarray(score, dtype=np.float32)
+    assert expert.shape == score.shape
+    num_tokens, rk = expert.shape
+    tk = int(top_k)
+    assert rk == tk
+    assert num_tokens % batch == 0
+    seq = num_tokens // batch
+    h, inter, e_ct = 384, 768, 8
+
+    mod, _, _, _ = _create_qwen3_moe_plugin(hidden_size=h,
+                                            moe_inter_size=inter,
+                                            num_experts=e_ct,
+                                            top_k=tk,
+                                            seed=moe_seed)
+
+    logits_np = NemotronHMoEReference.router_logits_from_desired_topk(
+        expert, score, num_tokens=num_tokens, num_experts=e_ct, top_k=tk)
+
+    torch.manual_seed(hidden_seed)
+    hidden_bsh = torch.randn(batch, seq, h) * 2.5
+    hidden_np = hidden_bsh.numpy().astype(np.float16)
+
+    mod_cpu = mod.cpu()
+    topw_np, topi_np = NemotronHMoEReference.moe_topk_softmax_renormalize_numpy(
+        logits_np, tk)
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    load_nvfp4_moe_edge_llm_plugins(logger, _PLUGIN_SO, verbose=False)
+    eng = _build_qwen3_gated_moe_engine_trt_api(mod_cpu,
+                                                batch=batch,
+                                                seq=seq,
+                                                logger=logger,
+                                                verbose=False)
+
+    stream = torch.cuda.Stream(device=device)
+    # hidden_global_scale [2] FP32: unused by W4A16 decode path, but the engine input must be bound.
+    hidden_gs_np = np.ones(2, dtype=np.float32)
+    trt_out = execute_trt_engine(
+        eng,
+        {
+            "router_logits": np.ascontiguousarray(logits_np.astype(
+                np.float32)),
+            "hidden_states": np.ascontiguousarray(hidden_np),
+            "hidden_global_scale": np.ascontiguousarray(hidden_gs_np),
+        },
+        stream,
+        device=device,
+        verbose=False,
+        label=f"qwen3-gated-{case}",
+    )
+
+    # Build torch reference with Q/DQ'd weights (quantize then dequantize to match NVFP4 rounding).
+    # The unified plugin stores interleaved gate+up in fc_up_qweights [E, H, 2*I/2] with
+    # moe_inter_size = 2*I. Extract the full interleaved FC1 weight, then split gate and up.
+    # Use N-major buffers with prefill atom-layout scales.
+    plugin_inter = int(mod_cpu.moe_intermediate_size)  # 2*I
+    w_fc1_qdq, w_down_qdq = NemotronHMoEReference.dense_weights_from_nvfp4_nmajor_buffers(
+        mod_cpu._stacked_up_weights.numpy(),
+        mod_cpu._stacked_up_block_scale.numpy(),
+        mod_cpu._stacked_down_weights.numpy(),
+        mod_cpu._stacked_down_block_scale.numpy(),
+        num_experts=e_ct,
+        hidden_size=h,
+        moe_inter_size=plugin_inter,
+        activation_type=1,
+    )
+    up_gs_np = mod_cpu._stacked_up_global_scale.numpy().reshape(-1)
+    dn_gs_np = mod_cpu._stacked_down_global_scale.numpy().reshape(-1)
+    for ex in range(e_ct):
+        w_fc1_qdq[ex] *= float(up_gs_np[ex])
+        w_down_qdq[ex] *= float(dn_gs_np[ex])
+    # De-interleave FC1: (up, gate) alternate at 32-col granularity along N.
+    # Reshape [E, H, 2*I] → [E, H, n_chunks, 2, 32] then split into up / gate.
+    _SWIGLU_GS = 32
+    _n_chunks = inter // _SWIGLU_GS
+    _fc1_paired = w_fc1_qdq.reshape(e_ct, h, _n_chunks, 2, _SWIGLU_GS)
+    w_up_qdq = _fc1_paired[:, :, :, 0, :].reshape(e_ct, h, inter)
+    w_gate_qdq = _fc1_paired[:, :, :, 1, :].reshape(e_ct, h, inter)
+
+    x_fp32 = hidden_np.reshape(-1, h).astype(np.float32)
+    ref_torch = _qwen3_dense_forward_from_topk_torch(
+        torch.from_numpy(x_fp32),
+        torch.from_numpy(topw_np),
+        torch.from_numpy(topi_np.astype(np.int64)),
+        torch.from_numpy(w_gate_qdq),
+        torch.from_numpy(w_up_qdq),
+        torch.from_numpy(w_down_qdq),
+        activation_type=1,
+    )
+    ref_fp32 = ref_torch.detach().numpy().astype(np.float32).reshape(
+        trt_out.shape)
+
+    # Compare TRT output against Q/DQ reference (FP4 quantize→dequantize weights).
+    trt_np = np.asarray(trt_out, dtype=np.float32)
+    med_cos, mean_cos, min_cos = _cosine_sim_per_row(trt_np, ref_fp32)
+    mag = _magnitude_ratio(trt_np, ref_fp32)
+    print(
+        f"[qwen3 {case}] numTokens={num_tokens} topK={tk} median_cos={med_cos:.4f} "
+        f"mean_cos={mean_cos:.4f} min_cos={min_cos:.4f} mag_ratio={mag:.3f} "
+        f"|trt|={float(np.linalg.norm(trt_np)):.4g} |ref|={float(np.linalg.norm(ref_fp32)):.4g}"
+    )
+    if med_cos < 0.99:
+        raise AssertionError(
+            f"{case}: median cosine vs Q/DQ ref {med_cos:.4f} < 0.99 "
+            f"(min_cos={min_cos:.4f}, mag={mag:.3f})")
+    if not (0.5 <= mag <= 2.0):
+        raise AssertionError(
+            f"{case}: magnitude ratio {mag:.3f} outside [0.5, 2.0]")
+
+
+@pytest.mark.parametrize(
+    ("top_k", "moe_seed", "expert_rows", "score_rows", "hidden_seed", "case"),
+    [
+        pytest.param(1,
+                     3026, [[0], [5]], [[1.0], [1.0]],
+                     92021,
+                     "qwen3_w4a16_topk1",
+                     id="topk1"),
+        pytest.param(2,
+                     3027, [[0, 1], [6, 3]], [[0.62, 0.38], [0.55, 0.45]],
+                     92022,
+                     "qwen3_w4a16_topk2",
+                     id="topk2"),
+        pytest.param(4,
+                     3028, [[0, 1, 2, 3], [7, 5, 4, 6]],
+                     [[0.40, 0.28, 0.20, 0.12], [0.36, 0.30, 0.22, 0.12]],
+                     92023,
+                     "qwen3_w4a16_topk4",
+                     id="topk4"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qwen3_gated_moe_w4a16_decode_accuracy(
+    top_k,
+    moe_seed,
+    expert_rows,
+    score_rows,
+    hidden_seed,
+    case,
+):
+    """Nvfp4MoePlugin gated (SwiGLU) accuracy: W4A16 decode vs torch Q/DQ reference."""
+    check_requirements()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    _run_qwen3_w4a16_case(
+        device=dev,
+        top_k=top_k,
+        moe_seed=moe_seed,
+        expert=np.array(expert_rows, dtype=np.int32),
+        score=np.array(score_rows, dtype=np.float32),
+        hidden_seed=hidden_seed,
         case=case,
     )

@@ -11,34 +11,36 @@ Phi-4-Multimodal requires merging its vision LoRA adapter into the base model be
 ## Step 1: Merge, Quantize, and Export (x86 Host)
 
 ```bash
+cd /path/to/TensorRT-Edge-LLM
+pip3 install ".[tools]"
+
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Phi-4-multimodal-instruct
 export MODEL_DIR=$WORKSPACE_DIR/$MODEL_NAME
-export EDGE_LLM_PATH=$HOME/tensorrt-edge-llm   # path to TensorRT-Edge-LLM repo root
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
-mkdir -p $WORKSPACE_DIR
+export HF_MODEL_DIR=$MODEL_DIR/hf
+mkdir -p $MODEL_DIR
 cd $WORKSPACE_DIR
 
 # Clone Phi-4-multimodal-instruct from HuggingFace
-git clone https://huggingface.co/microsoft/Phi-4-multimodal-instruct
-cd Phi-4-multimodal-instruct && git lfs pull && cd ..
+git lfs install
+git clone https://huggingface.co/microsoft/Phi-4-multimodal-instruct $HF_MODEL_DIR
+git -C $HF_MODEL_DIR lfs pull
 
 # Merge vision LoRA adapter into base model
-python -m llm_loader.lora.merge_lora_cli \
-  --model_dir Phi-4-multimodal-instruct \
-  --lora_dir Phi-4-multimodal-instruct/vision-lora \
+tensorrt-edgellm-merge-lora \
+  --model_dir $HF_MODEL_DIR \
+  --lora_dir $HF_MODEL_DIR/vision-lora \
   --output_dir $MODEL_DIR/merged
 
 # Quantize merged model
-cd $EDGE_LLM_PATH
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir $MODEL_DIR/merged \
   --output_dir $MODEL_DIR/quantized \
   --quantization nvfp4 \
   --lm_head_quantization nvfp4
 
 # Export language model and visual encoder
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_DIR/quantized \
   $MODEL_DIR/onnx
 ```
@@ -56,7 +58,7 @@ scp -r $MODEL_DIR/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Phi-4-multimodal-instruct
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build language model engine
 ./build/examples/llm/llm_build \
@@ -78,7 +80,7 @@ cd ~/TensorRT-Edge-LLM
 ## Step 4: Run Inference (Thor Device)
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \

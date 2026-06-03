@@ -3,14 +3,14 @@
 
 TensorRT Edge-LLM has two separate components that need to be installed on different systems:
 
-1. **Experimental Quantization and `llm_loader`** (runs on x86 host with GPU)
+1. **Quantization and `tensorrt_edgellm`** (runs on x86 host with GPU)
 2. **C++ Runtime** (Jetson Thor, NVIDIA DRIVE / DriveOS, or optional x86 developer build)
 
 ---
 
-## Part 1: Experimental Quantization and `llm_loader` (x86 Host with GPU)
+## Part 1: Quantization and `tensorrt_edgellm` (x86 Host with GPU)
 
-The experimental quantization package and `llm_loader` convert and quantize models. This must run on an x86 Linux system with an NVIDIA GPU.
+The quantization package and `tensorrt_edgellm` convert and quantize models. This must run on an x86 Linux system with an NVIDIA GPU.
 
 ### System Requirements
 
@@ -91,56 +91,55 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install the base and checkpoint-based loader dependencies. Add the standalone
-quantization dependencies only when you run `experimental.quantization`. Do not
-install the repository as a pip package for this workflow; the examples run
-directly from the checkout through `PYTHONPATH`.
+Install the base checkpoint export dependencies. Optional tool dependencies stay
+out of the base environment so export-only and server images do not pull
+quantization, audio, and LoRA-merge packages unnecessarily.
 
 ```bash
-# Required for llm_loader export, high-level API, and server workflows
+# Required for checkpoint export
 pip3 install -r requirements.txt
-pip3 install -r experimental/llm_loader/requirements.txt
 
-# Required only when running experimental.quantization
-pip3 install -r experimental/quantization/requirements.txt
+# Required for quantization, LoRA merge, vocabulary reduction, audio preprocessing,
+# and tokenizer helpers
+pip3 install ".[tools]"
+
+# Required only for the experimental high-level Python API and server
+pip3 install -r requirements-server.txt
 ```
 
-This installs all required Python dependencies including:
+The base install includes:
 - PyTorch
 - Transformers
-- NVIDIA Model Optimizer
 - ONNX
 - ONNX Script and ONNX GraphSurgeon
-- And all other required dependencies
 
-> **Note:** For specific version requirements, please refer to `requirements.txt`, `experimental/llm_loader/requirements.txt`, `experimental/quantization/requirements.txt`, and `pyproject.toml`.
+The optional `tools` extra adds NVIDIA Model Optimizer, calibration datasets,
+audio preprocessing dependencies, LoRA merge dependencies, and tokenizer helpers.
+The server requirements file adds FastAPI, Uvicorn, and pybind11 for the
+experimental high-level Python API and OpenAI-compatible server.
 
-**3. Configure and Verify the Experimental Export Workflow**
+> **Note:** Accuracy evaluation dependencies live under `examples/accuracy/requirements.txt`.
+
+**3. Configure and Verify the Checkpoint Export Workflow**
 
 Use the virtual environment created in Step 2 for this checkout. Do not mix
 packages from older release branches into the same environment.
 
-The recommended export path is `experimental.quantization` -> `llm_loader`.
+The recommended export path is `tensorrt-edgellm-quantize` -> `tensorrt-edgellm-export`.
 Use the quantization package only when you need to create a unified quantized
 checkpoint from an FP16/BF16 source checkpoint before export. Pre-quantized
-HuggingFace checkpoints can be exported directly with `llm_loader`.
+HuggingFace checkpoints can be exported directly with `tensorrt-edgellm-export`.
 
 ```bash
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
 
 # Verify the recommended quantization, export, LoRA, and vocabulary tools
-python -m experimental.quantization --help
-python -m llm_loader.export_all_cli --help
-python -m llm_loader.lora.merge_lora_cli --help
-python -m llm_loader.vocab_reduction --help
+tensorrt-edgellm-quantize --help
+tensorrt-edgellm-export --help
+tensorrt-edgellm-merge-lora --help
+tensorrt-edgellm-reduce-vocab --help
 ```
-
-The deprecated `tensorrt_edgellm/` export package remains available in 0.7.1 for
-compatibility and for components that are not yet fully covered by
-`llm_loader`. It will be removed in 0.8.0 after the
-`experimental/quantization` -> `experimental/llm_loader` workflow reaches full
-feature parity for all models and features.
 
 **4. Configure HuggingFace Access (Optional)**
 
@@ -164,22 +163,30 @@ hf auth login
 
 > **For the quick start guide:** You can skip this step and proceed to verification.
 
-**You're done with export pipeline setup!** You can now quantize and export models with the experimental workflow. The ONNX files will be transferred to the Edge device for runtime deployment.
+**You're done with export pipeline setup!** You can now quantize and export models with the checkpoint-based workflow. The ONNX files will be transferred to the Edge device for runtime deployment.
 
 ---
 
 ## Part 2: C++ Runtime (Edge Device)
 
-The C++ runtime builds and executes models on the target. **Jetson Thor:** follow the steps below on the device and use `EMBEDDED_TARGET=jetson-thor`. **NVIDIA DRIVE / DriveOS:** run the same flow inside the DriveOS SDK Docker image with **`EMBEDDED_TARGET=auto-thor`**, then copy **`build/`** to the DRIVE system. **x86:** optional local build using the **Alternative** `cmake` block (no toolchain).
+The C++ runtime builds TensorRT engines and runs inference on the target. Start
+from the platform row that matches the device or SDK image.
+
+| Platform | Software Release | `CUDA_CTK_VERSION` | Build Location | Precision Support |
+|:---------|:-----------------|:-------------------|:---------------|:------------------|
+| Jetson Thor | JetPack 7.0/7.1 | `13.0` | Jetson device | See [Supported Models](supported-models.md) |
+| Jetson Thor | JetPack 7.2 | `13.2` | Jetson device | See [Supported Models](supported-models.md) |
+| DRIVE Thor | DriveOS 7.2 | `13.2` | DriveOS SDK Docker image, then copy `build/` to the DRIVE system | See [Supported Models](supported-models.md) |
+| Jetson Orin | JetPack 7.2 | `13.2` | Jetson device | FP16, INT8, and INT4 |
+| Jetson Orin | JetPack 6.2+ | `12.6` | Jetson device | FP16, INT8, and INT4 |
+
+Jetson Orin does not support FP8, MXFP8, FP4, or NVFP4 runtime precision in
+this release. Use FP16, INT8, or INT4 checkpoints for Orin.
 
 ### System Requirements
 
-**Target Platform:**
-- NVIDIA Jetson Thor
-- JetPack 7.1
-- CUDA 13.x (included in JetPack)
-- TensorRT 10.x+ (included in JetPack)
-- Disk Space: ~20-50GB for ONNX files and TensorRT engines
+- CUDA and TensorRT from the target JetPack or DriveOS SDK release
+- Disk space: ~20-50GB for ONNX files and TensorRT engines
 
 ### Build Instructions
 
@@ -195,11 +202,12 @@ sudo apt install -y \
 
 **2. Verify CUDA and TensorRT Installation**
 
-After JetPack is installed, TensorRT should be installed in /usr
+After JetPack is installed, or inside the DriveOS SDK Docker image, TensorRT
+should be installed in `/usr`.
 
 ```bash
 # Check CUDA version
-nvcc --version  # Should show CUDA 13.x
+nvcc --version  # Should match the CUDA_CTK_VERSION for your platform below
 
 # Check TensorRT version
 dpkg -l | grep tensorrt  # Should show TensorRT 10.x+
@@ -208,8 +216,8 @@ dpkg -l | grep tensorrt  # Should show TensorRT 10.x+
 **3. Clone Repository (on Edge device)**
 
 ```bash
-# Clone to home directory (used in all examples)
-cd ~
+# Clone to your chosen source directory
+cd /path/to/parent-directory
 git clone https://github.com/NVIDIA/TensorRT-Edge-LLM.git
 cd TensorRT-Edge-LLM
 git submodule update --init --recursive
@@ -217,33 +225,100 @@ git submodule update --init --recursive
 
 **4. Configure Build**
 
-On your Jetson Thor device, configure the build with the following command:
+Use the CMake command for your platform. All commands enable CuTe DSL kernels
+because Qwen3.5 and several other model paths require them.
+
+**JetPack 7.0/7.1 Thor**
 
 ```bash
-mkdir build
+mkdir -p build
 cd build
 
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
-    -DEMBEDDED_TARGET=jetson-thor
+    -DEMBEDDED_TARGET=jetson-thor \
+    -DCUDA_CTK_VERSION=13.0 \
+    -DENABLE_CUTE_DSL=ALL
 ```
 
-**NVIDIA DRIVE / DriveOS:** The `cmake` line is the same except **`EMBEDDED_TARGET=auto-thor`**.
+**JetPack 7.2 Thor**
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-thor \
+    -DCUDA_CTK_VERSION=13.2 \
+    -DENABLE_CUTE_DSL=ALL
+```
+
+**DriveOS 7.2 Thor**
+
+Run this inside the DriveOS SDK Docker image, then copy `build/` to the DRIVE
+system.
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=auto-thor \
+    -DCUDA_CTK_VERSION=13.2 \
+    -DENABLE_CUTE_DSL=ALL
+```
+
+**JetPack 7.2 Orin**
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-orin \
+    -DCUDA_CTK_VERSION=13.2 \
+    -DENABLE_CUTE_DSL=ALL
+```
+
+**JetPack 6.2+ Orin**
+
+```bash
+mkdir -p build
+cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTRT_PACKAGE_DIR=/usr \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+    -DEMBEDDED_TARGET=jetson-orin \
+    -DCUDA_CTK_VERSION=12.6 \
+    -DENABLE_CUTE_DSL=ALL
+```
 
 **Alternative: Building on x86 GPU Systems (Optional for Developers)**
 
 If you want to build and test on an x86 workstation with NVIDIA GPU (for development purposes before deploying to Edge devices), you can use this configuration instead:
 
 ```bash
-mkdir build
+mkdir -p build
 cd build
 
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
-    -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION>
+    -DCUDA_CTK_VERSION=<YOUR_CUDA_VERSION> \
+    -DENABLE_CUTE_DSL=ALL
 ```
 
 > **Note:** Replace `/usr/local/TensorRT-10.x.x` with your actual TensorRT installation path. Use `dpkg -l | grep tensorrt` to find it, or download from [NVIDIA TensorRT downloads](https://developer.nvidia.com/tensorrt). Replace `<YOUR_CUDA_VERSION>` with your actual CUDA version (e.g., `13.0`). Use `nvcc --version` to check your CUDA version.
@@ -254,16 +329,19 @@ cmake .. \
 |:-------|:------------|:--------|
 | `TRT_PACKAGE_DIR` | Path to TensorRT installation. Auto-detected; manual hint to disambiguate multiple versions. | N/A |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
-| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson) or `auto-thor` (DRIVE / DriveOS). **Not needed for GPU builds** | N/A |
-| `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
+| `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson Thor), `auto-thor` (DRIVE Thor / DriveOS), or `jetson-orin` (Jetson Orin). **Not needed for GPU builds** | N/A |
+| `CUDA_CTK_VERSION` | CUDA Toolkit version. Use the platform command above to select `13.2`, `13.0`, or `12.6`. | target default |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF` (default), `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd` | OFF |
-| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_110` or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
+| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF`, `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd`. Set this to `ALL` for customer builds. | OFF |
+| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_87`, `sm_110`, or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
 
-**Building with CuTe DSL Kernels (Optional)**
+**CuTe DSL Kernel Artifacts**
 
-CuTe DSL binaries are prebuilt and shipped with the repository. Add `-DENABLE_CUTE_DSL=ALL` (or a group selection such as `gdn`, `fmha`, `gemm`, or `ssd`) to the CMake configure command when a model or kernel path needs them. Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
+CuTe DSL binaries are prebuilt and shipped with the repository. The platform
+commands above pass `-DENABLE_CUTE_DSL=ALL` because Qwen3.5 and several other
+model paths require them. If you select groups manually, Qwen3.5 GDN requires
+`-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
 
 If you have multiple local artifact tags for the same CPU architecture, also
 pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.
@@ -303,21 +381,22 @@ After installation, proceed to the [Quick Start Guide](quick-start-guide.md) for
 **Issue: Python module import errors**
 
 Solution: Ensure the virtual environment is activated and `PYTHONPATH` points to
-both the repository root and `experimental/`:
+the repository root:
 ```bash
 source venv/bin/activate
 export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
-python -m llm_loader.export_all_cli --help
+export PYTHONPATH=$EDGE_LLM_PATH:$PYTHONPATH
+tensorrt-edgellm-export --help
 ```
 
 **Issue: `nvcc: command not found`**
 
-Solution: Ensure JetPack 7.1 is properly installed with CUDA support:
+Solution: Ensure the target JetPack release or DriveOS SDK Docker image is
+installed with CUDA support:
 ```bash
 # Verify CUDA installation
 nvcc --version
-# Should show CUDA 13.x
+# Should match the CUDA_CTK_VERSION used for CMake
 ```
 
 **Issue: `TensorRT not found` during CMake**
@@ -327,7 +406,9 @@ Solution: Specify TensorRT package directory. This directory should contain `lib
 cmake .. \
     -DTRT_PACKAGE_DIR=/usr/local/TensorRT-10.x.x \
     -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
-    -DEMBEDDED_TARGET=jetson-thor
+    -DEMBEDDED_TARGET=<jetson-thor|auto-thor|jetson-orin> \
+    -DCUDA_CTK_VERSION=<target CUDA version> \
+    -DENABLE_CUTE_DSL=ALL
 ```
 
 **Issue: Thread issue during C++ build**
@@ -346,7 +427,7 @@ make -j  # Instead of make -j$(nproc)
 
 ## Uninstalling
 
-**Experimental Quantization and `llm_loader` (x86 Host):**
+**Quantization and `tensorrt_edgellm` (x86 Host):**
 - Deactivate and remove virtual environment: `deactivate && rm -rf venv`
 - Remove repository (optional): `rm -rf TensorRT-Edge-LLM`
 

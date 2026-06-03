@@ -306,7 +306,7 @@ private:
 
     //! @brief Handle stage completion
     //! @throws std::runtime_error if a CUDA error occurs
-    void onStageComplete(std::string const& stageId);
+    void onStageComplete(std::string const& stageId, cudaStream_t stream);
 };
 
 /*!

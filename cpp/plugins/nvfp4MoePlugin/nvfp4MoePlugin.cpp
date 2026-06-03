@@ -61,16 +61,19 @@ namespace plugins
 namespace
 {
 //! Version "1": NvFP4 MoE plugin — FP16 hidden + NVFP4 weights + FP32 router.
-//! - FC1 up weights: ``[E, H, I/2]`` INT8 (N-major; 2 FP4 nibbles per byte along I).
-//! - FC2 down weights: ``[E, I, H/2]`` INT8 (N-major; 2 FP4 nibbles per byte along H).
-//! - FC1 prefill SF atom: M=I, K=H/16 (raw IEEE FP8 E4M3 bytes, scheme B).
-//! - FC2 prefill SF atom: M=H, K=I/16 (raw IEEE FP8 E4M3 bytes, scheme B).
-//! - FC1 decode SF (slot 9): row-major ``[E, H/16, nOut]`` Marlin-projected FP8 bytes.
-//! - FC2 decode SF (slot 10): row-major ``[E, nOut/16, H]`` Marlin-projected FP8 bytes.
+//! ``mMoeInterSize`` is the raw FC1 weight N-dimension: ``I`` for non-gated,
+//! ``2*I`` for gated (SwiGLU interleaved gate+up). ``nOut = nOutFor()`` is the
+//! FC1 output (= FC2 contraction) dim after activation folding.
+//! - FC1 up weights: ``[E, H, mMoeInterSize/2]`` INT8 (N-major; 2 FP4 nibbles per byte).
+//! - FC2 down weights: ``[E, nOut, H/2]`` INT8 (N-major; 2 FP4 nibbles per byte along H).
+//! - FC1 prefill SF atom: M=mMoeInterSize, K=H/16 (raw IEEE FP8 E4M3 bytes, scheme B).
+//! - FC2 prefill SF atom: M=H, K=nOut/16 (raw IEEE FP8 E4M3 bytes, scheme B).
+//! - FC1 decode SF (slot 9): legacy CuTe DSL decode atom layout (no longer used; decode reads prefill SF at slot 4).
+//! - FC2 decode SF (slot 10): legacy CuTe DSL decode atom layout (no longer used; decode reads prefill SF at slot 7).
 //! - Per-expert FP32 global scales ``s_max_ex / 448`` for FC1 and FC2.
 //! - FP32 length-2 ``hidden_global_scale`` for the internal activation FP4 quants.
-//! Dispatch: ``numTokens <= kPrefillDispatchThreshold = 16`` → decode (W4A16 GEMV
-//! on row-major transposed SF); ``> 16`` → CuteDSL N-major prefill.
+//! Dispatch: ``numTokens <= kPrefillDispatchThreshold = 16`` → decode (CuTe DSL W4A16
+//! GEMV on atom-layout SF); ``> 16`` → CuteDSL N-major prefill.
 constexpr char const* kNVFP4_MOE_PLUGIN_VERSION{"1"};
 constexpr char const* kNVFP4_MOE_PLUGIN_NAME{"Nvfp4MoePlugin"};
 //! Input count: 11 FP4 MoE tensors (router logits / hidden / prefill + decode SFs / expert
@@ -80,23 +83,11 @@ constexpr int32_t kNbPluginInputs{12};
 constexpr int32_t kNvfp4MoeQuantizationGroupSize{16};
 //! Dispatch threshold: \c numTokens (B·S) > this value → prefill path; otherwise decode.
 //! Set to ``16`` — batches of 1..16 tokens take the W4A16 decode GEMV path with
-//! row-major transposed decode SF (slots 9/10); larger batches take the CuteDSL
+//! prefill atom-layout SF (slots 4/7); larger batches take the CuteDSL
 //! N-major prefill path.
 constexpr int32_t kPrefillDispatchThreshold{16};
 //! CuteDSL FC1/FC2 tile size. Matches the AOT kernel's persistent-tile block size.
 constexpr int32_t kPrefillTileSize{128};
-
-#if SUPPORTS_FP4
-MoEActivationKind nvfp4StoredActivationToKernelKind(ActivationType const t) noexcept
-{
-    int32_t const v = static_cast<int32_t>(t);
-    if (v == static_cast<int32_t>(MoEActivationKind::kSiLU))
-    {
-        return MoEActivationKind::kSiLU;
-    }
-    return MoEActivationKind::kReLU2;
-}
-#endif // SUPPORTS_FP4
 
 //! Map the serialized \c activation_type (0 = ReLU², 1 = SiLU decode / SwiGLU prefill) to
 //! the FC1 grouped-GEMM activation enum.
@@ -149,8 +140,13 @@ size_t computeNvfp4MoeDecodeWorkspaceSize(int32_t numTokens, int32_t numExperts,
                     size, rt::Coords{static_cast<int64_t>(softmaxWorkspaceSizeBytes)}, DataType::kINT8);
             }
         }
-        int64_t const interElems = trt_edgellm::nemotronMoeW4A16InterBufferNumElems(numTokens, topK, moeInterSize);
-        size = accumulateWorkspaceSize(size, rt::Coords{interElems}, DataType::kHALF);
+#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
+        // CuTe DSL decode GEMV intermediate buffer. Uses moeInterSize (which is 2*I for gated)
+        // so the workspace may over-allocate for gated models — harmless.
+        size_t const gemvWsBytes
+            = trt_edgellm::CuteDslDecodeGemvRunner::getWorkspaceSize(numTokens, topK, moeInterSize);
+        size = accumulateWorkspaceSize(size, rt::Coords{static_cast<int64_t>(gemvWsBytes)}, DataType::kINT8);
+#endif
         return size;
     }
     catch (std::exception const& e)
@@ -461,13 +457,14 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
     case 2: // hidden_global_scale FP32 [2]
         result = ok && td.type == DataType::kFLOAT && td.dims.nbDims == 1 && td.dims.d[0] == 2;
         break;
-    case 3: // up_qweights INT8 [E, H, nOut/2]
+    case 3: // up_qweights INT8 [E, H, mMoeInterSize/2] (gated: 2*I/2 = I bytes for interleaved gate+up)
         result = ok && td.type == DataType::kINT8 && td.dims.nbDims == 3 && td.dims.d[0] == mNumExperts
-            && td.dims.d[1] == mHiddenSize && td.dims.d[2] == nOut / 2;
+            && td.dims.d[1] == mHiddenSize && td.dims.d[2] == mMoeInterSize / 2;
         break;
-    case 4: // up_block_scale INT8 [E, padUp(nOut, 128), padUp(H/16, 4)] — atom-layout
+    case 4: // up_block_scale INT8 [E, padUp(mMoeInterSize, 128), padUp(H/16, 4)] — atom-layout
         result = ok && td.type == DataType::kINT8 && td.dims.nbDims == 3 && td.dims.d[0] == mNumExperts
-            && td.dims.d[1] == padUp64(nOut, 128) && td.dims.d[2] == padUp64(mHiddenSize / mQuantizationGroupSize, 4);
+            && td.dims.d[1] == padUp64(mMoeInterSize, 128)
+            && td.dims.d[2] == padUp64(mHiddenSize / mQuantizationGroupSize, 4);
         break;
     case 5: // up_global_scale FP32 [E]
         result = ok && td.type == DataType::kFLOAT && td.dims.nbDims == 1 && td.dims.d[0] == mNumExperts;
@@ -483,13 +480,9 @@ bool Nvfp4MoePlugin::supportsFormatCombination(
     case 8: // down_global_scale FP32 [E]
         result = ok && td.type == DataType::kFLOAT && td.dims.nbDims == 1 && td.dims.d[0] == mNumExperts;
         break;
-    case 9: // up_block_scale_decode INT8 [E, H/16, nOut] — row-major transposed
-        result = ok && td.type == DataType::kINT8 && td.dims.nbDims == 3 && td.dims.d[0] == mNumExperts
-            && td.dims.d[1] == mHiddenSize / mQuantizationGroupSize && td.dims.d[2] == nOut;
-        break;
-    case 10: // down_block_scale_decode INT8 [E, nOut/16, H] — row-major transposed
-        result = ok && td.type == DataType::kINT8 && td.dims.nbDims == 3 && td.dims.d[0] == mNumExperts
-            && td.dims.d[1] == nOut / mQuantizationGroupSize && td.dims.d[2] == mHiddenSize;
+    case 9:  // up_block_scale_decode — legacy, unused by decode path (reads prefill SF at slot 4)
+    case 10: // down_block_scale_decode — legacy, unused by decode path (reads prefill SF at slot 7)
+        result = ok && td.type == DataType::kINT8;
         break;
     case 11: // e_score_correction_bias FP32 [num_experts]
         result = ok && td.type == DataType::kFLOAT && td.dims.nbDims == 1 && td.dims.d[0] == mNumExperts;
@@ -650,6 +643,11 @@ IPluginV3* Nvfp4MoePlugin::attachToContext(IPluginResourceContext* context) noex
         (void) trt_edgellm::kernel::nvfp4_moe::NvFP4MoEContiguousGemmRunner::loadKernelModules();
         (void) trt_edgellm::kernel::nvfp4_moe::NvFP4MoEFC2FinalizeRunner::loadKernelModules();
 
+#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
+        // Load CuTe DSL decode GEMV kernel modules.
+        (void) trt_edgellm::CuteDslDecodeGemvRunner::loadKernelModules();
+#endif
+
         // Allocate layout buffers for the worst-case profile. Sized for `mMaxTokens` so the
         // same buffers handle every legal runtime shape without reallocation (a
         // potentially-captured runtime stream cannot safely call alloc/free).
@@ -751,7 +749,7 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
 }
 
 // ============================================================================
-// Decode path (numTokens <= 16): top-k softmax + W4A16 decode GEMVs
+// Decode path (numTokens <= 16): top-k softmax + CuTe DSL decode GEMVs
 // ============================================================================
 
 int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /*outputDesc*/,
@@ -802,62 +800,41 @@ int32_t Nvfp4MoePlugin::enqueueDecoding(PluginTensorDesc const* inputDesc, Plugi
     }
     CUDA_CHECK(cudaGetLastError());
 
-#if SUPPORTS_FP4
-    int64_t const int4PerNvfp4Tile = trt_edgellm::kNvfp4Int4PerTilePayload;
-    int32_t const numHiddenChunks = mHiddenSize / 64;
-    int32_t const numInterChunks = mMoeInterSize / 64;
-    int64_t const interFp16Elems = trt_edgellm::nemotronMoeW4A16InterBufferNumElems(numTokens, mTopK, mMoeInterSize);
-    __half* interFp16Scratch
-        = static_cast<__half*>(assignTensorFromWorkspace(ws, rt::Coords{interFp16Elems}, DataType::kHALF).rawPointer());
+#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
+    // CuTe DSL decode GEMV — W4A16 NVFP4: N-major weights + prefill atom-layout FP8 E4M3 block scales + FP32 global.
+    // For gated (SwiGLU): up_weights [E, H, I] interleaved gate+up, moeInterSize = I (post-fold).
+    // For non-gated: up_weights [E, H, I/2], moeInterSize = mMoeInterSize.
+    int32_t const nOut = nOutFor(mActivationType, mMoeInterSize);
+    bool const isGated = (mapActivation(mActivationType) == trt_edgellm::kernel::nvfp4_moe::Activation::kSwiglu);
 
-    NVFP4Tensor up{};
-    up.quantized_data = reinterpret_cast<int4*>(const_cast<void*>(inputs[3]));
-    // Decode path reads decode SF from slot 9 as a raw row-major `[E, H/16, nOut]` byte
-    // buffer via the `up_decode_sf` launcher argument; `up.block_scale` is unused by the
-    // SF-aware GEMV kernels (kept nullptr to surface bugs fast if ever dereferenced).
-    up.block_scale = nullptr;
-    up.global_scale = reinterpret_cast<float*>(const_cast<void*>(inputs[5]));
-    {
-        int64_t const h = static_cast<int64_t>(mHiddenSize);
-        int64_t const nic = static_cast<int64_t>(numInterChunks);
-        up.strides[0] = h * nic * int4PerNvfp4Tile;
-        up.strides[1] = nic * int4PerNvfp4Tile;
-        up.strides[2] = int4PerNvfp4Tile;
-    }
+    trt_edgellm::CuteDslDecodeGemvParams gemvParams{};
+    gemvParams.numTokens = numTokens;
+    gemvParams.numExperts = mNumExperts;
+    gemvParams.topK = mTopK;
+    gemvParams.hiddenSize = mHiddenSize;
+    gemvParams.moeInterSize = nOut;
+    gemvParams.hiddenStates = static_cast<__half const*>(inputs[1]);
+    gemvParams.topkIds = topkIndicesPtr;
+    gemvParams.topkWeights = topkWeightsPtr;
+    gemvParams.upWeights = inputs[3];
+    gemvParams.upScales = inputs[4];                                 // prefill atom-layout FP8 E4M3 SF
+    gemvParams.upGlobalScale = static_cast<float const*>(inputs[5]); // FP32 per-expert
+    gemvParams.downWeights = inputs[6];
+    gemvParams.downScales = inputs[7];                                 // prefill atom-layout FP8 E4M3 SF
+    gemvParams.downGlobalScale = static_cast<float const*>(inputs[8]); // FP32 per-expert
+    gemvParams.output = static_cast<__half*>(outputs[0]);
+    gemvParams.activationKind = (static_cast<int32_t>(mActivationType) == 1) ? 1 : 0; // 0=ReLU2, 1=SiLU
+    gemvParams.isGated = isGated;
 
-    NVFP4Tensor dn{};
-    dn.quantized_data = reinterpret_cast<int4*>(const_cast<void*>(inputs[6]));
-    // Same as up: decode SF is read from slot 10 via `down_decode_sf` pointer.
-    dn.block_scale = nullptr;
-    dn.global_scale = reinterpret_cast<float*>(const_cast<void*>(inputs[8]));
-    {
-        int64_t const i = static_cast<int64_t>(mMoeInterSize);
-        int64_t const h32 = static_cast<int64_t>(mHiddenSize) / 32;
-        dn.strides[0] = i * h32;
-        dn.strides[1] = h32;
-        dn.strides[2] = int4PerNvfp4Tile;
-    }
+    // Workspace for intermediate buffer (after router workspace).
+    size_t const gemvWsBytes = trt_edgellm::CuteDslDecodeGemvRunner::getWorkspaceSize(numTokens, mTopK, nOut);
+    void* gemvWs = assignTensorFromWorkspace(ws, {static_cast<int64_t>(gemvWsBytes)}, DataType::kINT8).rawPointer();
 
-    MoEActivationKind const activationKind = nvfp4StoredActivationToKernelKind(mActivationType);
-    __half const* actFp16 = static_cast<__half const*>(inputs[1]);
-    uint8_t const* upDecodeSf = static_cast<uint8_t const*>(inputs[9]);
-    uint8_t const* downDecodeSf = static_cast<uint8_t const*>(inputs[10]);
-    trt_edgellm::launchNemotronMoeW4A16DecodeUpGemvCuda(batch, seqLen, mHiddenSize, mMoeInterSize, numInterChunks,
-        mNumExperts, mTopK, topkIndicesPtr, topkWeightsPtr, actFp16, up, upDecodeSf, interFp16Scratch, stream);
-    CUDA_CHECK(cudaGetLastError());
-
-    trt_edgellm::launchNemotronMoeW4A16DecodeDownGemvCuda(batch, seqLen, mHiddenSize, mMoeInterSize, numHiddenChunks,
-        mNumExperts, mTopK, topkIndicesPtr, topkWeightsPtr, interFp16Scratch, dn, downDecodeSf,
-        static_cast<__half*>(outputs[0]), stream, activationKind);
-    CUDA_CHECK(cudaGetLastError());
+    return mDecodeGemvRunner.run(gemvParams, gemvWs, stream);
 #else
-    (void) inputs;
-    (void) outputs;
-    LOG_ERROR("Nvfp4MoePlugin: NVFP4 MoE decode requires CUDA >= 12.8 (FP4 support)");
+    LOG_ERROR("Nvfp4MoePlugin: decode path requires CuTe DSL NVFP4 MoE kernels (CUTE_DSL_NVFP4_MOE_ENABLED)");
     return -1;
 #endif
-
-    return 0;
 }
 
 // ============================================================================

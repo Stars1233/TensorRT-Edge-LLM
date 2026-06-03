@@ -309,6 +309,10 @@ private:
     //! @return true if copying was successful, false otherwise
     bool copyEmbeddingFile();
 
+    //! Copy externalized model weight files to the engine directory.
+    //! @return true if copying was successful, false otherwise
+    bool copyExternalWeightFiles();
+
     // Model dimensions extracted from config.json
     int64_t mHiddenSize{0};                 //!< Hidden size of the model
     int64_t mNumKVHeads{0};                 //!< Number of key-value heads

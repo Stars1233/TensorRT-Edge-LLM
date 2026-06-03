@@ -17,6 +17,7 @@
 
 #include "attentionPlugin.h"
 
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
@@ -28,7 +29,6 @@
 
 // CuTe DSL FMHA kernel (Blackwell SM100+)
 #ifdef CUTE_DSL_FMHA_ENABLED
-#include "common/checkMacros.h"
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
 
@@ -179,6 +179,46 @@ bool loadFMHAKernels(bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, 
     return canImplementFMHA;
 }
 
+// Workspace layout (cumulative, worst-case across all execution paths):
+//
+//   Slot  | Shape                            | Type  | Used by
+//   ------+----------------------------------+-------+------------------------------------------
+//   0     | [B+1]                            | INT32 | cuQSeqLens          (prefill)
+//   1     | [B+1]                            | INT32 | cuKVSeqLens         (prefill)
+//   2     | [B]                              | INT32 | kvCacheEndIdxs      (prefill)
+//   3     | [B+1]                            | INT32 | paddedCuKVSeqLens   (prefill, CuTe DSL)
+//   4     | [B, 2, Hkv, Smax, D]             | HALF  | transposedKV        (FMHA_v2 chunked prefill)
+//   5*    | [B, S, Hq, D]                    | FP8   | fp8Q                (CuTe DSL + FP8 prefill only)
+//
+//   * Slot 5 is conditionally allocated (CuTe DSL + FP8 KV cache only).
+//
+// Total allocation is the sum of all conditional slots (safe upper bound).
+size_t getAttentionWorkspaceSize(int64_t batchSize, int64_t seqLen, int64_t kvCacheCapacity, int32_t numQHeads,
+    int32_t numKVHeads, int32_t headSize, bool useCuteDslFMHA, bool enableFp8KVCache)
+{
+    size_t workspaceSize = 0;
+
+    // CuQSeqLens for FMHA.
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, {batchSize + 1}, DataType::kINT32);
+
+    // Always reserve workspace memory to prepare for chunked prefill decoding. The implementation should be further
+    // optimized to avoid the workspace size overhead.
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{batchSize + 1}, DataType::kINT32);
+    workspaceSize = accumulateWorkspaceSize(
+        workspaceSize, rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headSize}, DataType::kHALF);
+
+    // FP8 Q output: RoPE kernel writes FP8 Q to this workspace buffer (CuTe DSL FMHA path).
+    if (useCuteDslFMHA && enableFp8KVCache)
+    {
+        workspaceSize = accumulateWorkspaceSize(
+            workspaceSize, rt::Coords{batchSize, seqLen, numQHeads, headSize}, DataType::kFP8);
+    }
+
+    return workspaceSize;
+}
+
 } // namespace
 
 // Static class fields initialization
@@ -215,7 +255,7 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
     bool canImplementXQA = DecoderXQARunner::canImplement(
-        mNumQHeads, mNumKVHeads, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
+        mNumQHeads, mNumKVHeads, mHeadSize, mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache));
     if (canImplementXQA)
     {
         DecoderXQARunner::loadDecodeXQAKernels(
@@ -233,36 +273,36 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
     }
 }
 
-AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data, size_t length)
+AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
-    deserializeValue(&data, &length, &mNumQHeads);
-    deserializeValue(&data, &length, &mNumKVHeads);
-    deserializeValue(&data, &length, &mHeadSize);
-    deserializeValue(&data, &length, &mEnableTreeAttention);
-    deserializeValue(&data, &length, &mEnableFp8KVCache);
-    deserializeValue(&data, &length, &mSlidingWindowSize);
+    mNumQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc).value_or(0);
+    mNumKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc).value_or(0);
+    mHeadSize = parsePluginScalarField<int32_t>("head_size", fc).value_or(0);
+    mEnableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc).value_or(0);
+    mEnableFp8KVCache = parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc).value_or(0);
+    mSlidingWindowSize = parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1);
 
-    // QKV scales are the last serialized field: [int32 count][float × count].
-    // FP8 disabled → keep default {1,1,1}. FP8 enabled → must have exactly 3 scales.
-    // NOTE: This format is not backward-compatible with engines built before QKV scale
-    // support was added. FP8 engines must be rebuilt (they need recalibrated Q scale anyway).
-    if (mEnableFp8KVCache)
+    // Parse qkv_scales float array
+    for (int32_t i = 0; i < fc->nbFields; ++i)
     {
-        bool const hasHeader = length >= sizeof(int32_t);
-        int32_t qkvScaleCount = 0;
-        if (hasHeader)
+        if (std::string("qkv_scales") == fc->fields[i].name)
         {
-            deserializeValue(&data, &length, &qkvScaleCount);
+            auto const* data = static_cast<float const*>(fc->fields[i].data);
+            mQkvScales.assign(data, data + fc->fields[i].length);
+            break;
         }
-        ELLM_CHECK(hasHeader && qkvScaleCount == 3 && length >= 3 * sizeof(float),
+    }
+
+    if (!mEnableFp8KVCache)
+    {
+        mQkvScales = {1.f, 1.f, 1.f};
+    }
+    else
+    {
+        ELLM_CHECK(mQkvScales.size() == 3,
             "FP8 KV cache enabled but qkv_scales missing or incomplete "
-            "in serialized data (expected 3). Re-export the model with QKV scales [q, k, v].");
-        for (int32_t i = 0; i < 3; ++i)
-        {
-            deserializeValue(&data, &length, &mQkvScales[i]);
-        }
-        check::check(length == 0, "Unexpected trailing bytes in serialized AttentionPlugin data");
+            "in plugin fields (expected 3). Re-export the model with QKV scales [q, k, v].");
     }
 
     mSMVersion = getSMVersion();
@@ -278,17 +318,52 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
         mSMVersion, mDataType, selectKvCacheDataType(mEnableFp8KVCache), useSpecDecode);
 }
 
-AttentionPlugin::~AttentionPlugin() {}
+AttentionPlugin::~AttentionPlugin() = default;
 
-IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
+// ---------------------------------------------------------------------------
+// IPluginV3
+// ---------------------------------------------------------------------------
+
+IPluginCapability* AttentionPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
-        mEnableFp8KVCache, mSlidingWindowSize, mQkvScales);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    return plugin;
+    try
+    {
+        if (type == PluginCapabilityType::kBUILD)
+        {
+            return static_cast<IPluginV3OneBuildV2*>(this);
+        }
+        if (type == PluginCapabilityType::kRUNTIME)
+        {
+            return static_cast<IPluginV3OneRuntime*>(this);
+        }
+        return static_cast<IPluginV3OneCore*>(this);
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
 }
 
-char const* AttentionPlugin::getPluginType() const noexcept
+IPluginV3* AttentionPlugin::clone() noexcept
+{
+    try
+    {
+        auto* p = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
+            mEnableFp8KVCache, mSlidingWindowSize, mQkvScales);
+        p->setPluginNamespace(mNamespace.c_str());
+        return p;
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPluginV3OneCore — metadata
+// ---------------------------------------------------------------------------
+
+char const* AttentionPlugin::getPluginName() const noexcept
 {
     return kATTENTION_PLUGIN_NAME;
 }
@@ -300,7 +375,7 @@ char const* AttentionPlugin::getPluginNamespace() const noexcept
 
 void AttentionPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
 {
-    mNamespace = std::string(pluginNamespace);
+    mNamespace = pluginNamespace ? pluginNamespace : "";
 }
 
 char const* AttentionPlugin::getPluginVersion() const noexcept
@@ -308,14 +383,66 @@ char const* AttentionPlugin::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
+// ---------------------------------------------------------------------------
+// IPluginV3OneBuild — shape / format
+// ---------------------------------------------------------------------------
+
 int32_t AttentionPlugin::getNbOutputs() const noexcept
 {
     // At both context and generation phase, output attention result and kv-cache.
     return 2;
 }
 
+int32_t AttentionPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
+    DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
+{
+    try
+    {
+        assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
+        // Output[0] (attention): always FP16 (follows Q input dtype).
+        // Output[1] (KV cache) follows KV input dtype (HALF or FP8).
+        outputTypes[kOUT_ATTENTION_IDX] = inputTypes[kIN_Q_IDX];
+        outputTypes[kOUT_KV_CACHE_IDX] = inputTypes[kIN_KV_CACHE_IDX];
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
+}
+
+int32_t AttentionPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
+    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
+{
+    try
+    {
+        assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
+        // Output[0] is attention result, has shape [B, S, Hq, D]. Refers to Q shape [B, S, Hq*D]
+        outputs[kOUT_ATTENTION_IDX].nbDims = 4;
+        outputs[kOUT_ATTENTION_IDX].d[0] = inputs[kIN_Q_IDX].d[0];
+        outputs[kOUT_ATTENTION_IDX].d[1] = inputs[kIN_Q_IDX].d[1];
+        outputs[kOUT_ATTENTION_IDX].d[2] = exprBuilder.constant(mNumQHeads);
+        outputs[kOUT_ATTENTION_IDX].d[3] = exprBuilder.constant(mHeadSize);
+
+        // Output[1] is KVCache, same shape as input KV cache [B, 2, Hkv, Smax, D]
+        outputs[kOUT_KV_CACHE_IDX].nbDims = 5;
+        outputs[kOUT_KV_CACHE_IDX].d[0] = inputs[kIN_KV_CACHE_IDX].d[0];
+        outputs[kOUT_KV_CACHE_IDX].d[1] = inputs[kIN_KV_CACHE_IDX].d[1];
+        outputs[kOUT_KV_CACHE_IDX].d[2] = inputs[kIN_KV_CACHE_IDX].d[2];
+        outputs[kOUT_KV_CACHE_IDX].d[3] = inputs[kIN_KV_CACHE_IDX].d[3];
+        outputs[kOUT_KV_CACHE_IDX].d[4] = inputs[kIN_KV_CACHE_IDX].d[4];
+
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
+}
+
 bool AttentionPlugin::supportsFormatCombination(
-    int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // Support context/generation phase inputs:
     //      Q tensor (linear FP16) with shape [B, S, Hq, D]
@@ -334,7 +461,7 @@ bool AttentionPlugin::supportsFormatCombination(
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
     //      KV-cache tensor, same as the above.
-    auto checkQ = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkQ = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -347,7 +474,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkKV = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkKV = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -360,7 +487,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkKVCache = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkKVCache = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         // Support FP16 or FP8 storage;
         if (mEnableFp8KVCache)
@@ -383,7 +510,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkSequenceLen = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkSequenceLen = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -391,7 +518,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkPosEncodingCosSin = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkPosEncodingCosSin = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kFLOAT;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -400,7 +527,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkAttentionMask = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkAttentionMask = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -408,7 +535,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkAttentionPosId = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkAttentionPosId = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -416,7 +543,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkKVCacheStartIdx = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkKVCacheStartIdx = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -424,7 +551,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkAttentionOutput = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -455,13 +582,13 @@ bool AttentionPlugin::supportsFormatCombination(
     {
         switch (pos)
         {
-        case kIN_Q_IDX: result = checkQ(inOut[pos]); break;
-        case kIN_K_IDX: result = checkKV(inOut[pos]); break;
-        case kIN_V_IDX: result = checkKV(inOut[pos]); break;
-        case kIN_KV_CACHE_IDX: result = checkKVCache(inOut[pos]); break;
-        case kIN_CONTEXT_LENGTH_IDX: result = checkSequenceLen(inOut[pos]); break;
-        case kIN_ROPE_COS_SIN_IDX: result = checkPosEncodingCosSin(inOut[pos]); break;
-        case kIN_KV_CACHE_START_IDX: result = checkKVCacheStartIdx(inOut[pos]); break;
+        case kIN_Q_IDX: result = checkQ(inOut[pos].desc); break;
+        case kIN_K_IDX: result = checkKV(inOut[pos].desc); break;
+        case kIN_V_IDX: result = checkKV(inOut[pos].desc); break;
+        case kIN_KV_CACHE_IDX: result = checkKVCache(inOut[pos].desc); break;
+        case kIN_CONTEXT_LENGTH_IDX: result = checkSequenceLen(inOut[pos].desc); break;
+        case kIN_ROPE_COS_SIN_IDX: result = checkPosEncodingCosSin(inOut[pos].desc); break;
+        case kIN_KV_CACHE_START_IDX: result = checkKVCacheStartIdx(inOut[pos].desc); break;
         default: break;
         }
 
@@ -473,12 +600,12 @@ bool AttentionPlugin::supportsFormatCombination(
             {
                 if (pos == currentOptionalInputIdx)
                 {
-                    result = checkAttentionMask(inOut[pos]);
+                    result = checkAttentionMask(inOut[pos].desc);
                 }
                 currentOptionalInputIdx++;
                 if (pos == currentOptionalInputIdx)
                 {
-                    result = checkAttentionPosId(inOut[pos]);
+                    result = checkAttentionPosId(inOut[pos].desc);
                 }
                 currentOptionalInputIdx++;
             }
@@ -489,8 +616,8 @@ bool AttentionPlugin::supportsFormatCombination(
         int32_t outPos = pos - nbInputs;
         switch (outPos)
         {
-        case kOUT_ATTENTION_IDX: result = checkAttentionOutput(inOut[pos]); break;
-        case kOUT_KV_CACHE_IDX: result = checkKVCache(inOut[pos]); break;
+        case kOUT_ATTENTION_IDX: result = checkAttentionOutput(inOut[pos].desc); break;
+        case kOUT_KV_CACHE_IDX: result = checkKVCache(inOut[pos].desc); break;
         default: break;
         }
     }
@@ -498,122 +625,43 @@ bool AttentionPlugin::supportsFormatCombination(
     return result;
 }
 
-// IPluginV2Ext Methods
-DataType AttentionPlugin::getOutputDataType([[maybe_unused]] int32_t index,
-    [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
-{
-    // Output[0] (attention): always FP16 (follows Q input dtype).
-    // Output[1] (KV cache) follows KV input dtype (HALF or FP8).
-    if (index == kOUT_ATTENTION_IDX)
-    {
-        return inputTypes[kIN_Q_IDX];
-    }
-    return inputTypes[kIN_KV_CACHE_IDX];
-}
-
-DimsExprs AttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
-    [[maybe_unused]] int32_t nbInputs, nvinfer1::IExprBuilder& exprBuilder) noexcept
-{
-    // Output[0] is attention result, has shape [B, S, Hq, D]. Refers to Q shape [B, S, Hq, D]
-    DimsExprs output;
-    if (outputIndex == kOUT_ATTENTION_IDX)
-    {
-        output.nbDims = 4;
-        output.d[0] = inputs[kIN_Q_IDX].d[0];
-        output.d[1] = inputs[kIN_Q_IDX].d[1];
-        output.d[2] = exprBuilder.constant(mNumQHeads);
-        output.d[3] = exprBuilder.constant(mHeadSize);
-    }
-    else if (outputIndex == kOUT_KV_CACHE_IDX)
-    {
-        // Output[1] is KVCache, same shape as input KV cache
-        output.nbDims = 5;
-        output.d[0] = inputs[kIN_KV_CACHE_IDX].d[0];
-        output.d[1] = inputs[kIN_KV_CACHE_IDX].d[1];
-        output.d[2] = inputs[kIN_KV_CACHE_IDX].d[2];
-        output.d[3] = inputs[kIN_KV_CACHE_IDX].d[3];
-        output.d[4] = inputs[kIN_KV_CACHE_IDX].d[4];
-    }
-    return output;
-}
-
-void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
+int32_t AttentionPlugin::configurePlugin([[maybe_unused]] DynamicPluginTensorDesc const* in,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    return; // No need to configure anything since we will only use the runtime tensor shapes.
+    return 0; // No need to configure anything since we will only use the runtime tensor shapes.
 }
 
-// Workspace layout (cumulative, worst-case across all execution paths):
-//
-//   Slot  | Shape                            | Type  | Used by
-//   ------+----------------------------------+-------+------------------------------------------
-//   0     | [B+1]                            | INT32 | cuQSeqLens          (prefill)
-//   1     | [B+1]                            | INT32 | cuKVSeqLens         (prefill)
-//   2     | [B]                              | INT32 | kvCacheEndIdxs      (prefill)
-//   3     | [B+1]                            | INT32 | paddedCuKVSeqLens   (prefill, CuTe DSL)
-//   4     | [B, 2, Hkv, Smax, D]             | HALF  | transposedKV        (FMHA_v2 chunked prefill)
-//   5*    | [B, S, Hq, D]                    | FP8   | fp8Q                (CuTe DSL + FP8 prefill only)
-//
-//   * Slot 5 is conditionally allocated (CuTe DSL + FP8 KV cache only).
-//
-// Total allocation is the sum of all conditional slots (safe upper bound).
-size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
-    [[maybe_unused]] int32_t nbOutputs) const noexcept
+size_t AttentionPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] DynamicPluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
-    // TensorRT will supply max profile shape for each input/output tensor across all optimization profiles.
-    // We will request workspace to keep intermediate tensors under prefill/decode phase executions.
-    // Obtain max supported batch size from the input tensor shapes. The Q input tensor will be in shape
-    // [B, S, Hq, D] where S is padded the max length of the input sequence within this batch.
-    PluginTensorDesc const& qInputDesc = inputs[kIN_Q_IDX];
-    int64_t const maxBatchSize = qInputDesc.dims.d[0];
-
-    // Obtain max KV cache capacity from the KV cache tensor shape.
-    // The KV cache tensor has shape [B, 2, num_kv_heads, capacity, head_dim]
-    PluginTensorDesc const& kvCacheDesc = inputs[kIN_KV_CACHE_IDX];
-    int64_t const maxKVCacheCapacity = kvCacheDesc.dims.d[3];
-
-    size_t workspaceSize = 0;
-
-    // CuQSeqLens for FMHA.
-    workspaceSize = accumulateWorkspaceSize(workspaceSize, {maxBatchSize + 1}, DataType::kINT32);
-
-    // Always reserve workspace memory to prepare for chunked prefill decoding. The implementation should be further
-    // optimized to avoid the workspace size overhead.
-
-    // CuTotalKvCacheLens to describe the cumulative length of KV tensors.
-    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
-    // KVCache ends that denote the end index of each KVCache lane after adding current contents.
-    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize}, DataType::kINT32);
-    // Padded cumulative KV sequence lengths for CuTe DSL FMHA.
-    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
-    // KV workspace for split K and V tensors (split into K and V halves by pointer arithmetic in enqueue).
-    workspaceSize = accumulateWorkspaceSize(
-        workspaceSize, rt::Coords{maxBatchSize, 2, mNumKVHeads, maxKVCacheCapacity, mHeadSize}, DataType::kHALF);
-
-    // FP8 Q output: RoPE kernel writes FP8 Q to this workspace buffer (CuTe DSL FMHA path).
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA && mEnableFp8KVCache)
-    {
-        int64_t const maxSeqLen = qInputDesc.dims.d[1];
-        workspaceSize = accumulateWorkspaceSize(
-            workspaceSize, rt::Coords{maxBatchSize, maxSeqLen, mNumQHeads, mHeadSize}, DataType::kFP8);
-    }
-#endif
-
-    // Request another alignment size to align the workspace pointer.
-    workspaceSize += kDEVICE_ALIGNMENT;
+    int64_t const maxBatchSize = inputs[kIN_Q_IDX].max.d[0];
+    int64_t const maxSeqLen = inputs[kIN_Q_IDX].max.d[1];
+    // KV cache tensor shape: [B, 2, num_kv_heads, capacity, head_dim]
+    int64_t const maxKVCacheCapacity = inputs[kIN_KV_CACHE_IDX].max.d[3];
+    size_t const workspaceSize = getAttentionWorkspaceSize(maxBatchSize, maxSeqLen, maxKVCacheCapacity, mNumQHeads,
+        mNumKVHeads, mHeadSize, mUseCuteDslFMHA, mEnableFp8KVCache);
 
     LOG_DEBUG("AttentionPlugin workspace size: %zu bytes", workspaceSize);
     return workspaceSize;
 }
 
-int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
-    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
-    void* workspace, cudaStream_t stream) noexcept
+int32_t AttentionPlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
+    if (outputIndex == kOUT_KV_CACHE_IDX)
+    {
+        return kIN_KV_CACHE_IDX;
+    }
+    return -1;
+}
 
+// ---------------------------------------------------------------------------
+// IPluginV3OneRuntime — execution
+// ---------------------------------------------------------------------------
+
+int32_t AttentionPlugin::enqueue(PluginTensorDesc const* inputDesc, [[maybe_unused]] PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
+{
     // Construct non-owned tensor objects from I/O data pointers and shapes.
     // Q input in the graph will be in shape [B, S, Hq x D], for convenience,
     // we will use shape of [B, S, Hq, D] to represent the tensor.
@@ -697,16 +745,11 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         return 1;
     }
 
-    auto const nbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0);
-    auto const nbOutputs = kNUM_REQUIRED_OUTPUTS;
-    size_t space = getWorkspaceSize(inputDesc, nbInputs, outputDesc, nbOutputs);
-    // Align the workspace pointer so that each tensor assigned from the workspace will align to the device alignment
-    // granularity.
-    std::byte* alignedWorkspacePtr
-        = static_cast<std::byte*>(std::align(kDEVICE_ALIGNMENT, space - kDEVICE_ALIGNMENT, workspace, space));
-    if (alignedWorkspacePtr == nullptr)
+    auto* alignedWorkspacePtr = static_cast<std::byte*>(workspace);
+    if (alignedWorkspacePtr == nullptr
+        || reinterpret_cast<uintptr_t>(alignedWorkspacePtr) % static_cast<uintptr_t>(kDEVICE_ALIGNMENT) != 0)
     {
-        LOG_ERROR("Workspace size is too small to hold all data structures with correct alignment");
+        LOG_ERROR("Workspace pointer is not aligned to device alignment granularity");
         return 1;
     }
 
@@ -867,41 +910,36 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-size_t AttentionPlugin::getSerializationSize() const noexcept
-{
-    return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention)
-        + sizeof(mEnableFp8KVCache) + sizeof(int32_t) /* slidingWindowSize */
-        + sizeof(int32_t) /* qkv scale count */ + mQkvScales.size() * sizeof(float);
-}
-
-void AttentionPlugin::serialize(void* buffer) const noexcept
-{
-    std::byte* byteBuffer = static_cast<std::byte*>(buffer);
-    serializeValue(&byteBuffer, mNumQHeads);
-    serializeValue(&byteBuffer, mNumKVHeads);
-    serializeValue(&byteBuffer, mHeadSize);
-    serializeValue(&byteBuffer, mEnableTreeAttention);
-    serializeValue(&byteBuffer, mEnableFp8KVCache);
-    serializeValue(&byteBuffer, mSlidingWindowSize);
-    int32_t const qkvScaleCount = static_cast<int32_t>(mQkvScales.size());
-    serializeValue(&byteBuffer, qkvScaleCount);
-    for (auto const& s : mQkvScales)
-    {
-        serializeValue(&byteBuffer, s);
-    }
-}
-
-int32_t AttentionPlugin::initialize() noexcept
+int32_t AttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] PluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     return 0;
 }
 
-void AttentionPlugin::terminate() noexcept {}
-
-void AttentionPlugin::destroy() noexcept
+IPluginV3* AttentionPlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
-    delete this;
+    return clone();
 }
+
+PluginFieldCollection const* AttentionPlugin::getFieldsToSerialize() noexcept
+{
+    mDataToSerialize.clear();
+    mDataToSerialize.emplace_back("num_q_heads", &mNumQHeads, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("num_kv_heads", &mNumKVHeads, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("head_size", &mHeadSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_tree_attention", &mEnableTreeAttention, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("enable_fp8_kv_cache", &mEnableFp8KVCache, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("sliding_window_size", &mSlidingWindowSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back(
+        "qkv_scales", mQkvScales.data(), PluginFieldType::kFLOAT32, static_cast<int32_t>(mQkvScales.size()));
+    mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
+    mFCToSerialize.fields = mDataToSerialize.data();
+    return &mFCToSerialize;
+}
+
+// ---------------------------------------------------------------------------
+// Creator
+// ---------------------------------------------------------------------------
 
 AttentionPluginCreator::AttentionPluginCreator()
 {
@@ -929,14 +967,14 @@ char const* AttentionPluginCreator::getPluginName() const noexcept
     return kATTENTION_PLUGIN_NAME;
 }
 
-nvinfer1::PluginFieldCollection const* AttentionPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* AttentionPluginCreator::getFieldNames() noexcept
 {
     return &mFieldCollection;
 }
 
 void AttentionPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
 {
-    mNamespace = libNamespace;
+    mNamespace = libNamespace ? libNamespace : "";
 }
 
 char const* AttentionPluginCreator::getPluginNamespace() const noexcept
@@ -949,71 +987,18 @@ char const* AttentionPluginCreator::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
-nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
-    char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
+IPluginV3* AttentionPluginCreator::createPlugin(
+    char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
 {
     try
     {
-        std::optional<int32_t> numQHeads = parsePluginScalarField<int32_t>("num_q_heads", fc);
-        std::optional<int32_t> numKVHeads = parsePluginScalarField<int32_t>("num_kv_heads", fc);
-        std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
-        std::optional<int32_t> enableTreeAttention = parsePluginScalarField<int32_t>("enable_tree_attention", fc);
-        std::optional<int32_t> enableFp8KVCache = parsePluginScalarField<int32_t>("enable_fp8_kv_cache", fc);
-        // sliding_window_size: -1 = no sliding window (default), >0 = sliding window size
-        int32_t slidingWindowSize = parsePluginScalarField<int32_t>("sliding_window_size", fc).value_or(-1);
-        // Make enable_fp8_kv_cache optional with default value 0 (disable by default)
-        int32_t enableFp8KVCacheValue = enableFp8KVCache.value_or(0);
-
-        bool checkRequiredFields = numQHeads.has_value() && headSize.has_value() && numKVHeads.has_value()
-            && enableTreeAttention.has_value();
-        if (!checkRequiredFields)
-        {
-            LOG_ERROR("Missing required AttentionPlugin fields.");
-            return nullptr;
-        }
-
-        std::vector<float> qkvScales;
-        for (int32_t i = 0; i < fc->nbFields; ++i)
-        {
-            if (std::string("qkv_scales") == fc->fields[i].name)
-            {
-                auto const* data = static_cast<float const*>(fc->fields[i].data);
-                qkvScales.assign(data, data + fc->fields[i].length);
-                break;
-            }
-        }
-
-        if (enableFp8KVCacheValue && qkvScales.size() != 3)
-        {
-            LOG_ERROR(
-                "FP8 KV cache enabled but qkv_scales has %zu elements (expected 3). "
-                "Re-export the model to include QKV scales [q, k, v].",
-                qkvScales.size());
-            return nullptr;
-        }
-
-        AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), enableTreeAttention.value(), enableFp8KVCacheValue, slidingWindowSize, qkvScales);
-
+        auto* plugin = new AttentionPlugin(std::string(name), fc);
+        plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed to create AttentionPlugin: %s", e.what());
-    }
-    return nullptr;
-}
-
-nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
-    char const* name, void const* serialData, size_t serialLength) noexcept
-{
-    try
-    {
-        return new AttentionPlugin(name, static_cast<std::byte const*>(serialData), serialLength);
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to deserialize AttentionPlugin: %s", e.what());
     }
     return nullptr;
 }

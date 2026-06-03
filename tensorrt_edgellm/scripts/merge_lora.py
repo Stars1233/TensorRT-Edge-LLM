@@ -12,76 +12,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Command-line script for merging LoRA weights into a base HF model.
-
-Usage:
-    python merge_lora.py --model_dir /path/to/base_model --lora_dir /path/to/lora --output_dir /path/to/output
-"""
+"""CLI for merging a PEFT LoRA adapter into a HuggingFace checkpoint."""
 
 import argparse
-import os
-import shutil
+import logging
+import sys
 
-from peft import PeftModel
+from tensorrt_edgellm.lora.lora import merge_lora_and_save
 
-from tensorrt_edgellm.llm_models.model_utils import load_hf_model
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s:%(name)s:%(message)s")
     parser = argparse.ArgumentParser(
-        description=
-        "Merge LoRA weights into a base HF model and save the merged model")
-    parser.add_argument(
-        "--model_dir",
-        type=str,
-        required=True,
-        help="Base model directory",
-    )
-    parser.add_argument(
-        "--lora_dir",
-        type=str,
-        required=True,
-        help="LoRA checkpoint directory (e.g. vision-lora)",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Where to save the merged model",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        required=False,
-        default="cuda",
-        help=
-        "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
-    )
+        description="Merge LoRA weights into a base HF model")
+    parser.add_argument("--model_dir",
+                        required=True,
+                        help="Base model checkpoint directory")
+    parser.add_argument("--lora_dir",
+                        required=True,
+                        help="PEFT LoRA adapter directory")
+    parser.add_argument("--output_dir",
+                        required=True,
+                        help="Directory for the merged checkpoint")
+    parser.add_argument("--device",
+                        default="cuda",
+                        help="Device used while merging (default: cuda)")
+    parser.add_argument("--torch-dtype",
+                        "--torch_dtype",
+                        dest="torch_dtype",
+                        default="float16",
+                        help="Model dtype used while merging")
     args = parser.parse_args()
-    if os.path.exists(args.output_dir):
-        print(f"Removing existing output directory {args.output_dir}")
-        shutil.rmtree(args.output_dir)
-    os.makedirs(args.output_dir)
 
-    # 1. load base model
-    model, tokenizer, processor = load_hf_model(args.model_dir, "fp16",
-                                                args.device)
-
-    # 2. attach LoRA and merge into base model
-    lora_model = PeftModel.from_pretrained(model, args.lora_dir)
-    print("Merging LoRA weights into base model...")
-    merged_model = lora_model.merge_and_unload()
-
-    # 3. save merged model + tokenizer + processor
-    merged_model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    if processor is not None:
-        if model.config.model_type == "phi4mm":
-            # remove audio_tokenizer for Phi-4-multimodal to avoid error when saving processor
-            processor.audio_tokenizer = None
-        processor.save_pretrained(args.output_dir)
-    print(f"Saved merged model to {args.output_dir}")
+    try:
+        merge_lora_and_save(model_dir=args.model_dir,
+                            lora_dir=args.lora_dir,
+                            output_dir=args.output_dir,
+                            device=args.device,
+                            torch_dtype=args.torch_dtype)
+        logger.info("LoRA merge completed successfully")
+    except Exception:
+        logger.exception("Error during LoRA merge")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

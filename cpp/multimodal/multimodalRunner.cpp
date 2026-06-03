@@ -169,7 +169,7 @@ rt::OptionalInputTensors MultimodalRunner::getDeepstackFeatures()
 }
 
 bool MultimodalRunner::preprocessSystemPrompt([[maybe_unused]] std::string const& systemPrompt,
-    [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+    [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
     [[maybe_unused]] cudaStream_t stream)
 {
     // Default implementation is to do nothing for system prompt preprocessing and ND-RoPE parameter generation.

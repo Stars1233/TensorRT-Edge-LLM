@@ -580,6 +580,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_tensor_v,
             tma_atom_o,
             tma_tensor_o,
+            o,
             cum_seqlen_q,
             cum_seqlen_k,
             lse,
@@ -623,14 +624,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         (PADDING / RESIDUAL_MASK — no causal ordering).
 
         max_seqlen is the longest individual sequence length (not total_S).
-        It controls the grid size and CuTe layout tile counts.
-        Per-batch boundaries come from cu_seqlens via domain_offset.
+        It controls the grid size and per-sequence tile math. TMA descriptors
+        stay bounded by the compact total_S tensor extent.
         """
+        total_s = q_tensor.layout.shape[0]
         s_q = max_seqlen
         h_q = q_tensor.layout.shape[1]
         h_k = k_tensor.layout.shape[1]
-        s_k = max_seqlen
-        s_lse = s_q
         d = self.head_dim
 
         b = cu_seqlens.layout.shape[0] - 1
@@ -643,38 +643,30 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         cum_seqlen_q = cu_seqlens
         cum_seqlen_k = cu_seqlens
-        lse_iter = None
 
-        qo_offset = -s_q * d * h_r * h_k
-        kv_offset = -s_k * d * h_k
-        b_qo = s_q * (1 + b)
-        b_kv = s_k * (1 + b)
-        stride_b_qo = d * h_r * h_k
-        stride_b_kv = d * h_k
-        b_lse = 1
-        stride_b_lse = 0
-
-        # (s, d, ((h_r, h_k), b))
+        # Compact packed-varlen descriptor tensors. Per-batch tile offsets are
+        # applied in the device kernel with cu_seqlens; descriptor OOB is based
+        # on total_s, not on the synthetic max_seqlen * batch envelope.
         q_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            (total_s, d, (h_r, h_k)),
+            stride=(d * h_r * h_k, 1, (d, d * h_r)),
         )
-        q = cute.make_tensor(q_iter + qo_offset, q_layout)
+        q = cute.make_tensor(q_iter, q_layout)
         k_layout = cute.make_layout(
-            (s_k, d, ((h_r, h_k), b_kv)),
-            stride=(d * h_k, 1, ((0, d), stride_b_kv)),
+            (total_s, d, (h_r, h_k)),
+            stride=(d * h_k, 1, (0, d)),
         )
-        k = cute.make_tensor(k_iter + kv_offset, k_layout)
+        k = cute.make_tensor(k_iter, k_layout)
         v_layout = cute.make_layout(
-            (d, s_k, ((h_r, h_k), b_kv)),
-            stride=(1, d * h_k, ((0, d), stride_b_kv)),
+            (d, total_s, (h_r, h_k)),
+            stride=(1, d * h_k, (0, d)),
         )
-        v = cute.make_tensor(v_iter + kv_offset, v_layout)
+        v = cute.make_tensor(v_iter, v_layout)
         o_layout = cute.make_layout(
-            (s_q, d, ((h_r, h_k), b_qo)),
-            stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_qo)),
+            (total_s, d, (h_r, h_k)),
+            stride=(d * h_r * h_k, 1, (d, d * h_r)),
         )
-        o = cute.make_tensor(o_iter + qo_offset, o_layout)
+        o = cute.make_tensor(o_iter, o_layout)
         lse = None
 
         self.q_dtype = q.element_type
@@ -800,7 +792,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_atom_q, tma_tensor_q,
             tma_atom_k, tma_tensor_k,
             tma_atom_v, tma_tensor_v,
-            tma_atom_o, tma_tensor_o,
+            tma_atom_o, tma_tensor_o, o,
             cum_seqlen_q, cum_seqlen_k, lse,
             scale_softmax_log2, scale_softmax, scale_output,
             _wsl, _wsr,
@@ -827,6 +819,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mV_dkl: cute.Tensor,
         tma_atom_o: cute.CopyAtom,
         mO_qdl: cute.Tensor,
+        mO_gmem: cute.Tensor,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
@@ -1101,15 +1094,15 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         logical_offset_mQ = (
-                            mQ_qdl.shape[0] - seqlen_q,
+                            cuseqlen_q,
                             0,
-                            (0, cuseqlen_q + seqlen_q),
+                            (0, 0),
                         )
                         mQ_qdl_ = cute.domain_offset(logical_offset_mQ, mQ_qdl)
                         curr_block_coord_q = (
                             curr_block_coord[0],
                             curr_block_coord[1],
-                            (curr_block_coord[2][0], Int32(0)),
+                            curr_block_coord[2][0],
                         )
 
                     if cutlass.const_expr(cum_seqlen_k is not None):
@@ -1117,21 +1110,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                         if cutlass.const_expr(cum_seqlen_q is not None):
                             logical_offset_mK = (
-                                mK_kdl.shape[0] - seqlen_k,
+                                cuseqlen_k,
                                 0,
-                                (0, cuseqlen_k + seqlen_k),
+                                (0, 0),
                             )
                             logical_offset_mV = (
                                 0,
-                                mK_kdl.shape[0] - seqlen_k,
-                                (0, cuseqlen_k + seqlen_k),
+                                cuseqlen_k,
+                                (0, 0),
                             )
                             mK_kdl_ = cute.domain_offset(logical_offset_mK, mK_kdl)
                             mV_dkl_ = cute.domain_offset(logical_offset_mV, mV_dkl)
                             curr_block_coord_kv = (
                                 curr_block_coord[0],
                                 curr_block_coord[1],
-                                (curr_block_coord[2][0], Int32(0)),
+                                curr_block_coord[2][0],
                             )
 
                     # Local tile partition global tensors
@@ -1558,17 +1551,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if not continue_cond:
                     curr_block_coord_o = curr_block_coord
                     mO_qdl_ = mO_qdl
+                    mO_gmem_ = mO_gmem
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         logical_offset_mO = (
-                            mO_qdl_.shape[0] - seqlen_q,
+                            cuseqlen_q,
                             0,
-                            (0, cuseqlen_q + seqlen_q),
+                            (0, 0),
                         )
                         mO_qdl_ = cute.domain_offset(logical_offset_mO, mO_qdl_)
+                        mO_gmem_ = cute.domain_offset(logical_offset_mO, mO_gmem_)
                         curr_block_coord_o = (
                             curr_block_coord[0],
                             curr_block_coord[1],
-                            (curr_block_coord[2][0], 0),
+                            curr_block_coord[2][0],
                         )
 
                     o0_coord = 2 * curr_block_coord_o[0]
@@ -1591,20 +1586,39 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # 1. wait for O0 final
                     o0_handle = corr_epi_consumer.wait_and_advance()
                     # 2. copy O0 to gmem
-                    cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
-                    cute.arch.cp_async_bulk_commit_group()
+                    o0_row = o0_coord * self.epi_tile[0]
+                    o0_use_tma = o0_row + self.epi_tile[0] <= seqlen_q
+                    if o0_use_tma:
+                        cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
+                        cute.arch.cp_async_bulk_commit_group()
+                    else:
+                        self.store_o_tail(
+                            sO, mO_gmem_, o0_row, seqlen_q, curr_block_coord_o[2], 0
+                        )
                     # O1
                     # 1. wait for O1 final
                     o1_handle = corr_epi_consumer.wait_and_advance()
                     # 2. copy O1 to gmem
-                    cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
-                    cute.arch.cp_async_bulk_commit_group()
+                    o1_row = o1_coord * self.epi_tile[0]
+                    o1_use_tma = o1_row + self.epi_tile[0] <= seqlen_q
+                    if o1_use_tma:
+                        cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
+                        cute.arch.cp_async_bulk_commit_group()
+                    else:
+                        self.store_o_tail(
+                            sO, mO_gmem_, o1_row, seqlen_q, curr_block_coord_o[2], 1
+                        )
 
                     # Ensure O0 buffer is ready to be released
-                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    if o0_use_tma:
+                        if o1_use_tma:
+                            cute.arch.cp_async_bulk_wait_group(1, read=True)
+                        else:
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
                     o0_handle.release()
                     # Ensure O1 buffer is ready to be released
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    if o1_use_tma:
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
                     o1_handle.release()
 
                 # Advance to next tile
@@ -1851,6 +1865,31 @@ class BlackwellFusedMultiHeadAttentionForward:
             # End of persistent scheduler loop
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
         return
+
+    @cute.jit
+    def store_o_tail(
+        self,
+        sO: cute.Tensor,
+        mO_gmem: cute.Tensor,
+        row_start: Int32,
+        seqlen_q: Int32,
+        head_coord: cute.Coord,
+        stage: cutlass.Constexpr,
+    ):
+        """Predicated O tile store for packed-varlen sequence tails."""
+        tidx, _, _ = cute.arch.thread_idx()
+        lane_idx = tidx % self.threads_per_warp
+        tile_elems = self.epi_tile[0] * self.epi_tile[1]
+
+        for elem_idx in cutlass.range(
+            lane_idx, tile_elems, self.threads_per_warp, unroll=1
+        ):
+            row = elem_idx // self.epi_tile[1]
+            col = elem_idx - row * self.epi_tile[1]
+            global_row = row_start + row
+            if global_row < seqlen_q:
+                if col < self.head_dim:
+                    mO_gmem[global_row, col, head_coord] = sO[row, col, stage]
 
     @cute.jit
     def softmax_step(
@@ -2851,9 +2890,6 @@ def run(
         in_dtype,
         is_dynamic_layout=True,
     )
-    # Extract K/V references for numpy comparison (BHSD -> BSHD)
-    k_ref = np.ascontiguousarray(kvcache_ref[:, 0].transpose(0, 2, 1, 3))
-    v_ref = np.ascontiguousarray(kvcache_ref[:, 1].transpose(0, 2, 1, 3))
     _, o_tensor, o_cp, *_o_keep = create_and_pad_tensor(
         qo_shape,
         qo_padding,

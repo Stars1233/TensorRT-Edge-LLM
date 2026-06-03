@@ -43,7 +43,7 @@ make -j$(nproc) && cd ..
 ```bash
 # Run specific test suite
 pytest --priority=l0_pipeline_a30 -v
-pytest --priority=l0_export_ampere -v
+pytest --priority=l0_checkpoint_export_ampere -v
 ```
 
 ## Test Structure
@@ -55,9 +55,8 @@ pytest --priority=l0_export_ampere -v
 - **Common Tests** (`test_common.py`) - Build and unit tests
 
 ### Available Test Suites
-- `l0_export_ampere.yml` - Legacy model export tests (Ampere GPUs)
-- `l0_llm_loader_export_ampere.yml` - Checkpoint-based loader export tests (Ampere GPUs)
-- `l0_llm_loader_export.yml` - Checkpoint-based loader export tests (Blackwell/Thor models)
+- `l0_checkpoint_export_ampere.yml` - Checkpoint export tests (Ampere GPUs)
+- `l0_checkpoint_export.yml` - Checkpoint export tests (Blackwell/Thor models)
 - `l0_pipeline_a30.yml` - Pipeline tests (A30 GPU)
 - `l0_pipeline_orin.yml` - Pipeline tests (Jetson Orin)
 - `l0_pipeline_rtx5080.yml` - Pipeline tests (RTX 5080)
@@ -69,14 +68,15 @@ pytest --priority=l0_export_ampere -v
 
 ### Model Configuration String
 ```
-ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additional-Params]
+Export:  ModelName-Precision-[LmHeadPrecision-][Additional-Export-Params]
+Runtime: ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additional-Params]
 ```
 
 ### Core Parameters
 - **Model**: `Qwen2.5-0.5B-Instruct`, `InternVL3-1B-hf`
 - **Precision**: `fp16`, `fp8`, `int8_sq`, `int4_awq`, `nvfp4`, `int4_gptq`
 - **LM Head**: `lmfp16`, `lmfp8`, `lmint4_awq`, `lmnvfp4` (optional, defaults to fp16)
-- **Engine Config**: `mxsl4096` (max seq len), `mxbs1` (max batch), `mxil2048` (max input len)
+- **Runtime Engine Config**: `mxsl4096` (max seq len), `mxbs1` (max batch), `mxil2048` (max input len)
 
 ### Task-Specific Parameters
 **Build/Inference:**
@@ -90,12 +90,9 @@ ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additi
 
 **Export:**
 - `lora` - Enable LoRA support
-- `eagle` - Enable EAGLE (speculative decoding) model export
-- `draftfp16`, `draftfp8`, `draftnvfp4` - Draft model precision for EAGLE
-- `draftlmfp16`, `draftlmfp8` - Draft model LM head precision (optional, defaults to fp16)
-
-> **Note:** For detailed information on EAGLE model export with draft and base model support, 
-> see [EAGLE_EXPORT_README.md](./EAGLE_EXPORT_README.md)
+- `eagle-<draft_id>-<precision>` - Enable EAGLE export with a named draft
+- `lm<precision>` after the draft precision - Draft LM head precision (optional, defaults to fp16)
+- Export tests do not take sequence length, batch, or input length parameters.
 
 ### Examples
 ```bash
@@ -109,10 +106,10 @@ Qwen2.5-VL-3B-Instruct-int4_awq-mxsl4096-mxbs1-mxil2048-mnit128-mxit2048-mxpiit5
 Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs1-mxil2048-bs1-isl2048-osl128
 
 # EAGLE export with FP16 base and draft
-Qwen2.5-7B-Instruct-fp16-mxsl8192-eagle-draftfp16
+Qwen2.5-7B-Instruct-fp16-eagle-v1-fp16
 
 # EAGLE export with mixed precision
-Qwen2.5-7B-Instruct-fp8-lmfp8-mxsl8192-eagle-draftnvfp4-draftlmfp8
+Qwen2.5-7B-Instruct-fp8-lmfp8-eagle-v1-nvfp4-lmfp8
 ```
 
 ## Directory Structure

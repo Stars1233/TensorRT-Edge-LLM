@@ -20,6 +20,7 @@
 #include "logger.h"
 #include "stringUtils.h"
 #include <NvInfer.h>
+#include <NvInferVersion.h>
 #include <dlfcn.h>
 #include <memory>
 #include <optional>
@@ -93,9 +94,43 @@ std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
 //! Convert TensorRT dimensions to a string representation.
 std::string dimsToString(nvinfer1::Dims const& dims) noexcept;
 
+//! Return true when a TensorRT dimensions object contains runtime dimensions.
+bool hasDynamicDims(nvinfer1::Dims const& dims) noexcept;
+
+//! Return true when two TensorRT dimensions objects have the same rank and extent.
+bool dimsEqual(nvinfer1::Dims const& lhs, nvinfer1::Dims const& rhs) noexcept;
+
+//! Return true when @p tensorName exists in the engine I/O list and is an input.
+bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tensorName) noexcept;
+
 //! Print the engine information for a specific profile index.
 std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept;
 
+//! Short, human-readable name for a TensorRT data type (e.g. "FLOAT16").
+//! Used in logs and error messages; not intended for serialization.
+constexpr char const* getDataTypeString(nvinfer1::DataType const dataType) noexcept
+{
+    switch (dataType)
+    {
+    case nvinfer1::DataType::kINT64: return "INT64";
+    case nvinfer1::DataType::kINT32: return "INT32";
+    case nvinfer1::DataType::kFLOAT: return "FLOAT32";
+    case nvinfer1::DataType::kHALF: return "FLOAT16";
+    case nvinfer1::DataType::kBF16: return "BFLOAT16";
+    case nvinfer1::DataType::kFP8: return "FLOAT8_E4M3";
+    case nvinfer1::DataType::kINT8: return "INT8";
+    case nvinfer1::DataType::kUINT8: return "UINT8";
+    case nvinfer1::DataType::kBOOL: return "BOOL";
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 12)
+    case nvinfer1::DataType::kE8M0: return "FLOAT8_E8M0";
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+    case nvinfer1::DataType::kFP4: return "FLOAT4";
+#endif
+    case nvinfer1::DataType::kINT4: return "INT4";
+    }
+    return "UNKNOWN";
+}
 //! Whether the engine exposes an output binding with the given name.
 //! Use this instead of getTensorIOMode(name) when probing for an optional binding
 //! — getTensorIOMode logs a spurious TensorRT ERROR for unknown names.

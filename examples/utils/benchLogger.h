@@ -21,8 +21,8 @@
 #include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "profiling/layerProfiler.h"
-#include "runtime/eagleDraftEngineRunner.h"
-#include "runtime/llmEngineRunner.h"
+#include "runtime/legacy/eagleDraftEngineRunner.h"
+#include "runtime/legacy/llmEngineRunner.h"
 
 #include <filesystem>
 #include <map>

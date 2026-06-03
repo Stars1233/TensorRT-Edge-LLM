@@ -30,8 +30,8 @@
 //
 
 #include "common/utf8.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/state/decodingInferenceContext.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenEncoder.h"
 #include "tokenizer/tokenizer.h"
@@ -396,13 +396,13 @@ TEST_F(StreamChannelTest, CancelledChannelIsNotFinishedWithoutFinishCall)
 namespace
 {
 // Drive the finalizer to exercise push() + finish() on a channel.
-// Builds a SpecDecodeInferenceContext whose only slotStream carries an aliased
+// Builds a DecodingInferenceContext whose only slotStream carries an aliased
 // shared_ptr to the test-owned channel (no ownership transfer). The finalizer
 // sees tokenIds empty, so it pushes a terminal chunk with no tokens/text and
 // reason=kError, then calls finish(kError).
 void finalizeEmpty(std::shared_ptr<StreamChannel> const& ch)
 {
-    rt::SpecDecodeInferenceContext ctx;
+    rt::DecodingInferenceContext ctx;
     ctx.slotStreams.resize(1);
     ctx.slotStreams[0].channel = ch;
     tokenizer::Tokenizer tok; // unloaded — idToPiece returns "" and will not be called anyway
@@ -441,7 +441,7 @@ TEST_F(StreamChannelTest, FinishIsIdempotentFirstWriterWins)
     // Finalize a fresh context pointing at the same channel — it should skip
     // pushing another terminal chunk because isFinished() is true.
     {
-        rt::SpecDecodeInferenceContext ctx;
+        rt::DecodingInferenceContext ctx;
         ctx.slotStreams.resize(1);
         ctx.slotStreams[0].channel = ch;
         tokenizer::Tokenizer tok;
@@ -586,7 +586,7 @@ TEST_F(CompactVectorSlotStreamTest, SizeMismatchThrows)
 {
     std::vector<SlotStreamState> v(2);
     std::vector<int32_t> mapping{0, 1, 2};
-    EXPECT_THROW(rt::compactVector(mapping, v), std::invalid_argument);
+    EXPECT_THROW(rt::compactVector(mapping, v), std::runtime_error);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -636,4 +636,72 @@ TEST(StreamChunkTest, IsMovable)
     EXPECT_EQ(d.text, "abc");
     EXPECT_TRUE(d.finished);
     EXPECT_EQ(d.reason, FinishReason::kEndId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// applyStopStringMatch — pure helper for hold-back stream matching
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(ApplyStopStringMatchTest, NoMatchFinalFlushes)
+{
+    std::string buffer = "hello##";
+    auto out = rt::applyStopStringMatch(buffer, {"###"}, /*maxStopLen=*/3, /*isFinal=*/true);
+    EXPECT_EQ(out.emitted, "hello##");
+    EXPECT_FALSE(out.stopMatched);
+    EXPECT_TRUE(buffer.empty());
+}
+
+TEST(ApplyStopStringMatchTest, CrossChunkMatch)
+{
+    // Simulate two iterations: first appends "abc" (held), second appends "de###".
+    std::string buffer;
+    buffer.append("abc");
+    auto out1 = rt::applyStopStringMatch(buffer, {"###"}, /*maxStopLen=*/3, /*isFinal=*/false);
+    EXPECT_EQ(out1.emitted, "a"); // S-1=2 held → emit "a", retain "bc"
+    EXPECT_FALSE(out1.stopMatched);
+    EXPECT_EQ(buffer, "bc");
+
+    buffer.append("de###");
+    auto out2 = rt::applyStopStringMatch(buffer, {"###"}, /*maxStopLen=*/3, /*isFinal=*/false);
+    EXPECT_EQ(out2.emitted, "bcde");
+    EXPECT_TRUE(out2.stopMatched);
+    EXPECT_TRUE(buffer.empty());
+}
+
+TEST(ApplyStopStringMatchTest, EarliestPositionWins)
+{
+    // "END" at pos 9, "###" at pos 3 ⇒ "###" wins by position, not list order.
+    std::string buffer = "foo###barEND";
+    auto out = rt::applyStopStringMatch(buffer, {"END", "###"}, /*maxStopLen=*/3, /*isFinal=*/false);
+    EXPECT_EQ(out.emitted, "foo");
+    EXPECT_TRUE(out.stopMatched);
+    EXPECT_TRUE(buffer.empty());
+}
+
+TEST(ApplyStopStringMatchTest, HoldBackThenFinalFlush)
+{
+    // Held bytes from a no-match iteration must be flushed when isFinal fires
+    // without a match (e.g. stream ends with the model holding chars that
+    // *could* have started a stop). Otherwise the trailing characters are lost.
+    std::string buffer = "ab";
+    auto out1 = rt::applyStopStringMatch(buffer, {"###"}, /*maxStopLen=*/3, /*isFinal=*/false);
+    EXPECT_TRUE(out1.emitted.empty()); // S-1=2 ≥ buffer.size(), nothing safe to emit
+    EXPECT_EQ(buffer, "ab");
+
+    auto out2 = rt::applyStopStringMatch(buffer, {"###"}, /*maxStopLen=*/3, /*isFinal=*/true);
+    EXPECT_EQ(out2.emitted, "ab");
+    EXPECT_FALSE(out2.stopMatched);
+    EXPECT_TRUE(buffer.empty());
+}
+
+TEST(ApplyStopStringMatchTest, MultiByteUtf8StopMatches)
+{
+    // "你好" is E4 BD A0 E5 A5 BD (6 bytes). Algorithm is byte-level — verify
+    // it finds the stop correctly regardless of multi-byte codepoints.
+    std::string const stopCh = "\xE4\xBD\xA0\xE5\xA5\xBD"; // "你好"
+    std::string buffer = "hello" + stopCh + "tail";
+    auto out = rt::applyStopStringMatch(buffer, {stopCh}, /*maxStopLen=*/stopCh.size(), /*isFinal=*/false);
+    EXPECT_EQ(out.emitted, "hello");
+    EXPECT_TRUE(out.stopMatched);
+    EXPECT_TRUE(buffer.empty());
 }

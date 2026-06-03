@@ -17,6 +17,7 @@
 
 #include "vitAttentionPlugin.h"
 
+#include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
@@ -59,7 +60,6 @@ constexpr int32_t kOUT_ATTENTION_IDX{0};
 // these definitions shall be consistent.
 constexpr int32_t kNUM_REQUIRED_INPUTS{5};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{1};
-
 } // namespace
 
 // Static class fields initialization
@@ -116,11 +116,12 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads
     }
 }
 
-ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, std::byte const* data, size_t length)
+ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
-    deserializeValue(&data, &length, &mNumHeads);
-    deserializeValue(&data, &length, &mHeadSize);
+    mNumHeads = parsePluginScalarField<int32_t>("num_heads", fc).value_or(0);
+    mHeadSize = parsePluginScalarField<int32_t>("head_size", fc).value_or(0);
+    ELLM_CHECK(mNumHeads > 0 && mHeadSize > 0, "ViTAttentionPlugin requires both num_heads and head_size > 0.");
 
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -147,18 +148,58 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, std::byte const*
     }
 }
 
-ViTAttentionPlugin::~ViTAttentionPlugin() {}
+ViTAttentionPlugin::~ViTAttentionPlugin() = default;
 
-IPluginV2DynamicExt* ViTAttentionPlugin::clone() const noexcept
+// ---------------------------------------------------------------------------
+// IPluginV3
+// ---------------------------------------------------------------------------
+
+IPluginCapability* ViTAttentionPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
-    ViTAttentionPlugin* plugin = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    return plugin;
+    try
+    {
+        if (type == PluginCapabilityType::kBUILD)
+        {
+            return static_cast<IPluginV3OneBuild*>(this);
+        }
+        if (type == PluginCapabilityType::kRUNTIME)
+        {
+            return static_cast<IPluginV3OneRuntime*>(this);
+        }
+        return static_cast<IPluginV3OneCore*>(this);
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
 }
 
-char const* ViTAttentionPlugin::getPluginType() const noexcept
+IPluginV3* ViTAttentionPlugin::clone() noexcept
+{
+    try
+    {
+        auto* p = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize);
+        p->setPluginNamespace(mNamespace.c_str());
+        return p;
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPluginV3OneCore — metadata
+// ---------------------------------------------------------------------------
+
+char const* ViTAttentionPlugin::getPluginName() const noexcept
 {
     return kATTENTION_PLUGIN_NAME;
+}
+
+char const* ViTAttentionPlugin::getPluginVersion() const noexcept
+{
+    return kATTENTION_PLUGIN_VERSION;
 }
 
 char const* ViTAttentionPlugin::getPluginNamespace() const noexcept
@@ -168,22 +209,54 @@ char const* ViTAttentionPlugin::getPluginNamespace() const noexcept
 
 void ViTAttentionPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
 {
-    mNamespace = std::string(pluginNamespace);
+    mNamespace = pluginNamespace ? pluginNamespace : "";
 }
 
-char const* ViTAttentionPlugin::getPluginVersion() const noexcept
-{
-    return kATTENTION_PLUGIN_VERSION;
-}
+// ---------------------------------------------------------------------------
+// IPluginV3OneBuild — shape / format
+// ---------------------------------------------------------------------------
 
 int32_t ViTAttentionPlugin::getNbOutputs() const noexcept
 {
-    // Output attention result.
-    return 1;
+    return kNUM_REQUIRED_OUTPUTS;
+}
+
+int32_t ViTAttentionPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
+    DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
+{
+    try
+    {
+        assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
+        // Output[0] (attention) follows Q input dtype (HALF).
+        outputTypes[kOUT_ATTENTION_IDX] = inputTypes[kIN_Q_IDX];
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
+}
+
+int32_t ViTAttentionPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
+    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
+{
+    try
+    {
+        assert(nbInputs == kNUM_REQUIRED_INPUTS);
+        assert(nbOutputs == kNUM_REQUIRED_OUTPUTS);
+        // Output[0] has the same shape as Q: [total_S, H, D]
+        outputs[kOUT_ATTENTION_IDX] = inputs[kIN_Q_IDX];
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
 }
 
 bool ViTAttentionPlugin::supportsFormatCombination(
-    int32_t pos, nvinfer1::PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     // Support context/generation phase inputs:
     //      Q tensor (linear FP16) with shape [total_S, H, D]
@@ -196,7 +269,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [total_S, H, D]
     // Q, K, V, and output all have the same shape [total_S, H, D]
-    auto checkQKVO = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkQKVO = [this](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -210,7 +283,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkCuSeqLens = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkCuSeqLens = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -218,7 +291,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkMaxSeqLenCarrier = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkMaxSeqLenCarrier = [](PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -243,11 +316,11 @@ bool ViTAttentionPlugin::supportsFormatCombination(
     {
         switch (pos)
         {
-        case kIN_Q_IDX: result = checkQKVO(inOut[0]); break;
-        case kIN_K_IDX: result = checkQKVO(inOut[1]); break;
-        case kIN_V_IDX: result = checkQKVO(inOut[2]); break;
-        case kIN_CU_SEQLENS_IDX: result = checkCuSeqLens(inOut[3]); break;
-        case kIN_MAX_SEQLEN_CARRIER_IDX: result = checkMaxSeqLenCarrier(inOut[4]); break;
+        case kIN_Q_IDX: result = checkQKVO(inOut[0].desc); break;
+        case kIN_K_IDX: result = checkQKVO(inOut[1].desc); break;
+        case kIN_V_IDX: result = checkQKVO(inOut[2].desc); break;
+        case kIN_CU_SEQLENS_IDX: result = checkCuSeqLens(inOut[3].desc); break;
+        case kIN_MAX_SEQLEN_CARRIER_IDX: result = checkMaxSeqLenCarrier(inOut[4].desc); break;
         default: break;
         }
     }
@@ -256,7 +329,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         int32_t outPos = pos - nbInputs;
         switch (outPos)
         {
-        case kOUT_ATTENTION_IDX: result = checkQKVO(inOut[pos]); break;
+        case kOUT_ATTENTION_IDX: result = checkQKVO(inOut[pos].desc); break;
         default: break;
         }
     }
@@ -264,44 +337,28 @@ bool ViTAttentionPlugin::supportsFormatCombination(
     return result;
 }
 
-// IPluginV2Ext Methods
-DataType ViTAttentionPlugin::getOutputDataType([[maybe_unused]] int32_t index,
-    [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
-{
-    // Output[0] (attention) follows Q input dtype (HALF).
-    return inputTypes[kIN_Q_IDX];
-}
-
-DimsExprs ViTAttentionPlugin::getOutputDimensions(int32_t outputIndex, nvinfer1::DimsExprs const* inputs,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::IExprBuilder& exprBuilder) noexcept
-{
-    // Output[0] has the same shape as Q: [total_S, H, D]
-    if (outputIndex == kOUT_ATTENTION_IDX)
-    {
-        return inputs[kIN_Q_IDX];
-    }
-    return DimsExprs{};
-}
-
-void ViTAttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* in,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::DynamicPluginTensorDesc const* out,
+int32_t ViTAttentionPlugin::configurePlugin([[maybe_unused]] DynamicPluginTensorDesc const* in,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] DynamicPluginTensorDesc const* out,
     [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    return; // No need to configure anything since we will only use the runtime tensor shapes.
+    return 0; // No need to configure anything since we will only use the runtime tensor shapes.
 }
 
-size_t ViTAttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
+size_t ViTAttentionPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTensorDesc const* inputs,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] DynamicPluginTensorDesc const* outputs,
     [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     return 0;
 }
 
-int32_t ViTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
-    [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
+// ---------------------------------------------------------------------------
+// IPluginV3OneRuntime — execution
+// ---------------------------------------------------------------------------
+
+int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
+    [[maybe_unused]] PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs,
     [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
 {
-
     // Construct non-owned tensor objects from I/O data pointers and shapes.
     // Q, K, V inputs in the graph will be in same shape [total_S, H, D].
     PluginTensorDesc const& qInputDesc = inputDesc[kIN_Q_IDX];
@@ -353,29 +410,31 @@ int32_t ViTAttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     return 0;
 }
 
-size_t ViTAttentionPlugin::getSerializationSize() const noexcept
-{
-    return sizeof(mNumHeads) + sizeof(mHeadSize);
-}
-
-void ViTAttentionPlugin::serialize(void* buffer) const noexcept
-{
-    std::byte* byteBuffer = static_cast<std::byte*>(buffer);
-    serializeValue(&byteBuffer, mNumHeads);
-    serializeValue(&byteBuffer, mHeadSize);
-}
-
-int32_t ViTAttentionPlugin::initialize() noexcept
+int32_t ViTAttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc const* in,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] PluginTensorDesc const* out,
+    [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     return 0;
 }
 
-void ViTAttentionPlugin::terminate() noexcept {}
-
-void ViTAttentionPlugin::destroy() noexcept
+IPluginV3* ViTAttentionPlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
-    delete this;
+    return clone();
 }
+
+PluginFieldCollection const* ViTAttentionPlugin::getFieldsToSerialize() noexcept
+{
+    mDataToSerialize.clear();
+    mDataToSerialize.emplace_back("num_heads", &mNumHeads, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("head_size", &mHeadSize, PluginFieldType::kINT32, 1);
+    mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
+    mFCToSerialize.fields = mDataToSerialize.data();
+    return &mFCToSerialize;
+}
+
+// ---------------------------------------------------------------------------
+// Creator
+// ---------------------------------------------------------------------------
 
 ViTAttentionPluginCreator::ViTAttentionPluginCreator()
 {
@@ -394,14 +453,14 @@ char const* ViTAttentionPluginCreator::getPluginName() const noexcept
     return kATTENTION_PLUGIN_NAME;
 }
 
-nvinfer1::PluginFieldCollection const* ViTAttentionPluginCreator::getFieldNames() noexcept
+PluginFieldCollection const* ViTAttentionPluginCreator::getFieldNames() noexcept
 {
     return &mFieldCollection;
 }
 
 void ViTAttentionPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
 {
-    mNamespace = libNamespace;
+    mNamespace = libNamespace ? libNamespace : "";
 }
 
 char const* ViTAttentionPluginCreator::getPluginNamespace() const noexcept
@@ -414,43 +473,18 @@ char const* ViTAttentionPluginCreator::getPluginVersion() const noexcept
     return kATTENTION_PLUGIN_VERSION;
 }
 
-nvinfer1::IPluginV2* ViTAttentionPluginCreator::createPlugin(
-    char const* name, nvinfer1::PluginFieldCollection const* fc) noexcept
+IPluginV3* ViTAttentionPluginCreator::createPlugin(
+    char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
 {
     try
     {
-        std::optional<int32_t> numHeads = parsePluginScalarField<int32_t>("num_heads", fc);
-        std::optional<int32_t> headSize = parsePluginScalarField<int32_t>("head_size", fc);
-
-        // Enforce Core parameters are specified.
-        bool checkRequiredFields = numHeads.has_value() && headSize.has_value();
-        if (!checkRequiredFields)
-        {
-            LOG_ERROR("Missing required ViTAttentionPlugin fields.");
-            return nullptr;
-        }
-
-        ViTAttentionPlugin* plugin = new ViTAttentionPlugin(std::string(name), numHeads.value(), headSize.value());
-
+        auto* plugin = new ViTAttentionPlugin(std::string(name), fc);
+        plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed to create ViTAttentionPlugin: %s", e.what());
-    }
-    return nullptr;
-}
-
-nvinfer1::IPluginV2* ViTAttentionPluginCreator::deserializePlugin(
-    char const* name, void const* serialData, size_t serialLength) noexcept
-{
-    try
-    {
-        return new ViTAttentionPlugin(name, static_cast<std::byte const*>(serialData), serialLength);
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to deserialize ViTAttentionPlugin: %s", e.what());
     }
     return nullptr;
 }

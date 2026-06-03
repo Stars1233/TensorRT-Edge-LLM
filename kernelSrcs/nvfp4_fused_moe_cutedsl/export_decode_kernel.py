@@ -112,10 +112,9 @@ def export_decode_moe_variant(args):
         is thus compile-time per variant (n128 / n256).
         """
 
-        def __init__(self, kern, is_gated, hidden_size_static):
+        def __init__(self, kern, is_gated):
             self._kernel = kern
             self._is_gated = is_gated
-            self._hidden_size_static = hidden_size_static
 
         @cute.jit
         def __call__(
@@ -287,12 +286,9 @@ def export_decode_moe_variant(args):
                 token_weights,
                 max_active_clusters=max_active_clusters,
                 stream=stream,
-                hidden_size_static=self._hidden_size_static,
             )
 
-    launch = _DecodeMoELaunch(
-        kernel, is_gated=is_gated, hidden_size_static=args.hidden_size
-    )
+    launch = _DecodeMoELaunch(kernel, is_gated=is_gated)
 
     sm_count = get_num_sm()
     # The AOT wrapper launches with cluster_size=1, where max active clusters
@@ -439,11 +435,6 @@ def main():
         "--mma_tiler_n", type=int, default=128,
         choices=[128, 256],
         help="Compile-time MMA N-tile size (n128 or n256 variants)"
-    )
-    parser.add_argument(
-        "--hidden_size", type=int, required=True,
-        help="Compile-time hidden size (K). Baked into the AOT binary so the "
-             "ab_stage divisor loop in _setup_attributes stays traceable.",
     )
     parser.add_argument(
         "--output_dir", type=str, required=True,

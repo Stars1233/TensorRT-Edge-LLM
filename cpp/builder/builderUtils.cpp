@@ -17,6 +17,7 @@
 
 #include "builderUtils.h"
 #include "common/logger.h"
+#include "common/trtUtils.h"
 
 #include <NvOnnxParser.h>
 #include <fstream>
@@ -169,17 +170,7 @@ std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profi
         }
 
         nvinfer1::Dims const dims = input->getDimensions();
-        bool hasDynamic = false;
-        for (int k = 0; k < dims.nbDims; k++)
-        {
-            if (dims.d[k] == -1)
-            {
-                hasDynamic = true;
-                break;
-            }
-        }
-
-        if (hasDynamic)
+        if (hasDynamicDims(dims))
         {
             auto minDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kMIN);
             auto optDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kOPT);
@@ -264,6 +255,9 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
 
 #if (NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6) || NV_TENSORRT_MAJOR >= 11
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 3)
+    config->setPreviewFeature(nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03, true);
 #endif
 
     return config;

@@ -366,7 +366,7 @@ void NemotronOmniViTRunner::textPreprocess(rt::LLMGenerationRequest const& reque
 
 bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
@@ -381,7 +381,7 @@ bool NemotronOmniViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("NemotronOmniViTRunner::preprocess() failed: %s", e.what());
+        LOG_ERROR("Failed: %s", e.what());
         return false;
     }
 
@@ -402,13 +402,13 @@ bool NemotronOmniViTRunner::infer(cudaStream_t stream) noexcept
             mTotalNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW);
         if (!mVisualContext->setInputShape(binding_names::kVisualInput, inputDims))
         {
-            LOG_ERROR("NemotronOmniViTRunner::infer(): Failed to bind engine input tensors.");
+            LOG_ERROR("Failed to bind engine input tensors.");
             return false;
         }
 
         if (!mVisualContext->enqueueV3(stream))
         {
-            LOG_ERROR("NemotronOmniViTRunner::infer(): Failed to enqueue engine.");
+            LOG_ERROR("Failed to enqueue engine.");
             return false;
         }
     }

@@ -13,7 +13,7 @@ The C++ Runtime serves as the **final stage** in the TensorRT Edge-LLM workflow:
 %%{init: {'theme':'neutral', 'themeVariables': {'primaryColor':'#76B900','primaryTextColor':'#fff','primaryBorderColor':'#5a8f00','lineColor':'#666','edgeLabelBackground':'#ffffff','labelTextColor':'#000','clusterBkg':'#ffffff','clusterBorder':'#999'}}}%%
 graph LR
     HF_MODEL[HuggingFace<br>Model]
-    PYTHON_EXPORT[llm_loader<br>ONNX<br>Export]
+    PYTHON_EXPORT[tensorrt_edgellm<br>ONNX<br>Export]
     ONNX_FILES[ONNX<br>Models]
     ENGINE_BUILDER[Engine<br>Builder]
     TRT_ENGINE[TensorRT<br>Engine]
@@ -56,5 +56,4 @@ The C++ runtime is organized around **two distinct, mutually exclusive runtime i
 
 | Component | Description |
 |-----------|-------------|
-| **LLM Inference Runtime** | Top-level orchestrator for standard and multimodal inference. Owns and coordinates all components for the inference pipeline. Creates and directly manages a single `LLMEngineRunner` instance (`mLLMEngineRunner`) that handles both prefill and generation phases. Manages memory allocation, request processing, tokenization, and response generation. Supports both text-only and multimodal (VLM) inference scenarios. |
-| **LLM Inference SpecDecode Runtime** | Specialized runtime for EAGLE speculative decoding. Completely separate from the LLM Inference Runtime, owns and coordinates two distinct engine runners: `mBaseEngineRunner` (LLMEngineRunner) and `mDraftEngineRunner` (EagleDraftEngineRunner). Implements sophisticated EAGLE tree-based speculative generation with draft model candidate generation and base model verification. Handles draft vocabulary mapping for EAGLE3. |
+| **LLM Inference Runtime** | Unified runtime for all LLM inference, supporting both vanilla autoregressive decoding and speculative decoding modes (EAGLE, MTP, etc.) through a pluggable `DecodingStrategy` layer. When constructed without a drafting config, operates as a pure vanilla decoding runtime. When constructed with a `SpecDecodeDraftingConfig`, additionally loads a draft model and enables speculative decoding strategies. Manages memory allocation, request processing, tokenization, multimodal preprocessing (vision + audio), and response generation. |

@@ -6,30 +6,14 @@ The experimental Python API wraps export, engine build, engine loading, generati
 
 ## Prerequisites
 
-Build the C++ runtime and pybind extension first:
+Complete the [Installation Guide](../getting_started/installation.md) with the C++ runtime, Python bindings, and server dependencies enabled before proceeding. The examples below assume `experimental.server` and `tensorrt_edgellm` are importable from the active Python environment.
+
+If the active environment was installed with base export dependencies only, install the server dependencies before building Python bindings or launching the server:
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-cd $EDGE_LLM_PATH
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
-
-mkdir -p build && cd build
-cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_PYTHON_BINDINGS=ON
-make -j$(nproc)
+cd /path/to/TensorRT-Edge-LLM
+pip install -r requirements-server.txt
 ```
-
-Install server dependencies:
-
-```bash
-cd $EDGE_LLM_PATH
-pip install -r requirements.txt
-pip install -r experimental/llm_loader/requirements.txt
-pip install pybind11 fastapi uvicorn
-```
-
-Run examples from the repository root with the same `PYTHONPATH`. The
-repository root makes `experimental.server` importable; the `experimental`
-directory makes the `llm_loader` top-level package importable.
 
 ## Python API
 
@@ -93,6 +77,64 @@ curl -sN http://localhost:8000/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 128, "stream": true}'
 ```
 
+Tool-aware query:
+
+```bash
+curl -sN http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "tool_choice": "auto",
+    "max_tokens": 128
+  }'
+```
+
+To continue an agentic loop, include the previous assistant `tool_calls` and
+the matching `tool` response messages in the next request.
+
+Tool response follow-up:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "What is the weather in Paris?"},
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Paris\"}"
+        }
+      }]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "{\"temperature\":22,\"unit\":\"celsius\"}"
+    }
+  ],
+  "tools": [{
+    "type": "function",
+    "function": {"name": "get_weather", "parameters": {"type": "object"}}
+  }]
+}
+```
+
 ## Common Inputs
 
 `LLM` requires exactly one source:
@@ -115,6 +157,20 @@ For VLMs, also pass `visual_onnx_dir` or `visual_engine_dir`.
 | `max_tokens` | `2048` | Maximum generated tokens |
 | `enable_thinking` | `False` | Enables Qwen-style thinking output |
 | `disable_spec_decode` | `False` | Disables EAGLE for one request |
+
+## Tool Calls
+
+The OpenAI-compatible server accepts `tools`, `tool_choice`,
+`assistant.tool_calls`, and `tool` messages. Tool-aware requests are formatted
+with the model's Hugging Face chat template before they are sent to the runtime.
+
+`tool_choice` supports `auto`, `none`, `required`, and forced function choices.
+Malformed tools, unknown forced tools, and dangling `tool_call_id` values return
+a 400 response.
+
+When the model returns a supported tool-call format, non-streaming responses
+include `message.tool_calls` and `finish_reason: "tool_calls"`. Streaming
+responses include `delta.tool_calls` chunks.
 
 ## EAGLE
 
@@ -144,6 +200,7 @@ outputs = llm.generate(
 
 ## Notes
 
-- Chat templates are applied in the C++ runtime, not in Python.
+- Standard chat templates are applied in the C++ runtime. Tool-aware requests
+  are formatted in Python with the model's Hugging Face chat template.
 - Thinking output is returned in `reasoning`; final answer text is returned in `content`.
 - Supported finish reasons are `stop`, `length`, `cancelled`, and `error`.

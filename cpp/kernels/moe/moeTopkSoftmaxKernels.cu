@@ -38,6 +38,12 @@ limitations under the License.
 #include "moeTopkSoftmaxKernels.h"
 #include <cfloat>
 #include <cub/cub.cuh>
+// CCCL <cuda/functional> must be included at file scope. Including it inside
+// trt_edgellm::kernel breaks ::cuda::__is_commutative_static_assert on CUDA 13.3.
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12090
+#include <cuda/functional>
+#endif
+
 namespace trt_edgellm
 {
 namespace kernel
@@ -59,10 +65,13 @@ static constexpr float TOPK_MASK_VALUE = -10000.f;
 #define SHFL_XOR_SYNC(var, lane_mask) __shfl_xor_sync(0xffffffff, var, lane_mask)
 #define SHFL_XOR_SYNC_WIDTH(var, lane_mask, width) __shfl_xor_sync(0xffffffff, var, lane_mask, width)
 
-// Define reduction operators based on CUDA version
-// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12090
-#include <cuda/functional>
+// CUDA 12.9+ deprecated cub::Max/Min in favor of cuda::maximum/minimum.
+// CUDA_VERSION: 13020 = 13.2, 13030 = 13.3 (nvcc macro).
+// 13.3 needs ::cuda:: for the type aliases; 13.2 uses cuda:: (validated on Thor).
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13030
+using MaxReduceOp = ::cuda::maximum<>;
+using MinReduceOp = ::cuda::minimum<>;
+#elif defined(CUDA_VERSION) && CUDA_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else

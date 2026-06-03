@@ -15,6 +15,7 @@
 | **ViT time** | Total visual encoder processing time per inference run (ms) |
 | **ViT throughput** | Image tokens processed per second by the visual encoder (tok/s) |
 | **GPU memory** | Peak GPU memory usage during inference (MB) |
+| **MTP** | Multi-token prediction speculative decoding |
 
 ### Precision Key
 
@@ -25,6 +26,62 @@
 | INT4 AWQ | 4-bit integer (AWQ quantization) | All platforms |
 | INT4 GPTQ | 4-bit integer (GPTQ quantization) | All platforms |
 | NVFP4 | NVIDIA 4-bit float | SM100+ (Blackwell and newer) |
+
+---
+
+## v0.7.1 Results
+
+> **SDK Version:** TensorRT Edge-LLM 0.7.1 &nbsp;|&nbsp; **TensorRT:** 10.13.3.9
+
+### LLM — Vanilla Decoding
+
+| Model | Precision | Batch | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | Generation (tok/s) | GPU Mem (MB) |
+|-------|-----------|:-----:|-------------:|:--------------:|----------------:|-------------------:|-------------:|
+| Qwen3-1.7B | NVFP4 | 1 | 11.2 | 370 | 32,990 | 173.2 | 1,531 |
+| Qwen3-1.7B | NVFP4 | 8 | 132.5 | 2,959 | 22,324 | 935.8 | 1,475 |
+| Qwen3-30B-A3B-GPTQ-Int4 | INT4 GPTQ | 1 | 133.2 | 370 | 2,777 | 72.6 | 15,916 |
+| Qwen3-30B-A3B-GPTQ-Int4 | INT4 GPTQ | 8 | 1,344.5 | 2,959 | 2,201 | 215.9 | 15,894 |
+| Nemotron-3-Nano-4B | NVFP4 | 1 | 127.4 | 383 | 3,004 | 64.7 | 3,568 |
+| Nemotron-3-Nano-4B | NVFP4 | 8 | 986.6 | 3,062 | 3,104 | 312.9 | 3,592 |
+
+### Vision Language Model — Vanilla Decoding
+
+| Model | LLM Prec | ViT Prec | Batch | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | ViT Time (ms) | ViT Tok/Run | ViT (tok/s) | Generation (tok/s) | GPU Mem (MB) |
+|-------|----------|----------|:-----:|-------------:|:--------------:|----------------:|--------------:|------------:|------------:|-------------------:|-------------:|
+| Qwen2.5-VL-7B-Instruct | NVFP4 | FP16 | 1 | 31.0 | 376 | 12,124 | 27.8 | 344 | 12,392 | 49.5 | 5,224 |
+| Qwen3.5-0.8B | NVFP4 | FP16 | 1 | 9.4 | 287 | 30,410 | 4.3 | 262 | 60,606 | 287.0 | 1,192 |
+| Qwen3.5-2B | NVFP4 | FP16 | 1 | 12.7 | 287 | 22,550 | 10.5 | 262 | 25,000 | 164.4 | 1,694 |
+| Qwen3.5-27B | NVFP4 | FP16 | 1 | 103.3 | 287 | 2,775 | 15.0 | 262 | 17,483 | 16.1 | 14,725 |
+| Nemotron-3-Nano-Omni-30B-A3B | NVFP4 | FP16 | 1 | 226.0 | 1,663 | 7,358 | 121.3 | 1,635 | 13,477 | 31.3 | 20,327 |
+
+### LLM — EAGLE Speculative Decoding
+
+#### Draft Models
+
+| Base Model | Draft Model | Source |
+|------------|-------------|--------|
+| Qwen3-1.7B | Qwen3-1.7B_eagle3 | [AngelSlim/Qwen3-1.7B_eagle3](https://huggingface.co/AngelSlim/Qwen3-1.7B_eagle3) |
+
+> **Note:** Both base and draft models are quantized to NVFP4.
+
+| Model | Base Prec | Draft Prec | Batch | Prefill (ms) | Prefill Tokens | Generation (tok/s) | Accept Rate | Speedup | GPU Mem (MB) |
+|-------|-----------|------------|:-----:|-------------:|:--------------:|-------------------:|:-----------:|--------:|-------------:|
+| Qwen3-1.7B | NVFP4 | NVFP4 | 1 | 12.2 | 370 | 339.0 | 3.7 | 1.96x | 1,534 |
+| Qwen3-1.7B | NVFP4 | NVFP4 | 8 | 132.3 | 2,959 | 984.9 | 3.7 | 1.05x | 1,466 |
+
+### Vision Language Model — MTP Speculative Decoding
+
+> **Note:** MTP uses the model's built-in draft heads; no external draft checkpoint is required.
+> **Highlight:** MTP is the main v0.7.1 performance improvement, increasing Qwen3.5 VLM BS=1 generation throughput by 1.21x to 2.12x over vanilla decoding.
+
+| Model | Base Prec | Draft Prec | ViT Prec | Batch | Prefill (ms) | Prefill Tokens | ViT Time (ms) | ViT Tok/Run | ViT (tok/s) | Generation (tok/s) | Accept Rate | GPU Mem (MB) |
+|-------|-----------|------------|----------|:-----:|-------------:|:--------------:|--------------:|------------:|------------:|-------------------:|:-----------:|-------------:|
+| Qwen3.5-0.8B | NVFP4 | NVFP4 | FP16 | 1 | 9.2 | 287 | 4.2 | 263 | 62,500 | 348.5 | 2.1 | 1,210 |
+| Qwen3.5-0.8B | NVFP4 | NVFP4 | FP16 | 8 | 69.0 | 2,227 | 27.6 | 2,042 | 74,074 | 1,056.7 | 2.2 | 1,375 |
+| Qwen3.5-2B | NVFP4 | NVFP4 | FP16 | 1 | 13.8 | 287 | 10.9 | 262 | 24,096 | 236.9 | 2.4 | 1,662 |
+| Qwen3.5-2B | NVFP4 | NVFP4 | FP16 | 8 | 89.7 | 2,227 | 75.1 | 2,040 | 27,174 | 787.2 | 2.4 | 1,647 |
+| Qwen3.5-27B | NVFP4 | NVFP4 | FP16 | 1 | 111.1 | 287 | 14.4 | 262 | 18,215 | 34.2 | 2.8 | 14,680 |
+| Qwen3.5-27B | NVFP4 | NVFP4 | FP16 | 8 | 811.0 | 2,227 | 108.2 | 2,038 | 18,832 | 146.7 | 2.8 | 14,705 |
 
 ---
 
@@ -152,6 +209,10 @@
 ---
 
 ## Key Observations
+
+### v0.7.1
+
+- **MTP speculative decoding:** This is the v0.7.1 performance highlight. Qwen3.5 MTP improves BS=1 generation throughput by 1.21x for 0.8B, 1.44x for 2B, and 2.12x for 27B over vanilla decoding, with BS=8 throughput up to 1,056.7 tok/s for Qwen3.5-0.8B.
 
 ### v0.7.0
 

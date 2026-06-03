@@ -1,0 +1,367 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Qwen3.5 dense MTP draft model."""
+
+import itertools
+from typing import List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ...config import ModelConfig
+from ..default.modeling_default import OnnxSpec
+from ..linear import make_linear
+from ..ops import attention_plugin
+from .modeling_qwen3_5_text import MLP, GatedAttention, Qwen3_5RMSNorm
+
+__all__ = ["Qwen3_5MtpDraftModel", "Qwen3_5MtpDecoderLayer"]
+
+_BATCH_SIZE = 2
+_SEQ_LEN = 2
+_PAST_LEN = 1
+_MAX_POS = 4096
+
+
+class Qwen3_5MtpDecoderLayer(nn.Module):
+    """Single Qwen3.5 full-attention-only decoder block for MTP draft."""
+
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size,
+                                              config.rms_norm_eps)
+        self.self_attn = GatedAttention(config, layer_idx=layer_idx)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size,
+                                                       config.rms_norm_eps)
+        self.mlp = MLP(config, layer_idx=layer_idx)
+
+    def _forward_attention(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        attention_mask: torch.Tensor,
+        attention_pos_id: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        attn = self.self_attn
+
+        q_output = attn.q_proj(hidden_states)
+        q_output = q_output.view(batch_size, seq_len, attn.num_heads,
+                                 attn.head_dim * 2)
+        query_states, gate_states = q_output.chunk(2, dim=-1)
+
+        key_states = attn.k_proj(hidden_states)
+        value_states = attn.v_proj(hidden_states)
+
+        query_states = attn.q_norm(query_states).reshape(
+            batch_size, seq_len, attn.num_heads * attn.head_dim)
+        key_states = attn.k_norm(
+            key_states.reshape(batch_size, seq_len, attn.num_kv_heads,
+                               attn.head_dim)).reshape(
+                                   batch_size, seq_len,
+                                   attn.num_kv_heads * attn.head_dim)
+
+        attn_output, present_key_value = attention_plugin(
+            query_states,
+            key_states,
+            value_states,
+            past_key_value,
+            context_lengths,
+            rope_rotary_cos_sin,
+            kvcache_start_index,
+            num_q_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_size=attn.head_dim,
+            sliding_window_size=attn.sliding_window_size,
+            enable_tree_attention=True,
+            enable_fp8_kv_cache=attn.enable_fp8_kv_cache,
+            attention_mask=attention_mask,
+            attention_pos_id=attention_pos_id,
+            qkv_scales=getattr(attn, "_qkv_scales_float", [1.0, 1.0, 1.0]),
+        )
+        attn_output = attn_output * torch.sigmoid(gate_states)
+        attn_output = attn_output.reshape(batch_size, seq_len,
+                                          attn.num_heads * attn.head_dim)
+        return attn.o_proj(attn_output), present_key_value
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: torch.Tensor,
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        attention_mask: torch.Tensor,
+        attention_pos_id: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+        normed_hidden_states = self.input_layernorm(hidden_states)
+        attn_output, present_key_value = self._forward_attention(
+            normed_hidden_states,
+            past_key_value,
+            rope_rotary_cos_sin,
+            context_lengths,
+            kvcache_start_index,
+            attention_mask,
+            attention_pos_id,
+        )
+        hidden_states = residual + attn_output
+        residual = hidden_states
+        hidden_states = residual + self.mlp(
+            self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+
+
+def _make_flat_wrapper_qwen3_5_mtp(model: nn.Module,
+                                   num_layers: int) -> nn.Module:
+    """Build a flat-signature wrapper for Qwen3.5 MTP draft ONNX export."""
+    param_names: List[str] = (
+        ["inputs_embeds"] +
+        [f"past_key_values_{i}" for i in range(num_layers)] + [
+            "rope_rotary_cos_sin",
+            "context_lengths",
+            "kvcache_start_index",
+            "last_token_ids",
+            "hidden_states_input",
+            "hidden_states_from_draft",
+            "attention_pos_id",
+            "attention_mask",
+        ])
+
+    past_kv_tuple = "({},)".format(", ".join(
+        f"past_key_values_{i}"
+        for i in range(num_layers))) if num_layers else "()"
+    body = (
+        f"    logits, hidden_states, present_key_values = self._model(\n"
+        f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin,\n"
+        f"        context_lengths, kvcache_start_index, last_token_ids,\n"
+        f"        hidden_states_input, hidden_states_from_draft,\n"
+        f"        attention_pos_id, attention_mask)\n"
+        f"    return (logits, hidden_states) + tuple(present_key_values)\n")
+
+    src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
+    globs: dict = {}
+    exec(src, globs)  # noqa: S102
+
+    class _Wrapper(nn.Module):
+
+        def __init__(self, m: nn.Module) -> None:
+            super().__init__()
+            self._model = m
+
+    _Wrapper.forward = globs["_forward"]
+    return _Wrapper(model)
+
+
+class Qwen3_5MtpDraftModel(nn.Module):
+    """Qwen3.5 dense MTP draft model."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        if config.num_hidden_layers != 1:
+            raise ValueError("Qwen3.5 dense MTP draft currently requires "
+                             "num_hidden_layers == 1")
+
+        self.config = config
+        hidden_size = config.hidden_size
+
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(hidden_size,
+                                                    config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(hidden_size,
+                                                 config.rms_norm_eps)
+        self.fc = make_linear(config,
+                              hidden_size * 2,
+                              hidden_size,
+                              bias=False,
+                              module_name="fc")
+        self.layers = nn.ModuleList(
+            [Qwen3_5MtpDecoderLayer(config, layer_idx=0)])
+        self.norm = Qwen3_5RMSNorm(hidden_size, config.rms_norm_eps)
+        self.lm_head = make_linear(config,
+                                   hidden_size,
+                                   config.vocab_size,
+                                   bias=False,
+                                   module_name="lm_head")
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        hidden_states_from_base: torch.Tensor,
+        hidden_states_from_draft: torch.Tensor,
+        attention_pos_id: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]]:
+        # Merge base and draft hidden states via Add.  The runtime always
+        # zeroes exactly one of the two inputs so Add acts as a multiplexer:
+        #   - prefill / accept-token: base is real, draft is zero
+        #   - draft proposal steps:   draft is real, base is zero
+        hidden_states_input = hidden_states_from_base + hidden_states_from_draft
+        normed_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        normed_hidden_states = self.pre_fc_norm_hidden(hidden_states_input)
+        fused_hidden_states = self.fc(
+            torch.cat((normed_embeds, normed_hidden_states), dim=-1))
+
+        present_key_values: List[torch.Tensor] = []
+        hidden_states = fused_hidden_states
+        for idx, layer in enumerate(self.layers):
+            hidden_states, present_key_value = layer(
+                hidden_states,
+                past_key_values[idx],
+                rope_rotary_cos_sin,
+                context_lengths,
+                kvcache_start_index,
+                attention_mask,
+                attention_pos_id,
+            )
+            present_key_values.append(present_key_value)
+
+        # Select hidden states for specified token positions
+        hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states).to(torch.float32)
+        logits = F.log_softmax(logits, dim=-1)
+
+        return logits, hidden_states, tuple(present_key_values)
+
+    def onnx_export_spec(self) -> OnnxSpec:
+        """Return all model-specific parameters needed for ONNX export."""
+        num_layers = len(self.layers)
+        device = next(itertools.chain(self.parameters(),
+                                      self.buffers())).device
+        dtype16 = torch.float16
+        batch_size, seq_len, past_len, max_pos = (_BATCH_SIZE, _SEQ_LEN,
+                                                  _PAST_LEN, _MAX_POS)
+        config = self.config
+
+        inputs_embeds = torch.zeros(batch_size,
+                                    seq_len,
+                                    config.hidden_size,
+                                    dtype=dtype16,
+                                    device=device)
+        kv_dtype = (torch.float8_e4m3fn
+                    if config.quant.kv_cache_quant == "fp8" else dtype16)
+        past_key_values_list: List[torch.Tensor] = [
+            torch.zeros(batch_size,
+                        2,
+                        config.num_key_value_heads,
+                        past_len,
+                        config.head_dim,
+                        dtype=kv_dtype,
+                        device=device) for _ in range(num_layers)
+        ]
+        rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        rope_rotary_cos_sin = torch.zeros(batch_size,
+                                          max_pos,
+                                          rotary_dim,
+                                          dtype=torch.float32,
+                                          device=device)
+        context_lengths = torch.zeros(batch_size,
+                                      dtype=torch.int32,
+                                      device=device)
+        last_token_ids = torch.zeros(batch_size,
+                                     1,
+                                     dtype=torch.int64,
+                                     device=device)
+        kvcache_start_index = torch.zeros(batch_size,
+                                          dtype=torch.int32,
+                                          device=device)
+        hidden_states_input = torch.zeros(batch_size,
+                                          seq_len,
+                                          config.hidden_size,
+                                          dtype=dtype16,
+                                          device=device)
+        hidden_states_from_draft = torch.zeros(batch_size,
+                                               seq_len,
+                                               config.hidden_size,
+                                               dtype=dtype16,
+                                               device=device)
+        attention_pos_id = torch.zeros(batch_size,
+                                       seq_len,
+                                       dtype=torch.int32,
+                                       device=device)
+        attention_mask = torch.zeros(batch_size,
+                                     seq_len,
+                                     seq_len + past_len,
+                                     dtype=torch.int32,
+                                     device=device)
+
+        args = (
+            inputs_embeds,
+            *past_key_values_list,
+            rope_rotary_cos_sin,
+            context_lengths,
+            kvcache_start_index,
+            last_token_ids,
+            hidden_states_input,
+            hidden_states_from_draft,
+            attention_pos_id,
+            attention_mask,
+        )
+        input_names = (["inputs_embeds"] +
+                       [f"past_key_values_{i}" for i in range(num_layers)] + [
+                           "rope_rotary_cos_sin",
+                           "context_lengths",
+                           "kvcache_start_index",
+                           "last_token_ids",
+                           "hidden_states_input",
+                           "hidden_states_from_draft",
+                           "attention_pos_id",
+                           "attention_mask",
+                       ])
+        output_names = (["logits", "hidden_states"] +
+                        [f"present_key_values_{i}" for i in range(num_layers)])
+
+        batch = torch.export.Dim("batch", min=1, max=256)
+        seq = torch.export.Dim("seq_len", min=1, max=32768)
+        pos = torch.export.Dim("max_pos", min=1, max=32768)
+        past = torch.export.Dim("past_len", min=1, max=32768)
+        rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
+        kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        attn_seq = torch.export.Dim("attn_seq_len", min=1, max=32768)
+        num_selected = torch.export.Dim("num_selected", min=1, max=256)
+        mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
+
+        dynamic_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
+        for _ in range(num_layers):
+            dynamic_shapes.append({0: batch, 3: past})  # past_key_values_i
+        dynamic_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
+        dynamic_shapes.append({0: batch})  # context_lengths
+        dynamic_shapes.append({0: kv_batch})  # kvcache_start_index
+        dynamic_shapes.append({0: batch, 1: num_selected})  # last_token_ids
+        dynamic_shapes.append({0: batch, 1: seq})  # hidden_states_input
+        dynamic_shapes.append({0: batch, 1: seq})  # hidden_states_from_draft
+        dynamic_shapes.append({0: batch, 1: attn_seq})  # attention_pos_id
+        dynamic_shapes.append({
+            0: batch,
+            1: attn_seq,
+            2: mask_kv_len
+        })  # attention_mask
+
+        wrapped = _make_flat_wrapper_qwen3_5_mtp(self, num_layers)
+        wrapped.eval()
+        return OnnxSpec(wrapped=wrapped,
+                        args=args,
+                        input_names=input_names,
+                        output_names=output_names,
+                        dynamic_shapes=dynamic_shapes)

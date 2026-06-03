@@ -157,30 +157,58 @@ float getMultimodalAverageTimePerToken(metrics::MultimodalMetrics const& multimo
     return 0.0f;
 }
 
-//! Utility function for calculating Eagle overall tokens per second (excluding base model prefill)
-float getEagleOverallTokensPerSecond(metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+std::string getSpecDecodeDisplayName(char const* strategyName)
 {
-    if (eagleGenerationMetrics.totalGeneratedTokens <= 0)
+    std::string const name = strategyName ? strategyName : "";
+    if (name == "mtp")
+    {
+        return "MTP";
+    }
+    if (name == "eagle")
+    {
+        return "Eagle";
+    }
+    return "SpecDecode";
+}
+
+std::string getSpecDecodeGenerationJsonKey(char const* strategyName)
+{
+    std::string const name = strategyName ? strategyName : "";
+    if (name == "mtp")
+    {
+        return "mtp_generation";
+    }
+    if (name == "eagle")
+    {
+        return "eagle_generation";
+    }
+    return "spec_decode_generation";
+}
+
+//! Utility function for calculating speculative decoding overall tokens per second (excluding base model prefill)
+float getSpecDecodeOverallTokensPerSecond(metrics::SpecDecodeGenerationMetrics const& specDecodeGenerationMetrics)
+{
+    if (specDecodeGenerationMetrics.totalGeneratedTokens <= 0)
     {
         return 0.0f;
     }
 
-    // Calculate total time for all Eagle stages except base prefill
+    // Calculate total time for all speculative decoding stages except base prefill.
     float totalTimeMs = 0.0f;
 
-    auto draftPrefillData = gTimer.getTimingData(metrics::StageNames::kEAGLE_DRAFT_PREFILL);
+    auto draftPrefillData = gTimer.getTimingData(metrics::StageNames::kSPEC_DECODE_DRAFT_PREFILL);
     if (draftPrefillData)
     {
         totalTimeMs += draftPrefillData->getTotalGpuTimeMs();
     }
 
-    auto constructDraftTreeData = gTimer.getTimingData(metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE);
-    if (constructDraftTreeData)
+    auto constructDraftProposalData = gTimer.getTimingData(metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL);
+    if (constructDraftProposalData)
     {
-        totalTimeMs += constructDraftTreeData->getTotalGpuTimeMs();
+        totalTimeMs += constructDraftProposalData->getTotalGpuTimeMs();
     }
 
-    auto baseVerificationData = gTimer.getTimingData(metrics::StageNames::kEAGLE_BASE_VERIFICATION);
+    auto baseVerificationData = gTimer.getTimingData(metrics::StageNames::kSPEC_DECODE_BASE_VERIFICATION);
     if (baseVerificationData)
     {
         totalTimeMs += baseVerificationData->getTotalGpuTimeMs();
@@ -188,21 +216,21 @@ float getEagleOverallTokensPerSecond(metrics::EagleGenerationMetrics const& eagl
 
     if (totalTimeMs > 0.0f)
     {
-        return static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens) / (totalTimeMs / 1000.0f);
+        return static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens) / (totalTimeMs / 1000.0f);
     }
     return 0.0f;
 }
 
-//! Utility function for calculating Eagle average acceptance rate
-float getEagleAverageAcceptanceRate(metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+//! Utility function for calculating speculative decoding average acceptance rate
+float getSpecDecodeAverageAcceptanceRate(metrics::SpecDecodeGenerationMetrics const& specDecodeGenerationMetrics)
 {
-    if (eagleGenerationMetrics.totalIterations <= 0)
+    if (specDecodeGenerationMetrics.totalIterations <= 0)
     {
         return 0.0f;
     }
 
-    return static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens)
-        / static_cast<float>(eagleGenerationMetrics.totalIterations);
+    return static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens)
+        / static_cast<float>(specDecodeGenerationMetrics.totalIterations);
 }
 
 //! Helper function to append timing data for a stage to an ostream
@@ -297,26 +325,27 @@ void outputGenerationProfile(std::ostream& output, metrics::LLMGenerationMetrics
     }
 }
 
-void outputEagleGenerationProfile(std::ostream& output, metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+void outputSpecDecodeGenerationProfile(std::ostream& output,
+    metrics::SpecDecodeGenerationMetrics const& specDecodeGenerationMetrics, char const* strategyName)
 {
-    if (eagleGenerationMetrics.getTotalRuns() > 0)
+    if (specDecodeGenerationMetrics.getTotalRuns() > 0)
     {
-        output << "=== Eagle Generation ===" << std::endl;
-        output << "Total Iterations: " << eagleGenerationMetrics.totalIterations << std::endl;
-        output << "Total Generated Tokens: " << eagleGenerationMetrics.totalGeneratedTokens << std::endl;
+        output << "=== " << getSpecDecodeDisplayName(strategyName) << " Generation ===" << std::endl;
+        output << "Total Iterations: " << specDecodeGenerationMetrics.totalIterations << std::endl;
+        output << "Total Generated Tokens: " << specDecodeGenerationMetrics.totalGeneratedTokens << std::endl;
         output << "Average Tokens per Run: " << std::fixed << std::setprecision(2)
-               << static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens)
-                / eagleGenerationMetrics.getTotalRuns()
+               << static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens)
+                / specDecodeGenerationMetrics.getTotalRuns()
                << std::endl;
         output << "Average Acceptance Rate: " << std::fixed << std::setprecision(2)
-               << getEagleAverageAcceptanceRate(eagleGenerationMetrics) << std::endl;
+               << getSpecDecodeAverageAcceptanceRate(specDecodeGenerationMetrics) << std::endl;
         output << "Overall Tokens/Second (excluding base prefill): " << std::fixed << std::setprecision(1)
-               << getEagleOverallTokensPerSecond(eagleGenerationMetrics) << std::endl;
+               << getSpecDecodeOverallTokensPerSecond(specDecodeGenerationMetrics) << std::endl;
 
-        // Individual Eagle stage timing
-        appendStageTimingData(output, metrics::StageNames::kEAGLE_DRAFT_PREFILL, "Draft Model Prefill");
-        appendStageTimingData(output, metrics::StageNames::kEAGLE_CONSTRUCT_DRAFT_TREE, "Construct Draft Tree");
-        appendStageTimingData(output, metrics::StageNames::kEAGLE_BASE_VERIFICATION, "Base Model Verification");
+        // Individual speculative decoding stage timing.
+        appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_PREFILL, "Draft Model Prefill");
+        appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, "Construct Draft Proposal");
+        appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_BASE_VERIFICATION, "Base Model Verification");
     }
 }
 
@@ -464,20 +493,21 @@ void addJsonGenerationSummary(nlohmann::json& summary, metrics::LLMGenerationMet
     }
 }
 
-void addJsonEagleGenerationSummary(
-    nlohmann::json& summary, metrics::EagleGenerationMetrics const& eagleGenerationMetrics)
+void addJsonSpecDecodeGenerationSummary(nlohmann::json& summary,
+    metrics::SpecDecodeGenerationMetrics const& specDecodeGenerationMetrics, char const* strategyName)
 {
-    if (eagleGenerationMetrics.getTotalRuns() > 0)
+    if (specDecodeGenerationMetrics.getTotalRuns() > 0)
     {
-        summary["eagle_generation"] = {{"total_runs", eagleGenerationMetrics.getTotalRuns()},
-            {"total_iterations", eagleGenerationMetrics.totalIterations},
-            {"total_generated_tokens", eagleGenerationMetrics.totalGeneratedTokens},
-            {"average_tokens_per_run",
-                static_cast<float>(eagleGenerationMetrics.totalGeneratedTokens)
-                    / eagleGenerationMetrics.getTotalRuns()},
-            {"average_acceptance_rate", getEagleAverageAcceptanceRate(eagleGenerationMetrics)},
-            {"overall_tokens_per_second_excluding_base_prefill",
-                getEagleOverallTokensPerSecond(eagleGenerationMetrics)}};
+        summary[getSpecDecodeGenerationJsonKey(strategyName)]
+            = {{"total_runs", specDecodeGenerationMetrics.getTotalRuns()},
+                {"total_iterations", specDecodeGenerationMetrics.totalIterations},
+                {"total_generated_tokens", specDecodeGenerationMetrics.totalGeneratedTokens},
+                {"average_tokens_per_run",
+                    static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens)
+                        / specDecodeGenerationMetrics.getTotalRuns()},
+                {"average_acceptance_rate", getSpecDecodeAverageAcceptanceRate(specDecodeGenerationMetrics)},
+                {"overall_tokens_per_second_excluding_base_prefill",
+                    getSpecDecodeOverallTokensPerSecond(specDecodeGenerationMetrics)}};
     }
 }
 

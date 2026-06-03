@@ -64,11 +64,11 @@ public:
     //! \param[in] request LLM generation request containing audio and text
     //! \param[in,out] batchedInputIds Batched input token IDs after preprocessing
     //! \param[in] tokenizer Tokenizer for text processing
-    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
+    //! \param[out] mropeCosSinOut MRope cos/sin output cache (required: this runner is MRope-only)
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        tokenizer::Tokenizer const* tokenizer, rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream,
         bool imageOnly = false) override;
 
     //! \brief Run inference on the audio encoder
@@ -96,11 +96,11 @@ public:
     //!          because QwenViTRunner::preprocessSystemPrompt handles MRope initialization.
     //! \param[in] systemPrompt System prompt text
     //! \param[in] tokenizer Tokenizer instance
-    //! \param[in,out] ropeRotaryCosSinDevice RoPE cache tensor
+    //! \param[out] mropeCosSinOut MRope cos/sin output cache (required for non-empty system prompts)
     //! \param[in] stream CUDA stream
     //! \return True on success, false on failure
     bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
-        rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream) override;
 
 private:
     //! \brief Preprocess audio buffers and run encoder inference

@@ -87,7 +87,7 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --specDraft               Build as speculative decoding draft model (EAGLE/MTP)" << std::endl;
     std::cerr << "  --specBase                Build as speculative decoding base model (EAGLE/MTP)" << std::endl;
-    std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens for base model tree verification. Default = 60"
+    std::cerr << "  --maxVerifyTreeSize       Maximum input_ids tokens for base model verification. Default = 60"
               << std::endl;
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens for draft model generation. Default = 60"
               << std::endl;

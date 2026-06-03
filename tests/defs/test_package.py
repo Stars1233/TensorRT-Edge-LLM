@@ -35,12 +35,14 @@ class PackageTester:
             if not version:
                 return {"success": False, "error": "Package version not found"}
 
-            # Check required functions
+            # Check checkpoint-loader package surface
             required_functions = [
-                "quantize_and_save_llm", "quantize_and_save_draft",
-                "export_llm_model", "export_draft_model", "visual_export",
-                "insert_lora_and_save", "process_lora_weights_and_save",
-                "reduce_vocab_size", "audio_export", "action_export"
+                "AutoModel",
+                "ModelConfig",
+                "QuantConfig",
+                "export_onnx",
+                "load_config_dict",
+                "load_weights",
             ]
             for func_name in required_functions:
                 if not hasattr(tensorrt_edgellm, func_name):
@@ -60,11 +62,12 @@ class PackageTester:
     def test_command_line_tools(self) -> Dict[str, any]:
         """Test command-line tools availability"""
         tools = [
-            "tensorrt-edgellm-quantize-llm", "tensorrt-edgellm-export-llm",
-            "tensorrt-edgellm-export-visual", "tensorrt-edgellm-insert-lora",
-            "tensorrt-edgellm-process-lora", "tensorrt-edgellm-merge-lora",
-            "tensorrt-edgellm-reduce-vocab", "tensorrt-edgellm-export-audio",
-            "tensorrt-edgellm-export-action"
+            "tensorrt-edgellm-quantize",
+            "tensorrt-edgellm-export",
+            "tensorrt-edgellm-insert-lora",
+            "tensorrt-edgellm-process-lora",
+            "tensorrt-edgellm-merge-lora",
+            "tensorrt-edgellm-reduce-vocab",
         ]
 
         for tool in tools:

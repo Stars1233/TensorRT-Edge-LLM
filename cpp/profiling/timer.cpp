@@ -56,7 +56,7 @@ TimerSession Timer::startStage(std::string const& stageId, cudaStream_t stream)
     }
 
     startTimer(stageId, stream);
-    return TimerSession([this, stageId]() { onStageComplete(stageId); });
+    return TimerSession([this, stageId, stream]() { onStageComplete(stageId, stream); });
 }
 
 std::optional<StageTimingData> Timer::getTimingData(std::string const& stageId) const
@@ -189,9 +189,9 @@ void Timer::recordTiming(std::string const& stageId) const
     mTimingResults[stageId].push_back(gpuElapsedTime);
 }
 
-void Timer::onStageComplete(std::string const& stageId)
+void Timer::onStageComplete(std::string const& stageId, cudaStream_t stream)
 {
-    endTimer(stageId, 0);
+    endTimer(stageId, stream);
 }
 
 } // namespace timer

@@ -441,8 +441,8 @@ def generate_python_api_rst():
 
 This section provides documentation for the TensorRT Edge-LLM Python package.
 
-New Python workflows use ``experimental.quantization`` for checkpoint
-quantization, ``llm_loader`` for ONNX export, and ``experimental.server`` for
+Python workflows use ``tensorrt_edgellm.quantization`` for checkpoint
+quantization, ``tensorrt_edgellm`` for ONNX export, and ``experimental.server`` for
 the experimental high-level API and OpenAI-compatible server.
 
 Experimental Server
@@ -453,33 +453,22 @@ Experimental Server
    :undoc-members:
    :show-inheritance:
 
-Experimental Quantization
--------------------------
+Quantization
+------------
 
-.. automodule:: experimental.quantization
+.. automodule:: tensorrt_edgellm.quantization
    :members:
    :undoc-members:
    :show-inheritance:
 
-LLM Loader
-----------
-
-.. automodule:: llm_loader
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-Deprecated Export Package
--------------------------
-
-The ``tensorrt_edgellm`` package contains deprecated Python export utilities that
-remain available in 0.7.1 for compatibility. New model enablement should target
-the experimental quantization and ``llm_loader`` workflow above.
+Checkpoint Exporter
+-------------------
 
 .. automodule:: tensorrt_edgellm
    :members:
    :undoc-members:
    :show-inheritance:
+
 """
 
     with open(python_api_file, 'w') as f:

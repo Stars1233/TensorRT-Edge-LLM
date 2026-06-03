@@ -25,8 +25,8 @@
 #include "common/trtUtils.h"
 #include "multimodal/multimodalRunner.h"
 #include "profiling/layerProfiler.h"
-#include "runtime/eagleDraftEngineRunner.h"
-#include "runtime/llmEngineRunner.h"
+#include "runtime/legacy/eagleDraftEngineRunner.h"
+#include "runtime/legacy/llmEngineRunner.h"
 
 #include <cstdlib>
 #include <cstring>

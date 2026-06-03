@@ -143,7 +143,7 @@ public:
      * No-op when intermediate states are not allocated.
      *
      * @param activeBatchSize Current active batch size
-     * @param seqLen Actual sequence length (e.g. verifyTreeSize)
+     * @param seqLen Actual sequence length (for example, SpecDecode verifySize)
      */
     void reshapeIntermediateStates(int32_t activeBatchSize, int32_t seqLen);
 

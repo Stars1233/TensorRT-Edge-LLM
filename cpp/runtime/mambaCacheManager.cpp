@@ -287,7 +287,7 @@ void MambaCacheManager::scatterMtpStates(rt::Tensor const& acceptLengths, cudaSt
         return;
     }
 
-    int32_t const verifyTreeSize = static_cast<int32_t>(mIntermediateRecurrentStates[0].getShape()[1]);
+    int32_t const verifySize = static_cast<int32_t>(mIntermediateRecurrentStates[0].getShape()[1]);
     int32_t const recElements
         = mConfig.recurrentStateNumHeads * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
     int32_t const convElements = mConfig.convDim * mConfig.convKernel;
@@ -296,9 +296,9 @@ void MambaCacheManager::scatterMtpStates(rt::Tensor const& acceptLengths, cudaSt
     int32_t const* const acceptPtr = acceptLengths.dataPointer<int32_t>();
 
     kernel::mtpScatterRecurrentStates(
-        layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize, recElements, acceptPtr, stream);
+        layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifySize, recElements, acceptPtr, stream);
     kernel::mtpScatterConvStates(
-        layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize, convElements, acceptPtr, stream);
+        layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifySize, convElements, acceptPtr, stream);
 }
 
 } // namespace rt

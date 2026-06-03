@@ -1,0 +1,29 @@
+# L0 Export Tests - Checkpoint export for Blackwell runtime + new model types
+# Uses tensorrt_edgellm/scripts/export.py
+tests:
+  # FP8 LLM (Qwen2.5 architecture, pre-quantized)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-FP8-fp8]
+  # FP8 + FP8 KV cache LLM (pre-quantized with KV cache quantization)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-FP8-KV-fp8-fp8kv]
+  # FP8 LLM with LoRA support
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_lora_export[Qwen2.5-0.5B-Instruct-FP8-fp8]
+  # NVFP4 LLM (Qwen3 architecture, pre-quantized) - standalone for non-EAGLE tests
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-NVFP4-nvfp4]
+  # NVFP4 VLM (Qwen3-VL architecture, pre-quantized) - standalone for non-EAGLE tests
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-NVFP4-nvfp4]
+  # NVFP4 Hybrid Mamba LLM (Nemotron-H architecture, pre-quantized)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4]
+  # FP8 VLM (Phi-4 multimodal architecture, pre-quantized)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Phi-4-multimodal-instruct-FP8-fp8]
+  # ASR export-only (Qwen3-ASR architecture)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-ASR-0.6B-fp16]
+  # TTS integrated model export (Talker + CodePredictor + Code2Wav)
+  - tests/defs/test_model_export.py::TestModelExport::test_tts_model_export[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16]
+  # Qwen3.5 VLM (hybrid GDN+attention architecture, fp16)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-0.8B-fp16]
+  # Qwen3.5 MTP export (base + draft from single checkpoint)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_mtp_export[Qwen3.5-0.8B-fp16-mtp]
+  # EAGLE3 LLM - pre-quantized base + pre-quantized draft (skip quantization in CI)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_eagle_export[Qwen3-1.7B-NVFP4-nvfp4-eagle-eagle3-nvfp4]
+  # EAGLE3 VLM - pre-quantized base + pre-quantized draft (skip quantization in CI)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_eagle_export[Qwen3-VL-4B-Instruct-NVFP4-nvfp4-eagle-eagle3-nvfp4]

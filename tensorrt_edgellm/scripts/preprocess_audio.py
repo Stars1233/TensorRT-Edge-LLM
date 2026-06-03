@@ -30,24 +30,24 @@ Output format:
 
 Usage:
     # Qwen3-Omni (default, Whisper feature extractor)
-    python -m tensorrt_edgellm.scripts.preprocess_audio
+    tensorrt-edgellm-preprocess-audio
         --input /path/to/audio.wav
         --output /path/to/output.safetensors
 
     # Nemotron-Omni (Parakeet feature extractor)
-    python -m tensorrt_edgellm.scripts.preprocess_audio
+    tensorrt-edgellm-preprocess-audio
         --input /path/to/audio.wav
         --output /path/to/output.safetensors
         --feature_extractor parakeet
 
     # With model-specific preprocessor config
-    python -m tensorrt_edgellm.scripts.preprocess_audio
+    tensorrt-edgellm-preprocess-audio
         --input /path/to/audio.wav
         --output /path/to/output.safetensors
         --preprocessor_config /path/to/preprocessor_config.json
 
     # Batch mode: process all audio files in a directory
-    python -m tensorrt_edgellm.scripts.preprocess_audio
+    tensorrt-edgellm-preprocess-audio
         --input /path/to/audio_dir/
         --output /path/to/output_dir/
 """

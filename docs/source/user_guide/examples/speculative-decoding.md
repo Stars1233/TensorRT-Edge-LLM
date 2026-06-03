@@ -18,12 +18,12 @@ EAGLE3 [https://arxiv.org/abs/2503.01840] uses a smaller draft model to accelera
 
 Any EAGLE3-compatible draft model on HuggingFace can be tried however TensorRT Edge-LLM team does not test the accuracy or acceptance rate. Search for [eagle3 models](https://huggingface.co/models?search=eagle3) to find additional options.
 
-Draft model quantization is supported via `experimental.quantization` with
+Draft model quantization is supported via `tensorrt-edgellm-quantize` with
 `fp8`, `int4_awq`, `nvfp4`, `mxfp8`, and `int8_sq` backbone quantization. For
 example:
 
 ```bash
-python -m experimental.quantization draft \
+tensorrt-edgellm-quantize draft \
   --base_model_dir meta-llama/Llama-3.1-8B-Instruct \
   --draft_model_dir EAGLE3-LLaMA3.1-Instruct-8B \
   --quantization nvfp4 \
@@ -41,8 +41,6 @@ Note that quantizing the draft model will cause a drop in acceptance rate compar
 #### Step 1: Quantize and Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Llama-3.1-8B-Instruct
 cd $WORKSPACE_DIR
@@ -52,26 +50,26 @@ git clone https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
 cd EAGLE3-LLaMA3.1-Instruct-8B && git lfs pull && cd ..
 
 # Quantize base model
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir meta-llama/Llama-3.1-8B-Instruct \
   --quantization fp8 \
   --output_dir $MODEL_NAME/quantized-base
 
 # Export base model with EAGLE flag
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_NAME/quantized-base \
   $MODEL_NAME/onnx/base_export \
   --eagle-base
 
 # Quantize draft model
-python -m experimental.quantization draft \
+tensorrt-edgellm-quantize draft \
   --base_model_dir meta-llama/Llama-3.1-8B-Instruct \
   --draft_model_dir EAGLE3-LLaMA3.1-Instruct-8B \
   --quantization fp8 \
   --output_dir $MODEL_NAME/quantized-draft
 
 # Export draft model
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_NAME/quantized-draft \
   $MODEL_NAME/onnx/draft_export
 
@@ -94,7 +92,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Llama-3.1-8B-Instruct
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build base model EAGLE engine
 ./build/examples/llm/llm_build \
@@ -122,7 +120,7 @@ Build time: < 5 minutes
 #### Step 4: Run Inference (Thor Device)
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \
@@ -142,8 +140,6 @@ EAGLE for vision-language models combines accelerated text generation with image
 #### Step 1: Quantize and Export (x86 Host)
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-7B-Instruct
 cd $WORKSPACE_DIR
@@ -153,26 +149,26 @@ git clone https://huggingface.co/Rayzl/qwen2.5-vl-7b-eagle3-sgl
 cd qwen2.5-vl-7b-eagle3-sgl && git lfs pull && cd ..
 
 # Quantize base model
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen2.5-VL-7B-Instruct \
   --quantization fp8 \
   --output_dir $MODEL_NAME/quantized-base
 
 # Export base LLM and FP16 visual encoder
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_NAME/quantized-base \
   $MODEL_NAME/onnx/base_export \
   --eagle-base
 
 # Quantize draft model
-python -m experimental.quantization draft \
+tensorrt-edgellm-quantize draft \
   --base_model_dir Qwen/Qwen2.5-VL-7B-Instruct \
   --draft_model_dir qwen2.5-vl-7b-eagle3-sgl \
   --quantization fp8 \
   --output_dir $MODEL_NAME/quantized-draft
 
 # Export draft model
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   $MODEL_NAME/quantized-draft \
   $MODEL_NAME/onnx/draft_export
 
@@ -196,7 +192,7 @@ scp -r $MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen2.5-VL-7B-Instruct
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build base model EAGLE engine
 ./build/examples/llm/llm_build \
@@ -234,7 +230,7 @@ Build time: < 5 minutes
 #### Step 4: Run Inference (Thor Device)
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines/llm \
@@ -259,18 +255,16 @@ So far any Qwen3.5 dense model with `num_draft_layers > 0` in its config is MTP-
 
 #### Step 1: Export (x86 Host)
 
-MTP export produces both the base model and draft model ONNX from a single checkpoint using `llm_loader`:
+MTP export produces both the base model and draft model ONNX from a single checkpoint using `tensorrt_edgellm`:
 
 ```bash
-export EDGE_LLM_PATH=/path/to/TensorRT-Edge-LLM
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3.5-4B
-export PYTHONPATH=$EDGE_LLM_PATH:$EDGE_LLM_PATH/experimental:$PYTHONPATH
 mkdir -p $WORKSPACE_DIR
 cd $WORKSPACE_DIR
 
 # Export
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   Qwen/Qwen3.5-4B \
   $WORKSPACE_DIR/$MODEL_NAME/onnx \
   --mtp
@@ -295,7 +289,7 @@ scp -r $WORKSPACE_DIR/$MODEL_NAME/onnx \
 ```bash
 export WORKSPACE_DIR=$HOME/tensorrt-edgellm-workspace
 export MODEL_NAME=Qwen3.5-4B
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 # Build MTP base engine
 ./build/examples/llm/llm_build \
@@ -322,7 +316,7 @@ cd ~/TensorRT-Edge-LLM
 #### Step 4: Run Inference
 
 ```bash
-cd ~/TensorRT-Edge-LLM
+cd /path/to/TensorRT-Edge-LLM
 
 ./build/examples/llm/llm_inference \
   --engineDir $WORKSPACE_DIR/$MODEL_NAME/engines \

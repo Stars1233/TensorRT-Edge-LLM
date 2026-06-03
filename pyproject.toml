@@ -22,37 +22,38 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch~=2.10.0",
-    "transformers==5.3.0",
-    "nvidia-modelopt[torch]==0.39.0",
-    "nvidia-modelopt[onnx]==0.39.0",
+    "torch==2.12.0",
+    "transformers==5.9.0",
     "onnx==1.19.0",
-    "datasets==4.4.2",
-    "tqdm~=4.67.1",
-    "numpy~=2.2.6",
-    "pillow==12.1.1",
-    "torchvision==0.25.0",
-    "peft==0.18.1",
-    "backoff==2.2.1",
-    "soundfile==0.13.1",
-    "librosa==0.11.0",
-    "einops==0.8.2",
-    # For InternVL3/InternLM2 tokenizer support
-    "tiktoken>=0.5.0",
+    "onnxscript==0.7.0",
+    "safetensors==0.7.0",
+    "numpy==2.4.6",
+    "onnx-graphsurgeon==0.6.1",
 ]
 
 [project.optional-dependencies]
-dev = [
+tools = [
+    "nvidia-modelopt==0.44.0",
+    "datasets==4.8.5",
+    "tqdm==4.67.3",
+    "einops==0.8.2",
+    "peft==0.19.1",
+    "soundfile==0.13.1",
+    "librosa==0.11.0",
+    "tiktoken==0.13.0",
+    "torchvision==0.27.0",
+    "backoff",
 ]
+server = [
+    "fastapi==0.136.1",
+    "pybind11==2.13.6",
+    "uvicorn==0.47.0",
+]
+dev = []
 
 [project.scripts]
-tensorrt-edgellm-quantize-llm = "tensorrt_edgellm.scripts.quantize_llm:main"
-tensorrt-edgellm-quantize-draft = "tensorrt_edgellm.scripts.quantize_draft:main"
-tensorrt-edgellm-export-visual = "tensorrt_edgellm.scripts.export_visual:main"
-tensorrt-edgellm-export-llm = "tensorrt_edgellm.scripts.export_llm:main"
-tensorrt-edgellm-export-audio = "tensorrt_edgellm.scripts.export_audio:main"
-tensorrt-edgellm-export-draft = "tensorrt_edgellm.scripts.export_draft:main"
-tensorrt-edgellm-export-action = "tensorrt_edgellm.scripts.export_action:main"
+tensorrt-edgellm-quantize = "tensorrt_edgellm.scripts.quantize:main"
+tensorrt-edgellm-export = "tensorrt_edgellm.scripts.export:main"
 tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"
 tensorrt-edgellm-merge-lora = "tensorrt_edgellm.scripts.merge_lora:main"
@@ -61,11 +62,11 @@ tensorrt-edgellm-preprocess-audio = "tensorrt_edgellm.scripts.preprocess_audio:m
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tensorrt_edgellm*"]
+include = ["tensorrt_edgellm*", "experimental*"]
 
 [tool.setuptools.package-data]
 tensorrt_edgellm = ["README.md"]
-"tensorrt_edgellm.chat_templates" = ["templates/*.json"]
+"tensorrt_edgellm.chat_templates" = ["*.json"]
 
 [tool.setuptools.dynamic]
-version = {attr = "tensorrt_edgellm.version.__version__"}
+version = {attr = "tensorrt_edgellm._version.__version__"}

@@ -26,7 +26,7 @@
 #ifdef CUTE_DSL_GEMM_ENABLED
 #include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
 #endif
-#include "llmInferenceSpecDecodeRuntime.h"
+#include "llmInferenceRuntime.h"
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
@@ -1059,7 +1059,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
     response.numFramesPerSample.clear();
     response.success = false;
 
-    // Sampling params from requests[0], applied uniformly (matches LLMInferenceSpecDecodeRuntime design)
+    // Sampling params from requests[0], applied uniformly (matches LLMInferenceRuntime design)
     auto const& req0 = requests[0];
     float const talkerTemperature = (req0.talkerTemperature > 0) ? req0.talkerTemperature : 0.9f;
     int32_t const talkerTopK = (req0.talkerTopK > 0) ? req0.talkerTopK : 50;
@@ -1163,7 +1163,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
     response.numFramesPerSample.clear();
     response.success = false;
 
-    // Sampling params from requests[0], applied uniformly (matches LLMInferenceSpecDecodeRuntime design)
+    // Sampling params from requests[0], applied uniformly (matches LLMInferenceRuntime design)
     auto const& req0 = requests[0];
     float const talkerTemperature = (req0.talkerTemperature > 0) ? req0.talkerTemperature : 0.9f;
     int32_t const talkerTopK = (req0.talkerTopK > 0) ? req0.talkerTopK : 50;
@@ -2086,7 +2086,7 @@ void Qwen3OmniTTSRuntime::finalizeTrailing(rt::Tensor& trailingTextHidden, int32
 //        Thinker-Talker Streaming Pipeline (single CUDA stream)
 // ═══════════════════════════════════════════════════════════════════════════
 
-bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceSpecDecodeRuntime& thinkerRuntime,
+bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinkerRuntime,
     LLMGenerationRequest& thinkerRequest, LLMGenerationResponse& thinkerResponse,
     ThinkerTalkerStreamingConfig const& streamingConfig, OmniGenerationRequest const& omniBaseRequest,
     TalkerGenerationResponse& talkerResponse, cudaStream_t stream)

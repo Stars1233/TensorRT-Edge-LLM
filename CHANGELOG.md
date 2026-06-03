@@ -1,5 +1,18 @@
 # Release Notes
 
+## 0.8.0
+- Externalized INT4 FFN, INT4 MoE, and LM-head weights to reduce engine build memory usage
+- Upgraded plugins to TensorRT Plugin V3 for TensorRT 11 readiness
+- Replaced the experimental exporter namespace with the checkpoint-based `tensorrt_edgellm` loader and export workflow
+- Re-architected the C++ runtime with composable execution, decoding, preprocessing, and state-management components
+- Added pluggable decoding strategies and per-request stop-string support
+- Added tool-call parsing support for the experimental OpenAI-compatible server
+- Added Qwen3.5/Qwen3.6 MoE INT4 and NVFP4 frontend support, including XQA head-dim 256 / KV-ratio 8 handling
+- Updated `nvidia-cutlass-dsl` to 4.5.1
+- Improved quantization robustness for multimodal calibration, ModelOpt quant-config lists, Qwen3.5 MTP export, and mixed-precision overrides
+- Improved Qwen3-TTS, Qwen3-ASR, and LoRA export/test path validation
+- Fixed XQA kernel loader thread safety and CUDA 13.3 MoE top-k softmax namespace build issues
+
 ## 0.7.1
 - Added Qwen3.5 Multi-Token Prediction (MTP) support with performance improvements
 - Added Alpamayo-1 support

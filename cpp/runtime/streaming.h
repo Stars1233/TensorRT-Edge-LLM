@@ -38,10 +38,10 @@ class Tokenizer;
 namespace rt
 {
 
-// Forward declarations. SpecDecodeInferenceContext is defined in the spec-decode
-// runtime header (pulled in by the .cpp that implements the helpers); the request
-// struct lives in llmRuntimeUtils.h and holds the streamChannels vector.
-struct SpecDecodeInferenceContext;
+// Forward declarations. DecodingInferenceContext lives in
+// runtime/state/decodingInferenceContext.h; the request struct lives in
+// llmRuntimeUtils.h and holds the streamChannels vector.
+struct DecodingInferenceContext;
 struct LLMGenerationRequest;
 
 /*!
@@ -62,9 +62,15 @@ enum class FinishReason : uint8_t
     //! Runtime aborted — OOM in the finalizer, engine error, exception during
     //! `handleRequest`. Rare; the terminal chunk may omit text under memory pressure.
     kError = 4,
-    //! Reserved for future stop-string support. Not emitted today.
+    //! Per-request stop string was produced and matched.
     kStopWords = 5,
 };
+
+/*!
+ * @brief Human-readable name for a FinishReason. Returns a static, NUL-terminated
+ *        C-string. Useful for logs, footer lines, and JSON output.
+ */
+char const* finishReasonName(FinishReason r) noexcept;
 
 /*!
  * @brief Single delta chunk on a streaming channel.
@@ -88,8 +94,46 @@ class StreamChannel; // For the friend-function signatures below.
 // while consumers remain restricted to consume/tryPop/waitPop/cancel.
 void attachStreamChannel(std::shared_ptr<StreamChannel> const& channel, int32_t originalIdx);
 bool validateStreamingSubmission(LLMGenerationRequest const& request);
-void applyCancellationToFinishStates(SpecDecodeInferenceContext& context);
-void emitChunks(SpecDecodeInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
+void applyCancellationToFinishStates(DecodingInferenceContext& context);
+
+//! Stage 1 of the per-iter pipeline: decode new tokens into per-slot UTF-8 bytes
+//! and run stop-string matching. Sets `s.pendingEmitText` (bytes safe to emit
+//! this iter) and `s.stopMatchedThisIter` (signal for updateFinishStates to apply
+//! the kStopWords override). Does not push chunks and does not modify
+//! finishedStates / terminalReason — termination decisions live in
+//! updateFinishStates.
+void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
+
+//! Stage 2 of the per-iter pipeline (after updateFinishStates): push chunks
+//! to channels using the pre-computed `pendingEmitText` and finalized
+//! `terminalReason`. Non-streaming slots are skipped here — their output is
+//! assembled at handleRequest finalization.
+void emitChunks(DecodingInferenceContext& context);
+
+/*! @brief Result of applyStopStringMatch. */
+struct StopMatchOutcome
+{
+    std::string emitted;     //!< Bytes safe to push right now.
+    bool stopMatched{false}; //!< True iff a stop string was found and triggered truncation.
+};
+
+/*!
+ * @brief Stop-string match against a per-slot rolling buffer.
+ *
+ *  Caller appends new decoded bytes into `buffer` before invoking and passes
+ *  `maxStopLen = max(stops[*].size())` (cached at request entry; 0 ⇒ no stops
+ *  or all-empty entries — degenerates to pass-through). On return:
+ *
+ *  - Match found (earliest position wins): `emitted` = bytes before the match,
+ *    `stopMatched = true`, `buffer` cleared.
+ *  - `isFinal`, no match: full flush — `emitted = buffer`, `buffer` cleared.
+ *  - Otherwise: emit `buffer` minus its trailing `maxStopLen - 1` bytes; those
+ *    bytes stay in `buffer` for cross-iteration matching.
+ *
+ *  Matching is byte-level; caller must guarantee UTF-8.
+ */
+StopMatchOutcome applyStopStringMatch(
+    std::string& buffer, std::vector<std::string> const& stops, size_t maxStopLen, bool isFinal);
 
 /*!
  * @brief Per-slot streaming channel.
@@ -162,8 +206,9 @@ private:
     friend class StreamChannelFinalizer;
     friend void attachStreamChannel(std::shared_ptr<StreamChannel> const&, int32_t);
     friend bool validateStreamingSubmission(LLMGenerationRequest const&);
-    friend void applyCancellationToFinishStates(SpecDecodeInferenceContext&);
-    friend void emitChunks(SpecDecodeInferenceContext&, tokenizer::Tokenizer const&);
+    friend void applyCancellationToFinishStates(DecodingInferenceContext&);
+    friend void decodePerSlot(DecodingInferenceContext&, tokenizer::Tokenizer const&);
+    friend void emitChunks(DecodingInferenceContext&);
 
     // ── Producer API (runtime-only) ──────────────────────────────────────────
     void push(StreamChunk chunk);
@@ -214,7 +259,7 @@ void StreamChannel::consume(Handler&& handler, std::chrono::milliseconds poll)
 /*!
  * @brief Per-slot detokenization and streaming state.
  *
- * Lives in SpecDecodeInferenceContext, compacted in lockstep with tokenIds.
+ * Lives in DecodingInferenceContext, compacted in lockstep with tokenIds.
  */
 struct SlotStreamState
 {
@@ -233,6 +278,22 @@ struct SlotStreamState
     //! Terminal reason latched at the moment finishedStates[i] flips to 1.
     //! One writer (the code that flips the state), one reader (the emit hook).
     FinishReason terminalReason{FinishReason::kNotFinished};
+
+    //! Hold-back buffer for cross-iteration stop-string matching; bounded by maxStopLen - 1 bytes.
+    std::string stopMatchBuffer;
+
+    //! Cached max(stopStrings[*].size()) for this slot; 0 if no stops. Pre-computed
+    //! once at handleRequest entry so applyStopStringMatch can skip the per-call scan.
+    size_t maxStopLen{0};
+
+    //! Per-iteration emit text; populated by decodePerSlot, consumed (moved out) by emitChunks.
+    //! Empty between iterations.
+    std::string pendingEmitText;
+
+    //! True iff stop-string match fired in decodePerSlot this iteration. Read by
+    //! updateFinishStates to apply the kStopWords override; reset at top of each
+    //! decodePerSlot pass.
+    bool stopMatchedThisIter{false};
 };
 
 /*!
@@ -248,7 +309,7 @@ struct SlotStreamState
 class StreamChannelFinalizer
 {
 public:
-    StreamChannelFinalizer(SpecDecodeInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept;
+    StreamChannelFinalizer(DecodingInferenceContext& ctx, tokenizer::Tokenizer const& tok) noexcept;
     ~StreamChannelFinalizer() noexcept;
 
     StreamChannelFinalizer(StreamChannelFinalizer const&) = delete;
@@ -257,7 +318,7 @@ public:
     StreamChannelFinalizer& operator=(StreamChannelFinalizer&&) = delete;
 
 private:
-    SpecDecodeInferenceContext& mCtx;
+    DecodingInferenceContext& mCtx;
     tokenizer::Tokenizer const& mTok;
 };
 

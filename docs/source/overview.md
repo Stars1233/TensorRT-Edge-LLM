@@ -14,18 +14,19 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 | Platform | Software Release | Link |
 |----------|------------------|------|
-| NVIDIA Jetson Thor | JetPack 7.1 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
-| NVIDIA DRIVE Thor | NVIDIA DriveOS 7 | [NVIDIA DRIVE Developer](https://developer.nvidia.com/drive) |
+| NVIDIA Jetson Thor | JetPack 7.x | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
+| NVIDIA DRIVE Thor | NVIDIA DriveOS 7.2 | [NVIDIA DRIVE Developer](https://developer.nvidia.com/drive) |
+| NVIDIA Jetson Orin | JetPack 7.2 | [JetPack Website](https://developer.nvidia.com/embedded/jetpack) |
 
-> **Note:** The platforms listed above are officially supported and tested. While TensorRT Edge-LLM may run on other NVIDIA GPU platforms (for example, discrete GPUs, other Jetson devices), these are not officially supported but may be used for experimental purposes.
+> **Note:** The platforms listed above are officially supported and tested. Jetson Orin supports FP16, INT8, and INT4 model precisions. For exact build flags by platform and JetPack release, see the [Installation Guide](user_guide/getting_started/installation.md).
 
 **Compatible Platforms:**
 
 | Platform | Software Release |
 |----------|------------------|
-| NVIDIA Jetson Orin | JetPack 6.2.x |
+| NVIDIA Jetson Orin | JetPack 6.2+ |
 
-> **Note:** TensorRT Edge-LLM will officially support Jetson Orin via later JetPack releases. While JetPack 6.2.x is compatible, the support is experimental. 
+> **Note:** JetPack 7.2 is the supported Jetson Orin path. JetPack 6.2+ remains compatible for FP16, INT8, and INT4 workflows.
 
 
 ### Supported Model Families
@@ -45,7 +46,7 @@ TensorRT Edge-LLM supports Llama/Qwen/Nemotron language models, Qwen and InternV
 
 ## Key Components
 
-> **Code Location:** `experimental/quantization/` (checkpoint quantization), `experimental/llm_loader/` (ONNX export), `experimental/server/` (Python API/server), `cpp/` (runtime), `examples/` (C++ examples)
+> **Code Location:** `tensorrt_edgellm/quantization/` (checkpoint quantization), `tensorrt_edgellm/` (ONNX export), `experimental/server/` (Python API/server), `cpp/` (runtime), `examples/` (C++ examples)
 
 TensorRT Edge-LLM uses a three-stage pipeline:
 
@@ -54,7 +55,7 @@ TensorRT Edge-LLM uses a three-stage pipeline:
 
 graph LR
     HF_MODEL[HuggingFace Models<br>*including pre-quantized<br>checkpoints*]
-    PYTHON_EXPORT(Checkpoint-Based<br>Model Loader)
+    PYTHON_EXPORT(Checkpoint-Based<br>Model Exporter)
     ONNX_MODEL[ONNX<br>Model]
     ENGINE_BUILDER(Engine Builder)
     TRT_ENGINE[TensorRT<br>Engines]
@@ -85,10 +86,9 @@ graph LR
 
 | Component | Description |
 |-----------|-------------|
-| **Experimental Quantization Package** | Creates quantized HuggingFace-style checkpoints for `llm_loader`. [Usage](user_guide/features/quantization.md), [Design](developer_guide/software-design/experimental-quantization.md) |
-| **Checkpoint-Based Model Loader** | **Recommended.** Reads HuggingFace checkpoints directly and exports ONNX artifacts. [Learn More](developer_guide/software-design/llm-loader.md) |
+| **Quantization Package** | Creates quantized HuggingFace-style checkpoints for the checkpoint exporter. [Usage](user_guide/features/quantization.md), [Design](developer_guide/software-design/quantization-design.md) |
+| **Checkpoint Exporter** | Reads HuggingFace checkpoints directly and exports ONNX artifacts. [Learn More](developer_guide/software-design/checkpoint-export.md) |
 | **Experimental Python API and Server** | Provides a vLLM-style Python API and OpenAI-compatible server. [Learn More](user_guide/examples/experimental-server.md) |
-| **Deprecated Python Export Pipeline** | FX-tracing compatibility path for existing workflows. `tensorrt_edgellm/` will be removed in 0.8.0 after `experimental/quantization` -> `experimental/llm_loader` reaches full feature parity for all models and features. [Learn More](developer_guide/software-design/python-export-pipeline.md) |
 | **Engine Builder** | C++-based application that compiles ONNX models into optimized TensorRT engines. [Learn More](developer_guide/software-design/engine-builder.md) |
 | **C++ Runtime** | C++-based runtime that executes TensorRT engines with CUDA graphs, LoRA, and EAGLE support. [Learn More](developer_guide/software-design/cpp-runtime-overview.md) |
 | **Examples** | Reference implementations demonstrating LLM, multimodal, and utility use cases. See the [Quick Start Guide](user_guide/getting_started/quick-start-guide.md) and example guides in the User Guide. |
@@ -99,7 +99,7 @@ graph LR
 
 Ready to get started with TensorRT Edge-LLM? Follow these steps:
 
-1. **[Installation Guide](user_guide/getting_started/installation.md)** - Set up experimental quantization and `llm_loader` on your x86 host and build the C++ runtime on your edge device
+1. **[Installation Guide](user_guide/getting_started/installation.md)** - Set up quantization and `tensorrt_edgellm` on your x86 host and build the C++ runtime on your edge device
 
 2. **[Quick Start Guide](user_guide/getting_started/quick-start-guide.md)** - Run your first LLM inference in ~15 minutes with step-by-step instructions
 

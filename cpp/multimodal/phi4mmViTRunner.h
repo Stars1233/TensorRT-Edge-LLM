@@ -73,12 +73,12 @@ public:
     //! \param[in] request LLM generation request containing images and text
     //! \param[in,out] batchedInputIds Batched input token IDs after preprocessing
     //! \param[in] tokenizer Tokenizer for text processing
-    //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache (unused for Phi-4MM)
+    //! \param[out] mropeCosSinOut MRope cos/sin cache (unused by Phi-4MM; standard RoPE)
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
-        bool imageOnly = false) noexcept override;
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
+        cudaStream_t stream, bool imageOnly = false) noexcept override;
 
     //! \brief Run inference on the vision encoder and perform HD postprocess
     //! \param[in] stream CUDA stream for execution

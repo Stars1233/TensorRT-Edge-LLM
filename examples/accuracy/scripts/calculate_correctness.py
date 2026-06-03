@@ -28,10 +28,12 @@ def clean_text(text):
         Cleaned text string.
     """
 
-    # Drop ``<think>...</think>`` reasoning blocks emitted by reasoning models
-    # (Qwen3-thinking, Nemotron-Reasoning, DeepSeek-R1, etc.) so an MCQ answer
-    # like ``<think>...</think>\nC`` still scores against the clean reference.
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Drop reasoning blocks emitted by reasoning models (Qwen3-thinking,
+    # Nemotron-Reasoning, DeepSeek-R1, etc.) so an MCQ answer like
+    # ``<think>...</think>\nC`` still scores against the clean reference.
+    # The opening tag is optional because some chat templates inject it into
+    # the prompt prefix, so the model output contains only ``</think>``.
+    text = re.sub(r"(?:<think>)?.*?</think>", "", text, flags=re.DOTALL)
     # Drop chat / tokenizer special tokens (e.g. <|endoftext|>, <|im_end|>) so MCQ output
     # like "C<|im_end|>" still scores against "C"
     text = re.sub(r"<\|.*?\|>", "", text)
@@ -64,6 +66,26 @@ def parse_multi_choice_response(text):
     return text
 
 
+def is_correct(pred, ref):
+    """
+    Determines correctness between a prediction and a reference.
+    Handles text normalization and multiple-choice parsing.
+    
+    Args:
+        pred: The predicted text from the model.
+        ref: The reference/ground-truth answer.
+    Returns:
+        Boolean indicating if the prediction matches the reference.
+    """
+    pred_clean = clean_text(pred)
+    ref_clean = clean_text(ref)
+
+    if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+        pred_clean = parse_multi_choice_response(pred_clean)
+
+    return pred_clean == ref_clean
+
+
 def calculate_correctness(predictions, references):
     """
     Compute correctness score between predictions and references.
@@ -71,7 +93,7 @@ def calculate_correctness(predictions, references):
         predictions: List of predictions.
         references: List of references.
     Returns:
-        Overall correctness score (float between 0 and 1).
+        Tuple of (correct_count, total_count).
     """
     if len(predictions) != len(references):
         raise ValueError(
@@ -81,16 +103,10 @@ def calculate_correctness(predictions, references):
     total_count = len(predictions)
 
     for pred, ref in zip(predictions, references):
-        # Clean and normalize text for comparison
-        pred_clean = clean_text(pred)
-        ref_clean = clean_text(ref)
-        # Clean for multi-choice
-        if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
-            pred_clean = parse_multi_choice_response(pred_clean)
-        if pred_clean == ref_clean:
+        if is_correct(pred, ref):
             correct_count += 1
 
-    return correct_count / total_count if total_count > 0 else 0.0
+    return correct_count, total_count
 
 
 def calculate_subject_accuracy(predictions, references, subjects):
@@ -112,13 +128,7 @@ def calculate_subject_accuracy(predictions, references, subjects):
 
     for pred, ref, subject in zip(predictions, references, subjects):
         subject_stats[subject]['total'] += 1
-        # Clean and normalize text for comparison
-        pred_clean = clean_text(pred)
-        ref_clean = clean_text(ref)
-        # Clean for multi-choice
-        if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
-            pred_clean = parse_multi_choice_response(pred_clean)
-        if pred_clean == ref_clean:
+        if is_correct(pred, ref):
             subject_stats[subject]['correct'] += 1
 
     # Calculate accuracy for each subject
@@ -205,11 +215,11 @@ def main():
             'total_count': total_count
         }
 
-    overall_correctness = calculate_correctness(predictions, answers)
+    correct_count, valid_count = calculate_correctness(predictions, answers)
+    # Calculate correctness float
+    overall_correctness = correct_count / valid_count if valid_count > 0 else 0.0
 
     print("Correctness Results:")
-    valid_count = len(predictions)
-    correct_count = int(overall_correctness * valid_count)
     print(
         f"Overall Accuracy: {overall_correctness:.4f} ({overall_correctness*100:.2f}%) - {correct_count}/{valid_count} correct"
     )

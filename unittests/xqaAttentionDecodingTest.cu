@@ -91,7 +91,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
     thrust::device_vector<int32_t> kvCacheLengthDevice(kvCacheLengths);
 
     EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-        numQHeads, numKVHeads, smVersion, DataType::kHALF, DataType::kHALF));
+        numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kHALF));
     trt_edgellm::DecoderXQARunner runner(
         DataType::kHALF, DataType::kHALF, batchSize, numQHeads, numKVHeads, headSize, smVersion);
     auto params = runner.initXQAParams();
@@ -216,7 +216,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         thrust::device_vector<__nv_fp8_e4m3> kvInputFp8Device(kvInputFp8);
         thrust::device_vector<half> outFp8Device(batchSize * numQHeads * headSize, __float2half(0.0F));
         EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
-            numQHeads, numKVHeads, smVersion, DataType::kHALF, DataType::kFP8));
+            numQHeads, numKVHeads, headSize, smVersion, DataType::kHALF, DataType::kFP8));
         trt_edgellm::DecoderXQARunner runnerFp8(
             DataType::kHALF, DataType::kFP8, batchSize, numQHeads, numKVHeads, headSize, smVersion);
         auto paramsFp8 = runnerFp8.initXQAParams();
@@ -313,6 +313,12 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio8)
     TestXQAAttentionDecodingAccuracy(4, 32, 4, 128, 256);
 }
 
+TEST(XQAAttentionDecodingTest, accuracyKVRatio8HeadDim256)
+{
+    TestXQAAttentionDecodingAccuracy(1, 16, 2, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 16, 2, 256, 512);
+}
+
 TEST(XQAAttentionDecodingTest, accuracyKVRatio6)
 {
     TestXQAAttentionDecodingAccuracy(1, 24, 4, 256, 1024);
@@ -361,6 +367,12 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8)
     TestXQAAttentionDecodingAccuracy(1, 32, 4, 128, 1024, true);
     TestXQAAttentionDecodingAccuracy(2, 32, 4, 128, 512, true);
     TestXQAAttentionDecodingAccuracy(4, 32, 4, 128, 256, true);
+}
+
+TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8HeadDim256)
+{
+    TestXQAAttentionDecodingAccuracy(1, 16, 2, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(2, 16, 2, 256, 512, true);
 }
 
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio6)

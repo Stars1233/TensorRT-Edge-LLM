@@ -14,14 +14,11 @@
 # limitations under the License.
 """Model export test suite for TensorRT Edge-LLM
 
-Uses ``llm_loader.export_all_cli`` for the ONNX export step when possible
-(pre-quantized LLM, fp16 visual, ASR/TTS, EAGLE), and falls back to the
-legacy ``tensorrt-edgellm-export-*`` CLI tools for compatibility-only cases
-such as TensorRT native-ops export. FP8 visual/audio calibration still uses
-legacy post-export tools when needed.
+Uses the checkpoint exporter for ONNX export, including pre-quantized LLM,
+fp16 visual, ASR/TTS, EAGLE, and MTP checkpoints.
 
-The full pipeline is: ``experimental.quantization`` (ModelOpt; int4_gptq uses
-``tensorrt-edgellm-quantize-llm``) if needed → export ONNX → (fp8 visual if needed).
+The full pipeline is: ``tensorrt-edgellm-quantize`` if needed -> export ONNX
+-> post-export transforms such as dynamic LoRA insertion.
 """
 
 import os
@@ -31,14 +28,11 @@ from conftest import EnvironmentConfig
 from pytest_helpers import run_command, timer_context
 
 from .config import ModelType, TaskType, TestConfig
-from .utils.command_generation import (can_use_llm_loader,
-                                       generate_export_commands,
-                                       generate_post_llm_loader_commands,
+from .utils.checkpoint_export_helpers import (
+    _checkpoint_export_env, run_checkpoint_export, run_command_list,
+    run_tensorrt_edgellm_draft_export, run_tensorrt_edgellm_mtp_export)
+from .utils.command_generation import (generate_post_tensorrt_edgellm_commands,
                                        generate_pre_export_commands)
-from .utils.llm_loader_helpers import (_llm_loader_env, run_command_list,
-                                       run_llm_loader_draft_export,
-                                       run_llm_loader_export,
-                                       run_llm_loader_mtp_export)
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -119,8 +113,8 @@ def validate_export_result(config: TestConfig) -> None:
         if not os.path.exists(draft_onnx):
             raise FileNotFoundError(
                 f"Draft ONNX model not found: {draft_onnx}")
-        # d2t.safetensors is written by both legacy tensorrt-edgellm-export-draft
-        # and llm_loader's draft export (via write_runtime_artifacts) when the
+        # d2t.safetensors is written by both tensorrt-edgellm-export
+        # and tensorrt_edgellm's draft export (via write_runtime_artifacts) when the
         # draft carries a d2t mapping, which is required for reduced-vocab EAGLE.
         if config.reduced_vocab_size:
             d2t_path = os.path.join(draft_onnx_dir, "d2t.safetensors")
@@ -143,9 +137,8 @@ class TestModelExport:
                           env_config: EnvironmentConfig):
         """Universal export test — handles LLM, VLM, ASR, and TTS.
 
-        When ``can_use_llm_loader(config)`` is True the ONNX export step uses
-        ``llm_loader.export_all_cli``; otherwise the legacy
-        ``tensorrt-edgellm-export-*`` CLI tools are used.
+        ONNX export uses ``tensorrt_edgellm.scripts.export`` for all model
+        families.
         """
 
         config = TestConfig.from_param_string(test_param, model_type,
@@ -168,9 +161,8 @@ class TestModelExport:
         os.makedirs(llm_onnx_dir, exist_ok=True)
 
         if config.model_type in (ModelType.TTS, ModelType.ASR, ModelType.OMNI):
-            # llm_loader writes the fp16 audio ONNX; the legacy
-            # tensorrt-edgellm-export-audio post-step writes the fp8 variant
-            # (when audio_precision == "fp8"). Pre-create both dirs.
+            # Pre-create the audio output dirs expected by downstream build
+            # steps. FP8 audio exports are produced from a quantized checkpoint.
             os.makedirs(config.get_audio_onnx_dir("fp16"), exist_ok=True)
             if config.audio_precision == "fp8":
                 os.makedirs(config.get_audio_onnx_dir("fp8"), exist_ok=True)
@@ -216,55 +208,40 @@ class TestModelExport:
                 pytest.fail(f"Failed to install gptqmodel: "
                             f"{result.get('error', 'Unknown error')}")
 
-        use_loader = can_use_llm_loader(config)
         if test_logger:
-            test_logger.info("Using %s export path for %s",
-                             "llm_loader" if use_loader else "legacy",
+            test_logger.info("Using tensorrt_edgellm export path for %s",
                              config.model_name)
 
-        if use_loader:
-            # --- llm_loader path ---
-            # 1. Pre-export: quantize base + draft (experimental ``python -m
-            #    experimental.quantization``; gptq weights still use tensorrt
-            #    quantize-llm with --unified_checkpoint)
-            # 2. Export LLM + fp16 visual + audio/TTS via llm_loader
-            #    (chat_template handled internally by llm_loader)
-            #    For EAGLE: base is exported with --eagle-base, then the
-            #    draft is exported in a second llm_loader invocation.
-            #    For MTP: base + draft are exported together via --mtp.
-            # 3. Post-export: fp8 visual calibration (if needed, legacy tool)
-            pre_commands = generate_pre_export_commands(config)
-            post_commands = generate_post_llm_loader_commands(config)
+        # 1. Pre-export: quantize base + draft with
+        #    ``tensorrt-edgellm-quantize``.
+        # 2. Export LLM + fp16 visual + audio/TTS via the checkpoint exporter
+        #    (chat_template handled internally by tensorrt_edgellm).
+        #    For EAGLE: base is exported with --eagle-base, then the
+        #    draft is exported in a second tensorrt_edgellm invocation.
+        #    For MTP: base + draft are exported together via --mtp.
+        # 3. Post-export: dynamic LoRA insertion/weight processing when needed.
+        pre_commands = generate_pre_export_commands(config)
+        post_commands = generate_post_tensorrt_edgellm_commands(config)
 
-            with timer_context(
-                    f"Exporting {config.model_type.value} {config.model_name} "
-                    f"to {config.llm_precision} (llm_loader)", test_logger):
-                run_command_list(pre_commands, "Pre-export", test_logger)
-                if config.is_mtp:
-                    run_llm_loader_mtp_export(config, test_logger)
-                else:
-                    run_llm_loader_export(config,
-                                          test_logger,
-                                          eagle_base=config.is_eagle)
-                    if config.is_eagle:
-                        run_llm_loader_draft_export(config, test_logger)
-                # post_commands may include `python -m llm_loader.lora.*`
-                # which require PYTHONPATH to include experimental/.
-                # Legacy CLIs in the same list (tensorrt-edgellm-export-{visual,
-                # audio}) ignore the extra env var, so it's safe to apply
-                # uniformly.
-                run_command_list(post_commands,
-                                 "Post-export",
-                                 test_logger,
-                                 env_vars=_llm_loader_env(test_logger) or None)
-        else:
-            # --- Legacy path (trt_native_ops and compatibility-only cases) ---
-            commands = generate_export_commands(config)
-
-            with timer_context(
-                    f"Exporting {config.model_type.value} {config.model_name} "
-                    f"to {config.llm_precision} (legacy)", test_logger):
-                run_command_list(commands, "Export", test_logger)
+        with timer_context(
+                f"Exporting {config.model_type.value} {config.model_name} "
+                f"to {config.llm_precision} (tensorrt_edgellm)", test_logger):
+            run_command_list(pre_commands, "Pre-export", test_logger)
+            if config.is_mtp:
+                run_tensorrt_edgellm_mtp_export(config, test_logger)
+            else:
+                run_checkpoint_export(config,
+                                      test_logger,
+                                      eagle_base=config.is_eagle)
+                if config.is_eagle:
+                    run_tensorrt_edgellm_draft_export(config, test_logger)
+            # Post commands may include LoRA commands which require PYTHONPATH
+            # to include repository root.
+            run_command_list(post_commands,
+                             "Post-export",
+                             test_logger,
+                             env_vars=_checkpoint_export_env(test_logger)
+                             or None)
 
         validate_export_result(config)
 

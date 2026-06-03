@@ -21,10 +21,11 @@
 #include "kernels/mamba/causalConv1d.h"
 #include "plugins/utils/pluginUtils.h"
 
+#include <cassert>
 #include <cstdint>
-#include <cstring>
 #include <cuda_fp16.h>
 #include <mutex>
+#include <optional>
 
 using namespace nvinfer1;
 
@@ -93,84 +94,149 @@ CausalConv1dPlugin::CausalConv1dPlugin(
 {
 }
 
-CausalConv1dPlugin::CausalConv1dPlugin(std::string const& name, void const* data, size_t length)
+CausalConv1dPlugin::CausalConv1dPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
 {
-    auto const* d = static_cast<char const*>(data);
-    std::memcpy(&mStride, d, sizeof(int32_t));
-    d += sizeof(int32_t);
-    std::memcpy(&mPadding, d, sizeof(int32_t));
-    d += sizeof(int32_t);
-    std::memcpy(&mDilation, d, sizeof(int32_t));
-    d += sizeof(int32_t);
-    std::memcpy(&mGroups, d, sizeof(int32_t));
-    d += sizeof(int32_t);
-    // mUseMTP was added later; tolerate older serialized data that is only 4 ints.
-    if (length >= 5 * sizeof(int32_t))
-    {
-        int32_t useMTPInt = 0;
-        std::memcpy(&useMTPInt, d, sizeof(int32_t));
-        mUseMTP = (useMTPInt != 0);
-    }
+    mStride = parsePluginIntField("stride", fc).value_or(1);
+    mPadding = parsePluginIntField("padding", fc).value_or(0);
+    mDilation = parsePluginIntField("dilation", fc).value_or(1);
+    mGroups = parsePluginIntField("groups", fc).value_or(0);
+    mUseMTP = parsePluginIntField("use_mtp", fc).value_or(0) != 0;
 }
 
 CausalConv1dPlugin::~CausalConv1dPlugin() {}
 
 // ---------------------------------------------------------------------------
-// IPluginV2DynamicExt
+// IPluginV3
 // ---------------------------------------------------------------------------
 
-IPluginV2DynamicExt* CausalConv1dPlugin::clone() const noexcept
+IPluginCapability* CausalConv1dPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
 {
-    auto* plugin = new CausalConv1dPlugin(mLayerName, mStride, mPadding, mDilation, mGroups, mUseMTP);
-    plugin->setPluginNamespace(mNamespace.c_str());
-    return plugin;
+    try
+    {
+        if (type == PluginCapabilityType::kBUILD)
+        {
+            return static_cast<IPluginV3OneBuildV2*>(this);
+        }
+        if (type == PluginCapabilityType::kRUNTIME)
+        {
+            return static_cast<IPluginV3OneRuntime*>(this);
+        }
+        return static_cast<IPluginV3OneCore*>(this);
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
 }
+
+IPluginV3* CausalConv1dPlugin::clone() noexcept
+{
+    try
+    {
+        auto* plugin = new CausalConv1dPlugin(mLayerName, mStride, mPadding, mDilation, mGroups, mUseMTP);
+        plugin->setPluginNamespace(mNamespace.c_str());
+        return plugin;
+    }
+    catch (std::exception const& e)
+    {
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPluginV3OneCore — metadata
+// ---------------------------------------------------------------------------
+
+char const* CausalConv1dPlugin::getPluginName() const noexcept
+{
+    return kCAUSAL_CONV_PLUGIN_NAME;
+}
+
+char const* CausalConv1dPlugin::getPluginVersion() const noexcept
+{
+    return kCAUSAL_CONV_PLUGIN_VERSION;
+}
+
+char const* CausalConv1dPlugin::getPluginNamespace() const noexcept
+{
+    return mNamespace.c_str();
+}
+
+void CausalConv1dPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
+{
+    mNamespace = pluginNamespace ? pluginNamespace : "";
+}
+
+// ---------------------------------------------------------------------------
+// IPluginV3OneBuild — shape / format
+// ---------------------------------------------------------------------------
 
 int32_t CausalConv1dPlugin::getNbOutputs() const noexcept
 {
     return kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
 }
 
-DataType CausalConv1dPlugin::getOutputDataType(
-    int32_t index, DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
+int32_t CausalConv1dPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
+    DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
-    // All outputs (conv output, conv state, intermediate_conv_states) have the same type as x (FP16).
-    (void) index;
-    return inputTypes[kIN_X_IDX];
+    try
+    {
+        [[maybe_unused]] int32_t const expectedNbOutputs
+            = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+        assert(nbOutputs == expectedNbOutputs);
+        outputTypes[kOUT_IDX] = inputTypes[kIN_X_IDX];
+        outputTypes[kOUT_CONV_STATE_IDX] = inputTypes[kIN_X_IDX];
+        if (mUseMTP)
+        {
+            outputTypes[kOUT_INTERMEDIATE_CONV_STATES] = inputTypes[kIN_X_IDX];
+        }
+        return 0;
+    }
+    catch (std::exception const& e)
+    {
+        return -1;
+    }
 }
 
-DimsExprs CausalConv1dPlugin::getOutputDimensions(
-    int32_t outputIndex, DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, IExprBuilder& exprBuilder) noexcept
+int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
+    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
 {
-    if (outputIndex == kOUT_IDX)
+    try
     {
-        // Output[0]: same shape as x [batch, seq_len, dim].
-        return inputs[kIN_X_IDX];
+        [[maybe_unused]] int32_t const expectedNbOutputs
+            = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+        assert(nbInputs == kNUM_INPUTS);
+        assert(nbOutputs == expectedNbOutputs);
+        // Output: same shape as x [batch, seq_len, dim].
+        outputs[kOUT_IDX] = inputs[kIN_X_IDX];
+        // Conv state output: same shape as conv_state input [batch, dim, kernel].
+        outputs[kOUT_CONV_STATE_IDX] = inputs[kIN_CONV_STATE_IDX];
+        if (mUseMTP)
+        {
+            // Per-token decode checkpoints: [batch, seq_len, dim, kernel_size].
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].nbDims = 4;
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[0] = inputs[kIN_X_IDX].d[0];
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[1] = inputs[kIN_X_IDX].d[1];
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[2] = inputs[kIN_CONV_STATE_IDX].d[1];
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[3] = inputs[kIN_CONV_STATE_IDX].d[2];
+        }
+        return 0;
     }
-    if (outputIndex == kOUT_INTERMEDIATE_CONV_STATES)
+    catch (std::exception const& e)
     {
-        // Only reachable when mUseMTP is true (getNbOutputs() == 3).
-        DimsExprs out{};
-        // [batch, seq_len, dim, kernel_size]
-        out.nbDims = 4;
-        out.d[0] = inputs[kIN_X_IDX].d[0];          // batch
-        out.d[1] = inputs[kIN_X_IDX].d[1];          // seq_len (T)
-        out.d[2] = inputs[kIN_CONV_STATE_IDX].d[1]; // dim
-        out.d[3] = inputs[kIN_CONV_STATE_IDX].d[2]; // kernel_size
-        return out;
+        return -1;
     }
-    // Output[1]: conv state output — same shape as conv_state input [batch, dim, kernel].
-    return inputs[kIN_CONV_STATE_IDX];
 }
 
 bool CausalConv1dPlugin::supportsFormatCombination(
-    int32_t pos, PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     int32_t const expectedNbOutputs = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
     if (nbInputs != kNUM_INPUTS || nbOutputs != expectedNbOutputs)
         return false;
-    auto const& desc = inOut[pos];
+    auto const& desc = inOut[pos].desc;
     if (desc.format != TensorFormat::kLINEAR)
         return false;
     // INT32: context_lengths only
@@ -180,26 +246,41 @@ bool CausalConv1dPlugin::supportsFormatCombination(
     return desc.type == DataType::kHALF;
 }
 
-void CausalConv1dPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
+int32_t CausalConv1dPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
     [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     if (nbInputs != kNUM_INPUTS)
     {
         LOG_ERROR("causal_conv1d: expected %d inputs, got %d", kNUM_INPUTS, nbInputs);
+        return -1;
     }
     if (in[kIN_X_IDX].desc.type != DataType::kHALF)
     {
         LOG_ERROR(
             "causal_conv1d: only FP16 input is supported; got type %d", static_cast<int32_t>(in[kIN_X_IDX].desc.type));
+        return -1;
     }
+    return 0;
 }
 
-size_t CausalConv1dPlugin::getWorkspaceSize([[maybe_unused]] PluginTensorDesc const* inputs,
-    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] PluginTensorDesc const* outputs,
-    [[maybe_unused]] int32_t nbOutputs) const noexcept
+size_t CausalConv1dPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
+    DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
 {
     return 0;
 }
+
+int32_t CausalConv1dPlugin::getAliasedInput(int32_t outputIndex) noexcept
+{
+    if (outputIndex == kOUT_CONV_STATE_IDX)
+    {
+        return kIN_CONV_STATE_IDX;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// IPluginV3OneRuntime — execution
+// ---------------------------------------------------------------------------
 
 int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
@@ -320,64 +401,34 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Serialization
-// ---------------------------------------------------------------------------
-
-size_t CausalConv1dPlugin::getSerializationSize() const noexcept
-{
-    return 5 * sizeof(int32_t); // stride, padding, dilation, groups, useMTP
-}
-
-void CausalConv1dPlugin::serialize(void* buffer) const noexcept
-{
-    auto* d = static_cast<char*>(buffer);
-    std::memcpy(d, &mStride, sizeof(int32_t));
-    d += sizeof(int32_t);
-    std::memcpy(d, &mPadding, sizeof(int32_t));
-    d += sizeof(int32_t);
-    std::memcpy(d, &mDilation, sizeof(int32_t));
-    d += sizeof(int32_t);
-    std::memcpy(d, &mGroups, sizeof(int32_t));
-    d += sizeof(int32_t);
-    int32_t useMTPInt = mUseMTP ? 1 : 0;
-    std::memcpy(d, &useMTPInt, sizeof(int32_t));
-}
-
-// ---------------------------------------------------------------------------
-// Metadata
-// ---------------------------------------------------------------------------
-
-char const* CausalConv1dPlugin::getPluginType() const noexcept
-{
-    return kCAUSAL_CONV_PLUGIN_NAME;
-}
-
-char const* CausalConv1dPlugin::getPluginNamespace() const noexcept
-{
-    return mNamespace.c_str();
-}
-
-void CausalConv1dPlugin::setPluginNamespace(char const* pluginNamespace) noexcept
-{
-    mNamespace = std::string(pluginNamespace);
-}
-
-char const* CausalConv1dPlugin::getPluginVersion() const noexcept
-{
-    return kCAUSAL_CONV_PLUGIN_VERSION;
-}
-
-int32_t CausalConv1dPlugin::initialize() noexcept
+int32_t CausalConv1dPlugin::onShapeChange(PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
+    PluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
 {
     return 0;
 }
 
-void CausalConv1dPlugin::terminate() noexcept {}
-
-void CausalConv1dPlugin::destroy() noexcept
+IPluginV3* CausalConv1dPlugin::attachToContext(IPluginResourceContext* /* context */) noexcept
 {
-    delete this;
+    return clone();
+}
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+PluginFieldCollection const* CausalConv1dPlugin::getFieldsToSerialize() noexcept
+{
+    mDataToSerialize.clear();
+    mDataToSerialize.emplace_back("stride", &mStride, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("padding", &mPadding, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("dilation", &mDilation, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("groups", &mGroups, PluginFieldType::kINT32, 1);
+    mUseMTPField = mUseMTP ? 1 : 0;
+    mDataToSerialize.emplace_back("use_mtp", &mUseMTPField, PluginFieldType::kINT32, 1);
+
+    mFCToSerialize.nbFields = mDataToSerialize.size();
+    mFCToSerialize.fields = mDataToSerialize.data();
+    return &mFCToSerialize;
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +461,7 @@ PluginFieldCollection const* CausalConv1dPluginCreator::getFieldNames() noexcept
 
 void CausalConv1dPluginCreator::setPluginNamespace(char const* libNamespace) noexcept
 {
-    mNamespace = libNamespace;
+    mNamespace = libNamespace ? libNamespace : "";
 }
 
 char const* CausalConv1dPluginCreator::getPluginNamespace() const noexcept
@@ -423,38 +474,18 @@ char const* CausalConv1dPluginCreator::getPluginVersion() const noexcept
     return kCAUSAL_CONV_PLUGIN_VERSION;
 }
 
-IPluginV2* CausalConv1dPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
+IPluginV3* CausalConv1dPluginCreator::createPlugin(
+    char const* name, PluginFieldCollection const* fc, TensorRTPhase /* phase */) noexcept
 {
     try
     {
-        int32_t const stride = parsePluginIntField("stride", fc).value_or(1);
-        int32_t const padding = parsePluginIntField("padding", fc).value_or(0);
-        int32_t const dilation = parsePluginIntField("dilation", fc).value_or(1);
-        int32_t const groups = parsePluginIntField("groups", fc).value_or(0);
-        bool const useMTP = parsePluginIntField("use_mtp", fc).value_or(0) != 0;
-        auto* plugin = new CausalConv1dPlugin(name, stride, padding, dilation, groups, useMTP);
+        auto* plugin = new CausalConv1dPlugin(std::string(name), fc);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed to create CausalConv1dPlugin: %s", e.what());
-    }
-    return nullptr;
-}
-
-IPluginV2* CausalConv1dPluginCreator::deserializePlugin(
-    char const* name, void const* serialData, size_t serialLength) noexcept
-{
-    try
-    {
-        auto* plugin = new CausalConv1dPlugin(name, serialData, serialLength);
-        plugin->setPluginNamespace(mNamespace.c_str());
-        return plugin;
-    }
-    catch (std::exception const& e)
-    {
-        LOG_ERROR("Failed to deserialize CausalConv1dPlugin: %s", e.what());
     }
     return nullptr;
 }

@@ -17,10 +17,6 @@ tests:
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mxlr64]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mxlr64-llm_lora]
 
-  # === Qwen2.5-0.5B FP16 + TRT native attention (OOTB) ===
-  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs2-mxil2048-ootb]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs2-mxil2048-ootb-llm_basic]
-
   # === Qwen3-0.6B INT8_SQ (INT8 SmoothQuant + accuracy) ===
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-INT8-SQ-int8_sq-mxsl8192-mxbs2-mxil8192]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-INT8-SQ-int8_sq-mxsl8192-mxbs2-mxil8192-mmlu_5-bs2]

@@ -16,6 +16,8 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 - Set `TRT_PACKAGE_DIR` for all C++ builds; set `LLM_SDK_DIR` for all Python tests
 - Set `LD_LIBRARY_PATH` before running any built binary: `export LD_LIBRARY_PATH=$TRT_PACKAGE_DIR/lib:$LD_LIBRARY_PATH`
 - Git submodules must be initialized: `git submodule update --init` (googletest, nlohmann/json, NVTX)
+- Model validation must exercise `export -> build -> inference` in that order. Export-only checks are useful smoke
+  tests, but they are not sufficient evidence that a model works.
 
 ## Common Commands
 
@@ -28,6 +30,7 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 | C++ unit tests (all) | `./build/unitTest` |
 | C++ unit tests (filter) | `./build/unitTest --gtest_filter="LoggerTest.*"` |
 | Python package (install) | `pip install -r requirements.txt && python -m build --wheel --outdir dist . && pip install dist/*.whl` |
+| Python tool extras | `pip install ".[tools]"` |
 | Python test suite | `pytest --priority=l0_pipeline_a30 -v` |
 | Single Python test | `pytest tests/defs/test_model_export.py -v` |
 | Python unit tests | `pytest tests/python-unittests/ -v` |
@@ -44,50 +47,46 @@ For detailed software design, see `docs/source/developer_guide/software-design/`
 
 The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ Engine Builder (TRT engine) → C++ Runtime (inference)`.
 
-**C++ Runtime (`cpp/`)** has two mutually exclusive inference paths, both via `handleRequest()`:
-- `LLMInferenceRuntime` — standard inference (single engine + tokenizer + optional multimodal)
-- `LLMInferenceSpecDecodeRuntime` — EAGLE speculative decoding (base + draft engines)
+**C++ Runtime (`cpp/`)** uses a single unified `LLMInferenceRuntime` class for all inference via `handleRequest()`. It supports both vanilla autoregressive decoding (single base engine) and speculative decoding modes (EAGLE, MTP — base + draft engines) through a pluggable `DecodingStrategy` layer.
 
 **C++ sub-packages:** `common/` (tensor, logging, utils), `kernels/` (FMHA/RoPE/MoE/Mamba/EAGLE), `plugins/` (TRT custom plugins), `builder/` (ONNX→TRT), `tokenizer/`, `multimodal/`, `profiling/`, `sampler/`.
 
-**Python package (`tensorrt_edgellm/`)** mirrors HuggingFace model interfaces with quantization-aware rewrites. See `docs/source/developer_guide/software-design/python-export-pipeline.md`.
-
-**Experimental LLM Loader (`experimental/llm_loader/`)** is a next-gen checkpoint-based model loader that implements LLM architectures from scratch using ONNX builtin + custom ops (the only format EdgeLLM's compiler accepts). Instead of tracing HuggingFace FX graphs (which are unstable), it reads the stable HF checkpoint weights directly.
+**Python package (`tensorrt_edgellm/`)** is the checkpoint-based export frontend. It implements LLM architectures from scratch using ONNX builtin + custom ops (the only format EdgeLLM's compiler accepts). Instead of tracing HuggingFace FX graphs (which are unstable), it reads the stable HF checkpoint weights directly.
 - `model.py` — `AutoModel.from_pretrained()` factory with registry-based dispatch
 - `config.py` — `ModelConfig`/`QuantConfig` for parsing HF `config.json`
 - `checkpoint/loader.py` — Safetensors weight loading; `repacking.py` — weight repacking
 - `onnx/export.py` — Export via `torch.onnx.export(dynamo=True)`; `onnx_custom_schemas.py` — custom op definitions; `dynamo_translations.py` — custom translation rules
 - `models/` — Per-architecture implementations: `default/` (standard decoder + Mamba hybrid), `nemotron_h/` (hybrid Mamba2), `qwen3_moe/` (sparse MoE)
 - `models/ops.py` — Shared custom operations; `models/linear.py` — Shared linear layer implementations
+- `quantization/` — ModelOpt-based checkpoint quantization implementation
+- `scripts/` — All user-facing Python command entry points
 - Supported quant formats: `fp16`, `fp8`, `nvfp4`, `int4_awq`, `int4_awq_modelopt`, `int4_gptq`, `int8_sq`, `mixed_precision`
 
 ### CLI Entry Points (from `pyproject.toml`)
 
 | Command | Script |
 |---------|--------|
-| `tensorrt-edgellm-quantize-llm` | `tensorrt_edgellm.scripts.quantize_llm:main` |
-| `tensorrt-edgellm-export-llm` | `tensorrt_edgellm.scripts.export_llm:main` |
-| `tensorrt-edgellm-export-visual` | `tensorrt_edgellm.scripts.export_visual:main` |
-| `tensorrt-edgellm-export-audio` | `tensorrt_edgellm.scripts.export_audio:main` |
-| `tensorrt-edgellm-export-action` | `tensorrt_edgellm.scripts.export_action:main` |
-| `tensorrt-edgellm-quantize-draft` | `tensorrt_edgellm.scripts.quantize_draft:main` |
-| `tensorrt-edgellm-export-draft` | `tensorrt_edgellm.scripts.export_draft:main` |
-| `tensorrt-edgellm-insert-lora` | LoRA insertion into ONNX |
-| `tensorrt-edgellm-reduce-vocab` | Vocabulary reduction utility |
+| `tensorrt-edgellm-quantize` | `tensorrt_edgellm.scripts.quantize:main` |
+| `tensorrt-edgellm-export` | `tensorrt_edgellm.scripts.export:main` |
+| `tensorrt-edgellm-insert-lora` | `tensorrt_edgellm.scripts.insert_lora:main` |
+| `tensorrt-edgellm-process-lora` | `tensorrt_edgellm.scripts.process_lora_weights:main` |
+| `tensorrt-edgellm-merge-lora` | `tensorrt_edgellm.scripts.merge_lora:main` |
+| `tensorrt-edgellm-reduce-vocab` | `tensorrt_edgellm.scripts.reduce_vocab:main` |
+| `tensorrt-edgellm-preprocess-audio` | `tensorrt_edgellm.scripts.preprocess_audio:main` |
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `cpp/runtime/llmInferenceRuntime.{h,cpp}` | Main runtime entry point (`handleRequest()`) |
+| `cpp/runtime/llmInferenceRuntime.{h,cpp}` | Unified runtime entry point — vanilla + speculative decoding (`handleRequest()`) |
 | `cpp/runtime/llmEngineRunner.{h,cpp}` | Core TRT execution engine |
-| `cpp/runtime/llmInferenceSpecDecodeRuntime.{h,cpp}` | EAGLE speculative decoding runtime |
 | `cpp/common/tensor.{h,cpp}` | RAII GPU/CPU tensor abstraction |
 | `cpp/sampler/sampling.{cu,h}` | GPU token sampling |
 | `tensorrt_edgellm/__init__.py` | Python API entry points |
-| `tensorrt_edgellm/llm_models/models/llm_model.py` | Base LLM model (Llama, Qwen, etc.) |
-| `tensorrt_edgellm/quantization/llm_quantization.py` | Quantization orchestration |
-| `tensorrt_edgellm/onnx_export/llm_export.py` | ONNX export orchestration |
+| `tensorrt_edgellm/model.py` | Checkpoint model factory |
+| `tensorrt_edgellm/models/default/modeling_default.py` | Base LLM model (Llama, Qwen, etc.) |
+| `tensorrt_edgellm/quantization/quantize.py` | Quantization orchestration |
+| `tensorrt_edgellm/scripts/export.py` | ONNX export orchestration |
 | `tests/conftest.py` | Pytest configuration, YAML-driven test selection |
 
 ## Anti-Patterns / Gotchas
@@ -99,9 +98,8 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 - **FMHA kernels are SM-specific** — built per SM arch. When adding new SM support, update `cpp/CMakeLists.txt` FMHA build lists and optionally `cmake/CuteDslFMHA.cmake` for Blackwell+.
 - **Plugin shared library** — `NvInfer_edgellm_plugin` is shared (not static) because TRT loads plugins dynamically.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
-- **HF model consistency** — Python model classes in `llm_models/` must stay consistent with HuggingFace APIs when adding new models.
+- **HF checkpoint consistency** — Python model classes in `models/` must stay compatible with HuggingFace checkpoint tensor names when adding new models.
 - **Pinned dependencies** — `transformers`, `nvidia-modelopt`, `onnx`, and `torch` versions are pinned in `pyproject.toml`. Changing them can break export/quantization. Check compatibility before bumping.
-- **Two model loader paths** — `tensorrt_edgellm/llm_models/` (production, HF-mirroring) and `experimental/llm_loader/models/` (next-gen, checkpoint-based ONNX custom ops) are independent implementations. Don't confuse them.
 
 ## Development Workflow
 
@@ -133,6 +131,10 @@ CI tests are YAML-driven and parametrized by `--priority`.
 | Test lists (YAML) | `tests/test_lists/` | Per-GPU/platform test parametrization |
 | Code coverage | `scripts/run_coverage.sh` | gcov + SonarQube report |
 
+For model-facing changes, the expected test shape is `tensorrt-edgellm-export`
+followed by engine build and runtime inference. Use export-only priorities only
+as producer/smoke coverage for downstream pipeline jobs.
+
 ### CI Stages
 
 | Stage | Purpose |
@@ -146,9 +148,8 @@ CI tests are YAML-driven and parametrized by `--priority`.
 
 | Priority | GPU/Device | Type |
 |----------|-----------|------|
-| `l0_export_ampere` | A30 (x86) | Legacy ONNX export |
-| `l0_llm_loader_export_ampere` | A30 (x86) | `llm_loader` Ampere export |
-| `l0_llm_loader_export` | B100/Thor (x86) | `llm_loader` FP8/NVFP4 export |
+| `l0_checkpoint_export_ampere` | A30 (x86) | `tensorrt_edgellm` Ampere export |
+| `l0_checkpoint_export` | B100/Thor (x86) | `tensorrt_edgellm` FP8/NVFP4 export |
 | `l0_pipeline_a30` | A30 | Full pipeline |
 | `l0_pipeline_orin` | Jetson Orin (remote) | On-device pipeline |
 | `l0_pipeline_rtx5080` | RTX 5080 | FP8 small model pipeline |
@@ -157,7 +158,8 @@ CI tests are YAML-driven and parametrized by `--priority`.
 | `l0_pipeline_thor_2` | Drive Thor 2 (remote) | On-device FP8+KV pipeline |
 | `l0_python_ut` | Any | Python unit tests |
 
-Test parameter format: `ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additional-Params]`. See `tests/README.md`.
+Runtime test parameter format: `ModelName-Precision-[LmHeadPrecision-]MaxSeqLen-MaxBatchSize-MaxInputLen-[Additional-Params]`.
+Export tests omit sequence length, batch, and input length parameters. See `tests/README.md`.
 
 ## Key Documentation
 

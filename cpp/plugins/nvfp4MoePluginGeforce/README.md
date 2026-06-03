@@ -19,29 +19,31 @@ build `cute.Tensor` layouts from raw pointers and runtime `Int32`
 extents, so one AOT binary handles any (I, E, top_k) tuple meeting the
 alignment contract below.
 
-Two dims are **compile-time variant axes** and require a kernel rebuild
+One dim is a **compile-time variant axis** and requires a kernel rebuild
 to change:
 * The **MMA N-tile** currently dispatches n128. Add another dispatch axis
   after rebuilding the artifact pack and re-enabling n256 in
   `CuteDslNvfp4MoeRunner::selectMmaTilerN`.
-* The **hidden_size (K)** is baked into each AOT binary via the
-  `--hidden_size` flag on the export scripts, because
-  `_setup_attributes()` runs a Python-level `ab_stage` divisibility
-  search that cannot trace with a symbolic K.
-  `CuteDslNvfp4MoeRunner::kSupportedHiddenSize` declares the currently
-  supported value (see `cuteDslNvfp4MoeRunner.h`).
+
+The **hidden_size (K)** is runtime-shaped in the AOT wrapper. The only
+constraint is `H > 0 && H % kHiddenSizeAlignment == 0`, where
+`kHiddenSizeAlignment = kCuteDslTileK * kStaticAbStage = 128 * 2 = 256`
+in the current build. That divisor guarantees the K-tile mainloop pipeline
+drains cleanly with the AOT-baked `ab_stage = 2`. Validated for H in
+`{1024, 2048}`; other multiples of 256 are expected to work by shape
+polymorphism but should be accuracy-checked before production use.
 
 | Parameter | Supported values |
 |---|---|
 | `io_dtype` | FP16 |
 | `activation_type` | identity, silu, swiglu, gelu, relu2 |
 | `backend` | decode + prefill (`auto` picks decode when `num_tokens*top_k <= 640` else prefill; mirrors `select_sm120_moe_backend`) |
-| `hidden_size` (H) | Must equal `CuteDslNvfp4MoeRunner::kSupportedHiddenSize` (currently 2048) |
+| `hidden_size` (H) | positive multiple of `kHiddenSizeAlignment` (= 256 = `kCuteDslTileK * kStaticAbStage`) |
 | `moe_inter_size` (I) | `I > 0`, `I % kLevelTileN == 0` (128) |
 | `num_experts` (E) | `E > 0` |
 | `top_k` | `0 < top_k <= E` |
 
-The plugin's `configurePlugin` enforces the `hidden_size` equality and
+The plugin's `configurePlugin` enforces the hidden-size divisibility and
 the alignment rules, emitting a clear error when they are violated.
 `CuteDslNvfp4MoeRunner::canImplement` is the authoritative source.
 
@@ -92,24 +94,19 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
 
 ## Build
 
-1. Generate the AOT artifact (requires `nvidia-cutlass-dsl==4.4.1`,
+1. Generate the AOT artifact (requires `nvidia-cutlass-dsl==4.5.1`,
    `cuda-python`, `cupy-cuda13x`, and a sm_120 / sm_121 GPU):
 
    ```bash
    python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe
    ```
 
-   SM120 artifact generation does not need a CuTeDSL source patch. SM121
-   fused MoE artifact generation does. Before building the `sm_121` artifact,
-   check or apply the patch with:
-
-   ```bash
-   python kernelSrcs/nvfp4_fused_moe_cutedsl/patch_cutedsl_sm121_ops.py --check
-   python kernelSrcs/nvfp4_fused_moe_cutedsl/patch_cutedsl_sm121_ops.py --apply
-   ```
-
-   `build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121` enforces the
-   check and prints the patcher command if the installed package is unpatched.
+   `nvidia-cutlass-dsl==4.5.1` supports the `sm_121a` architecture used by
+   SM121.
+   No local CuTeDSL source patch is required for fused MoE artifact generation on
+   SM121. `build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121` sets
+   `CUTE_DSL_ARCH=sm_121a` for fused MoE so the generated images target SM121
+   directly.
 
    Output lands in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/` and
    includes `cutedsl_nvfp4_fused_moe_all.h`.
@@ -128,24 +125,10 @@ Block scales use the contiguous physical CuTeDSL NVFP4 layout
 
 ## Retargeting other shapes
 
-For `(I, E, top_k)` changes that still match the alignment contract
-(`I % 128 == 0`, `0 < top_k <= E`) and keep `H == kSupportedHiddenSize`:
-no rebuild needed. Configure the plugin with the desired tuple and the
-runner will use the n128 N-tile variant at launch.
-
-For a different hidden_size, the kernel pack must be rebuilt:
-
-1. Edit `_FUSED_MOE_K` (well, the inline `"--hidden_size", "2048"`
-   entries) in
-   [`build_cutedsl.py`](../../../kernelSrcs/build_cutedsl.py) -- change
-   to the new K, or add a second set of 16 variants suffixed with
-   `_h<K>` if you want both.
-2. Update `CuteDslNvfp4MoeRunner::kSupportedHiddenSize` in
-   [`cuteDslNvfp4MoeRunner.h`](../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeRunner.h)
-   (or promote it to a dispatch axis -- see `selectMmaTilerN` for the
-   pattern).
-3. Re-run `python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe`
-   and rebuild the plugin.
+For `(H, I, E, top_k)` changes that still match the alignment contract
+(`H > 0 && H % 256 == 0`, `I % 128 == 0`, `0 < top_k <= E`): no rebuild
+needed. Configure the plugin with the desired tuple and the runner will use
+the n128 N-tile variant at launch.
 
 If a new MMA N-tile granularity is needed (e.g. `n64` / `n512`), add a
 new `KernelVariant` row per activation / backend to

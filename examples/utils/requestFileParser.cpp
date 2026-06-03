@@ -126,11 +126,6 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                 batchRequest.disableSpecDecode = true;
             }
 
-            check::check(requestItem.contains("messages") && requestItem["messages"].is_array(),
-                "Each request object must contain a 'messages' array");
-
-            auto const& messagesArray = requestItem["messages"];
-
             std::string requestLoraName;
             if (requestItem.contains("lora_name") && !requestItem["lora_name"].is_null())
             {
@@ -150,14 +145,20 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                     "Different LoRA weights within the same batch are not supported");
             }
 
-            std::vector<rt::Message> chatMessages;
-            std::vector<rt::imageUtils::ImageData> imageBuffers;
-            std::vector<rt::audioUtils::AudioData> audioBuffers;
+            // Per-request messages
+            check::check(requestItem.contains("messages") && requestItem["messages"].is_array(),
+                "Each request object must contain a 'messages' array");
+
+            auto const& messagesArray = requestItem["messages"];
 
             check::check(messagesArray.size() <= limits::security::kMaxMessagesPerRequest,
                 format::fmtstr("Input rejected: too many messages in request %zu: %zu (max: %zu). Limit defined in %s.",
                     requestIdx, messagesArray.size(), limits::security::kMaxMessagesPerRequest,
                     limits::kInputLimitsLocation));
+
+            std::vector<rt::Message> chatMessages;
+            std::vector<rt::imageUtils::ImageData> imageBuffers;
+            std::vector<rt::audioUtils::AudioData> audioBuffers;
 
             for (auto const& messageJson : messagesArray)
             {
@@ -258,6 +259,29 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             request.messages = std::move(chatMessages);
             request.imageBuffers = std::move(imageBuffers);
             request.audioBuffers = std::move(audioBuffers);
+
+            // Optional per-request stop strings ("stop": string | string[]).
+            if (requestItem.contains("stop") && !requestItem["stop"].is_null())
+            {
+                auto const& stopField = requestItem["stop"];
+                if (stopField.is_string())
+                {
+                    request.stopStrings.push_back(stopField.get<std::string>());
+                }
+                else if (stopField.is_array())
+                {
+                    for (auto const& s : stopField)
+                    {
+                        check::check(s.is_string(), "Each entry in 'stop' must be a string");
+                        request.stopStrings.push_back(s.get<std::string>());
+                    }
+                }
+                else
+                {
+                    throw std::runtime_error("'stop' must be a string or array of strings");
+                }
+            }
+
             batchRequest.requests.push_back(std::move(request));
         }
 

@@ -26,7 +26,7 @@
 #include "common/trtUtils.h"
 #include "profiling/metrics.h"
 #include "runtime/imageUtils.h"
-#include "runtime/llmInferenceSpecDecodeRuntime.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 
 #include <chrono>
@@ -92,7 +92,7 @@ private:
     cudaStream_t mStream{nullptr};
 };
 
-//! Unified Python wrapper for LLMInferenceSpecDecodeRuntime.
+//! Unified Python wrapper for LLMInferenceRuntime.
 //! Supports both vanilla decoding (no draft model) and Eagle speculative decoding
 //! through constructor overloading — mirrors the C++ unified runtime.
 class PyLLMRuntime
@@ -103,8 +103,7 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        mRuntime = std::make_unique<LLMInferenceSpecDecodeRuntime>(
-            engineDir, multimodalEngineDir, loraWeightsMap, mStream.get());
+        mRuntime = std::make_unique<LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraWeightsMap, mStream.get());
     }
 
     //! Eagle speculative decoding constructor.
@@ -113,8 +112,8 @@ public:
         int32_t verifyTreeSize)
     {
         mPluginHandle = loadEdgellmPluginLib();
-        EagleDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
-        mRuntime = std::make_unique<LLMInferenceSpecDecodeRuntime>(
+        SpecDecodeDraftingConfig draftingConfig{draftTopK, draftStep, verifyTreeSize};
+        mRuntime = std::make_unique<LLMInferenceRuntime>(
             engineDir, multimodalEngineDir, loraWeightsMap, draftingConfig, mStream.get());
     }
 
@@ -151,9 +150,9 @@ public:
         return mRuntime->getGenerationMetrics();
     }
 
-    metrics::EagleGenerationMetrics const& getEagleGenerationMetrics() const
+    metrics::SpecDecodeGenerationMetrics const& getSpecDecodeGenerationMetrics() const
     {
-        return mRuntime->getEagleGenerationMetrics();
+        return mRuntime->getSpecDecodeGenerationMetrics();
     }
 
     metrics::MultimodalMetrics getMultimodalMetrics() const
@@ -163,7 +162,7 @@ public:
 
 private:
     CudaStreamWrapper mStream;
-    std::unique_ptr<LLMInferenceSpecDecodeRuntime> mRuntime;
+    std::unique_ptr<LLMInferenceRuntime> mRuntime;
     std::unique_ptr<void, DlDeleter> mPluginHandle;
 };
 
@@ -203,10 +202,10 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readonly("generated_tokens", &metrics::LLMGenerationMetrics::generatedTokens)
         .def("get_total_runs", &metrics::LLMGenerationMetrics::getTotalRuns);
 
-    py::class_<metrics::EagleGenerationMetrics>(m, "EagleGenerationMetrics")
-        .def_readonly("total_iterations", &metrics::EagleGenerationMetrics::totalIterations)
-        .def_readonly("total_generated_tokens", &metrics::EagleGenerationMetrics::totalGeneratedTokens)
-        .def("get_total_runs", &metrics::EagleGenerationMetrics::getTotalRuns);
+    py::class_<metrics::SpecDecodeGenerationMetrics>(m, "SpecDecodeGenerationMetrics")
+        .def_readonly("total_iterations", &metrics::SpecDecodeGenerationMetrics::totalIterations)
+        .def_readonly("total_generated_tokens", &metrics::SpecDecodeGenerationMetrics::totalGeneratedTokens)
+        .def("get_total_runs", &metrics::SpecDecodeGenerationMetrics::getTotalRuns);
 
     py::class_<metrics::MultimodalMetrics>(m, "MultimodalMetrics")
         .def_readonly("total_images", &metrics::MultimodalMetrics::totalImages)
@@ -282,7 +281,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         }),
             py::arg("messages"))
         .def_readwrite("messages", &LLMGenerationRequest::Request::messages)
-        .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers);
+        .def_readwrite("image_buffers", &LLMGenerationRequest::Request::imageBuffers)
+        .def_readwrite("stop_strings", &LLMGenerationRequest::Request::stopStrings);
 
     // ========================================================================
     // Streaming
@@ -340,7 +340,8 @@ PYBIND11_MODULE(_edgellm_runtime, m)
     py::class_<LLMGenerationResponse>(m, "LLMGenerationResponse")
         .def(py::init<>())
         .def_readwrite("output_ids", &LLMGenerationResponse::outputIds)
-        .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts);
+        .def_readwrite("output_texts", &LLMGenerationResponse::outputTexts)
+        .def_readonly("finish_reasons", &LLMGenerationResponse::finishReasons);
 
     // ========================================================================
     // Runtime: unified (vanilla + Eagle speculative decoding)
@@ -362,11 +363,13 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             "Capture CUDA graphs for optimized decoding")
         .def("save_system_prompt_kv_cache", &PyLLMRuntime::saveSystemPromptKVCache, py::arg("prompt"),
             py::arg("lora_weights_name") = "", "Pre-generate and cache system prompt KV cache")
-        .def("has_draft_model", &PyLLMRuntime::hasDraftModel, "Check if Eagle draft model is loaded")
+        .def("has_draft_model", &PyLLMRuntime::hasDraftModel, "Check if speculative decoding draft model is loaded")
         .def("get_prefill_metrics", &PyLLMRuntime::getPrefillMetrics, py::return_value_policy::reference_internal)
         .def("get_generation_metrics", &PyLLMRuntime::getGenerationMetrics, py::return_value_policy::reference_internal)
-        .def("get_eagle_generation_metrics", &PyLLMRuntime::getEagleGenerationMetrics,
+        .def("get_spec_decode_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
             py::return_value_policy::reference_internal)
+        .def("get_eagle_generation_metrics", &PyLLMRuntime::getSpecDecodeGenerationMetrics,
+            py::return_value_policy::reference_internal) // deprecated alias
         .def("get_multimodal_metrics", &PyLLMRuntime::getMultimodalMetrics);
 
     // ========================================================================

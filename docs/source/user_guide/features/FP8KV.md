@@ -16,21 +16,21 @@ FP8 KV cache reduces memory usage by quantizing the key-value cache from FP16 to
 
 ## Workflow
 
-FP8 KV cache is checkpoint-driven in the `experimental.quantization` ->
-`llm_loader` workflow. If checkpoint metadata marks KV cache quantization as
-`fp8`, `llm_loader` enables FP8 KV cache in the exported ONNX automatically.
+FP8 KV cache is checkpoint-driven in the `tensorrt-edgellm-quantize` ->
+`tensorrt_edgellm` workflow. If checkpoint metadata marks KV cache quantization as
+`fp8`, `tensorrt_edgellm` enables FP8 KV cache in the exported ONNX automatically.
 There is no FP8 KV export flag in this path.
 
 ```bash
-export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:$PYTHONPATH
 
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-8B \
   --output_dir /tmp/qwen3_nvfp4_fp8kv \
   --quantization nvfp4 \
   --kv_cache_quantization fp8
 
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   /tmp/qwen3_nvfp4_fp8kv \
   /tmp/qwen3_nvfp4_fp8kv_onnx
 ```
@@ -60,18 +60,18 @@ For EAGLE, quantize the base checkpoint with `--kv_cache_quantization fp8`,
 export it with `--eagle-base`, and export the draft checkpoint separately.
 
 ```bash
-python -m experimental.quantization llm \
+tensorrt-edgellm-quantize llm \
   --model_dir Qwen/Qwen3-8B \
   --output_dir Qwen3-8B/quantized-base-nvfp4-fp8kv \
   --quantization nvfp4 \
   --kv_cache_quantization fp8
 
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   Qwen3-8B/quantized-base-nvfp4-fp8kv \
   Qwen3-8B/onnx/base \
   --eagle-base
 
-python -m llm_loader.export_all_cli \
+tensorrt-edgellm-export \
   /path/to/eagle3_draft \
   Qwen3-8B/onnx/draft
 ```

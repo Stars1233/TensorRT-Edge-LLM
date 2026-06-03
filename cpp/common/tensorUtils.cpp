@@ -17,9 +17,9 @@
 
 #include "tensor.h"
 
-#include "NvInferVersion.h"
 #include "checkMacros.h"
 #include "cudaMacros.h"
+#include "trtUtils.h"
 #include <algorithm>
 #include <iomanip>
 #include <memory>
@@ -34,31 +34,6 @@ namespace rt
 {
 namespace utils
 {
-
-constexpr char const* getDataTypeString(DataType const dataType)
-{
-    switch (dataType)
-    {
-    case DataType::kINT64: return "INT64";
-    case DataType::kINT32: return "INT32";
-    case DataType::kFLOAT: return "FLOAT32";
-    case DataType::kHALF: return "FLOAT16";
-    case DataType::kBF16: return "BFLOAT16";
-    case DataType::kFP8: return "FLOAT8_E4M3";
-    case DataType::kINT8: return "INT8";
-    case DataType::kUINT8: return "UINT8";
-    case DataType::kBOOL: return "BOOL";
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 12)
-    case DataType::kE8M0: return "FLOAT8_E8M0";
-#endif
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
-    case DataType::kFP4: return "FLOAT4";
-#endif
-    case DataType::kINT4: return "INT4";
-    }
-
-    return "UNKNOWN";
-}
 
 constexpr char const* getDeviceTypeString(DeviceType deviceType)
 {
@@ -338,7 +313,7 @@ std::string formatString(Tensor const& tensor)
     }
     }
     ss << ", shape=" << shape.formatString() << ", device=" << utils::getDeviceTypeString(tensor.getDeviceType())
-       << ", dtype=" << utils::getDataTypeString(tensor.getDataType()) << ")";
+       << ", dtype=" << getDataTypeString(tensor.getDataType()) << ")";
     return ss.str();
 }
 

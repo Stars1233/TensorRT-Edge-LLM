@@ -45,9 +45,10 @@ void outputPrefillProfile(std::ostream& output, trt_edgellm::metrics::LLMPrefill
 //! Output generation stage summary (naive decoding) to ostream
 void outputGenerationProfile(std::ostream& output, trt_edgellm::metrics::LLMGenerationMetrics const& generationMetrics);
 
-//! Output Eagle generation stage summary to ostream
-void outputEagleGenerationProfile(
-    std::ostream& output, trt_edgellm::metrics::EagleGenerationMetrics const& eagleGenerationMetrics);
+//! Output speculative generation stage summary to ostream
+void outputSpecDecodeGenerationProfile(std::ostream& output,
+    trt_edgellm::metrics::SpecDecodeGenerationMetrics const& specDecodeGenerationMetrics,
+    char const* strategyName = "spec_decode");
 
 //! Output multimodal processing summary to ostream
 void outputMultimodalProfile(std::ostream& output, trt_edgellm::metrics::MultimodalMetrics const& multimodalMetrics);
@@ -68,9 +69,10 @@ void addJsonPrefillSummary(nlohmann::json& summary, trt_edgellm::metrics::LLMPre
 void addJsonGenerationSummary(
     nlohmann::json& summary, trt_edgellm::metrics::LLMGenerationMetrics const& generationMetrics);
 
-//! Add JSON for Eagle generation stage to existing json object
-void addJsonEagleGenerationSummary(
-    nlohmann::json& summary, trt_edgellm::metrics::EagleGenerationMetrics const& eagleGenerationMetrics);
+//! Add JSON for speculative generation stage to existing json object
+void addJsonSpecDecodeGenerationSummary(nlohmann::json& summary,
+    trt_edgellm::metrics::SpecDecodeGenerationMetrics const& specDecodeGenerationMetrics,
+    char const* strategyName = "spec_decode");
 
 //! Add JSON for multimodal processing to existing json object
 void addJsonMultimodalSummary(

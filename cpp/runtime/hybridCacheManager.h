@@ -130,7 +130,7 @@ public:
 
     //! @brief Minimal read-only view of one pre-computed KV head-dim group.
     //!
-    //! Exposes just what callers (e.g. EAGLE base-verify) need to launch a
+    //! Exposes just what callers (e.g. SpecDecode base verification) need to launch a
     //! batched per-layer kernel: a device-resident `KVLayerInfo` array plus
     //! the dispatch parameters. Internal bookkeeping (`hostInfos`,
     //! `deviceScratchInfos`, etc.) stays private.

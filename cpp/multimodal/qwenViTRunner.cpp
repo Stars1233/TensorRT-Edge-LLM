@@ -46,12 +46,12 @@ QwenViTRunner::QwenViTRunner(
 {
     if (!validateAndFillConfig(engineDir))
     {
-        LOG_ERROR("QwenViTRunner::QwenViTRunner(): Failed to validate and fill config");
+        LOG_ERROR("Failed to validate and fill config");
         throw std::runtime_error("QwenViTRunner::QwenViTRunner(): Failed to validate and fill config");
     }
     if (!allocateBuffer(stream))
     {
-        LOG_ERROR("QwenViTRunner::QwenViTRunner(): Failed to allocate buffer");
+        LOG_ERROR("Failed to allocate buffer");
         throw std::runtime_error("QwenViTRunner::QwenViTRunner(): Failed to allocate buffer");
     }
 }
@@ -64,7 +64,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     std::ifstream configFileStream(configPath);
     if (!configFileStream.is_open())
     {
-        LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Failed to open config file: %s", configPath.c_str());
+        LOG_ERROR("Failed to open config file: %s", configPath.c_str());
         return false;
     }
 
@@ -75,7 +75,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     }
     catch (Json::parse_error const& e)
     {
-        LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Failed to parse config file with error: %s", e.what());
+        LOG_ERROR("Failed to parse config file with error: %s", e.what());
         return false;
     }
 
@@ -85,7 +85,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
         && mModelType != multimodal::ModelType::QWEN3_VL && mModelType != multimodal::ModelType::QWEN3_5
         && mModelType != multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
-        LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Invalid model type: %s", modelTypeStr.c_str());
+        LOG_ERROR("Invalid model type: %s", modelTypeStr.c_str());
         return false;
     }
 
@@ -113,9 +113,8 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     }
     if (mConfig.mropeSectionH <= 0 || mConfig.mropeSectionW <= 0)
     {
-        LOG_ERROR(
-            "QwenViTRunner::validateAndFillConfig(): failed to parse mrope_section in text_config. Got H=%d, W=%d",
-            mConfig.mropeSectionH, mConfig.mropeSectionW);
+        LOG_ERROR("Failed to parse mrope_section in text_config. Got H=%d, W=%d", mConfig.mropeSectionH,
+            mConfig.mropeSectionW);
         return false;
     }
 
@@ -156,7 +155,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     if (mConfig.minImageTokensPerImage <= 0 || mConfig.maxImageTokensPerImage <= 0)
     {
         LOG_ERROR(
-            "QwenViTRunner::validateAndFillConfig(): minImageTokensPerImage and maxImageTokensPerImage must be "
+            "minImageTokensPerImage and maxImageTokensPerImage must be "
             "positive, got %d and %d",
             mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage);
         return false;
@@ -168,8 +167,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     std::ifstream preprocessorConfigFileStream(preprocessorConfigPath);
     if (!preprocessorConfigFileStream.is_open())
     {
-        LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Failed to open preprocessor config file: %s",
-            preprocessorConfigPath.c_str());
+        LOG_ERROR("Failed to open preprocessor config file: %s", preprocessorConfigPath.c_str());
         return false;
     }
     try
@@ -179,8 +177,7 @@ bool QwenViTRunner::validateAndFillConfig(std::string const& engineDir)
     }
     catch (Json::parse_error const& e)
     {
-        LOG_ERROR("QwenViTRunner::validateAndFillConfig(): Failed to parse preprocessor config file with error: %s",
-            e.what());
+        LOG_ERROR("Failed to parse preprocessor config file with error: %s", e.what());
         return false;
     }
 
@@ -791,7 +788,7 @@ void QwenViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, bool imageOnly)
+    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<std::vector<int64_t>> imageGridTHWs;
     std::vector<int64_t> imageTokenLengths;
@@ -802,13 +799,18 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
         imagePreprocess(request, imageGridTHWs, imageTokenLengths, numImages, !imageOnly, stream);
         if (!imageOnly)
         {
+            if (!mropeCosSinOut.has_value())
+            {
+                LOG_ERROR("mropeCosSinOut is required when imageOnly=false.");
+                return false;
+            }
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
-            generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+            generateMropeParams(batchedInputIds, imageGridTHWs, mropeCosSinOut.value().get(), stream);
         }
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("QwenViTRunner::preprocess() failed: %s", e.what());
+        LOG_ERROR("Failed: %s", e.what());
         return false;
     }
 
@@ -816,18 +818,24 @@ bool QwenViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 }
 
 bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream)
 {
     if (systemPrompt.empty())
     {
         return true;
     }
 
+    if (!mropeCosSinOut.has_value())
+    {
+        LOG_ERROR("mropeCosSinOut is required for non-empty system prompts.");
+        return false;
+    }
+
     // systemPrompt is already formatted by tokenizer's applyChatTemplate
     std::vector<int32_t> ids = tokenizer->encode(systemPrompt);
     if (ids.empty())
     {
-        LOG_ERROR("QwenViTRunner::preprocessSystemPrompt(): Failed to encode system prompt.");
+        LOG_ERROR("Failed to encode system prompt.");
         return false;
     }
     std::vector<std::vector<int32_t>> batchedInputIds;
@@ -836,7 +844,7 @@ bool QwenViTRunner::preprocessSystemPrompt(std::string const& systemPrompt, toke
 
     try
     {
-        generateMropeParams(batchedInputIds, imageGridTHWs, ropeRotaryCosSinDevice, stream);
+        generateMropeParams(batchedInputIds, imageGridTHWs, mropeCosSinOut.value().get(), stream);
     }
     catch (std::exception const& e)
     {
@@ -889,14 +897,14 @@ bool QwenViTRunner::infer(cudaStream_t stream) noexcept
 
         if (!setEngineIOStatus)
         {
-            LOG_ERROR("QwenViTRunner::infer(): Failed to bind engine input tensors.");
+            LOG_ERROR("Failed to bind engine input tensors.");
             return false;
         }
 
         bool enqueueStatus = mVisualContext->enqueueV3(stream);
         if (!enqueueStatus)
         {
-            LOG_ERROR("QwenViTRunner::infer(): Failed to enqueue engine.");
+            LOG_ERROR("Failed to enqueue engine.");
             return false;
         }
     }

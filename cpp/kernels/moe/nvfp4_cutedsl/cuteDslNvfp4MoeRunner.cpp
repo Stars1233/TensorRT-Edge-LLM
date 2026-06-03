@@ -23,7 +23,6 @@
 #include "common/logger.h"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstring>
 
@@ -72,10 +71,11 @@ bool CuteDslNvfp4MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSiz
     // Shape-polymorphism contract (enforced by the shape-polymorphic AOT
     // wrappers): I must be positive and a multiple of the smallest MMA
     // N-tile (kLevelTileN = 128); topK / numExperts must be non-degenerate.
-    // hiddenSize (K) is a compile-time variant axis (kSupportedHiddenSize)
-    // because _setup_attributes() in moe_{decode,prefill}_kernel.py runs a
-    // Python-level ab_stage divisibility search that cannot trace with a
-    // symbolic K.
+    // hiddenSize (K) is runtime; the only constraint is divisibility by
+    // kHiddenSizeAlignment (= kCuteDslTileK * kStaticAbStage), which keeps the
+    // K-tile pipeline phase-aligned. This replaces the Python-level ab_stage
+    // divisor loop in moe_{decode,prefill}_kernel.py, which could not trace
+    // with a symbolic K.
     if (moeInterSize <= 0 || numExperts <= 0 || topK <= 0)
     {
         return false;
@@ -88,7 +88,7 @@ bool CuteDslNvfp4MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSiz
     {
         return false;
     }
-    if (hiddenSize != kSupportedHiddenSize)
+    if (hiddenSize <= 0 || hiddenSize % kHiddenSizeAlignment != 0)
     {
         return false;
     }

@@ -20,20 +20,20 @@ to specified requirements including tensor name processing, shape corrections, a
 format conversions.
 
 Usage:
-    python process_lora_weights.py --input_dir /path/to/adapter --output_dir /path/to/output
+    tensorrt-edgellm-process-lora --input_dir /path/to/adapter --output_dir /path/to/output
 """
 
 import argparse
 import sys
 import traceback
 
-from tensorrt_edgellm.onnx_export.lora import process_lora_weights_and_save
+from tensorrt_edgellm.lora.lora import process_lora_weights_and_save
 
 
 def main() -> None:
     """
     Main function that parses command line arguments and processes LoRA weights.
-    
+
     This function sets up argument parsing for the LoRA weight processing script
     and calls the process_lora_weights_and_save function with the provided parameters.
     """

@@ -33,7 +33,7 @@ sys.path.insert(0, str(
     Path(__file__).parent.parent.parent))  # For importing tensorrt_edgellm
 sys.path.insert(
     0, str(Path(__file__).parent.parent.parent /
-           "experimental"))  # For importing llm_loader as a top-level package
+           "experimental"))  # For importing the experimental server package
 
 # Import helper functions for auto-generating API documentation
 from helper import generate_module_rst_files, generate_python_api_rst
@@ -59,8 +59,7 @@ last_updated = datetime.datetime.now(
     datetime.timezone.utc).strftime("%B %d, %Y")
 
 
-# Get the version from the checkpoint-based loader first, with a fallback for
-# release branches that still keep the legacy package as the canonical source.
+# Get the package version from the checkpoint-based exporter.
 def _load_version(relative_path, module_name):
     version_path = os.path.abspath(
         os.path.join(os.path.dirname(__file__), relative_path))
@@ -71,15 +70,11 @@ def _load_version(relative_path, module_name):
 
 
 version = "0.0.1"
-for version_file, module_name in (
-    ("../../experimental/llm_loader/_version.py", "llm_loader_version"),
-    ("../../tensorrt_edgellm/version.py", "legacy_version"),
-):
-    try:
-        version = _load_version(version_file, module_name)
-        break
-    except Exception:
-        pass
+try:
+    version = _load_version("../../tensorrt_edgellm/_version.py",
+                            "tensorrt_edgellm_version")
+except Exception:
+    pass
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration

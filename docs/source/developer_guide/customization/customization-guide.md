@@ -1,30 +1,24 @@
 # Customization Guide
 
 New model and feature enablement should target the checkpoint-based workflow:
-`experimental/quantization` for checkpoint quantization and `experimental/llm_loader`
+`tensorrt_edgellm/quantization` for checkpoint quantization and `tensorrt_edgellm`
 for ONNX export. This guide describes the main extension points used by that
 workflow.
 
 For user commands, see [Quantization](../../user_guide/features/quantization.md)
-and [Checkpoint-Based Model Loader Design](../software-design/llm-loader.md).
-
-The deprecated `tensorrt_edgellm/` export package remains available in 0.7.0 and 0.7.1 for
-compatibility, but new model and feature work should target the experimental
-workflow. The deprecated export package is scheduled for removal in 0.8.0 after
-full feature parity is available in `experimental/quantization` and
-`experimental/llm_loader`.
+and [Checkpoint Exporter Design](../software-design/checkpoint-export.md).
 
 ## Export Customization Points
 
 | Area | Files | What to update |
 |------|-------|----------------|
-| Text model | `experimental/llm_loader/models/<family>/` | Add a native `torch.nn.Module` implementation when the default decoder is not enough. Keep parameter names aligned with the HuggingFace checkpoint. |
-| Registration | `experimental/llm_loader/__init__.py` | Register custom text classes with `register_model("<model_type>", ModelClass)`. |
-| Checkpoint parsing | `experimental/llm_loader/config.py`, `experimental/llm_loader/checkpoint/` | Add model-specific config fields, tensor remapping, fused-weight splitting, or quantization metadata handling. |
-| Weight loading | `experimental/llm_loader/checkpoint/loader.py`, `experimental/llm_loader/checkpoint/repacking.py` | Load safetensors, remap checkpoint keys, and repack quantized tensors into the layout consumed by the exported graph. |
-| Encoder export | `experimental/llm_loader/onnx/export_encoder.py` | Register visual, audio, or action encoder builders and config extraction rules. |
-| Component orchestration | `experimental/llm_loader/export_all_cli.py` | Add model-type classification for LLM-only, VLM, audio, TTS, Omni, VLA, EAGLE, or MTP checkpoints. |
-| Custom ops | `experimental/llm_loader/models/ops.py`, `experimental/llm_loader/onnx/dynamo_translations.py`, `experimental/llm_loader/onnx/onnx_custom_schemas.py` | Add torch stubs, ONNX translations, and schemas for TensorRT Edge-LLM custom ops. |
+| Text model | `tensorrt_edgellm/models/<family>/` | Add a native `torch.nn.Module` implementation when the default decoder is not enough. Keep parameter names aligned with the HuggingFace checkpoint. |
+| Registration | `tensorrt_edgellm/__init__.py` | Register custom text classes with `register_model("<model_type>", ModelClass)`. |
+| Checkpoint parsing | `tensorrt_edgellm/config.py`, `tensorrt_edgellm/checkpoint/` | Add model-specific config fields, tensor remapping, fused-weight splitting, or quantization metadata handling. |
+| Weight loading | `tensorrt_edgellm/checkpoint/loader.py`, `tensorrt_edgellm/checkpoint/repacking.py` | Load safetensors, remap checkpoint keys, and repack quantized tensors into the layout consumed by the exported graph. |
+| Encoder export | `tensorrt_edgellm/onnx/export_encoder.py` | Register visual, audio, or action encoder builders and config extraction rules. |
+| Component orchestration | `tensorrt_edgellm/scripts/export.py` | Add model-type classification for LLM-only, VLM, audio, TTS, Omni, VLA, EAGLE, or MTP checkpoints. |
+| Custom ops | `tensorrt_edgellm/models/ops.py`, `tensorrt_edgellm/onnx/dynamo_translations.py`, `tensorrt_edgellm/onnx/onnx_custom_schemas.py` | Add torch stubs, ONNX translations, and schemas for TensorRT Edge-LLM custom ops. |
 | Runtime/plugins | `cpp/plugins/`, `cpp/runtime/`, `cpp/multimodal/`, `cpp/action/` | Add runtime support only when the exported graph or model I/O needs new behavior. |
 
 Update [Supported Models](../../user_guide/getting_started/supported-models.md)
@@ -37,10 +31,10 @@ checkpoints. It does not export ONNX or build TensorRT engines.
 
 | Area | Files | What to update |
 |------|-------|----------------|
-| Quantization recipes | `experimental/quantization/quantization_configs.py` | Add ModelOpt recipe presets, exclusions, or component-specific overrides. |
-| Model loading and calibration | `experimental/quantization/quantize.py` | Add model loading fallbacks, calibration data handling, or pre-save checkpoint fixups. |
-| EAGLE draft quantization | `experimental/quantization/models/eagle3_draft.py` | Update draft-model calibration and checkpoint writing. |
-| CLI surface | `experimental/quantization/cli.py` | Expose a new supported option after the implementation and tests exist. |
+| Quantization recipes | `tensorrt_edgellm/quantization/quantization_configs.py` | Add ModelOpt recipe presets, exclusions, or component-specific overrides. |
+| Model loading and calibration | `tensorrt_edgellm/quantization/quantize.py` | Add model loading fallbacks, calibration data handling, or pre-save checkpoint fixups. |
+| EAGLE draft quantization | `tensorrt_edgellm/quantization/models/eagle3_draft.py` | Update draft-model calibration and checkpoint writing. |
+| CLI surface | `tensorrt_edgellm/quantization/cli.py` | Expose a new supported option after the implementation and tests exist. |
 
 Supported methods are documented in
 [Quantization](../../user_guide/features/quantization.md). GPTQ checkpoints are
@@ -50,16 +44,16 @@ loaded as pre-quantized checkpoints; this package does not create GPTQ models.
 
 1. Check whether the default `CausalLM` implementation can load the checkpoint.
 2. If the architecture needs custom behavior, add a model implementation under
-   `experimental/llm_loader/models/<family>/`.
-3. Register the `model_type` in `experimental/llm_loader/__init__.py`.
+   `tensorrt_edgellm/models/<family>/`.
+3. Register the `model_type` in `tensorrt_edgellm/__init__.py`.
 4. Add any required config promotion, tensor-key remapping, or quantized-weight
-   handling in `experimental/llm_loader/config.py` and `checkpoint/`.
-5. Export with `python -m llm_loader.export_all_cli <checkpoint> <output_dir>`
+   handling in `tensorrt_edgellm/config.py` and `checkpoint/`.
+5. Export with `tensorrt-edgellm-export <checkpoint> <output_dir>`
    and verify `llm_build` plus `llm_inference`.
 
 ## Adding A Multimodal Or Action Component
 
-Use `experimental/llm_loader/export_all_cli.py` as the component dispatcher.
+Use `tensorrt_edgellm/scripts/export.py` as the component dispatcher.
 Each exported component should have a stable subdirectory and a `config.json`
 that the C++ builder can consume.
 
@@ -80,9 +74,9 @@ engine's `max_kv_cache_capacity` to match the LLM engine build.
 ## Custom Operators
 
 Custom operators are declared as `torch.library.custom_op` stubs in
-`experimental/llm_loader/models/ops.py`, translated in
-`experimental/llm_loader/onnx/dynamo_translations.py`, and registered as ONNX
-schemas in `experimental/llm_loader/onnx/onnx_custom_schemas.py`.
+`tensorrt_edgellm/models/ops.py`, translated in
+`tensorrt_edgellm/onnx/dynamo_translations.py`, and registered as ONNX
+schemas in `tensorrt_edgellm/onnx/onnx_custom_schemas.py`.
 
 Use this path when a PyTorch expression must lower to a TensorRT Edge-LLM
 plugin, specialized runtime op, or fixed ONNX node pattern. Runtime support must

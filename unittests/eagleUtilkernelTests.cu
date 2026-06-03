@@ -1132,6 +1132,148 @@ TEST(EagleKernels, EagleBaseCommitKVCacheHeterogeneousLayers)
 }
 
 // ============================================================================
+// Test 8c: eagleBaseAssembleHiddenState
+// Description: Exercise the 3D hidden-state compaction independently. This is the production
+// path when the EAGLE accept step invokes the split assembler exactly once after looping the
+// per-layer KV commit.
+//
+// Phase 1 validates single-call compaction against expected values.
+//
+// Phase 2 validates the non-idempotency property documented on the public API: calling the
+// assembler twice produces different output than calling it once. For this to actually
+// manifest, the second call's read positions (driven by acceptedIndices) must lie inside the
+// write region of the first call. The kernel writes to flat positions [0, acceptLen) within
+// each batch's compacted slab (output stride = maxDepth), so we pick acceptedIndices whose
+// values are all < acceptLen. The specific pattern below (batch 0 = [2, 0, 1]) creates a cycle
+// in the index → position mapping; one call produces one permutation, two calls produce a
+// different permutation.
+// ============================================================================
+TEST(EagleKernels, EagleBaseAssembleHiddenStateNonIdempotent)
+{
+    cudaStream_t stream = nullptr;
+    // maxDepth=3 and acceptLen=3 with acceptedIndices all < 3 guarantees the first call's write
+    // region overlaps the second call's read region (both are positions [0, 3) of each slab),
+    // which is the precondition for non-idempotency to manifest.
+    int32_t maxDepth = 3;
+    // numTokens=8 keeps maxDepth < numTokens (the kernel relies on this invariant to avoid
+    // overwriting unread data during the single-call compaction) while staying compact.
+    int32_t numTokens = 8;
+    int32_t baseHiddenDim = 512;
+
+    int32_t batchSize = 2;
+
+    // Accept patterns that each form a non-trivial permutation of {0, 1, 2}. After the kernel
+    // runs, positions 0..2 of each slab hold the permuted input values; running the kernel
+    // again on those permuted values reads a different sequence and produces a different
+    // permutation, demonstrating non-idempotency.
+    //
+    // Batch 0: acceptedIndices=[2, 0, 1] → after 1 call: [input[2], input[0], input[1]]
+    //                                    → after 2 calls (reading from permuted buffer):
+    //                                      [buf[2], buf[0], buf[1]] = [input[1], input[2], input[0]]
+    // Batch 1: acceptedIndices=[1, 2, 0] → after 1 call: [input[1], input[2], input[0]]
+    //                                    → after 2 calls: [input[0], input[1], input[2]] (input order!)
+    std::vector<int32_t> inputAcceptedIndices = {
+        2, 0, 1, // Batch 0
+        1, 2, 0  // Batch 1
+    };
+    std::vector<int32_t> inputAcceptLengths = {3, 3};
+
+    // Seed input with distinct markers at positions 0..2 (the only positions the test reads),
+    // and leave positions 3..numTokens-1 as zero. Markers are deterministic so we can compute
+    // expected outputs by hand.
+    // Batch 0 positions [0, 1, 2] = [100, 200, 300]
+    // Batch 1 positions [0, 1, 2] = [1100, 1200, 1300]
+    std::vector<half> inputHiddenState(batchSize * numTokens * baseHiddenDim, __float2half(0.0f));
+    auto setMarker = [&](int b, int t, float v) {
+        for (int d = 0; d < baseHiddenDim; ++d)
+        {
+            inputHiddenState[b * numTokens * baseHiddenDim + t * baseHiddenDim + d] = __float2half(v);
+        }
+    };
+    setMarker(0, 0, 100.0f);
+    setMarker(0, 1, 200.0f);
+    setMarker(0, 2, 300.0f);
+    setMarker(1, 0, 1100.0f);
+    setMarker(1, 1, 1200.0f);
+    setMarker(1, 2, 1300.0f);
+
+    auto acceptedIndicesDevice = rt::Tensor({batchSize, maxDepth}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto acceptLengthsDevice = rt::Tensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto hiddenStateDevice = rt::Tensor({batchSize, numTokens, baseHiddenDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    copyHostToDevice<int32_t>(acceptedIndicesDevice, inputAcceptedIndices);
+    copyHostToDevice<int32_t>(acceptLengthsDevice, inputAcceptLengths);
+    copyHostToDevice<half>(hiddenStateDevice, inputHiddenState);
+
+    // ---- Phase 1: single call — expect correct compaction. ----
+    eagleBaseAssembleHiddenState(acceptedIndicesDevice, acceptLengthsDevice, hiddenStateDevice, stream);
+
+    auto const afterOneCall = copyDeviceToHost<half>(hiddenStateDevice);
+
+    // The kernel writes compacted output at stride=maxDepth (see eagleBaseAssembleHiddenStateKernel:
+    // outputOffset = batchIdx * maxDepth * hiddenDim). So batch 0 lands at flat positions
+    // [0, 1, 2] * baseHiddenDim and batch 1 at flat positions [maxDepth, maxDepth+1, maxDepth+2]
+    // * baseHiddenDim (overlapping batch 0's allocation tail, which is fine per the kernel's
+    // in-place contract — the caller reshapes afterwards).
+    std::vector<float> expectedBatch0AfterOne{300.0f, 100.0f, 200.0f};    // input[2], input[0], input[1]
+    std::vector<float> expectedBatch1AfterOne{1200.0f, 1300.0f, 1100.0f}; // input[1], input[2], input[0]
+
+    int32_t const batch0Offset = 0;
+    int32_t const batch1Offset = maxDepth * baseHiddenDim;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        float const actual = __half2float(afterOneCall[batch0Offset + i * baseHiddenDim]);
+        EXPECT_TRUE(isclose(actual, expectedBatch0AfterOne[i], 1e-3f, 1e-3f))
+            << "After 1 call — Batch 0, position " << i << ": expected " << expectedBatch0AfterOne[i] << ", got "
+            << actual;
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        float const actual = __half2float(afterOneCall[batch1Offset + i * baseHiddenDim]);
+        EXPECT_TRUE(isclose(actual, expectedBatch1AfterOne[i], 1e-3f, 1e-3f))
+            << "After 1 call — Batch 1, position " << i << ": expected " << expectedBatch1AfterOne[i] << ", got "
+            << actual;
+    }
+
+    // ---- Phase 2: second call on the already-compacted buffer. ----
+    // The kernel always reads from `inputOffset = batchIdx * numTokens * hiddenDim`. For batch 0
+    // (batchIdx=0) that is flat offset 0 — exactly where the first call's compacted output
+    // landed. For batch 1 (batchIdx=1) that is flat offset `numTokens * hiddenDim = 8*512`, which
+    // was *not* touched by the first call (the first call's batch-1 writes went to offset
+    // `maxDepth * hiddenDim = 3*512`, inside batch 0's allocation slab). So batch 1 re-reads the
+    // original input unchanged and produces the same output as phase 1 — we only assert
+    // non-idempotency on batch 0, where the overlap is genuine.
+    eagleBaseAssembleHiddenState(acceptedIndicesDevice, acceptLengthsDevice, hiddenStateDevice, stream);
+
+    auto const afterTwoCalls = copyDeviceToHost<half>(hiddenStateDevice);
+
+    // Batch 0 expected after two calls: the first call left positions [0, 1, 2] holding
+    // [300, 100, 200]. The second call reads positions [2, 0, 1] from this permuted buffer, i.e.
+    // [200, 300, 100], and writes those to positions [0, 1, 2].
+    std::vector<float> expectedBatch0AfterTwo{200.0f, 300.0f, 100.0f};
+    bool batch0Deviation = false;
+    for (int i = 0; i < 3; ++i)
+    {
+        float const actual = __half2float(afterTwoCalls[batch0Offset + i * baseHiddenDim]);
+        // Confirm the exact expected permutation.
+        EXPECT_TRUE(isclose(actual, expectedBatch0AfterTwo[i], 1e-3f, 1e-3f))
+            << "After 2 calls — Batch 0, position " << i << ": expected " << expectedBatch0AfterTwo[i] << ", got "
+            << actual;
+        if (!isclose(actual, expectedBatch0AfterOne[i], 1e-3f, 1e-3f))
+        {
+            batch0Deviation = true;
+        }
+    }
+    EXPECT_TRUE(batch0Deviation)
+        << "Non-idempotency regression guard failed: calling eagleBaseAssembleHiddenState twice "
+        << "produced identical output to a single call on batch 0. The public API docstring "
+        << "promises the hidden-state compaction is NOT idempotent; if this test starts passing "
+        << "after a kernel change, either the docstring needs updating or the runtime's "
+        << "split-call sequencing in runBaseModelVerification needs a re-audit.";
+}
+
+// ============================================================================
 // Test 9: prepareEagleDraftProposalInputs
 // Description: Pack tree mask, compute positions, prepare select indices
 // selectIndices = [treeLen-selectTokenLen : treeLen]
