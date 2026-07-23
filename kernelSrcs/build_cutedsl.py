@@ -22,6 +22,10 @@ Kernel groups:
                      attention (D=512), Ampere instruction floor (sm_80+).
   ssd              — Mamba2 SSM chunk-scan prefill
   gemm             — Talker MLP GEMM (Ampere / Blackwell / BW GeForce)
+  int4_fp16_gemm   — W4A16 INT4-weight FP16 GEMM (Ampere; full 75-config sweep) +
+                     the decode GEMV (small-M, shares the GEMM's weight layout;
+                     one exported function per M in 1..8) — built together
+  f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere / Blackwell / SM12x)
   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 
@@ -43,8 +47,8 @@ Output (under {output_dir}/{arch}/{artifact_tag}/):
 Prebuilt tarballs:
   Prebuilt CuTe DSL artifacts are shipped in the release package. When building
   from the source tree, no tarball is committed — CI generates per-target
-  artifacts for testing. The container/build
-  flow still extracts a tarball if one is placed under
+  artifacts for testing. The container/build flow still extracts a tarball if
+  one is placed under
   kernelSrcs/cuteDSLPrebuilt/; otherwise build from source for your target:
     python kernelSrcs/build_cutedsl.py --gpu_arch sm_110 --arch aarch64 --clean
 """
@@ -67,11 +71,13 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DEFAULT_OUTPUT_DIR = (_SCRIPT_DIR / "../cpp/kernels/cuteDSLArtifact").resolve()
-_CUTLASS_DSL_VERSION = "4.5.2"
+_CUTLASS_DSL_VERSION = "4.6.0"
 _CUPY_VERSIONS = {12: ("cupy-cuda12x", "12.3.0"), 13: ("cupy-cuda13x", "13.6.0")}
 # Common flag sets for FMHA variants
 _LLM = ["--is_causal", "--is_persistent", "--export_only", "--bottom_right_align"]
 _LLM_FP8 = _LLM + ["--in_dtype", "Float8E4M3FN"]
+_LLM_PAGED = _LLM + ["--paged_kv"]
+_LLM_PAGED_FP8 = _LLM_FP8 + ["--paged_kv"]
 _VIT = ["--is_persistent", "--export_only", "--vit_mode"]
 
 
@@ -81,8 +87,9 @@ class KernelVariant:
 
     Attributes:
         name:          Unique identifier — used as --file_name / --function_prefix.
-        group:         Logical group ("gdn", "fmha", "nvfp4_fused_moe",
-                       "nvfp4_moe", "ssd", or "gemm"). cmake sets CUTE_DSL_<GROUP>_ENABLED.
+        group:         Logical group ("gdn", "fmha", "f16_moe",
+                       "nvfp4_fused_moe", "nvfp4_moe", "ssd", or "gemm").
+                       cmake sets CUTE_DSL_<GROUP>_ENABLED for integrated groups.
         supported_sms: Explicit SM whitelist. With --kernels ALL, only variants whose
                        supported_sms contains the detected/requested SM are compiled.
         script:        Kernel script path relative to kernelSrcs/.
@@ -100,9 +107,10 @@ class KernelVariant:
 # ---------------------------------------------------------------------------
 # Kernel registry — add new groups/variants here.
 #
-# Each KernelVariant has a supported_sms whitelist.  Only variants matching
-# the target SM are compiled.  All kernel scripts compile device-native
-# (no --gpu_arch forwarded), which works uniformly on Linux and QNX.
+# Each KernelVariant has a supported_sms whitelist. Only variants matching
+# the target SM are compiled. All kernel scripts compile device-native
+# (no --gpu_arch forwarded), which works uniformly on Linux and QNX. The
+# f16_moe exporters additionally require the target to match the current GPU.
 #
 # Groups:
 #   gdn              — Gated Delta Net decode/prefill
@@ -111,6 +119,7 @@ class KernelVariant:
 #                      attention (D=512), Ampere instruction floor (sm_80+).
 #   ssd              — Mamba2 SSM chunk-scan prefill
 #   gemm             — Talker MLP cuBLAS replacement (Ampere/Blackwell/BW GeForce)
+#   f16_moe          — FP16 grouped FC1/FC2 MoE (Ampere/Blackwell/SM12x)
 #   nvfp4_moe        — split FC1/FC2 NVFP4 MoE (currently SM110/Thor only)
 #   nvfp4_fused_moe  — End-to-end NvFP4 fused MoE (Blackwell GeForce)
 # ---------------------------------------------------------------------------
@@ -145,6 +154,28 @@ KERNEL_VARIANTS = [
         supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
         script="gdn_cutedsl/gdn_decode_mtp.py",
         script_args=["--export_only", "--cache_only"],
+    ),
+    # DDTree decode: tree-parent speculative verification with per-node recurrent checkpoints.
+    KernelVariant(
+        name="gdn_decode_tree",
+        group="gdn",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="gdn_cutedsl/gdn_decode_tree.py",
+        script_args=["--export_only"],
+    ),
+    KernelVariant(
+        name="gdn_decode_tree_split_v",
+        group="gdn",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="gdn_cutedsl/gdn_decode_tree.py",
+        script_args=["--export_only", "--split_v"],
+    ),
+    KernelVariant(
+        name="gdn_decode_tree_split_v_precomputed",
+        group="gdn",
+        supported_sms=[80, 86, 87, 89, 90, 100, 101, 110, 120, 121],
+        script="gdn_cutedsl/gdn_decode_tree.py",
+        script_args=["--export_only", "--precomputed"],
     ),
     # --- SSD group (Mamba2 SSM chunk scan) ---
     # --- SSD SM80 variants (D×N combinations) ---
@@ -231,6 +262,33 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM,
     ),
+    # Skip-softmax (BLASST) variants: causal-only, lambda baked at export.
+    # Lambdas are the 4096-context-safe values from the MR calibration table
+    # (kernelSrcs/fmha_cutedsl_blackwell/README.md), so any test seqlen up to
+    # 4096 passes the 0.1 max-abs accuracy gate.
+    KernelVariant(
+        name="fmha_d64_skipsoftmax",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"]
+                    + _LLM + ["--skip_softmax_threshold", "0.003"],
+    ),
+    KernelVariant(
+        name="fmha_d128_skipsoftmax",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM + ["--skip_softmax_threshold", "0.001"],
+    ),
+    KernelVariant(
+        name="fmha_d256",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM,
+    ),
     KernelVariant(
         name="fmha_d64_sw",
         group="fmha",
@@ -245,6 +303,14 @@ KERNEL_VARIANTS = [
         supported_sms=[100, 101, 110],
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d256_sw",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
                     + _LLM + ["--window_size", "4096,-1"],
     ),
     # LLM FP8 input → FP16 output
@@ -263,6 +329,13 @@ KERNEL_VARIANTS = [
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM_FP8,
     ),
     KernelVariant(
+        name="fmha_d256_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_FP8,
+    ),
+    KernelVariant(
         name="fmha_d64_sw_fp8",
         group="fmha",
         supported_sms=[100, 101, 110],
@@ -277,6 +350,105 @@ KERNEL_VARIANTS = [
         script="fmha_cutedsl_blackwell/fmha.py",
         script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
                     + _LLM_FP8 + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d256_sw_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
+                    + _LLM_FP8 + ["--window_size", "4096,-1"],
+    ),
+    # LLM paged KV cache variants. Direct TMA path requires tokens_per_page == 128.
+    KernelVariant(
+        name="fmha_d64_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"] + _LLM_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d128_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d256_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_PAGED,
+    ),
+    KernelVariant(
+        name="fmha_d64_sw_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"]
+                    + _LLM_PAGED + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d128_sw_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM_PAGED + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d256_sw_paged",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
+                    + _LLM_PAGED + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d64_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"] + _LLM_PAGED_FP8,
+    ),
+    KernelVariant(
+        name="fmha_d128_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"] + _LLM_PAGED_FP8,
+    ),
+    KernelVariant(
+        name="fmha_d256_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"] + _LLM_PAGED_FP8,
+    ),
+    KernelVariant(
+        name="fmha_d64_sw_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,64", "--k_shape", "1,1024,1,64"]
+                    + _LLM_PAGED_FP8 + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d128_sw_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,14,128", "--k_shape", "1,1024,1,128"]
+                    + _LLM_PAGED_FP8 + ["--window_size", "4096,-1"],
+    ),
+    KernelVariant(
+        name="fmha_d256_sw_paged_fp8",
+        group="fmha",
+        supported_sms=[100, 101, 110],
+        script="fmha_cutedsl_blackwell/fmha.py",
+        script_args=["--q_shape", "1,1024,16,256", "--k_shape", "1,1024,2,256"]
+                    + _LLM_PAGED_FP8 + ["--window_size", "4096,-1"],
     ),
     KernelVariant(
         name="vit_fmha_d64",
@@ -354,6 +526,44 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    KernelVariant(
+        name="ffpa_d512_causal_gqa16",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--skip_rescale",
+            "--kv_group_size", "16",
+            "--num_head", "16",
+            "--export_only",
+        ],
+    ),
+    # FFPA vision-block overlay variant (Gemma4 Unified prefill, global d512
+    # layers): the causal kernel plus two (B, S) Int32 mBlockBegin/mBlockEnd
+    # tensors carrying a per-query-row extra allowed KV interval so image
+    # blocks attend bidirectionally.  Traced with the Gemma4-12B
+    # global-layer GQA shape (Hq=16, Hkv=1) — GQA remains runtime-dynamic.
+    KernelVariant(
+        name="ffpa_d512_causal_visionblock",
+        group="ffpa",
+        supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+        script="ffpa_cutedsl/fmha.py",
+        script_args=[
+            "--head_dim", "512",
+            "--m_block_size", "64", "--n_block_size", "16", "--num_threads", "128",
+            "--dtype", "Float16",
+            "--is_causal",
+            "--vision_block",
+            "--skip_rescale",
+            "--kv_group_size", "16",
+            "--num_head", "16",
+            "--export_only",
+        ],
+    ),
     # --- NvFP4 MoE group (decomposed FC1/FC2; SM110/Thor today) ---
     # These variants build the decomposed grouped MoE pipeline:
     #   FC1 gather grouped GEMM + activation + FP4 requant
@@ -427,6 +637,23 @@ KERNEL_VARIANTS = [
         ],
     ),
     KernelVariant(
+        name="nvfp4_moe_sm110_fc1_geglu_n128",
+        group="nvfp4_moe",
+        supported_sms=[100, 101, 110],
+        script="nvfp4_moe_cutedsl/export_fc1_kernel.py",
+        script_args=[
+            "--activation",
+            "geglu",
+            "--mma_tiler_n",
+            "128",
+            "--dummy-experts",
+            "128",
+            "--dummy-top-k",
+            "8",
+            "--export_only",
+        ],
+    ),
+    KernelVariant(
         name="nvfp4_moe_sm110_fc2_n128_fp16",
         group="nvfp4_moe",
         supported_sms=[100, 101, 110],
@@ -460,6 +687,28 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # --- F16 MoE group (one FP16 ABI, architecture-specific grouped GEMM) ---
+    KernelVariant(
+        name="f16_moe_ampere_grouped_fp16",
+        group="f16_moe",
+        supported_sms=[80, 86, 87, 89],
+        script="f16_moe_cutedsl/export_grouped_gemm.py",
+        script_args=["--family", "ampere"],
+    ),
+    KernelVariant(
+        name="f16_moe_blackwell_grouped_fp16",
+        group="f16_moe",
+        supported_sms=[100, 101, 103, 110],
+        script="f16_moe_cutedsl/export_grouped_gemm.py",
+        script_args=["--family", "blackwell"],
+    ),
+    KernelVariant(
+        name="f16_moe_blackwell_geforce_grouped_fp16",
+        group="f16_moe",
+        supported_sms=[120, 121],
+        script="f16_moe_cutedsl/export_grouped_gemm.py",
+        script_args=["--family", "blackwell_geforce"],
+    ),
     # --- NvFP4 Fused MoE group (SM120/SM121 — Blackwell GeForce) ---
     # Fused route/pack + FC1 + activation + quant + FC2 + scatter kernels.
     # Decode backend: resident-grid barrier between route/pack and compute
@@ -467,8 +716,8 @@ KERNEL_VARIANTS = [
     #   see CuteDslNvfp4MoeRunner::kDecodePrefillCutoverRoutedRows).
     # Prefill backend: global task-queue driven producer/consumer overlap;
     #   best for large routed working sets.
-    # Nvfp4MoePlugin scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2}
-    # x {decode, prefill} x {n128 MMA N-tile} = 10 variants. Shape axes
+    # Nvfp4MoePlugin scope: FP16 io_dtype + {identity, silu, swiglu, gelu, relu2, geglu}
+    # x {decode, prefill} x {n128 MMA N-tile} = 12 variants. Shape axes
     # N / E / top_k / hidden_size (K) are runtime (shape-polymorphic). The
     # MMA N-tile remains a compile-time variant axis. CuteDslNvfp4MoeRunner
     # currently dispatches n128 and accepts the bounded K set {1024, 2048}.
@@ -508,6 +757,13 @@ KERNEL_VARIANTS = [
         script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
         script_args=["--activation", "relu2", "--mma_tiler_n", "128", "--export_only"],
     ),
+    KernelVariant(
+        name="nvfp4_fused_moe_decode_geglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_decode_kernel.py",
+        script_args=["--activation", "geglu", "--mma_tiler_n", "128", "--export_only"],
+    ),
 
     # Prefill backend, N-tile 128
     KernelVariant(
@@ -544,6 +800,13 @@ KERNEL_VARIANTS = [
         supported_sms=[120, 121],
         script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
         script_args=["--activation", "relu2", "--mma_tiler_n", "128", "--export_only"],
+    ),
+    KernelVariant(
+        name="nvfp4_fused_moe_prefill_geglu_n128",
+        group="nvfp4_fused_moe",
+        supported_sms=[120, 121],
+        script="nvfp4_fused_moe_cutedsl/export_prefill_kernel.py",
+        script_args=["--activation", "geglu", "--mma_tiler_n", "128", "--export_only"],
     ),
     # Prefill backend, N-tile 256 — DISABLED (same bug as decode n256).
 
@@ -756,6 +1019,22 @@ KERNEL_VARIANTS = [
             "--export_only",
         ],
     ),
+    # FP16-in / FP32-out twin of gemm_blackwell_small_fp16: same tile, cluster,
+    # and MNK; differs only by --c_dtype float32, which makes the C epilogue
+    # write FP32. A and B stay FP16 tensor-core operands.
+    KernelVariant(
+        name="gemm_blackwell_small_fp16in_fp32out",
+        group="gemm",
+        supported_sms=[100, 101, 103, 110],
+        script="gemm_cutedsl/gemm_blackwell.py",
+        script_args=[
+            "--mnk", "256,2048,2048",
+            "--mma_tiler_mn", "64,128",
+            "--cluster_shape_mn", "1,2",
+            "--c_dtype", "float32",
+            "--export_only",
+        ],
+    ),
     KernelVariant(
         name="gemm_blackwell_small_bias_silu_fp16",
         group="gemm",
@@ -944,6 +1223,87 @@ KERNEL_VARIANTS = [
         ],
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# int4_fp16_gemm group — W4A16 INT4-weight FP16 GEMM.  Ampere instruction floor
+# (cp.async + mma.sync 16x8x16 + ldmatrix), forward-compatible to SM80 and newer
+# (Ampere / Ada / Hopper / Blackwell).
+#
+# These are GENERATED rather than hand-listed: an AOT artifact has no runtime
+# autotune, so the full config universe is baked — 5 CTA tiles x {2,3,4}
+# pipeline stages x {1,2,4,8,16} split-K factors = 75 exported functions, one
+# each, and the consumer selects per shape.  swizzle (grouped-M raster) stays a
+# *runtime* Int32 kernel arg, so it is NOT a baked dimension.  split_k>1 uses an
+# in-kernel reduction; a baked split_k=N is correct only when N divides
+# ceil(K/64) (split_k=1 always works).
+# ---------------------------------------------------------------------------
+_INT4_FP16_GEMM_TILES = [
+    (16, 128, 64),
+    (16, 256, 64),
+    (32, 128, 64),
+    (64, 128, 64),
+    (128, 128, 64),
+]
+_INT4_FP16_GEMM_STAGES = (2, 3, 4)
+_INT4_FP16_GEMM_SPLIT_K = (1, 2, 4, 8, 16)
+# Quant group size, baked per variant (it sizes the in-kernel scale smem, so it
+# is compile-time, not a runtime arg). The kernel supports {16, 32, 64, 128, ...}
+# (any multiple of 16 mutually divisible with bK=64); only G=128 is baked today.
+# Single knob: set to 32 to build G=32 instead, or make it a list + add a
+# `_g{gs}` suffix to the variant name below to ship both group sizes at once.
+_INT4_FP16_GEMM_GROUP_SIZE = 128
+
+for _tile in _INT4_FP16_GEMM_TILES:
+    _tile_tag = f"{_tile[0]}x{_tile[1]}x{_tile[2]}"
+    for _stages in _INT4_FP16_GEMM_STAGES:
+        for _sk in _INT4_FP16_GEMM_SPLIT_K:
+            KERNEL_VARIANTS.append(
+                KernelVariant(
+                    name=f"int4_fp16_gemm_{_tile_tag}_s{_stages}_sk{_sk}",
+                    group="int4_fp16_gemm",
+                    supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+                    script="int4_fp16_gemm_cutedsl/int4_fp16_gemm_ampere.py",
+                    script_args=[
+                        "--mnk", "256,512,1024",
+                        "--cta_tiler_mnk", ",".join(str(d) for d in _tile),
+                        "--atom_layout_mnk", "1,4,1",
+                        "--num_stages", str(_stages),
+                        "--split_k", str(_sk),
+                        "--group_size", str(_INT4_FP16_GEMM_GROUP_SIZE),
+                        "--export_only",
+                    ],
+                )
+            )
+
+# int4_fp16_gemm group also includes the W4A16 decode GEMV — a CUDA-core kernel
+# for the decode regime (small M) that consumes the SAME offline fragment weight
+# buffer as the GEMM.  Prefill (GEMM) and decode (GEMV) are always needed together
+# (one weight copy serves both), so the GEMV is baked under the same group /
+# CUTE_DSL_INT4_FP16_GEMM_ENABLED define rather than a separate selectable group.
+# M is the baked dimension — one exported function per M in [1, 8] (8 total); N/K
+# stay dynamic.  Single W=8 config; the kernel bakes SKU-independent per-M tuning
+# (UNROLL2/MINB from _gemv_defaults) — no device-SM detection, so the AOT config
+# is identical on every arch.  group_size 128 only for now (the kernel also
+# supports 32).
+# ---------------------------------------------------------------------------
+_INT4_FP16_GEMV_MAX_M = 8
+_INT4_FP16_GEMV_GROUP_SIZE = 128
+
+for _m in range(1, _INT4_FP16_GEMV_MAX_M + 1):
+    KERNEL_VARIANTS.append(
+        KernelVariant(
+            name=f"int4_fp16_gemv_m{_m}",
+            group="int4_fp16_gemm",
+            supported_sms=[80, 86, 87, 89, 100, 101, 110, 120, 121],
+            script="int4_fp16_gemm_cutedsl/int4_fp16_gemv_ampere.py",
+            script_args=[
+                "--mnk", f"{_m},512,1024",
+                "--group_size", str(_INT4_FP16_GEMV_GROUP_SIZE),
+                "--export_only",
+            ],
+        )
+    )
 
 # All known group names (set for O(1) membership check — no manual maintenance needed).
 _ALL_GROUPS: set[str] = {v.group for v in KERNEL_VARIANTS}
@@ -1137,6 +1497,22 @@ def _cutlass_dsl_install_hint(cuda_ver):
     return f"pip install '{package}=={_CUTLASS_DSL_VERSION}'"
 
 
+def _cutlass_dsl_lib_dir(pkg_dir, cuda_ver):
+    candidates = []
+    if cuda_ver:
+        candidates.append(pkg_dir / f"cu{cuda_ver.split('.')[0]}" / "lib")
+    candidates.append(pkg_dir / "lib")
+
+    for candidate in candidates:
+        if (candidate / "libcuda_dialect_runtime_static.a").exists():
+            return candidate
+    raise FileNotFoundError(
+        f"libcuda_dialect_runtime_static.a not found in any of: "
+        f"{[str(c) for c in candidates]}. "
+        f"Ensure nvidia-cutlass-dsl=={_CUTLASS_DSL_VERSION} is installed correctly."
+    )
+
+
 def check_dependencies(sm=None, selected_groups=None):
     errors = []
     selected_groups = set(selected_groups or [])
@@ -1161,7 +1537,11 @@ def check_dependencies(sm=None, selected_groups=None):
                 if spec.submodule_search_locations
                 else Path(spec.origin).parent
             )
-            lib_dir = pkg_dir / "lib"
+            try:
+                lib_dir = _cutlass_dsl_lib_dir(pkg_dir, cuda_ver)
+            except FileNotFoundError as e:
+                errors.append(str(e))
+                lib_dir = None
     except importlib.metadata.PackageNotFoundError:
         errors.append(
             f"nvidia-cutlass-dsl not found.\n"
@@ -1222,7 +1602,7 @@ def _compile_one(variant, staging_dir, verbose, sm):
     cmd += variant.script_args
 
     env = os.environ.copy()
-    if sm == 121 and variant.group == "nvfp4_fused_moe":
+    if sm == 121 and variant.group in ("f16_moe", "nvfp4_fused_moe"):
         # Build a real SM121 image for DIGITS/GB10. SM120 cubins link, but
         # fail at runtime on SM121 with cudaErrorNoKernelImageForDevice.
         env.setdefault("CUTE_DSL_ARCH", "sm_121a")
@@ -1312,6 +1692,17 @@ def build(args):
         return
 
     groups_selected = sorted({v.group for v in variants})
+
+    # The grouped-MoE AOT output embeds device-native code and host objects.
+    # Refuse an override that would create a valid-looking but unusable pack.
+    if "f16_moe" in groups_selected:
+        native_sm = detect_gpu_sm()
+        native_arch = detect_arch()
+        if sm != native_sm or arch != native_arch:
+            raise RuntimeError(
+                "f16_moe requires native artifact generation: selected "
+                f"{arch}/sm_{sm}, but the build host is {native_arch}/sm_{native_sm}."
+            )
 
     # Check dependencies before cleaning — so a failed dep check doesn't
     # silently destroy a previously good build.
@@ -1438,8 +1829,8 @@ def main():
         "--kernels",
         default="ALL",
         help="Which kernels to build: ALL (default), a group name "
-             "(fmha | gdn | nvfp4_moe | "
-             "nvfp4_fused_moe | ssd | gemm), or a comma-separated list "
+             "(fmha | gdn | f16_moe | nvfp4_moe | "
+             "nvfp4_fused_moe | ssd | gemm | int4_fp16_gemm), or a comma-separated list "
              "of group names. Variants whose supported_sms does not include the target SM are skipped.",
     )
     p.add_argument(

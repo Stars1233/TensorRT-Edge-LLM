@@ -87,9 +87,32 @@ public:
      * @param N Number of rows in B / columns in C
      * @param K Inner dimension
      * @param stream CUDA stream
+     * @return true on success, false if kernel module not loaded or variant unavailable.
      */
-    /// @return true on success, false if kernel module not loaded or variant unavailable.
     static bool run(
+        void const* aPtr, void const* bPtr, void* cPtr, int32_t M, int32_t N, int32_t K, cudaStream_t stream);
+
+    /**
+     * @brief Execute GEMM with an FP32 C output: C[M,N] = A[M,K] @ B[N,K]^T.
+     *
+     * A and B are FP16 (tensor-core operands) and accumulation is FP32 — the same
+     * MMA path as run() — but C is written in FP32 (the acc->C cast is a no-op since
+     * tcgen05 already accumulates in FP32). The Blackwell ABI does not encode the C
+     * element type (the tensor struct's data is void*), so this differs from run()
+     * only in the dispatched AOT variant; both share the dispatch3d packing helper.
+     *
+     * Used by the parakeet online GPU fbank mel GEMM, whose output spans ~17 orders
+     * of magnitude and must not lose small values to FP16 storage underflow before
+     * the downstream natural log.
+     *
+     * Dispatches to the gemm_blackwell_small_fp16in_fp32out AOT variant (small 64x128
+     * tile — suitable for the small M=nMel of the mel projection). Blackwell DC only;
+     * returns false on other architectures or if the variant was not compiled.
+     *
+     * @param cPtr Output C [M, N] (FP32, N contiguous)
+     * @return true on success, false if the module / FP32-out variant is unavailable.
+     */
+    static bool runFp16inFp32out(
         void const* aPtr, void const* bPtr, void* cPtr, int32_t M, int32_t N, int32_t K, cudaStream_t stream);
 
     /**
@@ -164,6 +187,12 @@ private:
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
     static gemm_blackwell_small_bias_fp16_Kernel_Module_t sBlackwellSmallBiasModule;
+#endif
+
+// Blackwell DC small-tile FP16-in/FP32-out variant (64x128 tile, FP32 C
+// epilogue) for the parakeet mel GEMM. See runFp16inFp32out.
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED
+    static gemm_blackwell_small_fp16in_fp32out_Kernel_Module_t sBlackwellSmallFp16inFp32outModule;
 #endif
 
 // Blackwell DC 2-CTA variants (tile=256x256 cluster=(2,1) use_2cta=True)

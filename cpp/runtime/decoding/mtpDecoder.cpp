@@ -29,7 +29,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
-#include "runtime/decoding/specDecodeUtils.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -61,7 +61,7 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     check::check(runtime.deployment.base.specDecodeType == SpecDecodeMode::kMTP,
         "MTP decoding requires a base engine exported with spec_decode_type=mtp and engine_role=base.");
 
-    mDraftExecutor = spec_decode_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;
     int32_t const effectiveMaxDraftProposalSize = mRuntime.deployment.effectiveMaxDraftProposalSize();
@@ -117,11 +117,6 @@ MTPDecoder::MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path co
     // MTP: identity vocab mapping (zero-fill)
     CUDA_CHECK(
         cudaMemsetAsync(mDraftVocabMappingTable.rawPointer(), 0, mDraftVocabMappingTable.getMemoryCapacity(), stream));
-}
-
-char const* MTPDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
-{
-    return spec_decode_utils::isGreedyCompatible(request);
 }
 
 int64_t MTPDecoder::getRequiredContextMemorySize() const noexcept
@@ -496,6 +491,10 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     // MTP: inline prepareBaseVerificationState
     mRuntime.base.cacheManager.getMambaCacheManager().reshapeIntermediateStates(
         context.activeBatchSize, mRuntime.deployment.specConfig->verifySize);
+    if (!mRuntime.base.pipelineIO.specVerifyPhaseMarker.isEmpty())
+    {
+        check::check(mRuntime.base.pipelineIO.specVerifyPhaseMarker.reshape({1}), "Tensor reshape failed");
+    }
 
     auto const verifyDims
         = mRuntime.deployment.base.specVerifyDims(activeBatchSize, mRuntime.deployment.specConfig->verifySize);
@@ -544,14 +543,35 @@ bool MTPDecoder::runBaseModelVerification(DecodingInferenceContext& context)
     mRuntime.base.cacheManager.commitSequenceLength(mAcceptLength, context.stream);
 
     // MTP: inline commitAcceptedBaseState
-    mRuntime.base.cacheManager.getMambaCacheManager().scatterMtpStates(mAcceptLength, context.stream);
+    mRuntime.base.cacheManager.getMambaCacheManager().scatterAcceptedLinearStates(mAcceptLength, context.stream);
 
     check::check(
         mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, maxAcceptDepth, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    spec_decode_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
+    // Enqueue logprobs device work + D2H before appendAcceptedTokens so everything rides
+    // that call's single round synchronization.
+    if (context.numLogprobs > 0)
+    {
+        int32_t const verifyTreeSize = mRuntime.deployment.specConfig->verifySize;
+        int32_t const vocabSize = mRuntime.deployment.base.outputVocabSize;
+        int32_t const gatheredRows = activeBatchSize * maxAcceptDepth;
+        check::check(mRuntime.logprobs.gatheredLogits.reshape({gatheredRows, vocabSize}), "Tensor reshape failed");
+        gatherSpecVerifyAcceptedLogitRows(mRuntime.base.pipelineIO.outputLogits, mAcceptedTokenIndices,
+            mRuntime.logprobs.gatheredLogits, activeBatchSize, verifyTreeSize, maxAcceptDepth, vocabSize,
+            context.stream);
+        decoder_utils::enqueueLogprobsD2H(
+            mRuntime.logprobs.gatheredLogits, gatheredRows, mRuntime, context.numLogprobs, context.stream);
+    }
+
+    decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream);
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectSpecLogprobsFromHost(mRuntime, context, activeBatchSize, maxAcceptDepth,
+            mHostAcceptLengths.dataPointer<int32_t>(), context.numLogprobs);
+    }
 
     return true;
 }
@@ -798,6 +818,10 @@ bool MTPDecoder::captureCudaGraphs(cudaStream_t stream)
 
             // MTP: inline prepareBaseVerificationCapture
             mRuntime.base.cacheManager.getMambaCacheManager().reshapeIntermediateStates(batchSize, verifySize);
+            if (!mRuntime.base.pipelineIO.specVerifyPhaseMarker.isEmpty())
+            {
+                check::check(mRuntime.base.pipelineIO.specVerifyPhaseMarker.reshape({1}), "Tensor reshape failed");
+            }
 
             auto const verifyDims = mRuntime.deployment.base.specVerifyDims(batchSize, verifySize);
             baseVerificationCaptureStatus &= mRuntime.base.captureGraph(verifyDims, stream);

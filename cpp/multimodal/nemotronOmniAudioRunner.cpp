@@ -18,9 +18,13 @@
 #include "nemotronOmniAudioRunner.h"
 #include "audioUtils.h"
 #include "common/checkMacros.h"
-#include "common/mmapReader.h"
+#include "common/trtUtils.h"
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+#endif
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
+#include <cmath>
 #include <fstream>
 #include <nlohmann/json.hpp>
 
@@ -31,6 +35,50 @@ namespace trt_edgellm
 namespace rt
 {
 
+namespace
+{
+
+// Validate the bound CPU MelExtractor config is parakeet-spec — the GPU kernels
+// hard-code the parakeet geometry/algorithm, so a non-parakeet extractor must
+// fall back to CPU rather than produce a wrong-but-plausible spectrogram. Values
+// mirror makeParakeetExtractor (melSpectrogram.cpp).
+bool parakeetFbankConfigOk(audio::MelExtractorConfig const& cfg, std::string& reason)
+{
+    auto fail = [&reason](char const* msg) {
+        reason = msg;
+        return false;
+    };
+    // Shape: the kernel FFT is N=512-specific (winLength 400 centred in 512), the
+    // encoder takes [1, T, 128].
+    if (!(cfg.nFFT == 512 && cfg.winLength == 400 && cfg.nMel == 128))
+        return fail("needs nFFT==512, winLength==400, nMel==128.");
+    // Windowing / framing. windowCentredInFft must hold: the GPU embeds the 400-tap
+    // window centred at (nFft-winLength)/2 and frames the full nFft span, so a
+    // left-aligned config would diverge from the kernel. Compare preemph with a
+    // tolerance — an exact float == would silently reject a config whose 0.97 has any
+    // representation drift and fall back to CPU. preemphPostScale must be exactly 0:
+    // a non-zero value switches the CPU extractor to a per-frame pre-emphasis variant
+    // the GPU kernel does not implement (it is full-waveform only).
+    if (!(cfg.windowType == audio::WindowType::kHannSymmetric && cfg.framePadding == audio::FramePadding::kCenterZero
+            && cfg.windowCentredInFft && std::fabs(cfg.preemphCoeff - 0.97f) < 1e-6f && cfg.preemphPostScale == 0.0f))
+        return fail(
+            "needs symmetric Hann window centred in nFFT, centre-zero framing, full-waveform pre-emphasis 0.97 "
+            "(no per-frame post-scale).");
+    // Log + post-normalize.
+    if (!(cfg.logType == audio::LogType::kLn && cfg.logFloorMode == audio::LogFloorMode::kAdd
+            && cfg.postNormalize == audio::PostNormalize::kPerFeatureMeanStd))
+        return fail("needs natural log + add-floor + per-feature mean/std post-normalize.");
+    // Layout + dynamic T. dropLastStftFrame is true for parakeet (features_lengths
+    // = N // hop); the GPU kernel frames exactly floor(N/hop) directly, which is
+    // bit-equivalent to framing floor(N/hop)+1 and dropping the last.
+    if (!(cfg.layout == audio::MelLayout::kTimeMel && cfg.dropLastStftFrame
+            && cfg.timePadding == audio::TimePadding::kNone))
+        return fail("needs [T, nMel] time-first layout, drop-last-frame, no static time padding.");
+    return true;
+}
+
+} // namespace
+
 NemotronOmniAudioRunner::NemotronOmniAudioRunner(std::string const& engineDir, cudaStream_t stream)
     : MultimodalRunner()
 {
@@ -39,19 +87,39 @@ NemotronOmniAudioRunner::NemotronOmniAudioRunner(std::string const& engineDir, c
     mRuntime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
 
     std::string const enginePath = engineDir + "/audio_encoder.engine";
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    mAudioEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+    mAudioEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
 
     mAudioContext = std::unique_ptr<nvinfer1::IExecutionContext>(
         mAudioEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     bool const profileSet = mAudioContext->setOptimizationProfileAsync(0, stream);
     ELLM_CHECK(profileSet, "Failed to set optimization profile for audio engine");
 
+    setNonBlockingAuxStreams(mAudioContext.get(), mAudioEngine.get(), mAuxStreams);
+
     bool const configValid = validateAndFillConfig(engineDir);
     ELLM_CHECK(configValid, "NemotronOmniAudioRunner: Failed to validate config");
     bool const bufferAllocated = allocateBuffer(stream);
     ELLM_CHECK(bufferAllocated, "NemotronOmniAudioRunner: Failed to allocate buffer");
+
+    // Best-effort init of the online GPU fbank. Failure is non-fatal: the runner
+    // falls back to the CPU MelExtractor (mFeMel, already bound by
+    // validateAndFillConfig) for PCM→mel. initFbankResources issues H2D copies
+    // via CUDA_CHECK, which throws on failure (e.g. device OOM), so catch here to
+    // keep construction non-fatal.
+    try
+    {
+        mFbankReady = initFbankResources(stream);
+        if (!mFbankReady)
+        {
+            // initFbankResources already logged the specific reason; add the consequence.
+            LOG_WARNING("Online GPU fbank unavailable; using CPU MelExtractor for PCM→mel.");
+        }
+    }
+    catch (std::exception const& e)
+    {
+        mFbankReady = false;
+        LOG_WARNING("Online GPU fbank init failed (%s); using CPU MelExtractor for PCM→mel.", e.what());
+    }
 }
 
 bool NemotronOmniAudioRunner::validateAndFillConfig(std::string const& engineDir)
@@ -224,17 +292,220 @@ bool NemotronOmniAudioRunner::encodeSingleClip(
     return true;
 }
 
+bool NemotronOmniAudioRunner::initFbankResources(cudaStream_t stream)
+{
+    // ── 1. Validation: config is parakeet-spec, and fetch the CPU MelExtractor's
+    //    Slaney weights / symmetric-Hann taps (single source of truth so the GPU
+    //    fbank and CPU fallback can never drift), shape-checked via .size(). ──
+    audio::MelExtractorConfig const& cfg = mFeMel.config();
+    std::string reason;
+    if (!parakeetFbankConfigOk(cfg, reason))
+    {
+        LOG_WARNING("Online GPU fbank disabled (extractor not parakeet-spec): %s", reason.c_str());
+        return false;
+    }
+    int32_t const nFft = cfg.nFFT;
+    int32_t const nMel = cfg.nMel;
+    int32_t const nFreq = nFft / 2 + 1;
+
+    std::vector<float> const& melFilterHost = mFeMel.melFilterBank(); // [nMel, nFreq] row-major, freq-contiguous
+    if (melFilterHost.size() != static_cast<size_t>(nMel) * nFreq)
+    {
+        LOG_WARNING("Online GPU fbank disabled: mel filter size %zu != nMel(%d) x nFreq(%d).", melFilterHost.size(),
+            nMel, nFreq);
+        return false;
+    }
+    std::vector<float> const& windowHost = mFeMel.window(); // winLength taps, embedded centred in nFft below
+    if (windowHost.size() != static_cast<size_t>(cfg.winLength) || cfg.winLength > nFft)
+    {
+        LOG_WARNING("Online GPU fbank disabled: window size %zu invalid for winLength=%d, nFft=%d.", windowHost.size(),
+            cfg.winLength, nFft);
+        return false;
+    }
+
+    // ── 2. GEMM module load — before any allocation, so an unsupported SM or a
+    //    build without the FP32-out mel GEMM variant uses the CPU MelExtractor
+    //    without reserving device memory. The umbrella macro alone is not enough:
+    //    loadKernelModule() succeeds with any compiled GEMM variant, while the
+    //    per-clip pipeline needs gemm_blackwell_small_fp16in_fp32out specifically
+    //    (runFp16inFp32out has no in-variant fallback). ──
+#if defined(CUTE_DSL_GEMM_ENABLED) && defined(CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED)
+    if (!CuteDslGemmRunner::loadKernelModule())
+    {
+        LOG_ERROR("CuteDslGemmRunner::loadKernelModule failed — online fbank GEMM unavailable on this device.");
+        return false;
+    }
+#else
+    LOG_WARNING(
+        "Online GPU fbank disabled: FP16-in/FP32-out mel GEMM variant not compiled (need -DENABLE_CUTE_DSL=gemm "
+        "with an artifact providing gemm_blackwell_small_fp16in_fp32out). Using CPU MelExtractor.");
+    return false;
+#endif
+
+    // ── 3. Bound derivation from the engine "input_features" kMAX profile.
+    //    mMaxSeqLen (validateAndFillConfig) is the max raw mel time steps; parakeet
+    //    T_out == floor(N/hop), so the longest PCM the GPU path accepts is the
+    //    largest N with T_out <= maxFrames. The pass-1 gate routes longer clips to
+    //    the CPU fallback. ──
+    int64_t const maxFrames = mMaxSeqLen;
+    if (maxFrames <= 0)
+    {
+        LOG_WARNING("Online GPU fbank disabled: engine kMAX profile gives non-positive max mel frames (%ld).",
+            static_cast<long>(maxFrames));
+        return false;
+    }
+    int64_t const maxPcmSamples = (maxFrames + 1) * cfg.hopLength - 1;
+    int32_t const nPadMax = audioUtils::fbankNPad(static_cast<int32_t>(maxFrames));
+    int32_t const kPad = audioUtils::fbankKPadParakeet(nFreq);
+
+    // ── 4. Allocation block — the ONLY site fbank device tensors are constructed;
+    //    every buffer is sized at the kMAX bound, per-clip only reshapes. ──
+    mFbankResourcesParakeet.melFilterFp16Kmajor = rt::Tensor(
+        {nMel, kPad}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "NemotronOmniAudioRunner::melFilterFp16Kmajor");
+    mFbankResourcesParakeet.windowF32
+        = rt::Tensor({nFft}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::windowF32");
+    mFbankResourcesParakeet.fftTwiddle = rt::Tensor(
+        {nFft, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::fftTwiddle");
+    mFbankResourcesParakeet.framedF32 = rt::Tensor(
+        {maxFrames, nFft}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::framedF32");
+    mFbankResourcesParakeet.magFp16 = rt::Tensor({static_cast<int64_t>(nPadMax), kPad}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "NemotronOmniAudioRunner::magFp16");
+    mFbankResourcesParakeet.melPowerF32 = rt::Tensor({nMel, static_cast<int64_t>(nPadMax)}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::melPowerF32");
+    mFbankResourcesParakeet.mean
+        = rt::Tensor({nMel}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::mean");
+    mFbankResourcesParakeet.invDenom
+        = rt::Tensor({nMel}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::invDenom");
+    mPcmF32Device = rt::Tensor(
+        {maxPcmSamples}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "NemotronOmniAudioRunner::mPcmF32Device");
+    // Time-first [1, maxFrames, nMel] (parakeet layout; NOT whisper's [1, nMel, T]).
+    mMelSpecDevice = rt::Tensor({1, maxFrames, static_cast<int64_t>(nMel)}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "NemotronOmniAudioRunner::mMelSpecDevice");
+
+    // ── 5. Fill-only block: H2D the persistent weight / table tensors, and zero
+    //    the mag K-pad region once (see the per-clip-memset elimination below). ──
+    // Mel filter: cast + K-pad the Slaney weights into the [nMel, kPad] F16 K-major
+    // GEMM A-matrix layout (nMel-major, freq-contiguous — pure FP16 cast, no transpose).
+    if (!audioUtils::fillMelFilterFp16Kmajor(
+            melFilterHost.data(), nMel, nFreq, kPad, mFbankResourcesParakeet.melFilterFp16Kmajor, stream))
+    {
+        return false;
+    }
+    std::vector<float> windowEmbedded;
+    audioUtils::makeCentredWindowHost(windowHost, nFft, windowEmbedded);
+    CUDA_CHECK(cudaMemcpyAsync(mFbankResourcesParakeet.windowF32.rawPointer(), windowEmbedded.data(),
+        static_cast<size_t>(nFft) * sizeof(float), cudaMemcpyHostToDevice, stream));
+    std::vector<float> twiddleHost;
+    audioUtils::makeFftTwiddleHost(nFft, twiddleHost);
+    CUDA_CHECK(cudaMemcpyAsync(mFbankResourcesParakeet.fftTwiddle.rawPointer(), twiddleHost.data(),
+        twiddleHost.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+    // Zero magFp16 ONCE over the full [nPadMax, kPad] buffer. Per clip fbankParakeet
+    // only shrinks the view (no re-allocation) and stftR2C512FusedMagsq writes only
+    // the active [0, T_out) × [0, nFreq) window, so the K-pad columns [nFreq, kPad)
+    // and unused rows stay zero for every clip — the AOT GEMM (no K-residue handling)
+    // is exact without a per-clip memset.
+    CUDA_CHECK(cudaMemsetAsync(
+        mFbankResourcesParakeet.magFp16.rawPointer(), 0, static_cast<size_t>(nPadMax) * kPad * sizeof(__half), stream));
+
+    // windowEmbedded / twiddleHost are stack-local pageable host buffers feeding the
+    // async H2D copies above; a pageable async H2D does not guarantee the source is
+    // consumed before the call returns, so synchronise before they go out of scope.
+    // Runs once at construction, so the sync is negligible.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // ── 6. Publish the scalar params from cfg (single source of truth for
+    //    fbankParakeet / computeNumMelFramesParakeet). normEps is not a
+    //    MelExtractorConfig field — it is the fixed parakeet spec constant
+    //    kParakeetZScoreEps, matching the CPU MelExtractor's per-feature epsilon. ──
+    mFbankResourcesParakeet.nFft = nFft;
+    mFbankResourcesParakeet.hopLength = cfg.hopLength;
+    mFbankResourcesParakeet.centerPad = nFft / 2;
+    mFbankResourcesParakeet.nMel = nMel;
+    mFbankResourcesParakeet.nFreq = nFreq;
+    mFbankResourcesParakeet.maxFrames = static_cast<int32_t>(maxFrames);
+    mFbankResourcesParakeet.preemph = cfg.preemphCoeff;
+    mFbankResourcesParakeet.logGuard = cfg.logFloor;
+    mFbankResourcesParakeet.normEps = audioUtils::kParakeetZScoreEps;
+
+    LOG_INFO(
+        "Online GPU fbank ready (mel filter %dx%d Slaney reused from CPU MelExtractor; K-pad %d, FP32-out GEMM; "
+        "buffers pre-allocated for up to %ld mel frames).",
+        nMel, nFreq, kPad, static_cast<long>(maxFrames));
+    return true;
+}
+
+bool NemotronOmniAudioRunner::gpuFbankViable(rt::audio::AudioPCM const& pcm) const
+{
+    // Online fbank ready (config validated parakeet-spec, params published into
+    // mFbankResourcesParakeet), the engine mel width agrees, and the sample rate
+    // matches what the kernels assume (the CPU MelExtractor rejects a rate
+    // mismatch, so the GPU path must too).
+    return mFbankReady && mConfig.melBins == mFbankResourcesParakeet.nMel
+        && pcm.sampleRate == mFeMel.config().sampleRate;
+}
+
+bool NemotronOmniAudioRunner::runGpuFbankClip(
+    rt::audio::AudioPCM const& pcm, int64_t const numFrames, rt::Tensor& melSpec, cudaStream_t stream)
+{
+    // Upload host FP32 PCM [-1, 1] into the pre-allocated [N] staging tensor
+    // (metadata-only reshape; the pass-1 maxFrames gate bounds N). pcm.samples is
+    // owned by the request and outlives preprocess, covering the async fbank launches.
+    if (!audioUtils::uploadHostPcmF32ToGpu(pcm.samples, mPcmF32Device, stream))
+    {
+        return false;
+    }
+    // Non-owning view of the pre-allocated backing store at this clip's width,
+    // time-first [1, T, nMel] (parakeet layout; numFrames == fbankParakeet's internal
+    // floor(N/hop), so the shape contract holds). A move-assignment into melSpec on
+    // the CPU-fallback path (produceClipMel → uploadHostMelFp32ToFp16Gpu) rebinds it
+    // to a freshly-owned tensor and cannot free mMelSpecDevice; every consumer of
+    // melSpec runs within this encodeAllClips call, inside mMelSpecDevice's lifetime.
+    melSpec
+        = rt::Tensor(mMelSpecDevice.rawPointer(), {1, numFrames, static_cast<int64_t>(mFbankResourcesParakeet.nMel)},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+    return audioUtils::fbankParakeet(mPcmF32Device, mFbankResourcesParakeet, melSpec, stream);
+}
+
+bool NemotronOmniAudioRunner::produceClipMel(ClipPlan& plan, rt::Tensor& melSpec, cudaStream_t stream)
+{
+    if (plan.pcm != nullptr)
+    {
+        if (runGpuFbankClip(*plan.pcm, plan.numFrames, melSpec, stream))
+        {
+            return true;
+        }
+        // GPU fbank failed at runtime: re-extract on the CPU. It yields the same
+        // floor(N/hop) frame count, so the pass-1 row sizing still holds.
+        LOG_WARNING("Online GPU fbank failed; falling back to CPU MelExtractor for this clip.");
+        if (!mFeMel.extract(*plan.pcm, plan.hostMel))
+        {
+            LOG_ERROR("Mel extraction failed");
+            return false;
+        }
+    }
+    // CPU mel (pass-1 extracted, or the GPU fallback above): FP32 host mel →
+    // FP16 GPU mel ([1, T, mel_bins]).
+    return audioUtils::uploadHostMelFp32ToFp16Gpu(plan.hostMel, melSpec, stream, "NemotronOmniAudioRunner::mel");
+}
+
 bool NemotronOmniAudioRunner::encodeAllClips(
     rt::LLMGenerationRequest const& request, std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
 {
-    // Two-pass: extract mel host-side from PCM + size mAudioEmbedding first,
-    // then upload + encode each clip. Mid-loop encoder reallocation would
-    // invalidate addresses on prior clips whose enqueueV3 may not yet have
-    // run on the stream.
-    std::vector<rt::Tensor> hostMels;
+    // Two-pass: size mAudioEmbedding from every clip's mel frame count first, then
+    // produce each clip's mel + encode it. Mid-loop encoder reallocation would
+    // invalidate addresses on prior clips whose enqueueV3 may not yet have run on
+    // the stream, so the output buffer must be sized once up front.
+    //
+    // The online GPU fbank slots into pass 1 cheaply: T = floor(N / hop) is
+    // closed-form (computeNumMelFramesParakeet), so a GPU clip needs no kernel to
+    // size the buffer — the actual fbank runs in pass 2. A non-viable clip (gate
+    // miss) is CPU-extracted in pass 1; both paths yield the same T, so the sizing
+    // is valid regardless of which path a clip takes (incl. a pass-2 GPU→CPU fallback).
+    std::vector<ClipPlan> plans;
     int64_t totalEncodedRows = 0;
     auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
 
+    // Pass 1: determine each clip's mel frame count T and size mAudioEmbedding.
     for (auto const& req : request.requests)
     {
         for (auto const& audio : req.audioBuffers)
@@ -246,19 +517,40 @@ bool NemotronOmniAudioRunner::encodeAllClips(
                     "(server) or requestFileParser (CLI).");
                 return false;
             }
-            rt::Tensor hostMel;
-            if (!mFeMel.extract(*audio.pcm, hostMel))
+            ClipPlan plan;
+            int64_t numFrames = 0;
+            if (gpuFbankViable(*audio.pcm))
             {
-                LOG_ERROR("Mel extraction failed");
-                return false;
+                // GPU path: T = floor(N / hop), no kernel needed to size the buffer.
+                int32_t const t = audioUtils::computeNumMelFramesParakeet(
+                    static_cast<int64_t>(audio.pcm->samples.size()), mFbankResourcesParakeet.hopLength);
+                // The fbank buffers were pre-allocated for up to maxFrames frames;
+                // clips too short for the framing (t <= 0) and clips beyond that
+                // bound (t > maxFrames) fall back to the CPU MelExtractor without
+                // touching the GPU. Both paths yield the same floor(N/hop) T.
+                if (t > 0 && t <= mFbankResourcesParakeet.maxFrames)
+                {
+                    plan.pcm = audio.pcm.get();
+                    numFrames = t;
+                }
             }
-            // Parakeet layout: host mel is [T, mel_bins]; encoded length is
+            if (plan.pcm == nullptr)
+            {
+                // CPU path (gate miss, clip too short for the GPU framing, or over-bound).
+                if (!mFeMel.extract(*audio.pcm, plan.hostMel))
+                {
+                    LOG_ERROR("Mel extraction failed");
+                    return false;
+                }
+                numFrames = plan.hostMel.getShape()[0];
+            }
+            plan.numFrames = numFrames;
+            // Parakeet layout: mel is [T, mel_bins]; encoded length is
             // ceil(T / subsamplingFactor).
-            int64_t const encodedSeqLen
-                = alignUp(hostMel.getShape()[0], mConfig.subsamplingFactor) / mConfig.subsamplingFactor;
+            int64_t const encodedSeqLen = alignUp(numFrames, mConfig.subsamplingFactor) / mConfig.subsamplingFactor;
             audioTokenLengths.push_back(encodedSeqLen);
             totalEncodedRows += encodedSeqLen;
-            hostMels.push_back(std::move(hostMel));
+            plans.push_back(std::move(plan));
         }
     }
 
@@ -275,12 +567,13 @@ bool NemotronOmniAudioRunner::encodeAllClips(
         return false;
     }
 
+    // Pass 2: produce each clip's [1, T, mel_bins] FP16 mel (GPU fbank or CPU
+    // upload) and encode it into its row slot.
     int64_t rowOffset = 0;
-    for (auto const& hostMel : hostMels)
+    for (auto& plan : plans)
     {
-        // FP32 host mel -> FP16 GPU mel ([1, T, mel_bins] for parakeet layout).
         rt::Tensor melSpec;
-        if (!audioUtils::uploadHostMelFp32ToFp16Gpu(hostMel, melSpec, stream, "NemotronOmniAudioRunner::mel"))
+        if (!produceClipMel(plan, melSpec, stream))
         {
             return false;
         }

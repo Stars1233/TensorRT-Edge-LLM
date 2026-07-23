@@ -48,9 +48,10 @@ from cute_utils import (
     griddepcontrol_wait,
     is_power_of_2,
     silu_f32,
+    gelu_tanh_f32,
 )
 
-SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
+SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2, ActivationType.Geglu)
 
 
 def validate_activation_type(activation_type) -> ActivationType:
@@ -2780,6 +2781,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
                         acc_vec_gate = tTR_rAcc_gate.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
+                    elif cutlass.const_expr(self.activation_type == ActivationType.Geglu):
+                        acc_vec_gate = tTR_rAcc_gate.load()
+                        self._apply_geglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                         self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
 
@@ -3055,6 +3059,54 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
+
+    @cute.jit
+    def _apply_geglu_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """GeGLU: ``tCompute[i] = (alpha * up[i]) * gelu_tanh(alpha * gate[i])``
+
+        ``up`` and ``gate`` come from the two interleaved accumulator
+        subtiles loaded by the caller.
+        """
+        if cutlass.const_expr(self.vectorized_f32):
+            # Packed f32x2: compute gelu_tanh via 0.5*x*(1+tanh(0.7978845608*(x+0.044715*x^3)))
+            SQRT_2_OVER_PI = cutlass.Float32(0.7978845608)
+            COEFF = cutlass.Float32(0.044715)
+            HALF = cutlass.Float32(0.5)
+            ONE = cutlass.Float32(1.0)
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                acc_vec_up_alpha = cute.arch.mul_packed_f32x2(
+                    (acc_vec_up[i], acc_vec_up[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                acc_vec_gate_alpha = cute.arch.mul_packed_f32x2(
+                    (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                    (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
+                )
+                # gelu_tanh for each element (scalar, no packed tanh available)
+                g0 = acc_vec_gate_alpha[0]
+                g1 = acc_vec_gate_alpha[1]
+                gelu0 = HALF * g0 * (ONE + cute.math.tanh(
+                    SQRT_2_OVER_PI * (g0 + COEFF * g0 * g0 * g0), fastmath=True))
+                gelu1 = HALF * g1 * (ONE + cute.math.tanh(
+                    SQRT_2_OVER_PI * (g1 + COEFF * g1 * g1 * g1), fastmath=True))
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(
+                    (gelu0, gelu1),
+                    (acc_vec_up_alpha[0], acc_vec_up_alpha[1]),
+                )
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                tCompute[i] = acc_vec_up_alpha * gelu_tanh_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit
     def _apply_relu2_epilogue(

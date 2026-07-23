@@ -231,6 +231,22 @@ def silu_f32(a: Union[float, cutlass.Float32],
     return a * sigmoid_f32(a, fastmath=fastmath)
 
 
+def gelu_tanh_f32(a: Union[float, cutlass.Float32],
+                  fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the GELU (tanh approximation) of the input tensor.
+    gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    """
+    return cutlass.Float32(0.5) * a * (
+        cutlass.Float32(1.0) + cute.math.tanh(
+            cutlass.Float32(0.7978845608) * (
+                a + cutlass.Float32(0.044715) * a * a * a
+            ),
+            fastmath=fastmath,
+        )
+    )
+
+
 # TODO(zhichenj): try to move these to NVVM wrapper or helper functions
 @dsl_user_op
 def vectorized_atomic_add_bf16x8(rOut_epi_packed,

@@ -381,5 +381,10 @@ bool saveConfigWithBuilderInfo(
     return true;
 }
 
+void logTrtNativeAttentionPath(char const* component) noexcept
+{
+    LOG_INFO("%s: Using TRT-native IAttention (TRT_Attention) path", component);
+}
+
 } // namespace builder
 } // namespace trt_edgellm

@@ -44,6 +44,8 @@ struct Gemma4ViTConfig
     int64_t rotaryPosEmbDim{0};        //!< Gemma4 visual RoPE angle dimension
     float ropeTheta{100.0F};           //!< Gemma4 visual RoPE base frequency
     int32_t imageTokenId{0};           //!< Token ID for image placeholder
+    int32_t beginImageTokenId{-1};     //!< boi token ID wrapping each image span (-1 when absent)
+    int32_t endImageTokenId{-1};       //!< eoi token ID wrapping each image span (-1 when absent)
     std::vector<float> imageMean{};    //!< Image normalization mean values (RGB)
     std::vector<float> imageStd{};     //!< Image normalization standard deviation values (RGB)
 };

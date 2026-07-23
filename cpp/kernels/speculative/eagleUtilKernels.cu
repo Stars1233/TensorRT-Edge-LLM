@@ -33,10 +33,6 @@ namespace kernel
 constexpr int32_t kROOT_NODE_PREDECESSOR{-1};
 constexpr int32_t kEMPTY_NODE_PREDECESSOR{-5};
 
-// TRT native attention masks use bool*, and buffer sizes are computed assuming sizeof(bool) == 1.
-// This is true on all NVIDIA platforms but not guaranteed by the C++ standard.
-static_assert(sizeof(bool) == sizeof(uint8_t), "Unexpected boolean size");
-
 __global__ void prepareEaglePrefillInputKernel(int64_t* selectTokenIndices, int32_t const* sequenceContextLengths)
 {
     int32_t const batchIdx = blockIdx.x;
@@ -518,81 +514,6 @@ void prepareEaglePrefillInputs(
         selectTokenIndices.dataPointer<int64_t>(), sequenceContextLengths.dataPointer<int32_t>());
 }
 
-__global__ void assembleTrtNativePrefillCausalMaskAndPosIdsKernel(bool* trtNativeAttentionMask, int32_t* positionIds,
-    int32_t const* sequenceContextLengths, int32_t const inputSequenceLength, int32_t const presentLengthMax)
-{
-    // Each block handles one batch
-    // Each thread handles multiple rows of the mask and position IDs
-    int32_t const batchIdx = blockIdx.x;
-
-    // Get the past length from sequenceContextLengths (which is copied from KV cache lengths)
-    // For first prefill, pastLength = 0; for incremental/resumed, pastLength > 0
-    int32_t const presentLength = sequenceContextLengths[batchIdx];
-    int32_t const pastLength = presentLength - inputSequenceLength;
-
-    // Guard against invalid input where presentLength < inputSequenceLength
-    if (pastLength < 0)
-    {
-        return;
-    }
-
-    // Mask layout: [batch, 1, inputSequenceLength, presentLength]
-    int64_t const batchOffset = static_cast<int64_t>(batchIdx) * 1 * inputSequenceLength * presentLengthMax;
-
-    // Position IDs layout: [batch, inputSequenceLength]
-    int32_t const posIdOffset = batchIdx * inputSequenceLength;
-
-    // Each thread processes multiple query positions (rows)
-    for (int32_t queryIdx = threadIdx.x; queryIdx < inputSequenceLength; queryIdx += blockDim.x)
-    {
-        // Generate causal mask for this query position
-        int64_t const rowOffset = batchOffset + static_cast<int64_t>(queryIdx) * presentLengthMax;
-
-        // Allow attention to all past positions (before current input)
-        for (int32_t kvIdx = 0; kvIdx < pastLength; ++kvIdx)
-        {
-            trtNativeAttentionMask[rowOffset + kvIdx] = true;
-        }
-
-        // Causal mask for current input: token at queryIdx can attend to positions pastLength..(pastLength+queryIdx)
-        for (int32_t kvIdx = 0; kvIdx < inputSequenceLength; ++kvIdx)
-        {
-            trtNativeAttentionMask[rowOffset + pastLength + kvIdx] = (kvIdx <= queryIdx);
-        }
-
-        // Generate sequential position IDs: [pastLength, pastLength+1, ..., pastLength+inputSequenceLength-1]
-        positionIds[posIdOffset + queryIdx] = pastLength + queryIdx;
-    }
-}
-
-void prepareEaglePrefillInputsTrtNative(rt::Tensor const& sequenceContextLengths, rt::Tensor& trtNativeAttentionMask,
-    rt::Tensor& positionIds, cudaStream_t stream)
-{
-    // Validation
-    check::check(sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU
-            && trtNativeAttentionMask.getDeviceType() == rt::DeviceType::kGPU
-            && positionIds.getDeviceType() == rt::DeviceType::kGPU,
-        "All tensors must be on GPU");
-
-    check::check(sequenceContextLengths.getDataType() == DataType::kINT32
-            && trtNativeAttentionMask.getDataType() == DataType::kBOOL && positionIds.getDataType() == DataType::kINT32,
-        "Data type validation failed");
-
-    uint32_t const batchSize = sequenceContextLengths.getShape()[0];
-
-    // Get inputSequenceLength from mask shape: [batch, 1, inputSequenceLength, presentLength]
-    int32_t const inputSequenceLength = static_cast<int32_t>(trtNativeAttentionMask.getShape()[2]);
-    int32_t const presentLengthMax = static_cast<int32_t>(trtNativeAttentionMask.getShape()[3]);
-
-    // Launch causal mask and position IDs generation kernel
-    // Use 256 threads per block to handle multiple rows efficiently
-    dim3 const blockDim{256};
-    dim3 const gridDim{batchSize};
-    assembleTrtNativePrefillCausalMaskAndPosIdsKernel<<<gridDim, blockDim, 0, stream>>>(
-        trtNativeAttentionMask.dataPointer<bool>(), positionIds.dataPointer<int32_t>(),
-        sequenceContextLengths.dataPointer<int32_t>(), inputSequenceLength, presentLengthMax);
-}
-
 void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor const& draftTreeLength,
     rt::Tensor const& sequenceStartIndices, rt::Tensor& packedDraftTreeMask, rt::Tensor& tensorPositionIndices,
     rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream)
@@ -636,235 +557,6 @@ void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor
     prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(draftTreeLength.dataPointer<int32_t>(),
         sequenceStartIndices.dataPointer<int32_t>(), sequenceContextLengths.dataPointer<int32_t>(),
         selectTokenIndices.dataPointer<int64_t>(), selectTokenLength, paddedDraftTreeSize);
-}
-
-__global__ void assembleTrtNativeAttentionMaskKernel(int8_t const* draftTreeMask, int32_t const* draftTreeSizes,
-    int32_t const* sequenceStartIndices, bool* trtNativeAttentionMask, int32_t* tensorPositionIndices,
-    int32_t const paddedDraftTreeSize, int32_t const maxPresentLength)
-{
-    // Each thread handles one query token (row) in the draft tree
-    int32_t const batchIdx = blockIdx.x;
-    int32_t const queryTokenIdx = threadIdx.x;
-
-    int32_t const actualDraftTreeSize = (draftTreeSizes != nullptr) ? draftTreeSizes[batchIdx] : paddedDraftTreeSize;
-    int32_t const sequenceStartIndex = sequenceStartIndices[batchIdx];
-    int32_t const actualPresentLength = sequenceStartIndex + paddedDraftTreeSize;
-
-    // Mask layout: [batch, 1, padded_draft_tree_size, maxPresentLength]
-    // Note: maxPresentLength is the allocated tensor size, actualPresentLength is what we fill
-    int64_t const maskOffset = static_cast<int64_t>(batchIdx) * 1 * paddedDraftTreeSize * maxPresentLength
-        + static_cast<int64_t>(queryTokenIdx) * maxPresentLength;
-
-    // Tree mask layout: [batch, padded_draft_tree_size, padded_draft_tree_size]
-    int32_t const treeMaskOffset
-        = batchIdx * paddedDraftTreeSize * paddedDraftTreeSize + queryTokenIdx * paddedDraftTreeSize;
-
-    if (queryTokenIdx < paddedDraftTreeSize)
-    {
-        int32_t attendNodeNum = 0;
-
-        if (queryTokenIdx < actualDraftTreeSize)
-        {
-            // 1. Allow attention to all history (before draft tree)
-            for (int32_t kvIdx = 0; kvIdx < sequenceStartIndex; ++kvIdx)
-            {
-                trtNativeAttentionMask[maskOffset + kvIdx] = true;
-            }
-
-            // 2. Apply tree attention mask within draft tree
-            for (int32_t treeTokenIdx = 0; treeTokenIdx <= queryTokenIdx; ++treeTokenIdx)
-            {
-                int8_t const maskFlag = draftTreeMask[treeMaskOffset + treeTokenIdx];
-                bool const canAttend = (maskFlag != 0);
-                trtNativeAttentionMask[maskOffset + sequenceStartIndex + treeTokenIdx] = canAttend;
-
-                if (canAttend)
-                {
-                    attendNodeNum += 1;
-                }
-            }
-
-            // 3. Mask out future positions in tree
-            for (int32_t treeTokenIdx = queryTokenIdx + 1; treeTokenIdx < paddedDraftTreeSize; ++treeTokenIdx)
-            {
-                trtNativeAttentionMask[maskOffset + sequenceStartIndex + treeTokenIdx] = false;
-            }
-
-            // 4. Mask out positions beyond actualPresentLength (unused cache slots)
-            for (int32_t kvIdx = actualPresentLength; kvIdx < maxPresentLength; ++kvIdx)
-            {
-                trtNativeAttentionMask[maskOffset + kvIdx] = false;
-            }
-
-            // Compute position index (token always attends to itself, subtract 1)
-            tensorPositionIndices[batchIdx * paddedDraftTreeSize + queryTokenIdx]
-                = sequenceStartIndex + attendNodeNum - 1;
-        }
-        else
-        {
-            // Padding tokens: mask all positions
-            for (int32_t kvIdx = 0; kvIdx < maxPresentLength; ++kvIdx)
-            {
-                trtNativeAttentionMask[maskOffset + kvIdx] = false;
-            }
-            tensorPositionIndices[batchIdx * paddedDraftTreeSize + queryTokenIdx] = 0;
-        }
-    }
-}
-
-void prepareEagleDraftProposalInputsTrtNative(rt::Tensor const& draftTreeMask, rt::Tensor const& draftTreeLength,
-    rt::Tensor const& sequenceStartIndices, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
-    rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream)
-{
-    // Validation
-    check::check(draftTreeMask.getDeviceType() == rt::DeviceType::kGPU
-            && draftTreeLength.getDeviceType() == rt::DeviceType::kGPU
-            && sequenceStartIndices.getDeviceType() == rt::DeviceType::kGPU
-            && trtNativeAttentionMask.getDeviceType() == rt::DeviceType::kGPU
-            && tensorPositionIndices.getDeviceType() == rt::DeviceType::kGPU
-            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU
-            && sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU,
-        "All tensors must be on GPU");
-
-    check::check(draftTreeMask.getDataType() == DataType::kINT8 && draftTreeLength.getDataType() == DataType::kINT32
-            && sequenceStartIndices.getDataType() == DataType::kINT32
-            && trtNativeAttentionMask.getDataType() == DataType::kBOOL
-            && tensorPositionIndices.getDataType() == DataType::kINT32
-            && selectTokenIndices.getDataType() == DataType::kINT64
-            && sequenceContextLengths.getDataType() == DataType::kINT32,
-        "Data type validation failed");
-
-    uint32_t const batchSize = draftTreeMask.getShape()[0];
-    int32_t const paddedDraftTreeSize = draftTreeMask.getShape()[1];
-    int32_t const selectTokenLength = selectTokenIndices.getShape().volume() / batchSize;
-
-    // Get max present length from the mask tensor's last dimension
-    int32_t const maxPresentLength = trtNativeAttentionMask.getShape()[3];
-
-    // Launch mask generation kernel
-    uint32_t const blocksize = divUp(paddedDraftTreeSize, 32) * 32;
-    dim3 const blockDim{blocksize};
-    dim3 const gridDim{batchSize};
-    assembleTrtNativeAttentionMaskKernel<<<gridDim, blockDim, 0, stream>>>(draftTreeMask.dataPointer<int8_t>(),
-        draftTreeLength.dataPointer<int32_t>(), sequenceStartIndices.dataPointer<int32_t>(),
-        trtNativeAttentionMask.dataPointer<bool>(), tensorPositionIndices.dataPointer<int32_t>(), paddedDraftTreeSize,
-        maxPresentLength);
-
-    // Launch misc input setup (reuse existing kernel)
-    dim3 const blockDim2{32};
-    dim3 const gridDim2{batchSize};
-    prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(draftTreeLength.dataPointer<int32_t>(),
-        sequenceStartIndices.dataPointer<int32_t>(), sequenceContextLengths.dataPointer<int32_t>(),
-        selectTokenIndices.dataPointer<int64_t>(), selectTokenLength, paddedDraftTreeSize);
-}
-
-__global__ void assembleTrtNativeCausalMaskKernel(int32_t const* sequenceStartIndices, int32_t const* acceptedTokenNums,
-    bool* trtNativeAttentionMask, int32_t* tensorPositionIndices, int32_t const maxAcceptedTokenNum,
-    int32_t const maxPresentLength)
-{
-    // Each thread handles one query token in the accepted sequence
-    int32_t const batchIdx = blockIdx.x;
-    int32_t const tokenIdx = threadIdx.x;
-
-    int32_t const acceptedTokenNum = acceptedTokenNums[batchIdx];
-    int32_t const sequenceStartIndex = sequenceStartIndices[batchIdx];
-    int32_t const actualPresentLength = sequenceStartIndex + acceptedTokenNum;
-
-    // Mask layout: [batch, 1, max_accepted_token_num, maxPresentLength]
-    // Note: maxPresentLength is the allocated tensor size, actualPresentLength is what we fill
-    int64_t const maskOffset = static_cast<int64_t>(batchIdx) * 1 * maxAcceptedTokenNum * maxPresentLength
-        + static_cast<int64_t>(tokenIdx) * maxPresentLength;
-
-    if (tokenIdx < maxAcceptedTokenNum)
-    {
-        if (tokenIdx < acceptedTokenNum)
-        {
-            // Valid tokens: causal mask - attend to all history + all previous accepted tokens + self
-            // 1. Allow attention to all history (before accepted tokens)
-            for (int32_t kvIdx = 0; kvIdx < sequenceStartIndex; ++kvIdx)
-            {
-                trtNativeAttentionMask[maskOffset + kvIdx] = true;
-            }
-
-            // 2. Apply causal mask within accepted tokens (attend to tokens 0..tokenIdx)
-            for (int32_t acceptIdx = 0; acceptIdx <= tokenIdx; ++acceptIdx)
-            {
-                trtNativeAttentionMask[maskOffset + sequenceStartIndex + acceptIdx] = true;
-            }
-
-            // 3. Mask out future positions in accepted sequence
-            for (int32_t acceptIdx = tokenIdx + 1; acceptIdx < acceptedTokenNum; ++acceptIdx)
-            {
-                trtNativeAttentionMask[maskOffset + sequenceStartIndex + acceptIdx] = false;
-            }
-
-            // 4. Mask out positions beyond actualPresentLength (unused cache slots)
-            for (int32_t kvIdx = actualPresentLength; kvIdx < maxPresentLength; ++kvIdx)
-            {
-                trtNativeAttentionMask[maskOffset + kvIdx] = false;
-            }
-
-            // Compute position index (sequential positioning)
-            tensorPositionIndices[batchIdx * maxAcceptedTokenNum + tokenIdx] = sequenceStartIndex + tokenIdx;
-        }
-        else
-        {
-            // Padding tokens: mask all positions
-            for (int32_t kvIdx = 0; kvIdx < maxPresentLength; ++kvIdx)
-            {
-                trtNativeAttentionMask[maskOffset + kvIdx] = false;
-            }
-            tensorPositionIndices[batchIdx * maxAcceptedTokenNum + tokenIdx] = 0;
-        }
-    }
-}
-
-void prepareEagleAcceptDecodeTokenInputsTrtNative(rt::Tensor const& sequenceStartIndices,
-    rt::Tensor const& acceptedTokenNums, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
-    rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream)
-{
-    // Validation
-    check::check(sequenceStartIndices.getDeviceType() == rt::DeviceType::kGPU
-            && acceptedTokenNums.getDeviceType() == rt::DeviceType::kGPU
-            && trtNativeAttentionMask.getDeviceType() == rt::DeviceType::kGPU
-            && tensorPositionIndices.getDeviceType() == rt::DeviceType::kGPU
-            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU
-            && sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU,
-        "All tensors must be on GPU");
-
-    check::check(sequenceStartIndices.getDataType() == DataType::kINT32
-            && acceptedTokenNums.getDataType() == DataType::kINT32
-            && trtNativeAttentionMask.getDataType() == DataType::kBOOL
-            && tensorPositionIndices.getDataType() == DataType::kINT32
-            && selectTokenIndices.getDataType() == DataType::kINT64
-            && sequenceContextLengths.getDataType() == DataType::kINT32,
-        "Data type validation failed");
-
-    uint32_t const batchSize = sequenceStartIndices.getShape()[0];
-    int32_t const maxAcceptedTokenNum = tensorPositionIndices.getShape()[1];
-    check::check(maxAcceptedTokenNum < 32, "Current kernel implementation support accepted token <= 32 per batch.");
-
-    // Get max present length from the mask tensor's last dimension
-    int32_t const maxPresentLength = trtNativeAttentionMask.getShape()[3];
-
-    // Launch causal mask generation kernel
-    uint32_t const blocksize = divUp(maxAcceptedTokenNum, 32) * 32;
-    dim3 const blockDim{blocksize};
-    dim3 const gridDim{batchSize};
-    assembleTrtNativeCausalMaskKernel<<<gridDim, blockDim, 0, stream>>>(sequenceStartIndices.dataPointer<int32_t>(),
-        acceptedTokenNums.dataPointer<int32_t>(), trtNativeAttentionMask.dataPointer<bool>(),
-        tensorPositionIndices.dataPointer<int32_t>(), maxAcceptedTokenNum, maxPresentLength);
-
-    // Setup select token indices and sequence context lengths
-    // For accept decode, we select only the last token for logits output
-    // Reuse existing prepareEagleDraftProposalMiscInputKernel but with acceptedTokenNum as both params
-    dim3 const blockDim2{32};
-    dim3 const gridDim2{batchSize};
-    constexpr int32_t kSELECT_TOKEN_LENGTH = 1;
-    prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(
-        acceptedTokenNums.dataPointer<int32_t>(), sequenceStartIndices.dataPointer<int32_t>(),
-        sequenceContextLengths.dataPointer<int32_t>(), selectTokenIndices.dataPointer<int64_t>(), kSELECT_TOKEN_LENGTH,
-        maxAcceptedTokenNum);
 }
 
 void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices, rt::Tensor const& acceptedTokenNums,
@@ -947,52 +639,6 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
     prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(nullptr,
         sequenceStartIndices.dataPointer<int32_t>(), sequenceContextLengths.dataPointer<int32_t>(),
         selectTokenIndices.dataPointer<int64_t>(), treeSize, treeSize);
-}
-
-void prepareEagleBaseTreeDecodingInputsTrtNative(rt::Tensor const& baseTreeDecodingMask,
-    rt::Tensor const& sequenceStartIndices, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
-    rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream)
-{
-    // Validation
-    check::check(baseTreeDecodingMask.getDeviceType() == rt::DeviceType::kGPU
-            && sequenceStartIndices.getDeviceType() == rt::DeviceType::kGPU
-            && trtNativeAttentionMask.getDeviceType() == rt::DeviceType::kGPU
-            && tensorPositionIndices.getDeviceType() == rt::DeviceType::kGPU
-            && selectTokenIndices.getDeviceType() == rt::DeviceType::kGPU
-            && sequenceContextLengths.getDeviceType() == rt::DeviceType::kGPU,
-        "All tensors must be on GPU");
-
-    check::check(baseTreeDecodingMask.getDataType() == DataType::kINT8
-            && sequenceStartIndices.getDataType() == DataType::kINT32
-            && trtNativeAttentionMask.getDataType() == DataType::kBOOL
-            && tensorPositionIndices.getDataType() == DataType::kINT32
-            && selectTokenIndices.getDataType() == DataType::kINT64
-            && sequenceContextLengths.getDataType() == DataType::kINT32,
-        "Data type validation failed");
-
-    uint32_t const batchSize = baseTreeDecodingMask.getShape()[0];
-    int32_t const treeSize = baseTreeDecodingMask.getShape()[1];
-    int32_t const selectTokenLength = treeSize; // For base, all tokens are selected
-
-    // Get max present length from the mask tensor's last dimension
-    int32_t const maxPresentLength = trtNativeAttentionMask.getShape()[3];
-
-    // Launch mask generation kernel (reuse the same kernel as draft proposal)
-    uint32_t const blocksize = divUp(treeSize, 32) * 32;
-    dim3 const blockDim{blocksize};
-    dim3 const gridDim{batchSize};
-    assembleTrtNativeAttentionMaskKernel<<<gridDim, blockDim, 0, stream>>>(baseTreeDecodingMask.dataPointer<int8_t>(),
-        nullptr, // No tree sizes (assume full tree)
-        sequenceStartIndices.dataPointer<int32_t>(), trtNativeAttentionMask.dataPointer<bool>(),
-        tensorPositionIndices.dataPointer<int32_t>(), treeSize, maxPresentLength);
-
-    // Launch misc input setup (reuse existing kernel)
-    dim3 const blockDim2{32};
-    dim3 const gridDim2{batchSize};
-    prepareEagleDraftProposalMiscInputKernel<<<gridDim2, blockDim2, 0, stream>>>(
-        nullptr, // No draft tree lengths (use treeSize)
-        sequenceStartIndices.dataPointer<int32_t>(), sequenceContextLengths.dataPointer<int32_t>(),
-        selectTokenIndices.dataPointer<int64_t>(), selectTokenLength, treeSize);
 }
 
 template <int32_t HEAD_DIM, int32_t MAX_PATH, typename KV_T>
@@ -1149,8 +795,8 @@ void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const&
     check::check(
         static_cast<int32_t>(acceptIndicesShape[1]) == maxDepth, "acceptedIndices second dim must match maxDepth.");
 
-    constexpr int32_t MAX_PATH{8};
-    check::check(maxDepth <= (MAX_PATH + 1), "maxDepth > 9 is not supported by the kernel.");
+    constexpr int32_t MAX_PATH{16};
+    check::check(maxDepth <= MAX_PATH, "maxDepth > 16 is not supported by the kernel.");
 
     // Each CTA has 128 threads, each thread copies vecSize elements (DVec<half> = 8 elements;
     // DVec<__nv_fp8_e4m3> is also 8 elements wide, so the block-dim math is dtype-agnostic).
@@ -1252,8 +898,8 @@ void eagleBaseAssembleHiddenState(
     check::check(acceptLengthsShape[0] == batchSize, "acceptLengths should have same batch size as acceptedIndices.");
     check::check(hiddenStateShape[0] == batchSize, "hiddenState batch size should match acceptedIndices.");
 
-    constexpr int32_t MAX_PATH{8};
-    check::check(maxDepth <= (MAX_PATH + 1), "maxDepth > 9 is not supported by the kernel.");
+    constexpr int32_t MAX_PATH{16};
+    check::check(maxDepth <= MAX_PATH, "maxDepth > 16 is not supported by the kernel.");
 
     constexpr uint32_t vecSize = DVec<half>::vec_size;
     constexpr uint32_t threadsPerBlock = 128;

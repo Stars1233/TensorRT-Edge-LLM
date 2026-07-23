@@ -26,6 +26,7 @@
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/decoding/decoderRegistry.h"
+#include "runtime/decoding/logitBias.h"
 #include "runtime/exec/engineExecutor.h"
 #include "runtime/exec/tensorMap.h"
 #include "runtime/features/deepstackBinding.h"
@@ -225,13 +226,13 @@ private:
 
     rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for all execution contexts
     int32_t mMaxRuntimeBatchSize{1};       //!< Maximum runtime batch size
-    bool mHasFFPALayer{false};             //!< True if any attention layer uses headDim=512 (FFPA)
 
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
     std::unique_ptr<PipelineIO> mPipelineIO;           //!< Per-pipeline I/O tensors
     TensorMap mBaseTensorMap;                          //!< Base engine binding map
+    LogitBias mLogitBias; //!< Runtime-owned resources that outlive decoding objects borrowing them
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
     std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
@@ -261,7 +262,7 @@ private:
     rt::Tensor mSamplingWorkspace;
     rt::Tensor mSamplingIndices;
     rt::Tensor mSamplingScores;
-    rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
+    rt::Tensor mBaseVocabMappingTable; //!< Vocab mapping table for base model reduced vocab (empty if unused)
 
     // [3] Batch eviction support tensors.
     rt::Tensor mDeviceBatchMapping;
@@ -274,6 +275,15 @@ private:
     // [5] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
 
+    // [6] Logprobs support tensors (allocated once in the constructor)
+    // logprobsRows = B (vanilla) or B * maxAcceptDepth (EAGLE, accepted rows only, not the full verify tree).
+    rt::Tensor mDeviceLogprobsValues;  //!< GPU [logprobsRows, kMaxLogprobsK] top-K log-prob values
+    rt::Tensor mDeviceLogprobsIndices; //!< GPU [logprobsRows, kMaxLogprobsK] top-K token indices
+    rt::Tensor mHostLogprobsValues;    //!< CPU pinned D2H target for mDeviceLogprobsValues
+    rt::Tensor mHostLogprobsIndices;   //!< CPU pinned D2H target for mDeviceLogprobsIndices
+    rt::Tensor mGatheredLogits;        //!< GPU [logprobsRows, vocabSize] gathered accepted rows (EAGLE/MTP/DFlash)
+    int32_t mLogprobsMaxBatchDim{0};   //!< Max rows fed to extractTopKLogprobs; used only for workspace sizing
+
     // [8] Base model hidden states portal (Qwen3-Omni audio generation, future MTP).
     //     The actual buffers (engine-output and prefill-embeddings backup) live on
     //     PipelineIO so they can be wired into the engine TensorMap. The registry
@@ -285,17 +295,14 @@ private:
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
 
+    //! @brief Allocate logprobs tensors. Called once from the constructor.
+    void allocateLogprobsTensors();
+
     //! @brief Restore recurrent/conv states from a cached system prompt.
     void restoreRecurrentStates(int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream);
 
     //! @brief Zero all recurrent/conv states for a given batch index.
     void zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream);
-
-    //! @brief Zero embedding/PLE tensors at padding positions before engine execution.
-    //! FFPA (headDim=512) has no cu_seqlens support and processes all positions uniformly,
-    //! so non-zero padding embeddings cause fp16 overflow → NaN propagation.
-    void zeroPaddingForFFPA(
-        int32_t const* contextLengths, int32_t batchSize, int32_t inputIdsLength, cudaStream_t stream);
 
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.

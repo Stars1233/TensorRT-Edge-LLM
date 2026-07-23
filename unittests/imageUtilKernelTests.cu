@@ -337,6 +337,12 @@ TEST(TransposeToPatchQwen, Accuracy)
     TestTransposeToPatchQwenViT(448, 448);
 }
 
+TEST(TransposeToPatchQwen, AccuracyT4)
+{
+    // Video path: gridT > 1 (T = 4 with temporalPatchSize = 2 gives gridT = 2).
+    TestTransposeToPatchQwenViT(/*height*/ 224, /*width*/ 224, /*channels*/ 3, /*T*/ 4);
+}
+
 void BenchmarkTransposeToPatchQwenViT(int32_t const height, int32_t const width, int32_t const channels = 3,
     int32_t const T = 2, int32_t const temporalPatchSize = 2, int32_t const patchSize = 14, int32_t const mergeSize = 2)
 {

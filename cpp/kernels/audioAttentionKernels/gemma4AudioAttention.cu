@@ -229,7 +229,7 @@ __global__ void fusedChunkKernel(T const* __restrict__ qRaw, T const* __restrict
         bool const inLocalWindow = (queryKeyDist >= 0) && (queryKeyDist < L);
         bool const keyInSeq = (keyPos >= 0) && (keyPos < S);
         bool const queryInSeq = (queryPos < S);
-        bool const allowed = inLocalWindow && keyInSeq && queryInSeq && (keyInSeq ? valid[batch * S + keyPos] : false);
+        bool const allowed = inLocalWindow && keyInSeq && queryInSeq && valid[batch * S + keyPos];
 
         float logit = kNegInfFill;
         if (allowed)

@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved. SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy of
@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.9.0
+  VERSION 0.9.1
   LANGUAGES C CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -170,6 +170,8 @@ option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 #   ALL              -- enable every kernel group below
 #   fmha             -- FMHA Blackwell attention
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
+#   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
+#                       Blackwell DC, and Blackwell GeForce
 #   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
 #                       SM110-only ``Nvfp4MoePlugin``
 #   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4
@@ -180,7 +182,7 @@ set(ENABLE_CUTE_DSL
     "OFF"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;gdn)"
+      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe)"
 )
 
 if(BUILD_UNIT_TESTS)

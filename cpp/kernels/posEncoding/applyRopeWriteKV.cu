@@ -204,6 +204,12 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
         int32_t const tokenIdxInCache = kvCacheStartIdx + tokenIdx % qSeqLen;
         int32_t const cacheOffsetSequence = batchIdx * 2 * numKVHead * kvCacheCapacity * headDim;
 
+        // Load V before writing roped K in-place: when K and V share the same
+        // buffer (e.g. Gemma4 global layers where K=V projection), the in-place
+        // K write would corrupt V data if read afterwards.
+        DVec<T> vSrc;
+        vSrc.load(vPtr + DVec<T>::vec_size * tIdx);
+
         DVec<T> kRoped;
         kRoped = vecApplyRopeNonInterleave(kPtr, cosVec, sinVec, rotaryDim);
 
@@ -211,9 +217,6 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
         {
             kRoped.store(kPtr + DVec<T>::vec_size * tIdx);
         }
-
-        DVec<T> vSrc;
-        vSrc.load(vPtr + DVec<T>::vec_size * tIdx);
 
         // Skip writing K/V to cache for padding tokens (position = -1)
         // This ensures padding tokens don't corrupt valid cache entries

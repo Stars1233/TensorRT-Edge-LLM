@@ -59,7 +59,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...config import ModelConfig
+from ... import config as config_module
+from .. import ops
 from ..linear import make_linear
 
 logger = logging.getLogger(__name__)
@@ -122,17 +123,21 @@ class QwenAudioAttention(nn.Module):
     Checkpoint keys (under encoder prefix + ``layers.N.self_attn``):
         q_proj.{weight,bias}, k_proj.{weight,bias},
         v_proj.{weight,bias}, out_proj.{weight,bias}
+
+    Runtime module layout:
+        qkv.{weight,bias}, out_proj.{weight,bias}
     """
 
     def __init__(self,
-                 model_config: ModelConfig,
+                 model_config: config_module.ModelConfig,
+                 attention_scale: float,
                  d_model: int = _D_MODEL,
                  num_heads: int = _NUM_HEADS,
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.scaling = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.q_proj = make_linear(
             model_config,
             d_model,
@@ -157,31 +162,64 @@ class QwenAudioAttention(nn.Module):
             d_model,
             bias=True,
             module_name=f"{name_prefix}.out_proj" if name_prefix else "")
+        self._use_trt_attn = ops.is_trt_native_attention_enabled()
 
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor,
+                cu_seqlens: Optional[torch.Tensor] = None,
+                kv_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             hidden_states: [T, d_model] — ragged sequence (all chunks concatenated)
             attention_mask: [T, T] additive mask (0 = attend, -inf = ignore)
+            cu_seqlens: [batch+1] int32 cumulative sequence lengths — TRT path only
+            kv_lengths: [batch+1] int32 — TRT path only
         """
         T = hidden_states.shape[0]
-        q = self.q_proj(hidden_states).view(T, self.num_heads,
-                                            self.head_dim).transpose(0, 1)
-        k = self.k_proj(hidden_states).view(T, self.num_heads,
-                                            self.head_dim).transpose(0, 1)
-        v = self.v_proj(hidden_states).view(T, self.num_heads,
-                                            self.head_dim).transpose(0, 1)
-        # q/k/v: [num_heads, T, head_dim]
-        # Explicit softmax attention (avoids SDPA op which TRT ONNX parser rejects).
-        # scores: [num_heads, T, T]
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
-        # attention_mask: [T, T] → [1, T, T] (broadcast over heads)
-        scores = scores + attention_mask.unsqueeze(0)
-        attn_weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn_weights, v)
-        # out: [num_heads, T, head_dim] → [T, num_heads * head_dim]
-        out = out.transpose(0, 1).reshape(T, -1)
+        q = self.q_proj(hidden_states).view(T, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(T, self.num_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(T, self.num_heads, self.head_dim)
+
+        if self._use_trt_attn:
+            # TODO: Enable these paths when supported
+            raise RuntimeError(
+                "Qwen3-ASR TRT-native attention is currently not supported.")
+            """
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+
+            out = ops.trt_ragged_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                kv_lengths,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale,
+                mask=attention_mask,
+            )
+            # attn_output: [T, num_heads, head_dim] → [T, num_heads * head_dim]
+            out = out.reshape(T, -1)
+            """
+        else:
+            q = q.transpose(0, 1)
+            k = k.transpose(0, 1)
+            v = v.transpose(0, 1)
+            # q/k/v: [num_heads, T, head_dim]
+            # Explicit softmax attention (avoids SDPA op which TRT ONNX parser rejects).
+            # scores: [num_heads, T, T]
+            scores = torch.matmul(q, k.transpose(-2, -1))
+            if self.attention_scale != 1.0:
+                scores = scores * self.attention_scale
+            # attention_mask: [T, T] → [1, T, T] (broadcast over heads)
+            scores = scores + attention_mask.unsqueeze(0)
+            attn_weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            out = torch.matmul(attn_weights, v)
+            # out: [num_heads, T, head_dim] → [T, num_heads * head_dim]
+            out = out.transpose(0, 1).reshape(T, -1)
         return self.out_proj(out)
 
 
@@ -202,7 +240,8 @@ class QwenAudioEncoderLayer(nn.Module):
     """
 
     def __init__(self,
-                 model_config: ModelConfig,
+                 model_config: config_module.ModelConfig,
+                 attention_scale: float,
                  d_model: int = _D_MODEL,
                  num_heads: int = _NUM_HEADS,
                  ffn_dim: int = _FFN_DIM,
@@ -211,6 +250,7 @@ class QwenAudioEncoderLayer(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(d_model)
         self.self_attn = QwenAudioAttention(
             model_config,
+            attention_scale,
             d_model,
             num_heads,
             name_prefix=f"{name_prefix}.self_attn" if name_prefix else "")
@@ -228,11 +268,15 @@ class QwenAudioEncoderLayer(nn.Module):
             bias=True,
             module_name=f"{name_prefix}.fc2" if name_prefix else "")
 
-    def forward(self, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor,
+                cu_seqlens: Optional[torch.Tensor] = None,
+                kv_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states = self.self_attn(hidden_states, attention_mask,
+                                       cu_seqlens, kv_lengths)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -279,7 +323,8 @@ class QwenAudioEncoder(nn.Module):
                  output_dim: int = _OUTPUT_DIM,
                  downsample_hidden: int = _DOWNSAMPLE_HIDDEN,
                  *,
-                 model_config: ModelConfig,
+                 attention_scale: float,
+                 model_config: config_module.ModelConfig,
                  name_prefix: str = "audio_tower") -> None:
         super().__init__()
         self.config: Dict[str, Any] = {
@@ -322,12 +367,14 @@ class QwenAudioEncoder(nn.Module):
         self.layers = nn.ModuleList([
             QwenAudioEncoderLayer(
                 model_config,
+                attention_scale,
                 d_model,
                 num_heads,
                 ffn_dim,
                 name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
             for i in range(num_layers)
         ])
+        self._use_trt_attn = ops.is_trt_native_attention_enabled()
         self.ln_post = nn.LayerNorm(d_model)
         self.proj1 = make_linear(
             model_config,
@@ -342,18 +389,19 @@ class QwenAudioEncoder(nn.Module):
             bias=True,
             module_name=f"{name_prefix}.proj2" if name_prefix else "")
 
-    def forward(
-        self,
-        padded_feature: torch.Tensor,
-        padded_mask_after_cnn_indices: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self,
+                padded_feature: torch.Tensor,
+                padded_mask_after_cnn_indices: torch.Tensor,
+                attention_mask: torch.Tensor,
+                cu_seqlens: Optional[torch.Tensor] = None,
+                kv_lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             padded_feature: [num_chunks, num_mel_bins, n_window*2]
             padded_mask_after_cnn_indices: [num_attention_elems, 2]  int64
             attention_mask: [num_attention_elems, num_attention_elems]  float16
-
+            cu_seqlens: [batch+1] int32 cumulative sequence lengths — TRT path only
+            kv_lengths: [batch+1] int32 — TRT path only
         Returns:
             [num_attention_elems, output_dim]
         """
@@ -377,13 +425,78 @@ class QwenAudioEncoder(nn.Module):
                           padded_mask_after_cnn_indices[:, 1]]  # [T, d_model]
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+            hidden_states = layer(hidden_states, attention_mask, cu_seqlens,
+                                  kv_lengths)
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = F.gelu(hidden_states)
         hidden_states = self.proj2(hidden_states)
         return hidden_states
+
+    def get_onnx_export_args(self, config: dict, device: str):
+        """Return (dynamo_inputs, onnx_input_names, output_names, dynamic_shapes) for ONNX export."""
+        num_mel_bins = config.get("num_mel_bins", 128)
+        n_window = config.get("n_window", 100)
+        num_chunks = 3
+        t_out = n_window * 2 // 8  # after 3× stride-2 CNN layers
+        num_attention_elems = num_chunks * t_out - 1
+
+        padded_feature = torch.zeros(num_chunks,
+                                     num_mel_bins,
+                                     n_window * 2,
+                                     dtype=torch.float16,
+                                     device=device)
+        padded_mask_after_cnn_indices = torch.zeros(num_attention_elems,
+                                                    2,
+                                                    dtype=torch.int64,
+                                                    device=device)
+        attention_mask = torch.zeros(num_attention_elems,
+                                     num_attention_elems,
+                                     dtype=torch.float16,
+                                     device=device)
+
+        onnx_input_names = [
+            "padded_feature",
+            "padded_mask_after_cnn_indices",
+            "attention_mask",
+        ]
+        dynamo_inputs = {
+            "padded_feature": padded_feature,
+            "padded_mask_after_cnn_indices": padded_mask_after_cnn_indices,
+            "attention_mask": attention_mask,
+        }
+
+        output_names = ["last_hidden_state"]
+
+        T = torch.export.Dim("num_attention_elems")
+        dynamic_shapes = {
+            "padded_feature": {
+                0: torch.export.Dim("num_chunks")
+            },
+            "padded_mask_after_cnn_indices": {
+                0: T
+            },
+            "attention_mask": {
+                0: T,
+                1: T
+            },
+        }
+
+        if self._use_trt_attn:
+            onnx_input_names.extend(["cu_seqlens", "kv_lengths"])
+            cu_seqlens = torch.tensor([0, num_attention_elems],
+                                      dtype=torch.int32,
+                                      device=device)
+            kv_lengths = torch.tensor([0, num_attention_elems],
+                                      dtype=torch.int32,
+                                      device=device)
+
+            dynamo_inputs["cu_seqlens"] = cu_seqlens
+            dynamo_inputs["kv_lengths"] = kv_lengths
+            dynamic_shapes["cu_seqlens"] = {0: torch.export.Dim("batch_p1")}
+            dynamic_shapes["kv_lengths"] = {0: torch.export.Dim("kv_batch_p1")}
+        return dynamo_inputs, onnx_input_names, output_names, dynamic_shapes
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +564,7 @@ def build_qwen_audio(
     dtype: torch.dtype = torch.float16,
     prefix: Optional[str] = None,
     *,
-    model_config: ModelConfig,
+    model_config: config_module.ModelConfig,
     name_prefix: str = "audio_tower",
 ) -> QwenAudioEncoder:
     """Build and return a :class:`QwenAudioEncoder` with loaded weights.
@@ -481,16 +594,23 @@ def build_qwen_audio(
     def _get(key: str, default: Any) -> Any:
         return audio_cfg.get(key, config.get(key, default))
 
+    d_model = _get("d_model", _D_MODEL)
+    num_heads = _get("encoder_attention_heads", _NUM_HEADS)
+    head_dim = d_model // num_heads
+    attention_scale = config_module._get_attention_scaling(
+        audio_cfg, head_dim, 1.0 / (float(head_dim)**0.5))
+
     model = QwenAudioEncoder(
         num_mel_bins=_get("num_mel_bins", _NUM_MEL_BINS),
-        d_model=_get("d_model", _D_MODEL),
+        d_model=d_model,
         num_layers=_get("encoder_layers", _NUM_LAYERS),
-        num_heads=_get("encoder_attention_heads", _NUM_HEADS),
+        num_heads=num_heads,
         ffn_dim=_get("encoder_ffn_dim", _FFN_DIM),
         max_source_positions=_get("max_source_positions",
                                   _MAX_SOURCE_POSITIONS),
         output_dim=_get("output_dim", _OUTPUT_DIM),
         downsample_hidden=_get("downsample_hidden_size", _DOWNSAMPLE_HIDDEN),
+        attention_scale=attention_scale,
         model_config=model_config,
         name_prefix=name_prefix,
     )

@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Export Tests - Audio exports
+# Focus: Qwen3-ASR and Qwen3-TTS fp16 export coverage; fp8 audio intentionally excluded.
+
+tests:
+  # Audio model exports - fp16 only
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-ASR-0.6B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-ASR-1.7B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-TTS-12Hz-1.7B-CustomVoice-fp16]

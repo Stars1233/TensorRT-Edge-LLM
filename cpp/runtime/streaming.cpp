@@ -354,7 +354,7 @@ void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const
     }
 }
 
-void emitChunks(DecodingInferenceContext& context)
+void emitChunks(DecodingInferenceContext& context, tokenizer::Tokenizer const& tokenizer)
 {
     for (int32_t i = 0; i < context.activeBatchSize; ++i)
     {
@@ -381,6 +381,29 @@ void emitChunks(DecodingInferenceContext& context)
         if (isFinal)
         {
             chunk.reason = s.terminalReason;
+        }
+        if (context.numLogprobs > 0 && static_cast<size_t>(i) < context.stepLogprobs.size())
+        {
+            rt::LogprobsSlot const& slot = context.stepLogprobs[i];
+            int32_t const topK = context.numLogprobs;
+            size_t const newTokens = s.sentTokenCount - snapLastEmitted;
+            for (size_t j = 0; j < newTokens; ++j)
+            {
+                size_t const stepIdx = s.logprobsEmittedCount + j;
+                if (stepIdx >= static_cast<size_t>(slot.numSteps))
+                {
+                    break;
+                }
+                auto const* base = slot.data.data() + static_cast<std::ptrdiff_t>(stepIdx) * topK;
+                std::vector<LogprobEntry> entries;
+                entries.reserve(topK);
+                for (int32_t k = 0; k < topK; ++k)
+                {
+                    entries.push_back({base[k].first, base[k].second, tokenizer.idToPiece(base[k].first)});
+                }
+                chunk.logprobs.push_back(std::move(entries));
+            }
+            s.logprobsEmittedCount += chunk.logprobs.size();
         }
 
         s.channel->push(std::move(chunk));
@@ -429,6 +452,22 @@ StreamChannelFinalizer::~StreamChannelFinalizer() noexcept
             {
                 chunk.tokenIds.assign(mCtx.tokenIds[i].begin() + static_cast<std::ptrdiff_t>(s.lastEmittedTokenCount),
                     mCtx.tokenIds[i].end());
+            }
+            if (mCtx.numLogprobs > 0 && i < mCtx.stepLogprobs.size())
+            {
+                rt::LogprobsSlot const& slot = mCtx.stepLogprobs[i];
+                int32_t const topK = mCtx.numLogprobs;
+                for (size_t stepIdx = s.logprobsEmittedCount; stepIdx < static_cast<size_t>(slot.numSteps); ++stepIdx)
+                {
+                    auto const* base = slot.data.data() + static_cast<std::ptrdiff_t>(stepIdx) * topK;
+                    std::vector<LogprobEntry> entries;
+                    entries.reserve(topK);
+                    for (int32_t k = 0; k < topK; ++k)
+                    {
+                        entries.push_back({base[k].first, base[k].second, mTok.idToPiece(base[k].first)});
+                    }
+                    chunk.logprobs.push_back(std::move(entries));
+                }
             }
 
             // Decode any un-decoded tokens via idToPiece, then sanitize+flush.

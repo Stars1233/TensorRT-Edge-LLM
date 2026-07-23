@@ -93,4 +93,25 @@ void invokeCausalConv1dDecodeMTP(trt_edgellm::rt::Tensor& convState, trt_edgellm
     trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
     trt_edgellm::rt::Tensor& intermediateConvStates, int32_t T, cudaStream_t stream);
 
+/*!
+ * \brief DDTree decode: compute each tree node from the persistent conv state plus its root-to-node path.
+ *
+ * Node 0 is the root verify token. Its output/state are computed by shifting x[:, 0, :] into the persistent
+ * convState. Non-root nodes append the full root-to-node path and write one checkpoint per node.
+ *
+ * convState:               [batch, dim, width]           FP16  (persistent committed state, read-only)
+ * newCols:                 [batch, verifySeq, dim]       FP16  (tree-node conv inputs)
+ * weight:                  [dim, 1, width]               FP16
+ * bias:                    [dim]                         FP16  (optional)
+ * out:                     [batch, verifySeq, dim]       FP16  (tree-node conv outputs)
+ * convStateOut:            [batch, dim, width]           FP16  (copy of convState)
+ * intermediateConvStates:  [batch, verifySeq, dim, width] FP16 (per-node states for accepted-node scatter)
+ * treeParentIds:           [batch, verifySeq]            INT32 (root/padding parent is -1)
+ * treeDepths:              [batch, verifySeq]            INT32 (root/padding depth is 0)
+ */
+void invokeCausalConv1dDecodeDDTree(trt_edgellm::rt::Tensor const& convState, trt_edgellm::rt::Tensor const& newCols,
+    trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
+    trt_edgellm::rt::Tensor& convStateOut, trt_edgellm::rt::Tensor& intermediateConvStates,
+    trt_edgellm::rt::Tensor const& treeParentIds, trt_edgellm::rt::Tensor const& treeDepths, cudaStream_t stream);
+
 } // namespace mamba_ssm

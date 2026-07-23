@@ -1,0 +1,92 @@
+# L1 Export Tests - Ampere (fp16/int4_awq) model exports
+# Focus: LLM/VLM fp16, int4_awq, vocab reduction, and fp16 audio export coverage.
+
+tests:
+  - tests/defs/test_package.py::TestPackage::test_package_import
+  - tests/defs/test_package.py::TestPackage::test_command_line_tools
+  # LLM exports - fp16
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-fp16]
+
+  # LLM exports - int4_awq
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-int4_awq]
+
+  # VLM exports - fp16
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-fp16-vitfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-8B-Instruct-fp16-vitfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-VL-7B-Instruct-fp16-vitfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Phi-4-multimodal-instruct-fp16-merge_lora]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[InternVL3-2B-fp16]
+
+  # VLM exports - int4_awq
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-8B-Instruct-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-VL-7B-Instruct-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Phi-4-multimodal-instruct-int4_awq-merge_lora]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[InternVL3-2B-int4_awq]
+
+  # Vocab reduction exports
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-fp16-rvs16384]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-int4_awq-rvs16384]
+
+  # Audio exports - fp16 only
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-ASR-0.6B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-ASR-1.7B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-TTS-12Hz-1.7B-CustomVoice-fp16]
+
+  # Qwen3.5 LLM exports - fp16/int4_awq
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-int4_awq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-int4_awq]
+
+  # Llama-3.1-8B-Instruct - fp16/fp8 (restored)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-fp16]
+
+  # Cosmos-Reason2-8B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Cosmos-Reason2-8B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Cosmos-Reason2-8B-int4_awq]
+
+  # InternVL3-1B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[InternVL3-1B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[InternVL3-1B-int4_awq]
+
+  # NVIDIA-Nemotron-Nano-9B-v2
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[NVIDIA-Nemotron-Nano-9B-v2-fp16]
+
+  # Qwen2.5-0.5B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-int4_awq]
+
+  # Qwen2.5-3B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-3B-Instruct-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-3B-Instruct-int4_awq]
+
+  # Qwen2.5-VL-3B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-VL-3B-Instruct-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-VL-3B-Instruct-int4_awq]
+
+  # Qwen2.5-VL-7B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-VL-7B-Instruct-fp16]
+
+  # Qwen3-0.6B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-int4_awq]
+
+  # Qwen3-VL-2B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-2B-Instruct-fp16]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-2B-Instruct-int4_awq]
+
+  # Qwen3-VL-4B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-4B-Instruct-fp16]
+
+  # Qwen3-VL-8B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-VL-8B-Instruct-fp16]

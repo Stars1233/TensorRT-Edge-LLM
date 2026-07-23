@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Pipeline Tests - Drive Thor 2 (SM110 Blackwell, DOS 7.2.4)
+# Focus: supplementary Blackwell-export fp8, nvfp4, and mxfp8 coverage.
+
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  # Qwen2.5-0.5B-Instruct LLM LoRA - fp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs8-mxil4096-mxlr64]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_inference[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs8-mxil4096-mxlr64-llm_lora]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs8-mxil4096-mxlr64-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen2.5-0.5B-Instruct-fp8-mxsl4096-mxbs8-mxil4096-mxlr64-mtbench-bs8]
+
+  # Qwen2.5-0.5B-Instruct LLM LoRA - nvfp4
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen2.5-0.5B-Instruct-nvfp4-mxsl4096-mxbs8-mxil4096-mxlr64]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_inference[Qwen2.5-0.5B-Instruct-nvfp4-mxsl4096-mxbs8-mxil4096-mxlr64-llm_lora]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen2.5-0.5B-Instruct-nvfp4-mxsl4096-mxbs8-mxil4096-mxlr64-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen2.5-0.5B-Instruct-nvfp4-mxsl4096-mxbs8-mxil4096-mxlr64-mtbench-bs8]
+
+  # Qwen2.5-VL-3B-Instruct VLM LoRA - fp8
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen2.5-VL-3B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_inference[Qwen2.5-VL-3B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-vlm_lora]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-3B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-3B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-3B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-coco-bs2]
+
+  # Qwen2.5-VL-3B-Instruct VLM LoRA - nvfp4
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen2.5-VL-3B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_inference[Qwen2.5-VL-3B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-vlm_lora]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-3B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-3B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-3B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mxlr32-coco-bs2]
+
+  # Llama-3.1-8B-Instruct - mxfp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Llama-3.1-8B-Instruct-mxfp8-mxsl4096-mxbs8-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Llama-3.1-8B-Instruct-mxfp8-mxsl4096-mxbs8-mxil4096-mmlu_5-bs8]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Llama-3.1-8B-Instruct-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Llama-3.1-8B-Instruct-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs8]
+
+  # Qwen3-4B-Instruct-2507 - mxfp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3-4B-Instruct-2507-mxfp8-mxsl4096-mxbs8-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-mxfp8-mxsl4096-mxbs8-mxil4096-mmlu_5-bs8]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs8]
+
+  # Qwen3-8B - mxfp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3-8B-mxfp8-mxsl4096-mxbs8-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-8B-mxfp8-mxsl4096-mxbs8-mxil4096-mmlu_5-bs8]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-8B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-8B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs8]
+
+  # Qwen3.5-2B - mxfp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-2B-mxfp8-mxsl4096-mxbs8-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-mxfp8-mxsl4096-mxbs8-mxil4096-mmlu_5-bs8]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs8]
+
+  # Qwen3.5-4B - mxfp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-4B-mxfp8-mxsl4096-mxbs8-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-mxfp8-mxsl4096-mxbs8-mxil4096-mmlu_5-bs8]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs8]
+
+  # Qwen3.5-9B - mxfp8
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-9B-mxfp8-mxsl4096-mxbs8-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-9B-mxfp8-mxsl4096-mxbs8-mxil4096-mmlu_5-bs8]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-9B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-9B-mxfp8-mxsl4096-mxbs8-mxil4096-mtbench-bs8]

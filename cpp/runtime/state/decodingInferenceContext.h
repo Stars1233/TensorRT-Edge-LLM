@@ -21,6 +21,8 @@
 #include "runtime/streaming.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -30,6 +32,21 @@ namespace trt_edgellm
 {
 namespace rt
 {
+
+class LayerDebugger; // Few-layer-validation debug: per-layer logits/KV dump (runtime/debug/layerDebugger.h)
+
+/**
+ * @brief Pre-allocated flat accumulator for per-step log-probabilities of one batch slot.
+ *
+ * Stores up to `maxGenerateLength * topK` pairs in a single allocation made at request start,
+ * eliminating per-step heap allocations inside the decode loop.
+ * `data[step * topK .. (step+1) * topK - 1]` holds the top-K (token_id, log_prob) pairs for step `step`.
+ */
+struct LogprobsSlot
+{
+    std::vector<std::pair<int32_t, float>> data; //!< Flat [maxGenerateLength * topK] storage, pre-allocated once
+    int32_t numSteps{0};                         //!< Number of steps written so far
+};
 
 /*!
  * @brief Batch result data for a single sequence.
@@ -44,6 +61,9 @@ struct BatchResult
     int32_t generateLength{0};               //!< Number of tokens generated
     int32_t actualIterations{0};             //!< Number of iterations executed
     int32_t effectivePrefillLength{0};       //!< Effective prefill length after system prompt cache reuse
+    //! Per-step top log-probabilities: logprobs[step] = [LogprobEntry, ...], sorted descending.
+    //! Populated only when numLogprobs > 0 in the original request.
+    std::vector<std::vector<LogprobEntry>> logprobs;
     FinishReason terminalReason{
         FinishReason::kNotFinished}; //!< Why this batch terminated (EOS, length, stop string, cancel, error)
 };
@@ -78,14 +98,34 @@ struct DecodingInferenceContext
     float temperature{1.0f}; //!< Temperature for sampling
     float topP{1.0f};        //!< Top-P sampling parameter
     int64_t topK{0};         //!< Top-K sampling parameter
+    int32_t numLogprobs{0};  //!< Number of top log-probs to collect per generated token
+    //! Per-batch flat logprobs accumulator.  slot.data is pre-allocated
+    //! [(maxGenerateLength + draftingStep) * numLogprobs] in spec-decode mode (vanilla: maxGenerateLength)
+    //! to accommodate the up-to-(draftingStep+1) tokens accepted per verify step.
+    //! slot.data[step*numLogprobs .. (step+1)*numLogprobs-1] holds step's top-K (token_id, log_prob) pairs.
+    std::vector<rt::LogprobsSlot> stepLogprobs;
 
     // Per-slot stop strings; empty list disables stop-string termination for that slot.
     std::vector<std::vector<std::string>> stopStringsPerSlot;
+
+    std::vector<std::unordered_map<int32_t, float>>
+        logitBiasPerSlot;          //!< Per-active-slot sparse logit bias maps in output-vocab space
+    bool hasLogitBias{false};      //!< True when any active slot has logit bias entries
+    bool logitBiasGpuDirty{false}; //!< True when CPU-side bias state must be uploaded to GPU
 
     bool outputThinkerEmbeddings{false}; //!< Whether to capture hidden states for the Talker pipeline
 
     //! Optional per-token callback invoked after each accepted token update.
     std::optional<TokenCallback> onTokenGenerated;
+
+    //! Optional callback used by speculative decoders to stop appending accepted tokens.
+    std::function<bool(int32_t, int32_t)> shouldStopAfterAcceptedToken;
+
+    //! Few-layer-validation debug: per-request layer dumper (null unless the
+    //! EDGELLM_DUMP_LOGITS_KVCACHE_* env vars are set). Owned here via RAII so it shares the
+    //! context's lifetime exactly; see the out-of-line destructor. Also carries optional
+    //! teacher-forcing tokens (EDGELLM_FORCE_TOKENS_FILE) applied via LayerDebugger::applyForcedTokens.
+    std::unique_ptr<LayerDebugger> layerDebugger;
 
     /*!
      * @brief Initialize request-local vectors and scalar fields.
@@ -98,6 +138,19 @@ struct DecodingInferenceContext
      */
     void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
         rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
+
+    //! ctor / move ops / dtor are out-of-line (defined in the .cpp) because @ref
+    //! layerDebugger is a ``unique_ptr`` to the incomplete type ``LayerDebugger``:
+    //! a defaulted special member in the header would instantiate the member's
+    //! destructor against the incomplete type in every translation unit (e.g.
+    //! unit tests that only forward-declare LayerDebugger). Move ops are declared
+    //! because the user-declared destructor otherwise suppresses the implicit
+    //! move, and the context is returned by value in places. The struct stays
+    //! non-copyable via the unique_ptr member.
+    DecodingInferenceContext();
+    DecodingInferenceContext(DecodingInferenceContext&&) noexcept;
+    DecodingInferenceContext& operator=(DecodingInferenceContext&&) noexcept;
+    ~DecodingInferenceContext();
 };
 
 } // namespace rt

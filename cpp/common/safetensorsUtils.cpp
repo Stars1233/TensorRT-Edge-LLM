@@ -106,7 +106,7 @@ bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> 
     {
         Coords shape = tensor.getShape();
         nvinfer1::DataType dataType = tensor.getDataType();
-        std::string name = tensor.getName();
+        std::string const& name = tensor.getName();
 
         if (name.empty())
         {

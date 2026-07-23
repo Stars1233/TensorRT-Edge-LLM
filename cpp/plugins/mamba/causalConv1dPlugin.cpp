@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 
 using namespace nvinfer1;
 
@@ -44,12 +45,17 @@ constexpr int32_t kIN_WEIGHT_IDX{1};
 constexpr int32_t kIN_BIAS_IDX{2};
 constexpr int32_t kIN_CONV_STATE_IDX{3};
 constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{4};
+constexpr int32_t kIN_SPEC_VERIFY_PHASE_MARKER_IDX{5};
+constexpr int32_t kIN_TREE_PARENT_IDS_IDX{6};
+constexpr int32_t kIN_TREE_DEPTHS_IDX{7};
 constexpr int32_t kOUT_IDX{0};
 constexpr int32_t kOUT_CONV_STATE_IDX{1};
 constexpr int32_t kOUT_INTERMEDIATE_CONV_STATES{2};
-constexpr int32_t kNUM_INPUTS{5};
+constexpr int32_t kNUM_REQUIRED_INPUTS{5};
+constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_INPUTS{1};
+constexpr int32_t kNUM_DDTREE_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
-constexpr int32_t kNUM_MTP_OPTIONAL_OUTPUTS{1};
+constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS{1};
 
 std::optional<int32_t> parsePluginIntField(std::string const& fieldName, PluginFieldCollection const* fc)
 {
@@ -83,14 +89,15 @@ REGISTER_TENSORRT_PLUGIN(CausalConv1dPluginCreator);
 // Plugin — construction / destruction
 // ---------------------------------------------------------------------------
 
-CausalConv1dPlugin::CausalConv1dPlugin(
-    std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups, bool useMTP)
+CausalConv1dPlugin::CausalConv1dPlugin(std::string const& name, int32_t stride, int32_t padding, int32_t dilation,
+    int32_t groups, bool useSpecVerifyState, bool useDDTree)
     : mLayerName(name)
     , mStride(stride)
     , mPadding(padding)
     , mDilation(dilation)
     , mGroups(groups)
-    , mUseMTP(useMTP)
+    , mUseSpecVerifyState(useSpecVerifyState || useDDTree)
+    , mUseDDTree(useDDTree)
 {
 }
 
@@ -101,7 +108,9 @@ CausalConv1dPlugin::CausalConv1dPlugin(std::string const& name, PluginFieldColle
     mPadding = parsePluginIntField("padding", fc).value_or(0);
     mDilation = parsePluginIntField("dilation", fc).value_or(1);
     mGroups = parsePluginIntField("groups", fc).value_or(0);
-    mUseMTP = parsePluginIntField("use_mtp", fc).value_or(0) != 0;
+    mUseSpecVerifyState = parsePluginIntField("use_mtp", fc).value_or(0) != 0;
+    mUseDDTree = parsePluginIntField("use_ddtree", fc).value_or(0) != 0;
+    mUseSpecVerifyState = mUseSpecVerifyState || mUseDDTree;
 }
 
 CausalConv1dPlugin::~CausalConv1dPlugin() {}
@@ -134,7 +143,8 @@ IPluginV3* CausalConv1dPlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new CausalConv1dPlugin(mLayerName, mStride, mPadding, mDilation, mGroups, mUseMTP);
+        auto* plugin = new CausalConv1dPlugin(
+            mLayerName, mStride, mPadding, mDilation, mGroups, mUseSpecVerifyState, mUseDDTree);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }
@@ -174,7 +184,7 @@ void CausalConv1dPlugin::setPluginNamespace(char const* pluginNamespace) noexcep
 
 int32_t CausalConv1dPlugin::getNbOutputs() const noexcept
 {
-    return kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+    return kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
 }
 
 int32_t CausalConv1dPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
@@ -183,11 +193,11 @@ int32_t CausalConv1dPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_un
     try
     {
         [[maybe_unused]] int32_t const expectedNbOutputs
-            = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+            = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
         assert(nbOutputs == expectedNbOutputs);
         outputTypes[kOUT_IDX] = inputTypes[kIN_X_IDX];
         outputTypes[kOUT_CONV_STATE_IDX] = inputTypes[kIN_X_IDX];
-        if (mUseMTP)
+        if (mUseSpecVerifyState)
         {
             outputTypes[kOUT_INTERMEDIATE_CONV_STATES] = inputTypes[kIN_X_IDX];
         }
@@ -206,14 +216,17 @@ int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unu
     try
     {
         [[maybe_unused]] int32_t const expectedNbOutputs
-            = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
-        assert(nbInputs == kNUM_INPUTS);
+            = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
+        [[maybe_unused]] int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS
+            + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+            + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
+        assert(nbInputs == expectedNbInputs);
         assert(nbOutputs == expectedNbOutputs);
         // Output: same shape as x [batch, seq_len, dim].
         outputs[kOUT_IDX] = inputs[kIN_X_IDX];
         // Conv state output: same shape as conv_state input [batch, dim, kernel].
         outputs[kOUT_CONV_STATE_IDX] = inputs[kIN_CONV_STATE_IDX];
-        if (mUseMTP)
+        if (mUseSpecVerifyState)
         {
             // Per-token decode checkpoints: [batch, seq_len, dim, kernel_size].
             outputs[kOUT_INTERMEDIATE_CONV_STATES].nbDims = 4;
@@ -233,14 +246,21 @@ int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unu
 bool CausalConv1dPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    int32_t const expectedNbOutputs = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
-    if (nbInputs != kNUM_INPUTS || nbOutputs != expectedNbOutputs)
+    int32_t const expectedNbOutputs
+        = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+        + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
+    if (nbInputs != expectedNbInputs || nbOutputs != expectedNbOutputs)
         return false;
     auto const& desc = inOut[pos].desc;
     if (desc.format != TensorFormat::kLINEAR)
         return false;
-    // INT32: context_lengths only
+    // INT32: context_lengths and optional shape-only spec verify phase marker
     if (pos == kIN_CONTEXT_LENGTHS_IDX)
+        return desc.type == DataType::kINT32;
+    if (mUseSpecVerifyState && pos == kIN_SPEC_VERIFY_PHASE_MARKER_IDX)
+        return desc.type == DataType::kINT32;
+    if (mUseDDTree && (pos == kIN_TREE_PARENT_IDS_IDX || pos == kIN_TREE_DEPTHS_IDX))
         return desc.type == DataType::kINT32;
     // Everything else (all inputs + all outputs): FP16
     return desc.type == DataType::kHALF;
@@ -249,15 +269,32 @@ bool CausalConv1dPlugin::supportsFormatCombination(
 int32_t CausalConv1dPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
     [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    if (nbInputs != kNUM_INPUTS)
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+        + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
+    if (nbInputs != expectedNbInputs)
     {
-        LOG_ERROR("causal_conv1d: expected %d inputs, got %d", kNUM_INPUTS, nbInputs);
+        LOG_ERROR("causal_conv1d: expected %d inputs, got %d", expectedNbInputs, nbInputs);
         return -1;
     }
     if (in[kIN_X_IDX].desc.type != DataType::kHALF)
     {
         LOG_ERROR(
             "causal_conv1d: only FP16 input is supported; got type %d", static_cast<int32_t>(in[kIN_X_IDX].desc.type));
+        return -1;
+    }
+    if (mUseSpecVerifyState
+        && (in[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].desc.type != DataType::kINT32
+            || in[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].desc.dims.nbDims != 1))
+    {
+        LOG_ERROR("causal_conv1d: spec_verify_phase_marker must be 1D INT32");
+        return -1;
+    }
+    if (mUseDDTree
+        && (in[kIN_TREE_PARENT_IDS_IDX].desc.type != DataType::kINT32
+            || in[kIN_TREE_DEPTHS_IDX].desc.type != DataType::kINT32
+            || in[kIN_TREE_PARENT_IDS_IDX].desc.dims.nbDims != 2 || in[kIN_TREE_DEPTHS_IDX].desc.dims.nbDims != 2))
+    {
+        LOG_ERROR("causal_conv1d: DDTree tree_parent_ids/tree_depths must be 2D INT32");
         return -1;
     }
     return 0;
@@ -312,21 +349,50 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
 
     void* convStateOut = outputs[kOUT_CONV_STATE_IDX];
 
-    // MTP mode activates only for short multi-token verification sequences (tree verify),
-    // not for normal prefill. Small prefills (seqLen <= kMTPMaxSeqLen) that happen to pass
-    // through this path pay a minor cost for intermediate state writes, but it is harmless.
-    // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
-    // from prefill when 1 < seqLen <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
-    // from the runtime instead of relying solely on seq_len range heuristics).
-    constexpr int32_t kMTPMaxSeqLen = 16;
-    bool const mtpActive = mUseMTP && (seqLen > 1) && (seqLen <= kMTPMaxSeqLen);
+    constexpr int32_t kLinearSpecVerifyMaxSeqLen = 16;
+    // Shape-only phase marker: length 0 is ordinary prefill/decode, length 1 is speculative verify.
+    // The marker payload is ignored.
+    int32_t const phaseLen
+        = mUseSpecVerifyState ? static_cast<int32_t>(inputDesc[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].dims.d[0]) : 0;
+    if (phaseLen > 1)
+    {
+        LOG_ERROR("causal_conv1d: spec_verify_phase_marker length must be 0 or 1, got %d", phaseLen);
+        return 1;
+    }
+    bool const ddtreeActive = mUseDDTree && phaseLen > 0;
+    if (ddtreeActive)
+    {
+        PluginTensorDesc const& parentDesc = inputDesc[kIN_TREE_PARENT_IDS_IDX];
+        PluginTensorDesc const& depthDesc = inputDesc[kIN_TREE_DEPTHS_IDX];
+        if (seqLen < 1 || parentDesc.dims.nbDims != 2 || depthDesc.dims.nbDims != 2 || parentDesc.dims.d[0] != batch
+            || depthDesc.dims.d[0] != batch || parentDesc.dims.d[1] != seqLen || depthDesc.dims.d[1] != seqLen)
+        {
+            LOG_ERROR(
+                "causal_conv1d: DDTree requires tree_parent_ids/tree_depths shape [batch=%d, seq_len=%d]; got "
+                "parent nbDims=%d [%lld, %lld], depth nbDims=%d [%lld, %lld]",
+                batch, seqLen, parentDesc.dims.nbDims,
+                parentDesc.dims.nbDims > 0 ? static_cast<long long>(parentDesc.dims.d[0]) : -1LL,
+                parentDesc.dims.nbDims > 1 ? static_cast<long long>(parentDesc.dims.d[1]) : -1LL, depthDesc.dims.nbDims,
+                depthDesc.dims.nbDims > 0 ? static_cast<long long>(depthDesc.dims.d[0]) : -1LL,
+                depthDesc.dims.nbDims > 1 ? static_cast<long long>(depthDesc.dims.d[1]) : -1LL);
+            return 1;
+        }
+    }
+
+    bool const mtpActive = mUseSpecVerifyState && phaseLen > 0 && !ddtreeActive;
+    if (mtpActive && (seqLen < 1 || seqLen > kLinearSpecVerifyMaxSeqLen))
+    {
+        LOG_ERROR("causal_conv1d: linear spec-verify kernel supports seqLen in [1, %d], got %d",
+            kLinearSpecVerifyMaxSeqLen, seqLen);
+        return 1;
+    }
 
     namespace rt = trt_edgellm::rt;
 
     if (mtpActive)
     {
-        // MTP DECODE path: process T draft tokens with per-step state checkpointing.
-        // Copy input conv_state -> output conv_state (MTP kernel updates in-place).
+        // Linear spec-verify path: process T draft tokens with per-step state checkpointing.
+        // Copy input conv_state -> output conv_state (linear spec-verify kernel updates in-place).
         if (convStateOut != inputs[kIN_CONV_STATE_IDX])
         {
             size_t const stateBytes = static_cast<size_t>(batch) * dim * width * sizeof(half);
@@ -348,6 +414,31 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
         trt_edgellm::rt::OptionalInputTensor mtpBiasOpt = std::optional(std::cref(mtpBiasTensor));
         mamba_ssm::invokeCausalConv1dDecodeMTP(mtpStateTensor, mtpNewColsTensor, mtpWeightTensor, mtpBiasOpt,
             mtpOutTensor, mtpIntermTensor, seqLen, stream);
+    }
+    else if (ddtreeActive)
+    {
+        auto treeStateTensor = rt::Tensor{const_cast<void*>(inputs[kIN_CONV_STATE_IDX]), rt::Coords{batch, dim, width},
+            rt::DeviceType::kGPU, xDesc.type};
+        auto treeNewColsTensor = rt::Tensor{
+            const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto treeWeightTensor = rt::Tensor{const_cast<void*>(inputs[kIN_WEIGHT_IDX]),
+            rt::Coords{wDesc.dims.d[0], wDesc.dims.d[1], wDesc.dims.d[2]}, rt::DeviceType::kGPU, xDesc.type};
+        auto treeBiasTensor
+            = rt::Tensor{const_cast<void*>(inputs[kIN_BIAS_IDX]), rt::Coords{dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto treeOutTensor
+            = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
+        auto treeStateOutTensor
+            = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
+        auto treeIntermTensor = rt::Tensor{outputs[kOUT_INTERMEDIATE_CONV_STATES],
+            rt::Coords{batch, seqLen, dim, width}, rt::DeviceType::kGPU, xDesc.type};
+        auto treeParentTensor = rt::Tensor{const_cast<void*>(inputs[kIN_TREE_PARENT_IDS_IDX]),
+            rt::Coords{batch, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
+        auto treeDepthTensor = rt::Tensor{const_cast<void*>(inputs[kIN_TREE_DEPTHS_IDX]), rt::Coords{batch, seqLen},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
+
+        trt_edgellm::rt::OptionalInputTensor treeBiasOpt = std::optional(std::cref(treeBiasTensor));
+        mamba_ssm::invokeCausalConv1dDecodeDDTree(treeStateTensor, treeNewColsTensor, treeWeightTensor, treeBiasOpt,
+            treeOutTensor, treeStateOutTensor, treeIntermTensor, treeParentTensor, treeDepthTensor, stream);
     }
     else if (seqLen > 1)
     {
@@ -426,8 +517,10 @@ PluginFieldCollection const* CausalConv1dPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.emplace_back("padding", &mPadding, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("dilation", &mDilation, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("groups", &mGroups, PluginFieldType::kINT32, 1);
-    mUseMTPField = mUseMTP ? 1 : 0;
-    mDataToSerialize.emplace_back("use_mtp", &mUseMTPField, PluginFieldType::kINT32, 1);
+    mUseSpecVerifyStateField = mUseSpecVerifyState ? 1 : 0;
+    mDataToSerialize.emplace_back("use_mtp", &mUseSpecVerifyStateField, PluginFieldType::kINT32, 1);
+    mUseDDTreeField = mUseDDTree ? 1 : 0;
+    mDataToSerialize.emplace_back("use_ddtree", &mUseDDTreeField, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -448,6 +541,7 @@ CausalConv1dPluginCreator::CausalConv1dPluginCreator()
     mPluginAttributes.emplace_back(PluginField("dilation", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("groups", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("use_mtp", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("use_ddtree", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }

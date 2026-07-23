@@ -1,28 +1,96 @@
 # L0 Python Unit Tests - Low-level component tests
 #
-# These tests verify individual components and kernels at a low level.
+# These tests verify individual components and plugins at a low level.
 # They require:
-#   - TensorRT >= 10.15 (for TRT native attention tests)
+#   - TensorRT >= 10.15
 #   - CUDA-capable GPU
-#   - Built plugin library (for plugin tests)
+#   - A CUDA build of torch (plugin tests drive device memory via torch)
+#   - Built plugin library (build/libNvInfer_edgellm_plugin.so) for the plugin tests
 
 tests:
-  # TRT Native Attention Tests
-  # Tests TensorRT native attention layers against numpy reference
   - tests/defs/test_common.py::test_build_project
-  - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_prefill
-  - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_decode
-  - tests/python-unittests/test_attention_native.py::TestTRTNativeAttentionVsNumpy::test_tensorrt_vs_numpy_tree_attention
 
-  # Plugin Attention Tests
-  # Tests custom attention plugin against numpy reference
-  # Requires: build/libNvInfer_edgellm_plugin.so
-  - tests/python-unittests/test_attention_plugin.py::TestAttentionPluginVsNumpy::test_plugin_vs_numpy_prefill
-  - tests/python-unittests/test_attention_plugin.py::TestAttentionPluginVsNumpy::test_plugin_vs_numpy_decode
-  - tests/python-unittests/test_attention_plugin.py::TestAttentionPluginVsNumpy::test_plugin_vs_numpy_tree_attention
+  # AttentionPlugin tests (custom plugin vs PyTorch reference)
+  - tests/python-unittests/test_attention_plugin.py::test_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_decode
+  - tests/python-unittests/test_attention_plugin.py::test_gqa_decode
+  - tests/python-unittests/test_attention_plugin.py::test_gqa_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_head512
+  - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_decode
+  - tests/python-unittests/test_attention_plugin.py::test_fp8_kv_cache_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_prescaled_query_softmax_scale
+  - tests/python-unittests/test_attention_plugin.py::test_decode_head32
+  - tests/python-unittests/test_attention_plugin.py::test_shared_kv_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_shared_kv_chunked_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_shared_kv_decode
+  - tests/python-unittests/test_attention_plugin.py::test_shared_kv_tree_decode
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_successive_chunks
+  - tests/python-unittests/test_attention_plugin.py::test_ragged_context_lengths_decode
+  - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill
+  - tests/python-unittests/test_attention_plugin.py::test_ragged_prefill_batch_invariance
+  - tests/python-unittests/test_attention_plugin.py::test_batch_permutation_invariance_decode
+  - tests/python-unittests/test_attention_plugin.py::test_tree_attention
+  - tests/python-unittests/test_attention_plugin.py::test_tree_attention_topology
+  - tests/python-unittests/test_attention_plugin.py::test_prefill_decode_handoff
+
+  # Sliding-window attention tests
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_prefill_head256
+  - tests/python-unittests/test_sliding_window_attention_plugin.py::test_sliding_window_decode
+
+  # Mamba selective-state-update (update_ssm_state) plugin tests
+  - tests/python-unittests/test_mamba_plugin.py::test_decode
+  - tests/python-unittests/test_mamba_plugin.py::test_prefill_singlestep
+  - tests/python-unittests/test_mamba_plugin.py::test_ragged_prefill_singlestep
+  - tests/python-unittests/test_mamba_plugin.py::test_prefill_ssd
+  - tests/python-unittests/test_mamba_plugin.py::test_ragged_prefill_ssd
+  - tests/python-unittests/test_mamba_plugin.py::test_ssd_dim_sweep
+  - tests/python-unittests/test_mamba_plugin.py::test_ssd_group_sweep
+  - tests/python-unittests/test_mamba_plugin.py::test_nemotron_prefill_multichunk
+  - tests/python-unittests/test_mamba_plugin.py::test_nemotron_ragged_prefill_multichunk
+  - tests/python-unittests/test_mamba_plugin.py::test_prefill_decode_handoff
+  - tests/python-unittests/test_mamba_plugin.py::test_ragged_prefill_batch_sizes
+  - tests/python-unittests/test_mamba_plugin.py::test_batch_invariance
+
+  # Causal conv1d plugin tests
+  - tests/python-unittests/test_causal_conv1d_plugin.py::test_prefill
+  - tests/python-unittests/test_causal_conv1d_plugin.py::test_ragged_prefill
+  - tests/python-unittests/test_causal_conv1d_plugin.py::test_decode
+  - tests/python-unittests/test_causal_conv1d_plugin.py::test_ragged_prefill_batch_sizes
+  - tests/python-unittests/test_causal_conv1d_plugin.py::test_batch_invariance
+
+  # Gated delta net (GDN) plugin tests
+  - tests/python-unittests/test_gated_delta_net_plugin.py::test_decode
+  - tests/python-unittests/test_gated_delta_net_plugin.py::test_prefill
+  - tests/python-unittests/test_gated_delta_net_plugin.py::test_ragged_prefill
+  - tests/python-unittests/test_gated_delta_net_plugin.py::test_ragged_prefill_batch_sizes
+  - tests/python-unittests/test_gated_delta_net_plugin.py::test_batch_invariance
+  - tests/python-unittests/test_gated_delta_net_plugin.py::test_prefill_decode_handoff
+
+  # ViT attention plugin tests
+  - tests/python-unittests/test_vit_attention_plugin.py::test_ragged_prefill_batch_sizes
+  - tests/python-unittests/test_vit_attention_plugin.py::test_window_partition
+  - tests/python-unittests/test_vit_attention_plugin.py::test_head_sweep
+  - tests/python-unittests/test_vit_attention_plugin.py::test_batch_invariance
+
+  # Configurable Attention Scaling Tests
+  - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_attention_correctness
+  - tests/python-unittests/test_shared_kv.py::TestSharedKVAttention::test_shared_kv_decode_correctness
 
   # Experimental Server Tool Calling Tests
   - tests/python-unittests/test_tool_chat_template.py::test_formats_tool_template
   - tests/python-unittests/test_tool_calling.py::test_validates_tool_request
   - tests/python-unittests/test_tool_calling.py::test_parses_tool_calls
   - tests/python-unittests/test_tool_calling.py::test_builds_tool_response_shapes
+
+  # Experimental Server Logit Bias Validation Tests
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_accepts_integer_like_keys_and_boundaries
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_too_many_entries
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_non_integer_token_ids
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_token_ids_outside_nonnegative_int32
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_normalize_logit_bias_rejects_invalid_bias_values
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_validate_logit_bias_spec_decode_accepts_compatible_states
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_validate_logit_bias_spec_decode_rejects_active_spec_decode
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_hlapi_generate_rejects_logit_bias_with_active_spec_decode
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_api_rejects_logit_bias_with_active_spec_decode
+  - tests/python-unittests/test_experimental_server_logit_bias.py::test_api_rejects_overflowing_logit_bias

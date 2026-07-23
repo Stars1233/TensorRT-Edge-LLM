@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Pipeline Tests - RTX 5090 (Blackwell consumer 32GB)
+# Focus: >=7B VLM models.
+
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  # Cosmos-Reason2-8B
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Cosmos-Reason2-8B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Cosmos-Reason2-8B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Cosmos-Reason2-8B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Phi-4-multimodal-instruct
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Phi-4-multimodal-instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-coco-bs1]
+
+  # Qwen2.5-VL-7B-Instruct
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen2.5-VL-7B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3-VL-8B-Instruct
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-fp8-lmfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp8-lmfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp8-lmfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp8-lmfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-nvfp4-fp8kv-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-fp8kv-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-fp8kv-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-fp8kv-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-lmnvfp4-vitfp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3.5-9B
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu_pro_4-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu_pro_4-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-nvfp4-lmnvfp4-mxsl8192-vitfp8-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+
+  # Cosmos-Reason2-8B - fp16
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Cosmos-Reason2-8B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Cosmos-Reason2-8B - int4_awq
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Cosmos-Reason2-8B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Cosmos-Reason2-8B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Phi-4-multimodal-instruct - fp16
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Phi-4-multimodal-instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-coco-bs2]
+
+  # Phi-4-multimodal-instruct - int4_awq
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Phi-4-multimodal-instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Phi-4-multimodal-instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit256-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen2.5-VL-7B-Instruct - fp8
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen2.5-VL-7B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-fp8-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen2.5-VL-7B-Instruct - int4_awq
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen2.5-VL-7B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen2.5-VL-7B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3-VL-8B-Instruct - fp16
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3-VL-8B-Instruct - int4_awq
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3.5-9B - fp16
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-fp16-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3.5-9B - int4_awq
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl8192-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  # Qwen3-TTS fp16
+  - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_engine_build[Qwen3-TTS-12Hz-1.7B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096]
+
+  # Qwen3-ASR-0.6B fp16
+  - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_engine_build[Qwen3-ASR-0.6B-fp16-mxsl4096-mxbs1-mxil1024-mnts1000-mxts3000]
+  - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_e2e_bench[Qwen3-ASR-0.6B-fp16-mxsl4096-mxbs1-mxil1024-mnts1000-mxts3000-librispeech_clean_test]
+
+  # Qwen3-ASR-1.7B fp16
+  - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_engine_build[Qwen3-ASR-1.7B-fp16-mxsl4096-mxbs1-mxil1024-mnts1000-mxts3000]
+  - tests/defs/test_audio_pipeline.py::TestASRPipeline::test_e2e_bench[Qwen3-ASR-1.7B-fp16-mxsl4096-mxbs1-mxil1024-mnts1000-mxts3000-librispeech_clean_test]
+
+  # Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 - nvfp4 full bench
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_engine_build[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-OmniBench-bs1]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-mmlu_5-bs1]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-mmmu-bs1]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-mtbench-bs1]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-mtbench-bs2]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-coco-bs1]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-coco-bs2]
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_e2e_bench[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl8192-mxbs2-mxil8192-mnit128-mxit6400-mxpiit1280-mnts10-mxts6000-librispeech_clean_test-bs1]

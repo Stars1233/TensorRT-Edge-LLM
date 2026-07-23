@@ -219,15 +219,32 @@ inline float silu(float x)
     return x / (1.0f + std::exp(-x));
 }
 
-// GeForce SwiGLU FC1 layout: projection[:I] are the "up" rows, projection[I:2I]
-// are the "gate" rows (plain concat -- NOT the SM110 64-row interleave).
-// Matches _concat_qwen3_swiglu_fc1 in tensorrt_edgellm/checkpoint/repacking.py.
+// GeForce gated-activation FC1 layout: projection[:I] are the "up" rows,
+// projection[I:2I] are the "gate" rows (plain concat -- NOT the SM110 64-row interleave).
+// This matches the SM12x SwiGLU and GeGLU checkpoint repacking contract.
 std::vector<float> applySwigluConcat(float const* projection, int32_t intermediateSize)
 {
     std::vector<float> out(static_cast<size_t>(intermediateSize), 0.0f);
     for (int32_t i = 0; i < intermediateSize; ++i)
     {
         out[i] = projection[i] * silu(projection[i + intermediateSize]);
+    }
+    return out;
+}
+
+inline float geluTanh(float x)
+{
+    constexpr float kGeluScale = 0.7978845608f;
+    constexpr float kGeluCubicScale = 0.044715f;
+    return 0.5f * x * (1.0f + std::tanh(kGeluScale * (x + kGeluCubicScale * x * x * x)));
+}
+
+std::vector<float> applyGegluConcat(float const* projection, int32_t intermediateSize)
+{
+    std::vector<float> out(static_cast<size_t>(intermediateSize), 0.0f);
+    for (int32_t i = 0; i < intermediateSize; ++i)
+    {
+        out[i] = projection[i] * geluTanh(projection[i + intermediateSize]);
     }
     return out;
 }
@@ -247,10 +264,12 @@ std::vector<float> applyReLU2(float const* projection, int32_t intermediateSize)
 
 constexpr int32_t kActivationTypeSwiGLU = 2;
 constexpr int32_t kActivationTypeReLU2 = 4;
+constexpr int32_t kActivationTypeGeGLU = 5;
 
 inline int32_t fc1InputN(int32_t intermediateSize, int32_t activationType)
 {
-    return activationType == kActivationTypeSwiGLU ? 2 * intermediateSize : intermediateSize;
+    return activationType == kActivationTypeSwiGLU || activationType == kActivationTypeGeGLU ? 2 * intermediateSize
+                                                                                             : intermediateSize;
 }
 
 inline CuteDslMoeActivation toRunnerActivation(int32_t activationType)
@@ -259,6 +278,7 @@ inline CuteDslMoeActivation toRunnerActivation(int32_t activationType)
     {
     case kActivationTypeSwiGLU: return CuteDslMoeActivation::kSwiGLU;
     case kActivationTypeReLU2: return CuteDslMoeActivation::kReLU2;
+    case kActivationTypeGeGLU: return CuteDslMoeActivation::kGeGLU;
     default: return CuteDslMoeActivation::kSwiGLU;
     }
 }
@@ -269,6 +289,7 @@ std::vector<float> applyFc1Activation(float const* projection, int32_t intermedi
     {
     case kActivationTypeSwiGLU: return applySwigluConcat(projection, intermediateSize);
     case kActivationTypeReLU2: return applyReLU2(projection, intermediateSize);
+    case kActivationTypeGeGLU: return applyGegluConcat(projection, intermediateSize);
     default: throw std::runtime_error("unsupported activation_type in SM12x test reference");
     }
 }
@@ -283,7 +304,7 @@ struct MoeCase
     int32_t numTokens;
     int32_t hiddenSize;
     int32_t intermediateSize;
-    int32_t activationType; // 2 = SwiGLU; only SwiGLU is exercised here.
+    int32_t activationType;
     CuteDslMoeBackend backend;
     uint64_t seed;
 };
@@ -376,7 +397,7 @@ CaseData buildCase(MoeCase const& cfg)
 // ---------------------------------------------------------------------------
 // CPU reference: float[T, H]. For each (token, top-K slot) the path is
 // FP4-quantize hidden -> FC1 (dequantized weight @ hidden) * input_global_scale
-// -> SwiGLU (plain [up_all, gate_all] concat) or ReLU2 -> FP4-quantize
+// -> SwiGLU/GeGLU (plain [up_all, gate_all] concat) or ReLU2 -> FP4-quantize
 // activation -> FC2 -> router-weighted scatter-add. FP4 / FP8 SF / alpha math
 // matches the SM12x fused wrappers so the kernel and reference agree up to
 // FP4 rounding noise.
@@ -633,9 +654,9 @@ bool checkRequirementsAndLoad()
 
 std::vector<MoeCase> defaultCases()
 {
-    // Scope: prefill backend + SwiGLU only. Validated on real GB10 (SM121) at
-    // cosine == 1.0 against this true-MoE numpy reference. Two backends and
-    // ReLU2 were measured on GB10 but are intentionally NOT covered here yet:
+    // Scope: prefill backend with gated activations. SwiGLU was validated on real GB10 (SM121) at
+    // cosine == 1.0 against this true-MoE numpy reference. GeGLU is covered by
+    // the regression case below. Two backends and ReLU2 are intentionally NOT covered here yet:
     //   * the decode backend (kAuto/kDecode at small token counts) emitted an
     //     all-zero output in this standalone runner harness -- its resident-grid
     //     route/pack -> compute barrier appears to need launch conditions the
@@ -654,6 +675,9 @@ std::vector<MoeCase> defaultCases()
             /*backend=*/CuteDslMoeBackend::kPrefill, /*seed=*/0xDEADBEEFu},
         {/*name=*/"prefill_h1024_i768_t16_swiglu", /*numTokens=*/16, /*hiddenSize=*/1024,
             /*intermediateSize=*/768, /*activationType=*/kActivationTypeSwiGLU,
+            /*backend=*/CuteDslMoeBackend::kPrefill, /*seed=*/0xDEADBEEFu},
+        {/*name=*/"prefill_h1024_i768_t8_geglu", /*numTokens=*/8, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActivationTypeGeGLU,
             /*backend=*/CuteDslMoeBackend::kPrefill, /*seed=*/0xDEADBEEFu},
     };
 }

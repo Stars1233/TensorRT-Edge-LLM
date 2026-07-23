@@ -167,6 +167,13 @@ HybridCacheManager& HybridCacheManager::operator=(HybridCacheManager&& other) no
 // Routing by absolute layer index
 // ------------------------------------------------------------------
 
+HybridCacheManager::LayerType HybridCacheManager::getLayerType(int32_t absLayerIdx) const
+{
+    check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mConfig.layerTypes.size()),
+        "getLayerType: absLayerIdx " + std::to_string(absLayerIdx) + " out of range.");
+    return mConfig.layerTypes[absLayerIdx];
+}
+
 rt::Tensor& HybridCacheManager::getCombinedKVCache(int32_t absLayerIdx)
 {
     check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToKVIndex.size()),
@@ -175,16 +182,6 @@ rt::Tensor& HybridCacheManager::getCombinedKVCache(int32_t absLayerIdx)
     check::check(
         localIdx >= 0, "getCombinedKVCache: layer " + std::to_string(absLayerIdx) + " is not an attention layer.");
     return mKVCache.getCombinedKVCache(localIdx);
-}
-
-std::pair<rt::Tensor, rt::Tensor> HybridCacheManager::getSeparateKVCache(int32_t absLayerIdx)
-{
-    check::check(absLayerIdx >= 0 && absLayerIdx < static_cast<int32_t>(mAbsToKVIndex.size()),
-        "getSeparateKVCache: absLayerIdx " + std::to_string(absLayerIdx) + " out of range.");
-    int32_t const localIdx = mAbsToKVIndex[absLayerIdx];
-    check::check(
-        localIdx >= 0, "getSeparateKVCache: layer " + std::to_string(absLayerIdx) + " is not an attention layer.");
-    return mKVCache.getSeparateKVCache(localIdx);
 }
 
 rt::Tensor& HybridCacheManager::getRecurrentState(int32_t absLayerIdx)

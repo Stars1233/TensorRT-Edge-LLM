@@ -19,6 +19,9 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
+#include <cmath>
+#include <optional>
+
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
 #include "common/cudaUtils.h"
@@ -31,8 +34,10 @@ using namespace nvinfer1;
 using namespace trt_edgellm;
 
 void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, int32_t maxSeqLen, bool isCompact = false, bool causal = true)
+    int32_t headSize, int32_t maxSeqLen, bool isCompact = false, bool causal = true,
+    std::optional<float> attentionScale = std::nullopt)
 {
+    float const resolvedAttentionScale = attentionScale.value_or(1.0F / std::sqrt(static_cast<float>(headSize)));
     int32_t smVersion = getSMVersion();
     applyThorSMRenumberWAR(smVersion);
 
@@ -94,11 +99,11 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
     if (isCompact)
     {
         rt::launchFmhaReferenceCompact(
-            qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, false, stream);
+            qTensor, kTensor, vTensor, oTensorRef, cuSeqLensTensor, maxSeqLen, false, resolvedAttentionScale, stream);
     }
     else
     {
-        rt::launchFmhaReferenceBshd(qTensor, kTensor, vTensor, oTensorRef, causal, stream);
+        rt::launchFmhaReferenceBshd(qTensor, kTensor, vTensor, oTensorRef, causal, resolvedAttentionScale, stream);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaGetLastError());
@@ -117,7 +122,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
 
     // Setup parameters
     FusedMultiheadAttentionParamsV2 params;
-    runner.setupParams(params);
+    runner.setupParams(params, resolvedAttentionScale);
 
     // Set device pointers
     if (!isCompact)
@@ -182,8 +187,8 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
 }
 
 // Convenience wrapper for padded layout (fixed sequence length)
-void TestContextAttentionAccuracy(
-    int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, bool causal = true)
+void TestContextAttentionAccuracy(int32_t batchSize, int32_t seqLen, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, bool causal = true, std::optional<float> attentionScale = std::nullopt)
 {
     // Generate cu_seqlens for fixed-length sequences
     std::vector<int32_t> cuSeqlens(batchSize + 1);
@@ -191,7 +196,7 @@ void TestContextAttentionAccuracy(
     {
         cuSeqlens[i] = i * seqLen;
     }
-    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, seqLen, false, causal);
+    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, seqLen, false, causal, attentionScale);
 }
 
 // Test cases with different head ratios (similar to XQA tests)
@@ -250,10 +255,10 @@ TEST(ContextAttentionTest, longSequence_Causal)
 }
 
 // Convenience wrapper for compact layout (variable sequence lengths, non-causal)
-void TestContextAttentionCompactAccuracy(
-    std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t maxSeqLen)
+void TestContextAttentionCompactAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t numQHeads, int32_t numKVHeads,
+    int32_t headSize, int32_t maxSeqLen, std::optional<float> attentionScale = std::nullopt)
 {
-    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, maxSeqLen, true, false);
+    TestContextAttentionAccuracy(cuSeqlens, numQHeads, numKVHeads, headSize, maxSeqLen, true, false, attentionScale);
 }
 
 TEST(ContextAttentionTest, compactLayout_NonCausal)
@@ -262,4 +267,17 @@ TEST(ContextAttentionTest, compactLayout_NonCausal)
     TestContextAttentionCompactAccuracy({0, 32, 60, 88, 128}, 16, 16, 64, 128);
     TestContextAttentionCompactAccuracy({0, 16, 64}, 16, 16, 72, 128);
     TestContextAttentionCompactAccuracy({0, 100, 200, 300}, 8, 8, 80, 512);
+}
+
+TEST(ContextAttentionTest, configurableScale)
+{
+    float constexpr kIDENTITY_SCALE = 1.0F;
+    float constexpr kCUSTOM_SCALE = 0.37F;
+
+    TestContextAttentionAccuracy(1, 64, 8, 8, 64, true, kIDENTITY_SCALE);
+    TestContextAttentionAccuracy(1, 64, 8, 2, 128, true, kCUSTOM_SCALE);
+    TestContextAttentionAccuracy(1, 256, 8, 1, 256, true, kIDENTITY_SCALE);
+    TestContextAttentionAccuracy(1, 256, 8, 1, 256, true, kCUSTOM_SCALE);
+    TestContextAttentionCompactAccuracy({0, 16, 48}, 8, 8, 64, 48, kIDENTITY_SCALE);
+    TestContextAttentionCompactAccuracy({0, 24, 64}, 8, 8, 80, 64, kCUSTOM_SCALE);
 }

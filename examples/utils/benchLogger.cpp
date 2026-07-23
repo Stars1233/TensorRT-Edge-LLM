@@ -17,7 +17,7 @@
 
 #include "benchLogger.h"
 #include "common/logger.h"
-#include "common/mmapReader.h"
+#include "common/trtUtils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -165,14 +165,7 @@ std::pair<double, double> computeStats(std::vector<double> const& values)
 std::unique_ptr<nvinfer1::ICudaEngine> loadStandaloneEngine(std::filesystem::path const& enginePath)
 {
     auto runtime = std::unique_ptr<nvinfer1::IRuntime>(nvinfer1::createInferRuntime(gLogger));
-    file_io::MmapReader mmapReader(enginePath);
-    if (!mmapReader.getData())
-    {
-        LOG_ERROR("Failed to load engine file: %s", enginePath.string().c_str());
-        return nullptr;
-    }
-    return std::unique_ptr<nvinfer1::ICudaEngine>(
-        runtime->deserializeCudaEngine(mmapReader.getData(), mmapReader.getSize()));
+    return deserializeCudaEngineFromFile(*runtime, enginePath);
 }
 
 namespace

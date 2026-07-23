@@ -36,10 +36,11 @@ namespace rt
  * @param V        Value tensor [B, Sk, Hkv, D]
  * @param O        Output tensor [B, Sq, Hq, D]
  * @param causal   If true, apply causal mask (k > q disallowed).
+ * @param attentionScale Absolute multiplier applied to QK^T before softmax.
  * @param stream   CUDA stream for kernel launch
  */
-void launchFmhaReferenceBshd(
-    Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, bool causal, cudaStream_t stream = nullptr);
+void launchFmhaReferenceBshd(Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, bool causal,
+    float attentionScale, cudaStream_t stream = nullptr);
 
 /*!
  * Launch reference FMHA kernel for compact layout.
@@ -53,10 +54,11 @@ void launchFmhaReferenceBshd(
  * @param cuSeqlens Prefix-sum lengths [B+1]
  * @param maxSeqLen Maximum sequence length
  * @param causal   If true, apply causal mask (k > q disallowed).
+ * @param attentionScale Absolute multiplier applied to QK^T before softmax.
  * @param stream   CUDA stream for kernel launch
  */
 void launchFmhaReferenceCompact(Tensor const& Q, Tensor const& K, Tensor const& V, Tensor& O, Tensor const& cuSeqlens,
-    int32_t maxSeqLen, bool causal, cudaStream_t stream = nullptr);
+    int32_t maxSeqLen, bool causal, float attentionScale, cudaStream_t stream = nullptr);
 
 } // namespace rt
 } // namespace trt_edgellm

@@ -43,7 +43,7 @@ namespace trt_edgellm
 {
 
 //! Activation variants exposed by the fused NVFP4 MoE CuTeDSL kernel family.
-//! All five activations (identity, silu, swiglu, gelu, relu2) are wired through the runner:
+//! All six activations (identity, silu, swiglu, gelu, relu2, geglu) are wired through the runner:
 //! each is backed by its own AOT module (KernelVariant rows in kernelSrcs/build_cutedsl.py),
 //! loaded by loadKernelModules(), and dispatched by the decode/prefill switch ladders.
 enum class CuteDslMoeActivation : int32_t
@@ -53,6 +53,7 @@ enum class CuteDslMoeActivation : int32_t
     kSwiGLU = 2,
     kGeLU = 3,
     kReLU2 = 4,
+    kGeGLU = 5,
 };
 
 //! Decode vs prefill backend selection. kAuto picks decode when
@@ -243,18 +244,20 @@ private:
     //! Workspace must be at least getWorkspaceSize(...) bytes (which is max(decode, prefill)).
     int32_t runPrefill(CuteDslNvfp4MoeParams const& params, void* workspace, cudaStream_t stream);
 
-    // AOT kernel modules -- FP16 io_dtype, all five activations
-    // (identity/silu/swiglu/gelu/relu2) x both backends (decode/prefill) x n128 = 10 modules.
+    // AOT kernel modules -- FP16 io_dtype, all six activations
+    // (identity/silu/swiglu/gelu/relu2/geglu) x both backends (decode/prefill) x n128 = 12 modules.
     static nvfp4_fused_moe_decode_identity_n128_Kernel_Module_t sDecodeIdentity_n128;
     static nvfp4_fused_moe_decode_silu_n128_Kernel_Module_t sDecodeSiLU_n128;
     static nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_t sDecodeSwiGLU_n128;
     static nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_t sDecodeGeLU_n128;
     static nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_t sDecodeReLU2_n128;
+    static nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_t sDecodeGeGLU_n128;
     static nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_t sPrefillIdentity_n128;
     static nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_t sPrefillSiLU_n128;
     static nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_t sPrefillSwiGLU_n128;
     static nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_t sPrefillGeLU_n128;
     static nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_t sPrefillReLU2_n128;
+    static nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_t sPrefillGeGLU_n128;
 
     static bool sLoaded;
     static std::mutex sLoadMutex;

@@ -17,13 +17,19 @@
 
 #include "multimodalRunner.h"
 #include "common/checkMacros.h"
-#include "common/mmapReader.h"
+#include "common/trtUtils.h"
 #include "multimodal/audioRunner.h"
+#include "multimodal/gemma4AudioRunner.h"
+#include "multimodal/gemma4UnifiedAudioRunner.h"
+#include "multimodal/gemma4UnifiedVisionRunner.h"
 #include "multimodal/gemma4ViTRunner.h"
 #include "multimodal/internViTRunner.h"
 #include "multimodal/nemotronOmniAudioRunner.h"
 #include "multimodal/nemotronOmniViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
+#include "multimodal/qwen25vlViTRunner.h"
+#include "multimodal/qwen3omniViTRunner.h"
+#include "multimodal/qwen3vlViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
 #include "profiling/layerProfiler.h"
 #include "profiling/metrics.h"
@@ -48,9 +54,7 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     std::string enginePath = engineDir + "/visual.engine";
 
     // Load engine
-    auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
-    mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
-        mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+    mVisualEngine = deserializeCudaEngineFromFile(*mRuntime, enginePath);
 
     // Create context with user-managed memory (no device memory allocated here).
     // The context object is needed by subclasses for tensor binding during initialization.
@@ -59,6 +63,8 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
         mVisualEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
     bool const profileSet = mVisualContext->setOptimizationProfileAsync(0, stream);
     ELLM_CHECK(profileSet, "Failed to set optimization profile for visual engine");
+
+    setNonBlockingAuxStreams(mVisualContext.get(), mVisualEngine.get(), mAuxStreams);
 
     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
     {
@@ -95,6 +101,19 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
     return true;
 }
 
+namespace
+{
+//! \brief Construct a QwenViTRunner-family runner, then run its two-phase initialize().
+template <typename RunnerT>
+std::unique_ptr<RunnerT> makeInitializedQwenViTRunner(
+    std::string const& engineDir, int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
+{
+    auto runner = std::make_unique<RunnerT>(engineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    runner->initialize(stream);
+    return runner;
+}
+} // namespace
+
 std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir,
     int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
 {
@@ -119,11 +138,21 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     std::string modelTypeStr = jsonConfig["model_type"].get<std::string>();
     multimodal::ModelType modelType = multimodal::stringToModelType(modelTypeStr);
 
-    if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
-        || modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
+    // Qwen vision family: base QwenViTRunner == Qwen2-VL; each later model is a subclass that extends it.
+    if (modelType == multimodal::ModelType::QWEN2_VL)
     {
-        multimodalRunner
-            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+        multimodalRunner = makeInitializedQwenViTRunner<QwenViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN2_5_VL)
+    {
+        multimodalRunner = makeInitializedQwenViTRunner<Qwen25VLViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    }
+    else if (modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
+    {
+        multimodalRunner = makeInitializedQwenViTRunner<Qwen3VLViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
     {
@@ -131,9 +160,8 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
-        // Qwen3-Omni Vision Encoder: Visual engine should exist
-        multimodalRunner
-            = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+        multimodalRunner = makeInitializedQwenViTRunner<Qwen3OmniViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
     }
     else if (modelType == multimodal::ModelType::INTERNVL)
     {
@@ -147,6 +175,14 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     {
         multimodalRunner = std::make_unique<Gemma4ViTRunner>(multimodalEngineDir, stream);
     }
+    else if (modelType == multimodal::ModelType::GEMMA4_UNIFIED_VISION)
+    {
+        multimodalRunner = std::make_unique<Gemma4UnifiedVisionRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::GEMMA4_UNIFIED_AUDIO)
+    {
+        multimodalRunner = std::make_unique<Gemma4UnifiedAudioRunner>(multimodalEngineDir, stream);
+    }
     else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER)
     {
         multimodalRunner = std::make_unique<NemotronOmniViTRunner>(multimodalEngineDir, stream);
@@ -154,6 +190,10 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
     {
         multimodalRunner = std::make_unique<NemotronOmniAudioRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::GEMMA4_AUDIO_ENCODER)
+    {
+        multimodalRunner = std::make_unique<Gemma4AudioRunner>(multimodalEngineDir, stream);
     }
     else
     {

@@ -391,26 +391,162 @@ TEST_F(DeploymentConfigTest, DFlashHybridVerifySize16ValidatesOk)
     EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDFlash);
     ASSERT_TRUE(bundle.specConfig.has_value());
     EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
 }
 
-TEST_F(DeploymentConfigTest, DFlashHybridVerifySizeAbove16Throws)
+TEST_F(DeploymentConfigTest, DFlashDDTreeValidatesOk)
 {
-    Json const baseJson = makeHybridDFlashBaseConfig(/*maxVerify=*/32);
-    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/128);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
     auto const basePath = writeJsonToTempFile(baseJson, "base");
     auto const draftPath = writeJsonToTempFile(draftJson, "draft");
 
     SpecDecodeDraftingConfig drafting{};
-    drafting.draftingTopK = 1;
+    drafting.draftingTopK = 4;
     drafting.draftingStep = 1;
-    drafting.verifySize = 17;
+    drafting.verifySize = 128;
+    drafting.dflashBlockSize = 16;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    EXPECT_EQ(bundle.specDecodeMode(), SpecDecodeMode::kDFlash);
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 128);
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 4);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DFlashDDTreeVerifySizeAboveLimitThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/256);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 129;
+    drafting.dflashBlockSize = 16;
 
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
                      std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
 }
 
-TEST_F(DeploymentConfigTest, DFlashDenseVerifySizeAbove16Throws)
+TEST_F(DeploymentConfigTest, DFlashDDTreeBlockSizeOneThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+    drafting.dflashBlockSize = 1;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashNegativeBlockSizeThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 2;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 8;
+    drafting.dflashBlockSize = -1;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashBlockSizeAboveDraftCapacityThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/128);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 128;
+    drafting.dflashBlockSize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashDDTreeBlockSizeAboveIndexedCommitLimitThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/128);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 128;
+    drafting.dflashBlockSize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashDDTreeLargeBlockWithBoundedVerifySizeValidatesOk)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+    drafting.dflashBlockSize = 32;
+
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 32);
+}
+
+TEST_F(DeploymentConfigTest, DFlashHybridBlockSizeAbove16Throws)
+{
+    Json const baseJson = makeHybridDFlashBaseConfig(/*maxVerify=*/128);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 4;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 128;
+    drafting.dflashBlockSize = 17;
+
+    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
+                     std::optional<SpecDecodeDraftingConfig>{drafting}),
+        std::runtime_error);
+}
+
+TEST_F(DeploymentConfigTest, DFlashChainInfersBlockSizeFromEngineConfig)
 {
     Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/32);
     Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/32);
@@ -422,12 +558,16 @@ TEST_F(DeploymentConfigTest, DFlashDenseVerifySizeAbove16Throws)
     drafting.draftingStep = 1;
     drafting.verifySize = 17;
 
-    EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
-                     std::optional<SpecDecodeDraftingConfig>{drafting}),
-        std::runtime_error);
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 1);
+    EXPECT_EQ(bundle.specConfig->verifySize, 16);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
 }
 
-TEST_F(DeploymentConfigTest, DFlashRejectsMultiTopKOrStep)
+TEST_F(DeploymentConfigTest, DFlashCandidateTopKGreaterThanOneSelectsDDTree)
 {
     Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
     Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
@@ -439,12 +579,44 @@ TEST_F(DeploymentConfigTest, DFlashRejectsMultiTopKOrStep)
     drafting.draftingStep = 1;
     drafting.verifySize = 8;
 
+    DeploymentConfig bundle = createDeploymentConfig(
+        basePath, std::optional<std::filesystem::path>{draftPath}, std::optional<SpecDecodeDraftingConfig>{drafting});
+
+    ASSERT_TRUE(bundle.specConfig.has_value());
+    EXPECT_EQ(bundle.specConfig->draftingTopK, 2);
+    EXPECT_EQ(bundle.specConfig->verifySize, 8);
+    EXPECT_EQ(bundle.specConfig->dflashBlockSize, 16);
+}
+
+TEST_F(DeploymentConfigTest, DFlashRejectsMultiStep)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 1;
+    drafting.draftingStep = 2;
+    drafting.verifySize = 8;
+
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
                      std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);
+}
 
-    drafting.draftingTopK = 1;
-    drafting.draftingStep = 2;
+TEST_F(DeploymentConfigTest, DFlashDDTreeCandidateTopKAboveLimitThrows)
+{
+    Json const baseJson = makeDenseDFlashBaseConfig(/*maxVerify=*/16);
+    Json const draftJson = makeDFlashDraftConfig(/*maxDraft=*/16);
+    auto const basePath = writeJsonToTempFile(baseJson, "base");
+    auto const draftPath = writeJsonToTempFile(draftJson, "draft");
+
+    SpecDecodeDraftingConfig drafting{};
+    drafting.draftingTopK = 9;
+    drafting.draftingStep = 1;
+    drafting.verifySize = 16;
+
     EXPECT_THROW(createDeploymentConfig(basePath, std::optional<std::filesystem::path>{draftPath},
                      std::optional<SpecDecodeDraftingConfig>{drafting}),
         std::runtime_error);

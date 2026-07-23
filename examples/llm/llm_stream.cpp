@@ -80,6 +80,7 @@ struct Args
     int32_t specDraftTopK = 8;
     int32_t specDraftStep = 4;
     int32_t specVerifySize = 24;
+    int32_t dflashBlockSize = 0;
 };
 
 void printUsage(char const* argv0)
@@ -89,7 +90,12 @@ void printUsage(char const* argv0)
                  "           [--multimodalEngineDir DIR] [--maxGenerateLength N]\n"
                  "           [--streamInterval N] [--specDecode [--specDraftTopK K]\n"
                  "                                             [--specDraftStep S]\n"
-                 "                                             [--specVerifySize V]]\n\n"
+                 "                                             [--specVerifySize V]\n"
+                 "                                             [--dflashBlockSize B]]\n\n"
+                 "Spec decode:\n"
+                 "   --specDraftTopK K     For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree\n"
+                 "   --specDraftStep S     DFlash requires 1; use --dflashBlockSize for proposal horizon\n"
+                 "   --dflashBlockSize B   DFlash proposal block size; 0 means infer from engine config\n\n"
                  "Hotkeys while streaming:\n"
                  "   s         skip the current request\n"
                  "   q         quit (cancel current + stop)\n"
@@ -189,6 +195,18 @@ bool parseArgs(int argc, char** argv, Args& args)
         {
             if (!takeInt(i, a, args.specVerifySize))
             {
+                return false;
+            }
+        }
+        else if (a == "--dflashBlockSize")
+        {
+            if (!takeInt(i, a, args.dflashBlockSize))
+            {
+                return false;
+            }
+            if (args.dflashBlockSize < 0)
+            {
+                std::cerr << "--dflashBlockSize must be non-negative\n";
                 return false;
             }
         }
@@ -404,6 +422,19 @@ RequestResult runOneRequest(rt::LLMInferenceRuntime& runtime, cudaStream_t strea
             std::fwrite(c.text.data(), 1, c.text.size(), stdout);
             std::fflush(stdout);
         }
+
+        // When logprobs were requested (num_logprobs > 0), print each new token's
+        // top-K to stderr — kept off stdout so it does not interleave with the live
+        // text stream. Each entry is (token_id, log-prob).
+        for (auto const& stepEntries : c.logprobs)
+        {
+            std::fprintf(stderr, "[logprobs]");
+            for (auto const& e : stepEntries)
+            {
+                std::fprintf(stderr, " (%d, %.4f)", e.tokenId, e.logprob);
+            }
+            std::fprintf(stderr, "\n");
+        }
         if (c.finished)
         {
             result.finishReason = c.reason;
@@ -508,14 +539,18 @@ int main(int argc, char** argv)
     std::cout << "Loaded " << singleRequests.size() << " request(s) from " << args.inputFile << "\n";
 
     cudaStream_t stream{};
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     std::unique_ptr<rt::LLMInferenceRuntime> runtime;
     try
     {
         if (args.specDecode)
         {
-            rt::SpecDecodeDraftingConfig draft{args.specDraftTopK, args.specDraftStep, args.specVerifySize};
+            rt::SpecDecodeDraftingConfig draft{};
+            draft.draftingTopK = args.specDraftTopK;
+            draft.draftingStep = args.specDraftStep;
+            draft.verifySize = args.specVerifySize;
+            draft.dflashBlockSize = args.dflashBlockSize;
             runtime = std::make_unique<rt::LLMInferenceRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraMap, draft, stream);
         }

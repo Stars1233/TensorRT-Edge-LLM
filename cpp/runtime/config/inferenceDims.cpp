@@ -43,7 +43,7 @@ std::string toString(InferenceDims const& dims)
     ss << "{batch=" << dims.batch << ", seq_len=" << dims.seqLen << ", kv_len=" << dims.kvLen
        << ", select_len=" << dims.selectLen << ", attn_seq_len=" << dims.attnMaskSeqLen
        << ", rope_batch=" << dims.ropeBatch << ", packed_mask_len=" << dims.packedMaskLen
-       << ", start_index_len=" << dims.startIndexLen << "}";
+       << ", start_index_len=" << dims.startIndexLen << ", spec_verify_phase_len=" << dims.specVerifyPhaseLen << "}";
     return ss.str();
 }
 

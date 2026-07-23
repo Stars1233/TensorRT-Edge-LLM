@@ -573,7 +573,7 @@ int main(int argc, char** argv)
     auto pluginHandles = loadEdgellmPluginLib();
 
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     if (!args.noProfile)
     {
@@ -792,6 +792,12 @@ int main(int argc, char** argv)
         {
             rt::buildTensorMap(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
         }
+
+        // --- Load externalized model weights ---
+        std::filesystem::path const& activeConfigPath = useDraftEngine ? *draftConfigPath : baseConfigPath;
+        resources->externalWeightManager->load(dir, activeConfigPath, stream);
+        resources->externalWeightManager->validateAgainstEngine(*executor, useDraftEngine ? "draft" : "base");
+        resources->externalWeightManager->registerTensorMapEntries(tensorMap);
 
         // --- Context memory ---
         int64_t memSize = executor->getRequiredContextMemorySize();

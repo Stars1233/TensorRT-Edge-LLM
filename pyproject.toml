@@ -59,6 +59,9 @@ tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:m
 tensorrt-edgellm-merge-lora = "tensorrt_edgellm.scripts.merge_lora:main"
 tensorrt-edgellm-reduce-vocab = "tensorrt_edgellm.scripts.reduce_vocab:main"
 
+[tool.isort]
+known_third_party = ["onnx", "onnx_graphsurgeon", "onnxscript"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["tensorrt_edgellm*", "experimental*"]

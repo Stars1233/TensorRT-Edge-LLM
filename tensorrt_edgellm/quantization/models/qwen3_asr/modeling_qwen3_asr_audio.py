@@ -39,6 +39,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..attention_scale import resolve_attention_scale
+
 logger = logging.getLogger(__name__)
 
 # Default architecture constants (Qwen3-ASR 1.7B / Qwen3-Omni 30B).
@@ -88,11 +90,14 @@ class Qwen3ASRAudioAttention(nn.Module):
 
     def __init__(self,
                  d_model: int = _D_MODEL,
-                 num_heads: int = _NUM_HEADS) -> None:
+                 num_heads: int = _NUM_HEADS,
+                 attention_scale: Optional[float] = None) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.scaling = self.head_dim**-0.5
+        self.attention_scale = (resolve_attention_scale({}, "", self.head_dim)
+                                if attention_scale is None else
+                                attention_scale)
         self.q_proj = nn.Linear(d_model, d_model, bias=True)
         self.k_proj = nn.Linear(d_model, d_model, bias=True)
         self.v_proj = nn.Linear(d_model, d_model, bias=True)
@@ -107,7 +112,7 @@ class Qwen3ASRAudioAttention(nn.Module):
                                             self.head_dim).transpose(0, 1)
         v = self.v_proj(hidden_states).view(T, self.num_heads,
                                             self.head_dim).transpose(0, 1)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.attention_scale
         scores = scores + attention_mask.unsqueeze(0)
         attn_weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
         out = torch.matmul(attn_weights, v)
@@ -121,10 +126,12 @@ class Qwen3ASRAudioEncoderLayer(nn.Module):
     def __init__(self,
                  d_model: int = _D_MODEL,
                  num_heads: int = _NUM_HEADS,
-                 ffn_dim: int = _FFN_DIM) -> None:
+                 ffn_dim: int = _FFN_DIM,
+                 attention_scale: Optional[float] = None) -> None:
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(d_model)
-        self.self_attn = Qwen3ASRAudioAttention(d_model, num_heads)
+        self.self_attn = Qwen3ASRAudioAttention(d_model, num_heads,
+                                                attention_scale)
         self.final_layer_norm = nn.LayerNorm(d_model)
         self.fc1 = nn.Linear(d_model, ffn_dim, bias=True)
         self.fc2 = nn.Linear(ffn_dim, d_model, bias=True)
@@ -161,7 +168,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
                  ffn_dim: int = _FFN_DIM,
                  max_source_positions: int = _MAX_SOURCE_POSITIONS,
                  output_dim: int = _OUTPUT_DIM,
-                 downsample_hidden: int = _DOWNSAMPLE_HIDDEN) -> None:
+                 downsample_hidden: int = _DOWNSAMPLE_HIDDEN,
+                 attention_scale: Optional[float] = None) -> None:
         super().__init__()
         # Architecture knobs the dataloader needs to read back at runtime
         # (n_window / num_mel_bins drive chunk-shape computation).
@@ -198,7 +206,8 @@ class Qwen3ASRAudioEncoder(nn.Module):
         self.positional_embedding = SinusoidsPositionEmbedding(
             max_source_positions, d_model)
         self.layers = nn.ModuleList([
-            Qwen3ASRAudioEncoderLayer(d_model, num_heads, ffn_dim)
+            Qwen3ASRAudioEncoderLayer(d_model, num_heads, ffn_dim,
+                                      attention_scale)
             for _ in range(num_layers)
         ])
         self.ln_post = nn.LayerNorm(d_model)
@@ -391,16 +400,23 @@ def build_qwen3_asr_audio(
     def _get(key: str, default: Any) -> Any:
         return audio_cfg.get(key, config.get(key, default))
 
+    d_model = _get("d_model", _D_MODEL)
+    num_heads = _get("encoder_attention_heads", _NUM_HEADS)
+    attention_scale = resolve_attention_scale(audio_cfg,
+                                              audio_cfg.get("model_type", ""),
+                                              d_model // num_heads)
+
     model = Qwen3ASRAudioEncoder(
         num_mel_bins=_get("num_mel_bins", _NUM_MEL_BINS),
-        d_model=_get("d_model", _D_MODEL),
+        d_model=d_model,
         num_layers=_get("encoder_layers", _NUM_LAYERS),
-        num_heads=_get("encoder_attention_heads", _NUM_HEADS),
+        num_heads=num_heads,
         ffn_dim=_get("encoder_ffn_dim", _FFN_DIM),
         max_source_positions=_get("max_source_positions",
                                   _MAX_SOURCE_POSITIONS),
         output_dim=_get("output_dim", _OUTPUT_DIM),
         downsample_hidden=_get("downsample_hidden_size", _DOWNSAMPLE_HIDDEN),
+        attention_scale=attention_scale,
     )
     model.config["n_window"] = _get("n_window", _N_WINDOW)
     # 0.6B and 1.7B both ship n_window_infer = 800 = 16 * 50; runtime

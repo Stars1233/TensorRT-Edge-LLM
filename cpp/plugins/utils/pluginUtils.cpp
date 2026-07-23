@@ -23,7 +23,7 @@
 // Follow the TRT initLibNvInferPlugins(void*, char const*) convention:
 // the host application calls this after dlopen to pass its logger,
 // so plugin LOG_DEBUG messages respect the application's log level.
-extern "C" bool initEdgellmPlugins(void* logger, char const* /*libNamespace*/)
+extern "C" EDGELLM_PLUGIN_EXPORT bool initEdgellmPlugins(void* logger, char const* /*libNamespace*/)
 {
     if (logger)
     {

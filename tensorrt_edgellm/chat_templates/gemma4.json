@@ -11,6 +11,10 @@
     "assistant": {
       "prefix": "<|turn>model\n",
       "suffix": "<turn|>\n"
+    },
+    "model": {
+      "prefix": "<|turn>model\n",
+      "suffix": "<turn|>\n"
     }
   },
   "content_types": {
@@ -25,5 +29,6 @@
     }
   },
   "generation_prompt": "<|turn>model\n",
+  "generation_prompt_thinking": "<|turn>model\n<|channel>thought\n",
   "default_system_prompt": ""
 }

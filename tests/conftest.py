@@ -48,6 +48,9 @@ class EnvironmentConfig:
     build_dir: str
     test_log_dir: str
     trt_package_dir: Optional[str]
+    vlmevalkit_dir: Optional[str] = None
+    vlmevalkit_data_dir: Optional[str] = None
+    vlmevalkit_work_dir: Optional[str] = None
 
     @classmethod
     def from_environment(cls) -> 'EnvironmentConfig':
@@ -93,6 +96,9 @@ class EnvironmentConfig:
         # Optional directories - will be validated when needed
         engine_dir = os.environ.get('ENGINE_DIR')
         trt_package_dir = os.environ.get('TRT_PACKAGE_DIR')
+        vlmevalkit_dir = os.environ.get('VLMEVALKIT_DIR')
+        vlmevalkit_data_dir = os.environ.get('VLMEVALKIT_DATA_DIR')
+        vlmevalkit_work_dir = os.environ.get('VLMEVALKIT_WORK_DIR')
 
         build_dir = os.environ.get('BUILD_DIR', 'build')
         test_log_dir = os.environ.get('TEST_LOG_DIR', 'logs')
@@ -104,7 +110,10 @@ class EnvironmentConfig:
                    engine_dir=engine_dir,
                    build_dir=build_dir,
                    test_log_dir=test_log_dir,
-                   trt_package_dir=trt_package_dir)
+                   trt_package_dir=trt_package_dir,
+                   vlmevalkit_dir=vlmevalkit_dir,
+                   vlmevalkit_data_dir=vlmevalkit_data_dir,
+                   vlmevalkit_work_dir=vlmevalkit_work_dir)
 
     def validate_for_export_tests(self):
         """Validate that required directories are set for export tests"""
@@ -121,6 +130,25 @@ class EnvironmentConfig:
             raise ValueError(
                 "ENGINE_DIR environment variable is required for pipeline tests. "
                 "Please set it to the directory for TensorRT engines.")
+
+    def validate_for_vlmevalkit_tests(self):
+        """Validate that required directories are set for VLMEvalKit tests."""
+        if not self.vlmevalkit_dir:
+            raise ValueError(
+                "VLMEVALKIT_DIR environment variable is required for VLMEvalKit tests. "
+                "Please set it to a VLMEvalKit checkout.")
+        if not os.path.isdir(self.vlmevalkit_dir):
+            raise ValueError(
+                f"VLMEVALKIT_DIR does not exist: {self.vlmevalkit_dir}")
+
+        data_root = self.vlmevalkit_data_dir or self.edgellm_data_dir
+        if not data_root:
+            raise ValueError(
+                "VLMEVALKIT_DATA_DIR or EDGELLM_DATA_DIR is required for VLMEvalKit tests. "
+                "Please set it to the directory containing updated_datasets.")
+        if not os.path.isdir(data_root):
+            raise ValueError(
+                f"VLMEvalKit data directory does not exist: {data_root}")
 
     def validate_trt_package(self, remote_config=None, logger=None):
         """Validate that TensorRT package directory exists and contains required files"""

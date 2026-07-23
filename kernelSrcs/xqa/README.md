@@ -61,8 +61,8 @@ edgellm_config_list = [[
     CompileMacroOption('HEAD_ELEMS', 'd', [128, 64, 32]),
     CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
     CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0]),
-    CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                       [0]),  # 0 denotes contiguous kv cache.
+    # 0 denotes contiguous kv cache; 128 denotes paged kv cache page size.
+    CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0, 128]),
     CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
     CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [1, 2, 3, 4, 5, 6, 7, 8]),
     CompileMacroOption('M_TILESIZE', 'm', [8]),

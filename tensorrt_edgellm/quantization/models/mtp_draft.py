@@ -35,10 +35,9 @@ and SwiGLU MLP.
 """
 
 import json
-import math
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -47,7 +46,9 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
+from .attention_scale import resolve_attention_scale
 from .layers import RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb, repeat_kv
 
 # ---------------------------------------------------------------------------
@@ -90,13 +91,21 @@ class Qwen3_5GatedAttention(nn.Module):
     After attention: ``output = o_proj(attn_out * sigmoid(gate))``.
     """
 
-    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim,
-                 rms_norm_eps, bias):
+    def __init__(self,
+                 hidden_size,
+                 num_heads,
+                 num_kv_heads,
+                 head_dim,
+                 rms_norm_eps,
+                 bias,
+                 attention_scale=None):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_groups = num_heads // num_kv_heads
+        self.attention_scale = (resolve_attention_scale({}, "", head_dim) if
+                                attention_scale is None else attention_scale)
 
         self.q_proj = nn.Linear(hidden_size,
                                 num_heads * head_dim * 2,
@@ -145,8 +154,8 @@ class Qwen3_5GatedAttention(nn.Module):
         value_states = repeat_kv(value_states, self.kv_groups)
 
         # Scaled dot-product attention with causal mask
-        w = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            self.head_dim)
+        w = (torch.matmul(query_states, key_states.transpose(2, 3)) *
+             self.attention_scale)
         if L > 1:
             mask = torch.triu(
                 torch.ones(1, 1, L, L, device=x.device, dtype=torch.bool), 1)
@@ -171,13 +180,21 @@ class Qwen3_5GatedAttention(nn.Module):
 class MtpDecoderLayer(nn.Module):
     """Single Qwen3.5 MTP decoder layer (gated attention + SwiGLU MLP)."""
 
-    def __init__(self, hidden_size, intermediate_size, num_heads, num_kv_heads,
-                 head_dim, rms_norm_eps, bias):
+    def __init__(self,
+                 hidden_size,
+                 intermediate_size,
+                 num_heads,
+                 num_kv_heads,
+                 head_dim,
+                 rms_norm_eps,
+                 bias,
+                 attention_scale=None):
         super().__init__()
         self.input_layernorm = Qwen3_5RMSNorm(hidden_size, eps=rms_norm_eps)
         self.self_attn = Qwen3_5GatedAttention(hidden_size, num_heads,
                                                num_kv_heads, head_dim,
-                                               rms_norm_eps, bias)
+                                               rms_norm_eps, bias,
+                                               attention_scale)
         self.post_attention_layernorm = Qwen3_5RMSNorm(hidden_size,
                                                        eps=rms_norm_eps)
         self.mlp = SwiGLUMLP(hidden_size, intermediate_size)
@@ -207,6 +224,8 @@ class MtpDraftModel(nn.Module):
         head_dim = getattr(config, "head_dim",
                            hs // config.num_attention_heads)
         bias = getattr(config, "attention_bias", False)
+        attention_scale = resolve_attention_scale(
+            config, getattr(config, "model_type", ""), head_dim)
 
         # MTP fusion layers
         self.pre_fc_norm_embedding = Qwen3_5RMSNorm(hs,
@@ -219,7 +238,7 @@ class MtpDraftModel(nn.Module):
             MtpDecoderLayer(hs, config.intermediate_size,
                             config.num_attention_heads,
                             config.num_key_value_heads, head_dim,
-                            config.rms_norm_eps, bias)
+                            config.rms_norm_eps, bias, attention_scale)
         ])
 
         self.norm = Qwen3_5RMSNorm(hs, eps=config.rms_norm_eps)
@@ -338,7 +357,8 @@ def quantize_mtp_from_base(
     kv_cache_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    *,
+    text_dataset: Union[str, TextDataset, None] = None,
     num_samples: int = 512,
 ) -> "MtpDraftModel":
     """Load and quantize the MTP draft using the unquantized base model.
@@ -364,9 +384,11 @@ def quantize_mtp_from_base(
     quant_cfg = build_quant_config(quantization, lm_head_quantization,
                                    kv_cache_quantization)
     from ..quantize import _text_calib_dataloader
+    text_ds = resolve_dataset(text_dataset, "text")
+    print(f"MTP text calibration: {dataset_name(text_ds)}")
     loader = _text_calib_dataloader(
         tokenizer,
-        dataset,
+        text_ds,
         num_samples=num_samples,
         batch_size=16 if "int4" in quantization else 1)
 

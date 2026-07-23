@@ -117,6 +117,29 @@ TEST(GenerateMultimodalIndices, MultiBatchGlobalIndexing)
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 1, 0}));
 }
 
+// Contiguous image runs get one block id each; audio tokens stay causal (-1).
+TEST(GenerateVisionBlockIds, ImageRunsGrouped)
+{
+    int32_t constexpr kImageTok = 50;
+    int32_t constexpr kAudioTok = 52;
+    auto ids = makeCpuIds({10, kImageTok, kImageTok, 20, kImageTok, kAudioTok, kImageTok, 30}, 1, 8);
+    auto result = rt::generateVisionBlockIds(ids, kImageTok);
+    auto v = toVec(result);
+    // Adjacent image placeholders form one vision run, matching HF's
+    // block grouping. Audio remains -1 (causal).
+    EXPECT_EQ(v, (std::vector<int32_t>{-1, 0, 0, -1, 1, -1, 2, -1}));
+}
+
+// Block numbering restarts at 0 for each batch entry.
+TEST(GenerateVisionBlockIds, BlockIdsRestartPerBatch)
+{
+    int32_t constexpr kImageTok = 50;
+    auto ids = makeCpuIds({kImageTok, 10, kImageTok, 20, kImageTok, kImageTok}, 2, 3);
+    auto result = rt::generateVisionBlockIds(ids, kImageTok);
+    auto v = toVec(result);
+    EXPECT_EQ(v, (std::vector<int32_t>{0, -1, 1, -1, 0, 0}));
+}
+
 TEST(LLMRuntimeUtils, ClampMaxGenerateLengthForKVCapacitySingleBatch)
 {
     EXPECT_EQ(rt::clampMaxGenerateLengthForKVCapacity({100}, 80, 256, 0), 80);

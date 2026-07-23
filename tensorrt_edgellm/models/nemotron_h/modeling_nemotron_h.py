@@ -207,6 +207,12 @@ class MambaMixer(nn.Module):
         norm.weight              - [intermediate_size] (gated RMSNorm)
     """
 
+    # Bound for dt before softplus. FP8 in_proj carries a per-tensor weight
+    # scale, so an outlier channel can drive dt past the fp16 range; softplus(dt)
+    # then overflows the SSM recurrence. softplus is ~identity in this range, so
+    # clamping keeps well-behaved dt exact while capping the pathological ones.
+    _DT_CLAMP = 50.0
+
     def __init__(self, config: ModelConfig, mc: MambaConfig,
                  module_prefix: str) -> None:
         super().__init__()
@@ -264,6 +270,7 @@ class MambaMixer(nn.Module):
         # Split: [gate, BC conv path, dt]
         gate, hidden_states_for_conv, dt = projected_states.split(
             [d_inner, self.conv_dim, self.num_heads], dim=-1)
+        dt = dt.clamp(-self._DT_CLAMP, self._DT_CLAMP)
 
         hidden_states_for_conv, conv_state_out, _ = causal_conv1d(
             hidden_states_for_conv,
@@ -662,6 +669,7 @@ class NemotronHAttentionMixer(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
 
@@ -681,6 +689,7 @@ class NemotronHAttentionMixer(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj")
         if self.enable_fp8_kv_cache:
+            self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 
@@ -710,6 +719,8 @@ class NemotronHAttentionMixer(nn.Module):
             "sliding_window_size": self.sliding_window_size,
             "enable_tree_attention": False,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
+            "enable_vision_block_attention": False,
         }
         # Always pass qkv_scales so torch.export includes a valid FLOATS
         # value in the FX graph for the unified ONNX translation.

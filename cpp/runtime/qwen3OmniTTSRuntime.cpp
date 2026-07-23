@@ -618,6 +618,12 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
             = rt::Tensor({maxBS, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32, "mCodePredictorSelectedIndices");
         mHostSelectedCodeIds
             = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostSelectedCodeIds");
+        // Pinned (cudaMallocHost) buffer that accumulates the deferred CP gen samples
+        // across all (mNumRvqLayers - 1) steps for up to maxBS active batches, so we
+        // can do a single cudaStreamSynchronize per frame instead of one per step.
+        // Layout: [step_idx, batch_idx] — step k writes to row k.
+        mHostGenCodeBuf = rt::Tensor({static_cast<int64_t>(mNumRvqLayers - 1), maxBS}, rt::DeviceType::kCPU,
+            nvinfer1::DataType::kINT32, "mHostGenCodeBuf");
         mHostCodePredictorContextLength
             = rt::Tensor({maxBS}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "mHostCodePredictorContextLength");
 
@@ -1197,7 +1203,11 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
 
     SamplingParams talkerSamplingParams(
         activeBatchSize, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+    // CP sampling params come from HF's hardcoded ``code_predictor.generate``
+    // defaults; see ``kCPSamplingTemperature`` / ``kCPSamplingTopK`` /
+    // ``kCPSamplingTopP`` in qwen3OmniTTSRuntime.h for the source-code links.
+    SamplingParams predictorSamplingParams(
+        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
     SamplingParams singleSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
 
     // Build per-batch Talker prefill embeddings into mTalkerInputEmbeds, then run a single
@@ -1390,7 +1400,8 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
 
     SamplingParams talkerSamplingParams(
         activeBatchSize, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+    SamplingParams predictorSamplingParams(
+        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     int64_t const trailingStride = mTalkerConfig.maxSeqLen + 1;
@@ -1628,7 +1639,7 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
     // NOTE: the host set / GPU buffer are still off-by-one (host set tracks the token entering
     // each iteration while the GPU buffer receives the newly sampled token). That functional
     // drift is pre-existing and tracked as a follow-up together with the standalone-TTS
-    // Chinese-prompt prefill-EOS anomaly surfaced during MR 770 review.
+    // Known Chinese-prompt prefill-EOS anomaly; pending technical follow-up.
     for (int32_t b = 0; b < activeBatchSize; ++b)
     {
         states[b].numSeenTokens = 0;
@@ -1987,6 +1998,26 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
     check::check(mCodecHiddensBuffer.reshape({activeBatchSize, mNumCodesPerFrame, talkerH}), "Tensor reshape failed");
 
     // ---- Step 6: Decode loop for codes 2 .. mNumRvqLayers (batched) ----
+    //
+    // Tokens flow GPU-only across the loop: each step's embeddingLookup reads
+    // the PREVIOUS step's sample directly from ``mCodePredictorSelectedIndices``
+    // (device tensor) instead of round-tripping through host memory.  Per-step
+    // sample is async-D2H'd into row ``step - 2`` of ``mHostGenCodeBuf`` on
+    // pinned host memory; one ``cudaStreamSynchronize`` at the end of the loop
+    // drains all 14 steps × activeBatchSize codes.
+    //
+    // CP has no EOS / no per-token streaming callback, so the host doesn't need
+    // any sample value during the inner loop — making this loop a strictly
+    // safer place to defer sync than the Thinker/Talker loops.  AR ordering is
+    // preserved by stream order: step k's topK kernel happens-before step k+1's
+    // embeddingLookup on the same CUDA stream.
+    //
+    // Entry condition: ``mCodePredictorSelectedIndices`` already holds code_1
+    // from the prefill block above (its topK wrote there), so step 2 reads it
+    // correctly.  See the prefill block for the post-sample state.
+    int32_t* const hostGenBuf = mHostGenCodeBuf.dataPointer<int32_t>();
+    int64_t const hostGenBufStride = mMaxBatchSize; // row stride of mHostGenCodeBuf
+    int32_t const numGenSteps = mNumRvqLayers - 1;
     {
         TIME_STAGE(metrics::StageNames::kCODEPREDICTOR_GENERATION, stream);
         for (int32_t step = 2; step <= mNumRvqLayers; ++step)
@@ -1994,17 +2025,15 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
             int32_t const embedIdx = step - 2;  // step=2 → codec_embedding[0]
             int32_t const lmHeadIdx = step - 1; // step=2 → lm_head[1]
 
-            // Lookup code_(step-1) for each batch.
-            // Codes are in outputCodesPerBatch[b].back() from last sample (= code_(step-1)).
-            std::vector<int32_t> codesForStep(activeBatchSize);
-            for (int32_t b = 0; b < activeBatchSize; ++b)
-                codesForStep[b] = outputCodesPerBatch[b].back();
-            check::check(mCodePredictorCodecIds.reshape({activeBatchSize, 1}), "Tensor reshape failed");
-            CUDA_CHECK(cudaMemcpyAsync(mCodePredictorCodecIds.rawPointer(), codesForStep.data(),
-                activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            // Lookup code_(step-1) for each batch from the PREVIOUS step's
+            // sampled-token device tensor — skip the host round-trip via
+            // outputCodesPerBatch.back() + H2D copy that the original
+            // implementation did, since outputCodesPerBatch isn't drained
+            // until end-of-loop under the deferred-sync scheme.
+            check::check(mCodePredictorSelectedIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
             check::check(mRawCodecEmbed.reshape({activeBatchSize, 1, talkerH}), "Tensor reshape failed");
-            kernel::embeddingLookup(
-                mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
+            kernel::embeddingLookup(mCodePredictorSelectedIndices, mCodePredictorEmbeddingTables[embedIdx],
+                std::nullopt, mRawCodecEmbed, stream);
 
             // Save raw embedding to mCodecHiddensBuffer[b][step-1] for residual (matches PyTorch position mapping).
             int32_t const savePos = step - 1; // 1..mNumRvqLayers-1
@@ -2044,13 +2073,27 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t activeBatch
                 activeBatchSize, codebookSize, samplingParams.temperature, samplingParams.topK, samplingParams.topP);
             trt_edgellm::topKtopPSamplingFromLogits(
                 logitsForHead, mCodePredictorSelectedIndices, perCallParams, mSamplingWorkspace, stream);
-            CUDA_CHECK(cudaMemcpyAsync(mHostSelectedCodeIds.rawPointer(), mCodePredictorSelectedIndices.rawPointer(),
-                activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
 
-            int32_t* hostCodes = mHostSelectedCodeIds.dataPointer<int32_t>();
+            // Async D2H to row (step - 2) × maxBS of pinned host buffer;
+            // deliberately NO cudaStreamSynchronize here — the value will be
+            // drained after the loop.  Pinned (cudaMallocHost) backing makes
+            // this truly async.
+            int32_t const rowIdx = step - 2;
+            CUDA_CHECK(
+                cudaMemcpyAsync(hostGenBuf + rowIdx * hostGenBufStride, mCodePredictorSelectedIndices.rawPointer(),
+                    activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        }
+
+        // Single sync per frame: blocks until all numGenSteps × activeBatchSize
+        // D2H copies (and the sampling kernels they depend on) have completed.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        for (int32_t row = 0; row < numGenSteps; ++row)
+        {
             for (int32_t b = 0; b < activeBatchSize; ++b)
-                outputCodesPerBatch[b].push_back(hostCodes[b]); // code_step
+            {
+                outputCodesPerBatch[b].push_back(hostGenBuf[row * hostGenBufStride + b]); // code_(row+2)
+            }
         }
     }
 
@@ -2423,7 +2466,8 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceRuntime& thinker
     float const repetitionPenalty = omniBaseRequest.repetitionPenalty;
 
     SamplingParams talkerSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
-    SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+    SamplingParams predictorSamplingParams(
+        1, mTalkerConfig.codebookSize, kCPSamplingTemperature, kCPSamplingTopK, kCPSamplingTopP);
 
     int32_t const codecEosId = mTalkerConfig.codecEosId;
     int32_t numSeenTokens = 0;

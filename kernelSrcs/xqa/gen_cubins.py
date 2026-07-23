@@ -31,7 +31,22 @@ CompileArchMacrosAndFile = namedtuple(
     'CompileArchMacrosAndFile', 'arch compile_arch macro_list input_file_name')
 
 build_func_name_prefix = 'xqa_kernel'
+TOKENS_PER_PAGE_OPTIONS = [0, 128]
 arch_options = [80, 86, 90]
+
+
+def is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def check_tokens_per_page(tokens_per_page: int):
+    if tokens_per_page == 0:
+        return
+    if not is_power_of_two(tokens_per_page):
+        raise ValueError(
+            'TOKENS_PER_PAGE must be 0 or a power-of-two page size.')
+
+
 config_list = [
     # for llama v2 70b
     [
@@ -39,9 +54,8 @@ config_list = [
         CompileMacroOption('HEAD_ELEMS', 'd', [128, 256]),
         CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
         CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 1, 2]),
-        CompileMacroOption(
-            'TOKENS_PER_PAGE', 'pagedKV',
-            [0, 16, 32, 64, 128]),  # 0 denotes contiguous kv cache.
+        CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                           TOKENS_PER_PAGE_OPTIONS),  # 0 denotes contiguous kv cache.
         CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [8]),
         CompileMacroOption('M_TILESIZE', 'm', [8]),
     ],
@@ -51,9 +65,8 @@ config_list = [
         CompileMacroOption('HEAD_ELEMS', 'd', [256]),
         CompileMacroOption('BEAM_WIDTH', 'beam', [4]),
         CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 1, 2]),
-        CompileMacroOption(
-            'TOKENS_PER_PAGE', 'pagedKV',
-            [0, 16, 32, 64, 128]),  # 0 denotes contiguous kv cache.
+        CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                           TOKENS_PER_PAGE_OPTIONS),  # 0 denotes contiguous kv cache.
         CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [1]),
         CompileMacroOption('M_TILESIZE', 'm', [4]),
     ]
@@ -226,10 +239,12 @@ def generate_cubin_meta_info_line(arch: int,
         if compile_macro.macro_name == 'M_TILESIZE':
             m_tilesize = compile_macro.value
         if compile_macro.macro_name == 'TOKENS_PER_PAGE':
+            if compile_macro.value not in TOKENS_PER_PAGE_OPTIONS:
+                raise ValueError(
+                    f'TOKENS_PER_PAGE must be one of {TOKENS_PER_PAGE_OPTIONS}.')
+            check_tokens_per_page(compile_macro.value)
             tokens_per_page = compile_macro.value
-            # Power of 2 tokens per page.
-            assert (tokens_per_page % 2 == 0)
-            paged_kv_cache = 'true' if tokens_per_page > 0 else 'false'
+            paged_kv_cache = 'true' if compile_macro.value > 0 else 'false'
         if compile_macro.macro_name == 'SLIDING_WINDOW':
             assert compile_macro.value in (0, 1)
             sliding_window = 'true' if compile_macro.value == 1 else 'false'
@@ -247,6 +262,8 @@ def generate_cubin_meta_info_line(arch: int,
     assert beam_width is not None
     assert num_q_heads_per_kv is not None
     assert sliding_window is not None
+    assert paged_kv_cache is not None
+    assert tokens_per_page is not None
     unique_func_name = "kernel_mha"
     kernel_variant = 'XQAKernelMetaInfo::KERNEL_VARIANT_STANDARD'
     requires_cluster_launch = 'false'
@@ -692,14 +709,14 @@ if __name__ == "__main__":
     cubin_dir = os.path.abspath(args.output_dir)
     nvcc_bin = args.nvcc if args.nvcc else nvcc_bin
     clean_cubin = not args.keep_cubin
-
     edgellm_config_list = [
         [
             CompileMacroOption('DTYPE', 'dt', ['__half']),
             CompileMacroOption('HEAD_ELEMS', 'd', [128, 64, 32]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                               TOKENS_PER_PAGE_OPTIONS),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv',
                                [1, 2, 3, 4, 5, 6, 7, 8]),
@@ -714,7 +731,8 @@ if __name__ == "__main__":
             CompileMacroOption('HEAD_ELEMS', 'd', [128]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                               TOKENS_PER_PAGE_OPTIONS),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [16]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
@@ -728,7 +746,8 @@ if __name__ == "__main__":
             CompileMacroOption('HEAD_ELEMS', 'd', [256]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                               TOKENS_PER_PAGE_OPTIONS),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [2, 4, 6, 8]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
@@ -736,15 +755,34 @@ if __name__ == "__main__":
         ],
         [
             # Gemma 4 global attention uses 512-wide heads.
-            # nqpkv=4: E4B (8 Q heads / 2 KV heads)
+            # nqpkv=2: E4B assistant (4 Q heads / 2 KV heads)
+            # nqpkv=4: E4B base (8 Q heads / 2 KV heads)
             # nqpkv=8: E2B (8 Q heads / 1 KV head)
             CompileMacroOption('DTYPE', 'dt', ['__half']),
             CompileMacroOption('HEAD_ELEMS', 'd', [512]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
+                               TOKENS_PER_PAGE_OPTIONS),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
-            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [4, 8]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [2, 4, 8]),
+            CompileMacroOption('M_TILESIZE', 'm', [8]),
+            CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
+        ],
+        [
+            # Gemma4 Unified 12B global attention: 16 Q heads / 1 KV head
+            # (GQA ratio 16) with 512-wide heads. The decode kernel tiles Q
+            # rows as roundUp(headGrpSize * beamWidth, 16), so ratio 16 fully
+            # occupies the same 16-row M tile that the nqpkv 4/8 kernels pad;
+            # shared-memory and register footprints are unchanged. Generated
+            # for the same SM set as the other d512 kernels.
+            CompileMacroOption('DTYPE', 'dt', ['__half']),
+            CompileMacroOption('HEAD_ELEMS', 'd', [512]),
+            CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
+            CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
+            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV', [0]),
+            CompileMacroOption('SLIDING_WINDOW', 'sw', [0]),
+            CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [16]),
             CompileMacroOption('M_TILESIZE', 'm', [8]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [0]),
         ],
@@ -753,24 +791,24 @@ if __name__ == "__main__":
     edgellm_config_list_spec_dec = [
         [
             CompileMacroOption('DTYPE', 'dt', ['__half']),
-            CompileMacroOption('HEAD_ELEMS', 'd', [256, 128, 64]),
+            CompileMacroOption('HEAD_ELEMS', 'd', [256, 128, 64, 32]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                               [0]),  # 0 denotes contiguous kv cache.
+                               TOKENS_PER_PAGE_OPTIONS),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [32]),
             CompileMacroOption('SPEC_DEC', 'spec_dec', [1]),
         ],
         [
-            # MTP head_dim=512 uses the standard separate K/V cache contract.
+            # MTP head_dim=512 supports both contiguous and paged separate K/V cache contracts.
             CompileMacroOption('DTYPE', 'dt', ['__half']),
             CompileMacroOption('HEAD_ELEMS', 'd', [512]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 2]),
             CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                               [0]),  # 0 denotes contiguous kv cache.
+                               TOKENS_PER_PAGE_OPTIONS),
             CompileMacroOption('SLIDING_WINDOW', 'sw', [0, 1]),
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [32]),

@@ -49,8 +49,6 @@ public:
         return true;
     }
 
-    char const* unsupportedReason(LLMGenerationRequest const& request) const noexcept override;
-
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
 
@@ -69,58 +67,77 @@ public:
 
 private:
     bool runDraftForward(DecodingInferenceContext& context);
+    bool prepareDFlashVerifyInputs(DecodingInferenceContext& context);
+    bool captureDraftCudaGraphs(cudaStream_t stream);
+    bool buildTreeVerifyInputs(DecodingInferenceContext& context);
     bool runBaseVerification(DecodingInferenceContext& context);
+    bool executeBaseVerification(DecodingInferenceContext& context, int32_t verifySize);
+    void reshapeBaseVerificationForCapture(int32_t batchSize, int32_t verifySize, bool includeTreeMetadata);
+    void prepareLinearBaseVerificationMetadata(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+    void copyVerifyTokenIdsToBaseInput(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+    void runBaseVerificationEmbeddingLookup(
+        int32_t batchSize, int32_t verifySize, cudaStream_t stream, bool reshapeGemmaPleOutputs);
+    bool capturePreparedBaseVerification(int32_t batchSize, int32_t verifySize, cudaStream_t stream);
+    void reshapeBaseVerificationInputsOutputs(int32_t batchSize, int32_t verifySize);
+    void prepareCommonBaseVerificationInputs(int32_t batchSize, int32_t verifySize);
+    void commitAcceptedTreePath(DecodingInferenceContext& context, int32_t verifySize, int32_t maxAcceptLength);
+    bool checkCudaLastError(char const* stage) const;
 
     DecodingRuntimeContext& mRuntime;
-
-    //! Draft KV cache manager (shared resource index 1)
     HybridCacheManager& mDraftCacheManager;
 
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
 
-    //! Draft engine I/O tensors
-    Tensor mDraftInputsEmbeds; //!< [B, BS, draftHiddenSize] FP16
-    Tensor mDraftTargetHidden; //!< [B, deltaLen, baseOutputHiddenDim] FP16 — target hidden delta only
-    Tensor mDraftOutputLogits; //!< [B, BS, vocabSize] FP32
+    Tensor mDraftInputsEmbeds;        //!< [B, blockSize, draftHiddenSize] FP16
+    Tensor mDraftTargetHidden;        //!< Compact scratch for [B, <= blockSize, baseOutputHiddenDim] FP16
+    Tensor mDraftPrefillTargetHidden; //!< Lazy scratch for non-compact round-0 target hidden FP16, max batch reserve
+    Tensor mDraftOutputLogits;        //!< [B, blockSize, vocabSize] FP32
 
-    //! Proposal attention inputs (prepared by DFlash prep kernel)
-    Tensor mDraftPackedAttentionMask; //!< [B, BS, divUp(BS,32)] INT32
-    Tensor mDraftAttentionPosId;      //!< [B, BS] INT32
+    Tensor mDraftPackedAttentionMask; //!< [B, blockSize, divUp(blockSize,32)] INT32
+    Tensor mDraftAttentionPosId;      //!< [B, blockSize] INT32
     Tensor mDraftContextLengths;      //!< [B] INT32
-    Tensor mDraftDeltaLenCommit;      //!< [B] INT32 — pre-allocated for draft cache commit
-    Tensor mDraftDeltaLens;           //!< [B] INT32 — per-batch delta lengths for KV cache update plugin
+    Tensor mDraftDeltaLenCommit;      //!< [B] INT32
+    Tensor mDraftDeltaLens;           //!< [B] INT32
 
-    //! Draft/verify tokens
-    Tensor mDraftTokenIds;          //!< [B, BS] INT32
-    Tensor mVerifyTokenIds;         //!< [B, BS] INT32
-    Tensor mAcceptedTokenIds;       //!< [B, BS] INT32
-    Tensor mAcceptLength;           //!< [B] INT32
-    Tensor mHostAcceptLengths;      //!< [B] INT32 (CPU)
-    Tensor mHostAcceptedTokenIds;   //!< [B, BS] INT32 (CPU)
-    Tensor mHostDraftInputIds;      //!< [B, BS] INT32 (CPU)
-    Tensor mHostLastAcceptedTokens; //!< [B] INT32 (CPU)
-    Tensor mHostDeltaLens;          //!< [B] INT32 (CPU)
+    Tensor mDraftTokenIds;          //!< [B, blockSize] INT32
+    Tensor mHostDraftInputIds;      //!< [B, blockSize] INT32 CPU
+    Tensor mHostLastAcceptedTokens; //!< [B] INT32 CPU
+    Tensor mHostDeltaLens;          //!< [B] INT32 CPU
+    Tensor mLastAcceptedTokens;     //!< [B] INT32 GPU
 
-    //! Pre-allocated argmax scratch buffer for dflashSequentialAccept [maxBatch * BS] INT32
-    Tensor mArgmaxScratch;
-
-    //! Last accepted token per batch [maxBatch] INT32 (GPU)
-    Tensor mLastAcceptedTokens;
-
-    //! System prompt KV cache for draft target KV
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 
+    Tensor mTreeTokenIds;         //!< [B, verifySize] INT32, DDTree node tokens
+    Tensor mTreeNodeScores;       //!< [B, verifySize] FP32, DDTree prefix scores
+    Tensor mValidCounts;          //!< [B] INT32, DDTree valid node counts
+    Tensor mVerifyTokenIds;       //!< [B, verifyTokenCount] INT32
+    Tensor mVerifyTreeMask;       //!< [B, verifyTokenCount, verifyTokenCount] INT8
+    Tensor mAcceptedTokenIds;     //!< [B, dflashBlockSize] INT32
+    Tensor mAcceptedTokenIndices; //!< [B, dflashBlockSize] INT32, verify logits/KV indices
+    Tensor mAcceptLength;         //!< [B] INT32
+    Tensor mHostAcceptLengths;    //!< [B] INT32 (CPU)
+    Tensor mHostAcceptedTokenIds; //!< [B, dflashBlockSize] INT32 (CPU)
+    Tensor mBuildWorkspace;       //!< DDTree build workspace bytes
+
     //! DFlash-specific parameters
-    //! mBlockSize is the runtime proposal/verify block size, set from specConfig->verifySize.
-    //! This is the number of tokens the draft engine generates per round and base verifies.
-    //! It may be smaller than the DFlash checkpoint's training block_size (e.g., verify=8
-    //! on a block_size=16 checkpoint for Qwen3.5 4B with GDN intermediate-state constraints).
+    //! Linear DFlash proposal/verify chain length. This comes from the shared
+    //! DFlash runtime block-size helper rather than treating verifySize as the
+    //! permanent block horizon.
     int32_t mBlockSize{16};
-    int32_t mMaskTokenId{248070};
+    int32_t mVerifySize{16};
+    int32_t mCandidateTopK{1};
+    int32_t mMaskTokenId{0};
     int32_t mDraftHiddenSize{0};
     int32_t mBaseOutputHiddenDim{0};
     int32_t mDraftVocabSize{0};
+
+    bool mUseDDTree{false};
+
+    //! Draft vocab map [reducedVocabSize] INT32 (GPU). Active when draft
+    //! lm_head uses a reduced vocabulary. Sized to zero otherwise.
+    Tensor mDraftVocabMappingTable;
+    bool mHasDraftVocabMap{false};
 };
 
 } // namespace rt

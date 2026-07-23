@@ -24,8 +24,11 @@
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
+#include "sampler/sampling.h" // kMaxLogprobsK
 
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -36,8 +39,50 @@ namespace exampleUtils
 
 using Json = nlohmann::json;
 
+namespace
+{
+
+std::unordered_map<int32_t, float> parseLogitBias(Json const& logitBiasJson, std::string const& fieldName)
+{
+    check::check(logitBiasJson.is_object(), fieldName + " must be an object mapping token IDs to bias values");
+    check::check(logitBiasJson.size() <= limits::security::kMaxLogitBiasTokens,
+        format::fmtstr("%s has %zu entries, max is %zu (matching vLLM)", fieldName.c_str(), logitBiasJson.size(),
+            limits::security::kMaxLogitBiasTokens));
+
+    std::unordered_map<int32_t, float> logitBias;
+    logitBias.reserve(logitBiasJson.size());
+    for (auto const& [tokenIdStr, biasJson] : logitBiasJson.items())
+    {
+        size_t parsedChars = 0;
+        long long tokenIdLong = 0;
+        try
+        {
+            tokenIdLong = std::stoll(tokenIdStr, &parsedChars);
+        }
+        catch (std::exception const&)
+        {
+            throw std::runtime_error(fieldName + " token ID '" + tokenIdStr + "' is not an integer");
+        }
+        check::check(parsedChars == tokenIdStr.size(), fieldName + " token ID '" + tokenIdStr + "' is not an integer");
+        check::check(
+            tokenIdLong >= std::numeric_limits<int32_t>::min() && tokenIdLong <= std::numeric_limits<int32_t>::max(),
+            fieldName + " token ID '" + tokenIdStr + "' is outside int32 range");
+        check::check(biasJson.is_number(), fieldName + " value for token ID '" + tokenIdStr + "' must be numeric");
+        float const bias = biasJson.get<float>();
+        check::check(
+            std::isfinite(bias) && bias >= limits::security::kMinLogitBias && bias <= limits::security::kMaxLogitBias,
+            format::fmtstr("%s value for token ID '%s' must be finite and in [%.1f, %.1f]", fieldName.c_str(),
+                tokenIdStr.c_str(), limits::security::kMinLogitBias, limits::security::kMaxLogitBias));
+        logitBias[static_cast<int32_t>(tokenIdLong)] = bias;
+    }
+    return logitBias;
+}
+
+} // namespace
+
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseRequestFile(
-    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride, int64_t maxGenerateLengthOverride)
+    std::filesystem::path const& inputFilePath, int32_t batchSizeOverride, int64_t maxGenerateLengthOverride,
+    int32_t numLogprobsOverride)
 {
     std::vector<rt::LLMGenerationRequest> batchedRequests;
 
@@ -73,6 +118,18 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
     bool applyChatTemplate = inputData.value("apply_chat_template", true);
     bool addGenerationPrompt = inputData.value("add_generation_prompt", true);
     bool enableThinking = inputData.value("enable_thinking", false);
+    std::unordered_map<int32_t, float> defaultLogitBias;
+    if (inputData.contains("logit_bias") && !inputData["logit_bias"].is_null())
+    {
+        defaultLogitBias = parseLogitBias(inputData["logit_bias"], "logit_bias");
+    }
+    // Top-level num_logprobs is the default for every request; a request may raise it.
+    // A CLI override (>= 0) takes precedence over both file levels, mirroring
+    // batchSizeOverride / maxGenerateLengthOverride.
+    int32_t const defaultNumLogprobs
+        = (numLogprobsOverride >= 0) ? numLogprobsOverride : inputData.value("num_logprobs", 0);
+    check::check(defaultNumLogprobs >= 0 && defaultNumLogprobs <= kMaxLogprobsK,
+        format::fmtstr("Invalid num_logprobs value: %d (must be in [0, %d])", defaultNumLogprobs, kMaxLogprobsK));
 
     std::unordered_map<std::string, std::string> loraWeightsMap;
     if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
@@ -106,6 +163,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
         batchRequest.applyChatTemplate = applyChatTemplate;
         batchRequest.addGenerationPrompt = addGenerationPrompt;
         batchRequest.enableThinking = enableThinking;
+        batchRequest.numLogprobs = defaultNumLogprobs;
 
         std::string batchLoraWeightsName;
         bool firstInBatch = true;
@@ -126,6 +184,16 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             {
                 batchRequest.disableSpecDecode = true;
             }
+            // num_logprobs: request value overrides the top-level default (unless a CLI
+            // override is active); applied batch-uniformly (like disable_spec_decode) —
+            // the batch uses the max.
+            int32_t const requestNumLogprobs = (numLogprobsOverride >= 0)
+                ? numLogprobsOverride
+                : requestItem.value("num_logprobs", defaultNumLogprobs);
+            check::check(requestNumLogprobs >= 0 && requestNumLogprobs <= kMaxLogprobsK,
+                format::fmtstr(
+                    "Invalid num_logprobs value: %d (must be in [0, %d])", requestNumLogprobs, kMaxLogprobsK));
+            batchRequest.numLogprobs = std::max(batchRequest.numLogprobs, requestNumLogprobs);
 
             std::string requestLoraName;
             if (requestItem.contains("lora_name") && !requestItem["lora_name"].is_null())
@@ -219,6 +287,25 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                 imageBuffers.push_back(std::move(image));
                             }
                         }
+                        else if (msgContent.type == "video")
+                        {
+                            // Schema: {"type": "video", "frames": [path1, path2, ...], "fps": 1.0}
+                            // fps is optional (default 1.0); frames are assumed pre-sampled in temporal order.
+                            check::check(contentItemJson.contains("frames") && contentItemJson["frames"].is_array(),
+                                "Video content must have a 'frames' array of frame file paths");
+                            std::vector<std::string> framePaths;
+                            for (auto const& f : contentItemJson["frames"])
+                            {
+                                framePaths.push_back(f.get<std::string>());
+                            }
+                            double const fps = contentItemJson.value("fps", 1.0);
+                            msgContent.content = "video[" + std::to_string(framePaths.size()) + " frames]";
+                            auto video = rt::imageUtils::loadVideoFromFrames(framePaths, fps);
+                            if (video.buffer != nullptr)
+                            {
+                                imageBuffers.push_back(std::move(video));
+                            }
+                        }
                         else if (msgContent.type == "audio")
                         {
                             msgContent.content = contentItemJson["audio"].get<std::string>();
@@ -227,6 +314,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                             std::string const extension = (dotPos != std::string::npos) ? audioPath.substr(dotPos) : "";
                             bool const isRawAudio
                                 = (extension == ".wav" || extension == ".mp3" || extension == ".flac");
+                            bool const isMelSpectrogram = (extension == ".safetensors");
 
                             if (isRawAudio)
                             {
@@ -246,16 +334,27 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                 LOG_INFO("Decoded audio (PCM): %s (%ld samples @ %d Hz)", audioPath.c_str(),
                                     static_cast<long>(numSamples), kTargetSampleRate);
                             }
+                            else if (isMelSpectrogram)
+                            {
+                                // Pre-computed mel-spectrogram (Gemma4 audio encoder input).
+                                rt::audioUtils::AudioData audio;
+                                audio.melSpectrogramPath = audioPath;
+                                audio.melSpectrogramFormat = "safetensors";
+                                audioBuffers.push_back(std::move(audio));
+                                LOG_INFO("Mel-spectrogram input: %s", audioPath.c_str());
+                            }
                             else
                             {
-                                LOG_WARNING("Unsupported audio format: %s (CLI accepts raw .wav / .mp3 / .flac files)",
+                                LOG_WARNING(
+                                    "Unsupported audio format: %s (CLI accepts .wav / .mp3 / .flac / .safetensors)",
                                     audioPath.c_str());
                             }
                         }
                         else
                         {
-                            throw std::runtime_error(format::fmtstr(
-                                "Content type must be 'text', 'image', 'audio', but got: %s", msgContent.type.c_str()));
+                            throw std::runtime_error(
+                                format::fmtstr("Content type must be 'text', 'image', 'video', 'audio', but got: %s",
+                                    msgContent.type.c_str()));
                         }
                         chatMsg.contents.push_back(msgContent);
                     }
@@ -272,6 +371,12 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
             request.messages = std::move(chatMessages);
             request.imageBuffers = std::move(imageBuffers);
             request.audioBuffers = std::move(audioBuffers);
+            request.logitBias = defaultLogitBias;
+            if (requestItem.contains("logit_bias") && !requestItem["logit_bias"].is_null())
+            {
+                request.logitBias
+                    = parseLogitBias(requestItem["logit_bias"], format::fmtstr("requests[%zu].logit_bias", requestIdx));
+            }
 
             // Optional per-request stop strings ("stop": string | string[]).
             if (requestItem.contains("stop") && !requestItem["stop"].is_null())

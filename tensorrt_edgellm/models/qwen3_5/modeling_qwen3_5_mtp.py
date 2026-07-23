@@ -91,6 +91,8 @@ class Qwen3_5MtpDecoderLayer(nn.Module):
             sliding_window_size=attn.sliding_window_size,
             enable_tree_attention=True,
             enable_fp8_kv_cache=attn.enable_fp8_kv_cache,
+            attention_scale=attn.attention_scale,
+            enable_vision_block_attention=False,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=getattr(attn, "_qkv_scales_float", [1.0, 1.0, 1.0]),

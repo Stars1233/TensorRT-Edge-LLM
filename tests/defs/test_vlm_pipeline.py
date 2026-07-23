@@ -43,7 +43,7 @@ class TestVLMPipeline:
         """Test TensorRT engine building for VLM models."""
         config = TestConfig.from_param_string(test_param, ModelType.VLM,
                                               TaskType.BUILD, env_config)
-        config.check_trt_native_vit_attn()
+        config.check_trt_native_attn()
 
         with timer_context(f"VLM build for {config.model_name}", test_logger):
             result = execute_build_test(config, executable_files,
@@ -58,7 +58,7 @@ class TestVLMPipeline:
         """Test end-to-end benchmarking for VLM models."""
         config = TestConfig.from_param_string(test_param, ModelType.VLM,
                                               TaskType.E2E_BENCH, env_config)
-        config.check_trt_native_vit_attn()
+        config.check_trt_native_attn()
 
         with timer_context(f"VLM e2e_bench for {config.model_name}",
                            test_logger):
@@ -76,7 +76,7 @@ class TestVLMPipeline:
         """Test batch inference for VLM models."""
         config = TestConfig.from_param_string(test_param, ModelType.VLM,
                                               TaskType.INFERENCE, env_config)
-        config.check_trt_native_vit_attn()
+        config.check_trt_native_attn()
 
         with timer_context(f"VLM inference for {config.model_name}",
                            test_logger):

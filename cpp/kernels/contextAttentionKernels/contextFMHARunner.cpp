@@ -368,18 +368,18 @@ ContextFMHARunner::ContextFMHARunner(nvinfer1::DataType const dataType, int32_t 
     }
 }
 
-void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
+void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params, float attentionScale)
 {
-    float const invSqrtScale = (1.f / sqrtf(mHeadSize));
+    validateAttentionScale(attentionScale);
+    float const scaleBmm1 = attentionScale;
+    float const scaleSoftmax = 1.0F; // Used by the INT8 path; keep neutral for FP16.
+    float const scaleBmm2 = 1.0F;
 
-    float const scale_bmm1 = invSqrtScale;
-    float const scale_softmax = 1.f; // Seems to be only required for int8
-    float const scale_bmm2 = 1.f;
-
-    FMHADataType scale_type = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
-    set_alpha(params.scale_bmm1, scale_bmm1, scale_type);
-    set_alpha(params.scale_softmax, scale_softmax, scale_type);
-    set_alpha(params.scale_bmm2, scale_bmm2, scale_type);
+    FMHADataType const scaleType
+        = mLaunchParams.force_fp32_acc ? fmha_v2::DATA_TYPE_FP32 : trtToFMHADataType(mDataType);
+    set_alpha(params.scale_bmm1, scaleBmm1, scaleType);
+    set_alpha(params.scale_softmax, scaleSoftmax, scaleType);
+    set_alpha(params.scale_bmm2, scaleBmm2, scaleType);
 
     params.b = mBatchSize;
     params.h = mNumHeads;
@@ -403,6 +403,42 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
     params.v_stride_in_bytes = kv_stride_in_bytes;
 }
 
+namespace
+{
+//! Scan the cubin metadata table for a CUSTOM_MASK flash-attention kernel
+//! matching the requested configuration.  Availability is discovered from the
+//! table so newly generated cubins are picked up without code changes.
+bool hasCustomMaskKernel(
+    int32_t headSize, int32_t sm, nvinfer1::DataType dataType, AttentionInputLayout inputLayout) noexcept
+{
+    ContextAttentionMaskType constexpr maskType = ContextAttentionMaskType::CUSTOM_MASK;
+    FMHADataType fmhaDataType{};
+    try
+    {
+        fmhaDataType = trtToFMHADataType(dataType);
+    }
+    catch (std::exception const&)
+    {
+        return false;
+    }
+    int32_t const maskTypeInt = attentionMaskTypeToInt(maskType);
+    int32_t const layoutInt = attentionInputLayoutToInt(inputLayout);
+    size_t const kernelMetaCount = sizeof(fmha_v2::sMhaKernelMetaInfosV2) / sizeof(fmha_v2::sMhaKernelMetaInfosV2[0]);
+    for (size_t i = 0; i < kernelMetaCount; ++i)
+    {
+        auto const& kernelMeta = fmha_v2::sMhaKernelMetaInfosV2[i];
+        if (kernelMeta.mDataTypeIn == fmhaDataType && kernelMeta.mDataTypeOut == fmhaDataType
+            && kernelMeta.mSM == static_cast<uint32_t>(sm) && kernelMeta.mD == static_cast<uint32_t>(headSize)
+            && kernelMeta.mAttentionMaskType == maskTypeInt && kernelMeta.mAttentionInputLayout == layoutInt
+            && kernelMeta.mFlashAttention && kernelMeta.mCubin != nullptr)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
 bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType,
     AttentionInputLayout inputLayout, ContextAttentionMaskType maskType) noexcept
 {
@@ -411,6 +447,23 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
         LOG_ERROR(
             "ContextFMHARunner::canImplement() only supports FP16. Got dataType=%d.", static_cast<int32_t>(dataType));
         return false;
+    }
+
+    // CUSTOM_MASK availability is discovered from the cubin metadata table:
+    // these kernels are generated per head size/SM on demand, so the table is
+    // the source of truth.  No error log — callers probe this to decide
+    // per-instance routing (vision-block prefill).
+    if (maskType == ContextAttentionMaskType::CUSTOM_MASK)
+    {
+        bool const available = hasCustomMaskKernel(headSize, sm, dataType, inputLayout);
+        if (!available)
+        {
+            LOG_DEBUG(
+                "ContextFMHARunner::canImplement() no CUSTOM_MASK kernel in the cubin table for headSize=%d, SM=%d, "
+                "inputLayout=%d.",
+                headSize, sm, static_cast<int32_t>(inputLayout));
+        }
+        return available;
     }
 
     if (headSize == 64 || headSize == 128 || headSize == 256)
@@ -444,11 +497,33 @@ bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::Data
     return fmhaKernelList != nullptr;
 }
 
+bool ContextFMHARunner::isKernelAvailable() const noexcept
+{
+    try
+    {
+        FMHAKernelHashKey const hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize,
+            mLaunchParams.force_unroll, mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
+            attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,
+            attentionInputLayoutToInt(mLaunchParams.attention_input_layout)};
+        FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
+        return fmhaKernelList != nullptr && fmhaKernelList->findKernelFunction(hashKey).mSharedMemBytes != 0;
+    }
+    catch (std::exception const&)
+    {
+        return false;
+    }
+}
+
 void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream)
 {
     check::check(params.q_ptr != nullptr && params.k_ptr != nullptr && params.v_ptr != nullptr
             && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
         "Device pointers are supposed to be valid");
+    if (mLaunchParams.attention_mask_type == ContextAttentionMaskType::CUSTOM_MASK)
+    {
+        check::check(params.packed_mask_ptr != nullptr && params.packed_mask_stride_in_bytes > 0,
+            "CUSTOM_MASK requires a valid packed mask pointer and stride");
+    }
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,

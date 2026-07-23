@@ -103,6 +103,158 @@ void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor con
         runtimeBatchSize);
 }
 
+// ===== FMHA_v2 CUSTOM_MASK packed-mask builder for vision-block prefill =====
+namespace
+{
+
+//! Allowed(q, k) predicate for Gemma4 vision-block attention: sliding-causal
+//! OR same non-negative vision block.
+__device__ __forceinline__ bool isVisionPositionAllowed(
+    int32_t const* blockIds, int32_t contextLen, int32_t slidingWindowSize, int32_t q, int32_t k)
+{
+    if (q >= contextLen || k >= contextLen)
+    {
+        return false;
+    }
+    bool const slidingCausal = (k <= q) && (slidingWindowSize <= 0 || k > q - slidingWindowSize);
+    int32_t const qBlock = blockIds[q];
+    bool const sameVisionBlock = qBlock >= 0 && qBlock == blockIds[k];
+    return slidingCausal || sameVisionBlock;
+}
+
+//! One thread produces one uint32 of the packed mask.  Grid:
+//! (mmasN, mmasMPerSeq, batch), block: 128 threads (one warp group covering a
+//! 64x64 tile).  See utilKernels.h for the bit layout contract.
+__global__ void buildVisionPackedMaskKernel(int32_t const* __restrict__ visionBlockIds,
+    int32_t const* __restrict__ contextLengths, uint32_t* __restrict__ packedMask, int32_t seqLen,
+    int32_t slidingWindowSize)
+{
+    int32_t const mmaN = static_cast<int32_t>(blockIdx.x);
+    int32_t const mmaM = static_cast<int32_t>(blockIdx.y);
+    int32_t const batch = static_cast<int32_t>(blockIdx.z);
+    int32_t const tidx = static_cast<int32_t>(threadIdx.x);
+    int32_t const mmasN = static_cast<int32_t>(gridDim.x);
+    int32_t const mmasMPerSeq = static_cast<int32_t>(gridDim.y);
+
+    int32_t const contextLen = min(contextLengths[batch], seqLen);
+    int32_t const* blockIds = visionBlockIds + static_cast<int64_t>(batch) * seqLen;
+
+    // The base (row, col) covered by this thread within the 64x64 tile.
+    int32_t const warp = tidx / 32;
+    int32_t const lane = tidx % 32;
+    int32_t const row = mmaM * kFMHA_PACKED_MASK_MMA_M + (warp % 4) * 16 + lane / 4;
+    int32_t const colBase = mmaN * kFMHA_PACKED_MASK_MMA_N + (lane % 4) * 2;
+
+    uint32_t mask = 0U;
+#pragma unroll
+    for (int32_t ni = 0; ni < 8; ++ni)
+    {
+        int32_t const col = colBase + ni * 8;
+        mask |= (isVisionPositionAllowed(blockIds, contextLen, slidingWindowSize, row, col) ? 1U : 0U) << (4 * ni + 0);
+        mask |= (isVisionPositionAllowed(blockIds, contextLen, slidingWindowSize, row, col + 1) ? 1U : 0U)
+            << (4 * ni + 1);
+        mask |= (isVisionPositionAllowed(blockIds, contextLen, slidingWindowSize, row + 8, col) ? 1U : 0U)
+            << (4 * ni + 2);
+        mask |= (isVisionPositionAllowed(blockIds, contextLen, slidingWindowSize, row + 8, col + 1) ? 1U : 0U)
+            << (4 * ni + 3);
+    }
+
+    // Word layout: [globalMmaM][mmaN][threads].
+    int64_t const globalMmaM = static_cast<int64_t>(batch) * mmasMPerSeq + mmaM;
+    int64_t const wordIdx = (globalMmaM * mmasN + mmaN) * kFMHA_PACKED_MASK_THREADS_PER_WARP_GROUP + tidx;
+    packedMask[wordIdx] = mask;
+}
+
+//! Fills cuMaskRows[i] = i * paddedRowsPerSeq (uniform padded rows per batch).
+__global__ void fillCuMaskRowsKernel(int32_t* cuMaskRows, int32_t batchSize, int32_t paddedRowsPerSeq)
+{
+    int32_t const i
+        = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x) + static_cast<int32_t>(threadIdx.x);
+    if (i <= batchSize)
+    {
+        cuMaskRows[i] = i * paddedRowsPerSeq;
+    }
+}
+
+//! One thread per (batch, position): expand vision-block IDs into per-position
+//! [blockBegin, blockEnd] intervals for the FFPA vision-block overlay prefill.
+__global__ void buildVisionBlockRangesKernel(int32_t const* visionBlockIds, int32_t const* contextLengths,
+    int32_t* blockBegin, int32_t* blockEnd, int32_t seqLen)
+{
+    int32_t const pos
+        = static_cast<int32_t>(blockIdx.x) * static_cast<int32_t>(blockDim.x) + static_cast<int32_t>(threadIdx.x);
+    int32_t const batch = static_cast<int32_t>(blockIdx.y);
+    if (pos >= seqLen)
+    {
+        return;
+    }
+    int64_t const base = static_cast<int64_t>(batch) * seqLen;
+    int32_t const contextLen = min(contextLengths[batch], seqLen);
+
+    int32_t begin = -1;
+    int32_t end = -1;
+    if (pos < contextLen)
+    {
+        int32_t const blockId = visionBlockIds[base + pos];
+        if (blockId >= 0)
+        {
+            // Contiguous-run expansion: blocks are short (a few hundred
+            // tokens), so the linear scans are cheap.
+            begin = pos;
+            end = pos;
+            while (begin > 0 && visionBlockIds[base + begin - 1] == blockId)
+            {
+                --begin;
+            }
+            while (end + 1 < contextLen && visionBlockIds[base + end + 1] == blockId)
+            {
+                ++end;
+            }
+        }
+    }
+    blockBegin[base + pos] = begin;
+    blockEnd[base + pos] = end;
+}
+
+} // namespace
+
+void launchBuildVisionPackedMask(int32_t const* visionBlockIds, int32_t const* contextLengths, uint32_t* packedMask,
+    int32_t* cuMaskRows, int32_t batchSize, int32_t seqLen, int32_t slidingWindowSize, cudaStream_t stream)
+{
+    check::check(visionBlockIds != nullptr && contextLengths != nullptr && packedMask != nullptr,
+        "Vision packed mask builder received a null pointer");
+    check::check(batchSize > 0 && seqLen > 0, "Vision packed mask builder received invalid dimensions");
+
+    int32_t const paddedRowsPerSeq = static_cast<int32_t>(getPackedMaskRowsPerSeq(seqLen));
+    int32_t const mmasMPerSeq = paddedRowsPerSeq / kFMHA_PACKED_MASK_MMA_M;
+    int32_t const mmasN = static_cast<int32_t>(getPackedMaskRowStrideInBytes(seqLen) * 8) / kFMHA_PACKED_MASK_MMA_N;
+
+    if (cuMaskRows != nullptr)
+    {
+        uint32_t const fillBlocks = static_cast<uint32_t>((batchSize + 1 + 127) / 128);
+        fillCuMaskRowsKernel<<<fillBlocks, 128, 0, stream>>>(cuMaskRows, batchSize, paddedRowsPerSeq);
+    }
+    dim3 const grid(static_cast<uint32_t>(mmasN), static_cast<uint32_t>(mmasMPerSeq), static_cast<uint32_t>(batchSize));
+    buildVisionPackedMaskKernel<<<grid, kFMHA_PACKED_MASK_THREADS_PER_WARP_GROUP, 0, stream>>>(
+        visionBlockIds, contextLengths, packedMask, seqLen, slidingWindowSize);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* contextLengths, int32_t* blockBegin,
+    int32_t* blockEnd, int32_t batchSize, int32_t seqLen, cudaStream_t stream)
+{
+    check::check(visionBlockIds != nullptr && contextLengths != nullptr && blockBegin != nullptr && blockEnd != nullptr,
+        "Vision block range expansion received a null pointer");
+    check::check(batchSize > 0 && seqLen > 0, "Vision block range expansion received invalid dimensions");
+
+    constexpr int32_t kRANGE_THREADS = 256;
+    dim3 const grid(
+        static_cast<uint32_t>((seqLen + kRANGE_THREADS - 1) / kRANGE_THREADS), static_cast<uint32_t>(batchSize));
+    buildVisionBlockRangesKernel<<<grid, kRANGE_THREADS, 0, stream>>>(
+        visionBlockIds, contextLengths, blockBegin, blockEnd, seqLen);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ===== kernel: produce separate K [B, S, H, D] and V [B, S, H, D] =====
 // Unified deinterleave kernel: copies tokens [0, dstS) from source [B, 2, H, srcS, D] to
 // separate K [B, dstS, H, D] and V [B, dstS, H, D].  When dstS == srcS this is a full copy;

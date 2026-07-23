@@ -141,7 +141,8 @@ def validate_quantization_result(config: TestConfig) -> None:
             label="KV-cache quantized model",
         )
 
-    if (config.is_eagle and not config.is_mtp and config.draft_llm_precision
+    if ((config.is_eagle or config.is_dflash) and not config.is_mtp
+            and config.draft_llm_precision
             and config.draft_llm_precision not in ("fp16", "int4_gptq")):
         draft_dir = config.get_quantized_draft_model_dir()
         _require_hf_quant_checkpoint(draft_dir, "Quantized draft model")
@@ -161,6 +162,17 @@ def validate_quantization_result(config: TestConfig) -> None:
         if not os.path.exists(action_onnx):
             raise FileNotFoundError(
                 f"VLA action expert ONNX not found: {action_onnx}")
+
+
+def _needs_gptqmodel_install(config: TestConfig) -> bool:
+    """True only when on-the-fly int4_gptq base quantization needs gptqmodel."""
+    if config.llm_precision != "int4_gptq":
+        return False
+    if config.is_prequantized():
+        return False
+    if config.is_dflash or config.is_eagle:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -183,13 +195,18 @@ class TestModelExport:
         if not os.path.exists(torch_dir):
             raise FileNotFoundError(f"Torch model not found: {torch_dir}")
 
-        if config.is_eagle and not config.is_mtp:
+        if config.is_dflash:
+            draft_torch_dir = config.get_dflash_draft_model_dir()
+            if not os.path.exists(draft_torch_dir):
+                raise FileNotFoundError(
+                    f"DFlash draft model not found: {draft_torch_dir}")
+        elif config.is_eagle and not config.is_mtp:
             draft_torch_dir = config.get_draft_torch_model_dir()
             if not os.path.exists(draft_torch_dir):
                 raise FileNotFoundError(
                     f"Draft model not found: {draft_torch_dir}")
 
-        if config.llm_precision == "int4_gptq":
+        if _needs_gptqmodel_install(config):
             install_gptq_cmd = [
                 "bash", "-c",
                 "BUILD_CUDA_EXT=0 pip install -v gptqmodel==5.7.0 "

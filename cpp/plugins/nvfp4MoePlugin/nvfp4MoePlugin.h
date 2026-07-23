@@ -32,8 +32,9 @@ namespace plugins
 //! Router selection kernel chosen by the \c routing_mode plugin attribute.
 enum class Nvfp4MoeRoutingMode : int32_t
 {
-    kSOFTMAX_TOPK = 0,       //!< \c moeTopkSoftmax: softmax over experts + flat top-k + renormalize (default).
-    kSIGMOID_GROUP_TOPK = 1, //!< \c moeSigmoidGroupTopk: sigmoid + grouped top-k + renormalize + scale (NemotronH).
+    kSOFTMAX_TOPK = 0,            //!< softmax + flat top-k + pre-softmax additive bias (DeepSeek, Qwen3).
+    kSIGMOID_GROUP_TOPK = 1,      //!< sigmoid + grouped top-k + renormalize + scale (NemotronH).
+    kSOFTMAX_TOPK_POST_SCALE = 2, //!< softmax + flat top-k + post-renorm multiplicative scale (Gemma4).
 };
 
 /*!

@@ -34,8 +34,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
 from ..linear import make_linear
-from ..ops import get_vit_attention_fn, vit_attention_plugin, vit_trt_attention
+from ..ops import (is_trt_native_attention_enabled, trt_ragged_attention,
+                   vit_attention_plugin)
 
 if TYPE_CHECKING:
     from ...config import ModelConfig
@@ -185,12 +187,13 @@ class Qwen3VLVisionAttention(nn.Module):
     def __init__(self,
                  hidden_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self._use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
+        self.attention_scale = attention_scale
         self.qkv = make_linear(
             model_config,
             hidden_size,
@@ -203,12 +206,13 @@ class Qwen3VLVisionAttention(nn.Module):
             hidden_size,
             bias=True,
             module_name=f"{name_prefix}.proj" if name_prefix else "")
+        self._use_trt_attn = is_trt_native_attention_enabled()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen_carrier: torch.Tensor,
+        max_seqlen_carrier: Optional[torch.Tensor],
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         kv_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -222,22 +226,25 @@ class Qwen3VLVisionAttention(nn.Module):
         k = k.to(torch.float16)
         v = v.to(torch.float16)
         if self._use_trt_attn:
-            q = q * (self.head_dim**-0.5)
-            attn_output = vit_trt_attention(q,
-                                            k,
-                                            v,
-                                            cu_seqlens,
-                                            kv_lengths,
-                                            num_heads=self.num_heads,
-                                            head_size=self.head_dim)
+            attn_output = trt_ragged_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                kv_lengths,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale)
         else:
-            attn_output = vit_attention_plugin(q,
-                                               k,
-                                               v,
-                                               cu_seqlens,
-                                               max_seqlen_carrier,
-                                               num_heads=self.num_heads,
-                                               head_size=self.head_dim)
+            attn_output = vit_attention_plugin(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                max_seqlen_carrier,
+                num_heads=self.num_heads,
+                head_size=self.head_dim,
+                attention_scale=self.attention_scale)
         attn_output = attn_output.reshape(seq_length, -1)
         return self.proj(attn_output)
 
@@ -252,6 +259,7 @@ class Qwen3VLVisionBlock(nn.Module):
                  hidden_size: int,
                  intermediate_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -260,6 +268,7 @@ class Qwen3VLVisionBlock(nn.Module):
         self.attn = Qwen3VLVisionAttention(
             hidden_size,
             num_heads,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.attn" if name_prefix else "")
         self.mlp = Qwen3VLMLP(
@@ -272,7 +281,7 @@ class Qwen3VLVisionBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen_carrier: torch.Tensor,
+        max_seqlen_carrier: Optional[torch.Tensor],
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         kv_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -371,6 +380,8 @@ class Qwen3VLVisualModel(nn.Module):
                                              bias=True)
         self.pos_embed = nn.Embedding(num_position_embeddings,
                                       self.hidden_size)
+        attention_scale = config_module._get_attention_scaling(
+            config, self.head_dim, 1.0 / (float(self.head_dim)**0.5))
         # Module-name prefixes match the keys ``layer_overrides`` carries for
         # MIXED_PRECISION checkpoints (full HF path with the leading ``model.``
         # stripped) so per-layer FP8 / NVFP4 / ... overrides resolve correctly.
@@ -378,6 +389,7 @@ class Qwen3VLVisualModel(nn.Module):
             Qwen3VLVisionBlock(self.hidden_size,
                                intermediate_size,
                                self.num_heads,
+                               attention_scale,
                                model_config,
                                name_prefix=f"visual.blocks.{i}")
             for i in range(depth)
@@ -404,6 +416,7 @@ class Qwen3VLVisualModel(nn.Module):
             torch.arange(0, self.rotary_pos_emb_dim, 2, dtype=torch.float) /
             self.rotary_pos_emb_dim))
         self.register_buffer("_rotary_inv_freq", inv_freq, persistent=False)
+        self._use_trt_attn = is_trt_native_attention_enabled()
 
     @property
     def device(self) -> torch.device:
@@ -478,9 +491,9 @@ class Qwen3VLVisualModel(nn.Module):
         hidden_states: torch.Tensor,
         rotary_pos_emb: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        max_seqlen_carrier: torch.Tensor,
         fast_pos_embed_idx: torch.Tensor,  # [4, T] int64
         fast_pos_embed_weight: torch.Tensor,  # [4, T] float16
+        max_seqlen_carrier: Optional[torch.Tensor] = None,
         kv_lengths: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         hidden_states = self.patch_embed(hidden_states)
@@ -517,7 +530,7 @@ class Qwen3VLVisualModel(nn.Module):
         return hidden_states, deepstack_features
 
     def get_onnx_export_args(self, config: dict, device: str):
-        """Return (args, input_names, output_names, dynamic_shapes) for ONNX export."""
+        """Return (dynamo_inputs, onnx_input_names, output_names, dynamic_shapes) for ONNX export."""
         patch_size = config["patch_size"]
         temporal = config.get("temporal_patch_size", 2)
         num_patches = 256
@@ -535,9 +548,6 @@ class Qwen3VLVisualModel(nn.Module):
         cu_seqlens = torch.tensor([0, num_patches],
                                   dtype=torch.int32,
                                   device=device)
-        max_seqlen_carrier = torch.zeros(num_patches,
-                                         dtype=torch.int32,
-                                         device=device)
         fast_idx = torch.zeros(4,
                                num_patches,
                                dtype=torch.int64,
@@ -547,44 +557,23 @@ class Qwen3VLVisualModel(nn.Module):
                                   dtype=torch.float16,
                                   device=device)
 
-        use_trt_attn = get_vit_attention_fn() is not vit_attention_plugin
-        if use_trt_attn:
-            kv_lengths = torch.tensor([0, num_patches],
-                                      dtype=torch.int32,
-                                      device=device)
-            args = (pixel_values, rotary_pos_emb, cu_seqlens,
-                    max_seqlen_carrier, fast_idx, fast_weight, kv_lengths)
-            input_names = [
-                "input",
-                "rotary_pos_emb",
-                "cu_seqlens",
-                "max_seqlen_carrier",
-                "fast_pos_embed_idx",
-                "fast_pos_embed_weight",
-                "kv_lengths",
-            ]
-        else:
-            args = (pixel_values, rotary_pos_emb, cu_seqlens,
-                    max_seqlen_carrier, fast_idx, fast_weight)
-            input_names = [
-                "input",
-                "rotary_pos_emb",
-                "cu_seqlens",
-                "max_seqlen_carrier",
-                "fast_pos_embed_idx",
-                "fast_pos_embed_weight",
-            ]
+        onnx_input_names = [
+            "input", "rotary_pos_emb", "cu_seqlens", "fast_pos_embed_idx",
+            "fast_pos_embed_weight"
+        ]
+        dynamo_inputs = {
+            "hidden_states": pixel_values,
+            "rotary_pos_emb": rotary_pos_emb,
+            "cu_seqlens": cu_seqlens,
+            "fast_pos_embed_idx": fast_idx,
+            "fast_pos_embed_weight": fast_weight,
+        }
+
         output_names = (["output"] + [
             f"deepstack_features_{i}"
             for i in range(len(self.deepstack_visual_indexes))
         ])
         T = torch.export.Dim("total_tokens")
-        # max_seqlen_carrier must use an INDEPENDENT dynamic dim.
-        # The C++ builder profiles kMaxSeqLenCarrier independently from T
-        # (min=1, opt=maxSeqLen, max=maxSeqLen).  Linking it to T causes a
-        # shape-profile conflict ("expect min <= common <= max") when the
-        # C++ opt value for max_seqlen_carrier differs from that for total_tokens.
-        _max_seqlen = torch.export.Dim("max_seqlen", min=1)
         dynamic_shapes = {
             "hidden_states": {
                 0: T
@@ -595,9 +584,6 @@ class Qwen3VLVisualModel(nn.Module):
             "cu_seqlens": {
                 0: torch.export.Dim("batch_p1")
             },
-            "max_seqlen_carrier": {
-                0: _max_seqlen
-            },
             "fast_pos_embed_idx": {
                 1: T
             },
@@ -605,9 +591,28 @@ class Qwen3VLVisualModel(nn.Module):
                 1: T
             },
         }
-        if use_trt_attn:
+
+        if self._use_trt_attn:
+            onnx_input_names.extend(["kv_lengths"])
+            kv_lengths = torch.tensor([0, num_patches],
+                                      dtype=torch.int32,
+                                      device=device)
+            dynamo_inputs["kv_lengths"] = kv_lengths
             dynamic_shapes["kv_lengths"] = {0: torch.export.Dim("kv_batch_p1")}
-        return args, input_names, output_names, dynamic_shapes
+        else:
+            onnx_input_names.extend(["max_seqlen_carrier"])
+            max_seqlen_carrier = torch.zeros(num_patches,
+                                             dtype=torch.int32,
+                                             device=device)
+            dynamo_inputs["max_seqlen_carrier"] = max_seqlen_carrier
+            # max_seqlen_carrier must use an INDEPENDENT dynamic dim.
+            # The C++ builder profiles kMaxSeqLenCarrier independently from T
+            # (min=1, opt=maxSeqLen, max=maxSeqLen).  Linking it to T causes a
+            # shape-profile conflict ("expect min <= common <= max") when the
+            # C++ opt value for max_seqlen_carrier differs from that for total_tokens.
+            _max_seqlen = torch.export.Dim("max_seqlen", min=1)
+            dynamic_shapes["max_seqlen_carrier"] = {0: _max_seqlen}
+        return dynamo_inputs, onnx_input_names, output_names, dynamic_shapes
 
 
 def build_qwen3_vl_visual(

@@ -39,6 +39,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
+
 # ---------------------------------------------------------------------------
 # Subsampling
 # ---------------------------------------------------------------------------
@@ -147,11 +149,12 @@ class RelPosMultiHeadAttention(nn.Module):
         ``relative_k_proj.weight``, ``bias_u`` [H, D], ``bias_v`` [H, D]
     """
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(self, hidden_size: int, num_heads: int,
+                 attention_scale: float) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -186,7 +189,9 @@ class RelPosMultiHeadAttention(nn.Module):
         pos_score = torch.matmul(q_with_v, rel_k.transpose(-2, -1))
         pos_score = self._rel_shift(pos_score)
 
-        scores = (content_score + pos_score) * self.scale
+        scores = content_score + pos_score
+        if self.attention_scale != 1.0:
+            scores = scores * self.attention_scale
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().reshape(B, T, -1)
@@ -275,13 +280,15 @@ class ConformerBlock(nn.Module):
     """
 
     def __init__(self, hidden_size: int, num_heads: int,
-                 intermediate_size: int, conv_kernel_size: int) -> None:
+                 intermediate_size: int, conv_kernel_size: int,
+                 attention_scale: float) -> None:
         super().__init__()
         self.norm_feed_forward1 = nn.LayerNorm(hidden_size)
         self.feed_forward1 = ConformerFeedForward(hidden_size,
                                                   intermediate_size)
         self.norm_self_att = nn.LayerNorm(hidden_size)
-        self.self_attn = RelPosMultiHeadAttention(hidden_size, num_heads)
+        self.self_attn = RelPosMultiHeadAttention(hidden_size, num_heads,
+                                                  attention_scale)
         self.norm_conv = nn.LayerNorm(hidden_size)
         self.conv = ConformerConvModule(hidden_size, conv_kernel_size)
         self.norm_feed_forward2 = nn.LayerNorm(hidden_size)
@@ -313,13 +320,14 @@ class ParakeetEncoder(nn.Module):
 
     def __init__(self, hidden_size: int, num_heads: int, num_layers: int,
                  intermediate_size: int, mel_bins: int, conv_kernel_size: int,
-                 conv_channels: int) -> None:
+                 conv_channels: int, attention_scale: float) -> None:
         super().__init__()
         self.subsampling = Subsampling(mel_bins, hidden_size, conv_channels)
         self.encode_positions = RelPositionalEncoding(hidden_size)
         self.layers = nn.ModuleList([
             ConformerBlock(hidden_size, num_heads, intermediate_size,
-                           conv_kernel_size) for _ in range(num_layers)
+                           conv_kernel_size, attention_scale)
+            for _ in range(num_layers)
         ])
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
@@ -394,6 +402,9 @@ class NemotronOmniAudioModel(nn.Module):
         super().__init__()
         sc = config["sound_config"]
         llm_cfg = config.get("llm_config", config.get("text_config", {}))
+        head_dim = sc["hidden_size"] // sc["num_attention_heads"]
+        attention_scale = config_module._get_attention_scaling(
+            sc, head_dim, 1.0 / (float(head_dim)**0.5))
 
         self.encoder = ParakeetEncoder(
             hidden_size=sc["hidden_size"],
@@ -403,6 +414,7 @@ class NemotronOmniAudioModel(nn.Module):
             mel_bins=sc.get("num_mel_bins", 128),
             conv_kernel_size=sc.get("conv_kernel_size", 9),
             conv_channels=sc.get("subsampling_conv_channels", 256),
+            attention_scale=attention_scale,
         )
         self.projection = SoundProjection(
             sound_hidden_size=sc["hidden_size"],

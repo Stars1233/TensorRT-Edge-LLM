@@ -234,13 +234,13 @@ size_t DFlashTargetKVCacheUpdatePlugin::getWorkspaceSize(DynamicPluginTensorDesc
 
 int32_t DFlashTargetKVCacheUpdatePlugin::getAliasedInput(int32_t outputIndex) noexcept
 {
-    // WAR: this is not the correct plugin API usage. The
-    // plugin updates the KV cache in place, so the correct return is the KV-cache
-    // input index. We return -1 to drop the alias because declaring it makes
-    // Myelin keep a redundant per-layer KV copy (the perf regression). In-place
-    // read-write still works because the runtime binds past_key_value and
-    // present_key_value to the same buffer. TODO: restore the alias declaration
-    // once the Myelin issue is fixed.
+    // present_key_value (output 0) aliases past_key_value (input 2). DFlash
+    // draft depends on this in-engine target KV update before subsequent
+    // attention layers read the same KV cache.
+    if (outputIndex == kOUT_PRESENT_KV)
+    {
+        return kIN_PAST_KV;
+    }
     return -1;
 }
 

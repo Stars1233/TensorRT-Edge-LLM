@@ -35,7 +35,8 @@ from .checkpoint.checkpoint_utils import (load_checkpoint_config_dicts,
                                           load_config_dict)
 from .checkpoint.loader import load_weights
 from .config import ModelConfig, QuantConfig
-from .model import AutoModel, register_model
+from .model import (AutoModel, register_attention_scale_default,
+                    register_model, standard_attention_scale)
 # Register model-type-specific implementations
 from .models.gemma4.modeling_gemma4_text import Gemma4ForCausalLM
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
@@ -50,26 +51,44 @@ from .models.qwen3_omni.modeling_qwen3_omni_moe_text import \
 from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
 from .onnx.export import export_onnx
 
-register_model("gemma4", Gemma4ForCausalLM)
-register_model("gemma4_text", Gemma4ForCausalLM)
-register_model("nemotron_h", NemotronHCausalLM)
-register_model("qwen3_5_text", Qwen3_5CausalLM)
-register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM)
-register_model("qwen3_5_moe", Qwen3_5MoeCausalLM)
-register_model("qwen3_moe", Qwen3MoeCausalLM)
-register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM)
-register_model("NemotronH_Nano_Omni_Reasoning_V3", NemotronHCausalLM)
+
+def _identity_attention_scale(head_dim: int) -> float:
+    del head_dim
+    return 1.0
+
+
+register_model("gemma4", Gemma4ForCausalLM, _identity_attention_scale)
+register_model("gemma4_text", Gemma4ForCausalLM, _identity_attention_scale)
+register_model("gemma4_unified", Gemma4ForCausalLM, _identity_attention_scale)
+register_model("gemma4_unified_text", Gemma4ForCausalLM,
+               _identity_attention_scale)
+register_attention_scale_default("gemma4_assistant", _identity_attention_scale)
+register_model("nemotron_h", NemotronHCausalLM, standard_attention_scale)
+register_model("qwen3_5_text", Qwen3_5CausalLM, standard_attention_scale)
+register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM,
+               standard_attention_scale)
+register_model("qwen3_5_moe", Qwen3_5MoeCausalLM, standard_attention_scale)
+register_model("qwen3_moe", Qwen3MoeCausalLM, standard_attention_scale)
+register_model("NemotronH_Nano_VL_V2", NemotronHCausalLM,
+               standard_attention_scale)
+register_model("NemotronH_Nano_Omni_Reasoning_V3", NemotronHCausalLM,
+               standard_attention_scale)
 # Qwen3-Omni thinker needs an extra ``hidden_states`` ONNX output for the
 # Talker hidden_states emission. Cover every model_type string that can appear in the
 # thinker's config.json across HF / exported variants.
-register_model("qwen3_omni", Qwen3OmniLanguageModel)
-register_model("qwen3_omni_thinker", Qwen3OmniLanguageModel)
-register_model("qwen3_omni_text", Qwen3OmniLanguageModel)
+register_model("qwen3_omni", Qwen3OmniLanguageModel, standard_attention_scale)
+register_model("qwen3_omni_thinker", Qwen3OmniLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_text", Qwen3OmniLanguageModel,
+               standard_attention_scale)
 # Qwen3-Omni-MoE Thinker / Talker (30B-A3B sparse-MoE backbone).
-register_model("qwen3_omni_moe_text", Qwen3OmniMoeThinkerCausalLM)
-register_model("qwen3_omni_moe_talker", Qwen3OmniMoeTalkerCausalLM)
-register_model("qwen3_asr", Qwen3ASRLanguageModel)
-register_model("qwen3_asr_thinker", Qwen3ASRLanguageModel)
+register_model("qwen3_omni_moe_text", Qwen3OmniMoeThinkerCausalLM,
+               standard_attention_scale)
+register_model("qwen3_omni_moe_talker", Qwen3OmniMoeTalkerCausalLM,
+               standard_attention_scale)
+register_model("qwen3_asr", Qwen3ASRLanguageModel, standard_attention_scale)
+register_model("qwen3_asr_thinker", Qwen3ASRLanguageModel,
+               standard_attention_scale)
 
 __all__ = [
     "__version__",

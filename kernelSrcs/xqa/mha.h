@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
  *
  * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -50,8 +50,7 @@ constexpr bool useKVCache = USE_KV_CACHE;
 
 using SeqLenDataType = uint32_t;
 
-constexpr bool usePagedKVCache = USE_PAGED_KV_CACHE;
-constexpr uint32_t tokensPerPage = TOKENS_PER_PAGE;
+constexpr bool usePagedKVCache = (TOKENS_PER_PAGE != 0);
 
 using IOHead = Vec<InputElem, validElemsPerHead>;
 using InputHead = IOHead;
@@ -80,13 +79,14 @@ constexpr bool useInputKV = USE_INPUT_KV;
 
 using GMemKVCacheHead = mha::conditional_t<useInputKV, GMemCacheHead, GMemCacheHead const>;
 
-using KVCachePageIndex = int32_t; // shape: KVCacheHead[nbKHeads][tokensPerPage]. Page index in the global pool of pages
+// Page index in the global pool of pages; page size is selected by TOKENS_PER_PAGE.
+using KVCachePageIndex = int32_t;
 
 constexpr bool allowSlidingWindow = SLIDING_WINDOW;
 
 struct BeamSearchParams
 {
-    uint32_t const* __restrict__ indices;    // shape: [batchSize][beamWidth][capacity]
+    uint32_t const* __restrict__ indices; // shape: [batchSize][beamWidth][capacity]
     uint32_t capacity;
     uint32_t const* __restrict__ ctxLenList; // shape: [batchSize][beamWidth]. Should be [batchSize] but we have to
                                              // match trt-llm API.
@@ -96,7 +96,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float attentionScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,
 #endif
@@ -109,7 +109,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
     InputHead const* q,
 #endif
     float const* attentionSinks, // [headGrpSize]
-#if USE_PAGED_KV_CACHE
+#if TOKENS_PER_PAGE != 0
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
 #else
@@ -136,7 +136,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float attentionScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float const* rcpOutScale,
 #endif
@@ -149,7 +149,7 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     InputHead const* q,
 #endif
     float const* attentionSinks, // [headGrpSize]
-#if USE_PAGED_KV_CACHE
+#if TOKENS_PER_PAGE != 0
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
 #else
@@ -174,8 +174,8 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 
 void launchMLA(cudaDeviceProp const& prop,
     uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
-    float qScale, OutputHead* output, InputHead const* q,
-#if USE_PAGED_KV_CACHE
+    float attentionScale, OutputHead* output, InputHead const* q,
+#if TOKENS_PER_PAGE != 0
     GMemCacheHead* pool, // global pool of pages
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]

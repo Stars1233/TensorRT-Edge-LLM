@@ -116,6 +116,78 @@ __global__ void mtpStateScatterKernel(MtpLayerInfo const* __restrict__ layerInfo
     v.store(dst + dstScalar);
 }
 
+// Each thread copies one DVec (8 elements) for one (layer, batch, vecIdx).
+// Unlike linear MTP, DDTree cannot derive the source step from acceptLength.
+// It must use the last verified tree node id in the accepted path.
+template <typename T, StateKind Kind>
+__global__ void mtpAcceptedTreeStateScatterKernel(MtpLayerInfo const* __restrict__ layerInfos, // [numLayers]
+    int32_t const* __restrict__ acceptedStateNodeIds, // [batchSize, maxAcceptLen]
+    int32_t const* __restrict__ acceptLengths,        // [batchSize]
+    int32_t maxAcceptLen, int32_t verifyTreeSize,
+    int32_t vecCount) // stateElements / DVec<T>::vec_size
+{
+    int32_t const b = blockIdx.x;     // batch index
+    int32_t const layer = blockIdx.y; // layer index
+
+    int32_t acceptedCount = acceptLengths[b];
+    if (acceptedCount > maxAcceptLen)
+    {
+        acceptedCount = maxAcceptLen;
+    }
+
+    int32_t nodeId = -1;
+    for (int32_t i = acceptedCount - 1; i >= 0; --i)
+    {
+        int32_t const candidate = acceptedStateNodeIds[b * maxAcceptLen + i];
+        if (candidate >= 0)
+        {
+            nodeId = candidate;
+            break;
+        }
+    }
+
+    if (nodeId < 0 || nodeId >= verifyTreeSize)
+    {
+        return;
+    }
+
+    constexpr int32_t kVecSize = DVec<T>::vec_size;
+
+    int32_t const vecIdx = blockIdx.z * blockDim.x + threadIdx.x;
+    if (vecIdx >= vecCount)
+    {
+        return;
+    }
+
+    auto const& info = layerInfos[layer];
+    void* dstRaw;
+    void const* srcRaw;
+    if constexpr (Kind == StateKind::Recurrent)
+    {
+        dstRaw = info.recurrentDst;
+        srcRaw = info.recurrentSrc;
+    }
+    else
+    {
+        dstRaw = info.convDst;
+        srcRaw = info.convSrc;
+    }
+    auto* const dst = static_cast<T*>(dstRaw);
+    auto const* const src = static_cast<T const*>(srcRaw);
+
+    // dst layout: [batchSize, stateElements]
+    int64_t const stateElems = static_cast<int64_t>(vecCount) * kVecSize;
+    int64_t const dstScalar = static_cast<int64_t>(b) * stateElems + static_cast<int64_t>(vecIdx) * kVecSize;
+
+    // src layout: [batchSize, verifyTreeSize, stateElements]
+    int64_t const srcScalar
+        = (static_cast<int64_t>(b) * verifyTreeSize + nodeId) * stateElems + static_cast<int64_t>(vecIdx) * kVecSize;
+
+    DVec<T> v;
+    v.load(src + srcScalar);
+    v.store(dst + dstScalar);
+}
+
 template <typename T, StateKind Kind>
 void launchScatter(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
     int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptLengths, cudaStream_t stream)
@@ -142,6 +214,33 @@ void launchScatter(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int3
         <<<grid, block, 0, stream>>>(deviceLayerInfos, acceptLengths, verifyTreeSize, vecCount);
 }
 
+template <typename T, StateKind Kind>
+void launchAcceptedTreeScatter(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
+    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptedStateNodeIds, int32_t maxAcceptLen,
+    int32_t const* acceptLengths, cudaStream_t stream)
+{
+    if (numLayers == 0 || activeBatchSize == 0 || stateElements == 0 || maxAcceptLen == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kVecSize = DVec<T>::vec_size;
+    ELLM_CHECK(stateElements % kVecSize == 0, "stateElements must be divisible by DVec vec_size (8)");
+
+    int32_t const vecCount = stateElements / kVecSize;
+
+    // 256 threads per block — good default for memory-bound vectorized copy.
+    constexpr int32_t kThreads = 256;
+
+    // Grid: (batch, layer, ceil(vecCount / kThreads))
+    int32_t const zBlocks = (vecCount + kThreads - 1) / kThreads;
+    dim3 const grid(activeBatchSize, numLayers, zBlocks);
+    dim3 const block(kThreads);
+
+    mtpAcceptedTreeStateScatterKernel<T, Kind><<<grid, block, 0, stream>>>(
+        deviceLayerInfos, acceptedStateNodeIds, acceptLengths, maxAcceptLen, verifyTreeSize, vecCount);
+}
+
 } // anonymous namespace
 
 void mtpScatterRecurrentStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
@@ -156,6 +255,22 @@ void mtpScatterConvStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayer
 {
     launchScatter<half, StateKind::Conv>(
         deviceLayerInfos, numLayers, activeBatchSize, verifyTreeSize, stateElements, acceptLengths, stream);
+}
+
+void mtpScatterAcceptedTreeRecurrentStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers,
+    int32_t activeBatchSize, int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptedStateNodeIds,
+    int32_t maxAcceptLen, int32_t const* acceptLengths, cudaStream_t stream)
+{
+    launchAcceptedTreeScatter<float, StateKind::Recurrent>(deviceLayerInfos, numLayers, activeBatchSize, verifyTreeSize,
+        stateElements, acceptedStateNodeIds, maxAcceptLen, acceptLengths, stream);
+}
+
+void mtpScatterAcceptedTreeConvStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
+    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptedStateNodeIds, int32_t maxAcceptLen,
+    int32_t const* acceptLengths, cudaStream_t stream)
+{
+    launchAcceptedTreeScatter<half, StateKind::Conv>(deviceLayerInfos, numLayers, activeBatchSize, verifyTreeSize,
+        stateElements, acceptedStateNodeIds, maxAcceptLen, acceptLengths, stream);
 }
 
 } // namespace kernel

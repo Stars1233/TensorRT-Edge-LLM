@@ -1,6 +1,12 @@
 tests:
   - tests/defs/test_common.py::test_build_project
 
+  # Keep few-layer numeric validation automatic while B100 jobs are manual.
+  # The Nemotron NVFP4 few-layer golden path is waived because HF cache
+  # construction fails on interleaved MLP layer types; full Nemotron engine
+  # build and inference coverage remains below.
+  - tests/defs/test_few_layer_validation.py::test_few_layer_validation[Qwen3-0.6B]
+
   - tests/defs/test_llm_pipeline.py::test_engine_build[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl4096-mxbs2-mxil2048-llm_basic]
 

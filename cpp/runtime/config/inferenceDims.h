@@ -38,7 +38,7 @@ namespace rt
 //! `proposalDims`, `acceptDims`, `resetDims`). Direct construction (aggregate
 //! or designated initializers) is supported for unit tests.
 //!
-//! The eight fields are the complete set of symbolic dims used by LLM and SpecDecode
+//! The nine fields are the complete set of symbolic dims used by LLM and SpecDecode
 //! draft engines. Fixed-shape tensor dims do not appear here.
 struct InferenceDims
 {
@@ -60,11 +60,14 @@ struct InferenceDims
     int64_t ropeBatch;     //!< RoPE broadcast dim (1 for non-MRope; batch for MRope)
     int64_t packedMaskLen; //!< divUp(attnMaskSeqLen, 32) for SpecDecode masks; else 1
     //! Shape length for `kvcache_start_index`. Zero is the engine's sentinel
-    //! for "initial prefill of an empty KV cache" (plugin-path engines only);
-    //! `batch` means "use these per-batch start offsets" for chunked prefill,
-    //! decode, verify, and accept. TRT-native-ops engines always use
-    //! `batch`. Zero is a legitimate, engine-meaningful value for this dim.
+    //! for "initial prefill of an empty KV cache"; `batch` means "use these
+    //! per-batch start offsets" for chunked prefill, decode, verify, and
+    //! accept. Zero is a legitimate, engine-meaningful value for this dim.
     int64_t startIndexLen;
+    //! Shape length for `spec_verify_phase_marker`. Zero means normal
+    //! prefill/decode; one means speculative verification. The plugin reads
+    //! this shape, not the marker payload.
+    int64_t specVerifyPhaseLen;
 };
 
 //! Tripwires: if `InferenceDims` gains, loses, or reorders a field, these asserts fire
@@ -74,7 +77,7 @@ struct InferenceDims
 //! change the meaning of every positional aggregate init). Note: these do NOT catch
 //! "short" aggregate inits (omitting trailing fields) — the policy is that production
 //! construction goes through recipe methods, which always set every field.
-static_assert(sizeof(InferenceDims) == 8 * sizeof(int64_t),
+static_assert(sizeof(InferenceDims) == 9 * sizeof(int64_t),
     "InferenceDims layout changed: update kDimNames, toString(), kZeroAllowedMembers, and every recipe "
     "method in LLMEngineConfig (prefillDims / decodeDims / specVerifyDims / "
     "proposalDims / acceptDims / resetDims).");
@@ -87,13 +90,15 @@ static_assert(
 static_assert(offsetof(InferenceDims, ropeBatch) == 5 * sizeof(int64_t), "InferenceDims::ropeBatch reordered");
 static_assert(offsetof(InferenceDims, packedMaskLen) == 6 * sizeof(int64_t), "InferenceDims::packedMaskLen reordered");
 static_assert(offsetof(InferenceDims, startIndexLen) == 7 * sizeof(int64_t), "InferenceDims::startIndexLen reordered");
+static_assert(
+    offsetof(InferenceDims, specVerifyPhaseLen) == 8 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
 
 namespace detail
 {
 //! Compile-time mapping from member pointer to human-readable name.
 //!
 //! Diagnostics-only (log messages, assertions). Never used on the bind-time
-//! hot path. Linear-scan over 7 entries is fine for that use.
+//! hot path. Linear-scan over the small field set is fine for that use.
 //!
 //! The array size is derived from `InferenceDims` layout so that an extra or
 //! missing entry here fails to compile alongside the `sizeof(InferenceDims)`
@@ -109,14 +114,16 @@ inline constexpr std::array<std::pair<int64_t InferenceDims::*, std::string_view
         {&InferenceDims::ropeBatch, "rope_batch"},
         {&InferenceDims::packedMaskLen, "packed_mask_len"},
         {&InferenceDims::startIndexLen, "start_index_len"},
+        {&InferenceDims::specVerifyPhaseLen, "spec_verify_phase_len"},
     }};
 
 //! Members where `0` is a legitimate engine-meaningful value (not a recipe
 //! bypass). `firstInvalidMember` excludes these from the `> 0` positivity
 //! check. Keep this set as small as possible — default validation should be
 //! strict, and most dims (batch, seqLen, kvLen, etc.) must be > 0.
-inline constexpr std::array<int64_t InferenceDims::*, 1> kZeroAllowedMembers{
+inline constexpr std::array<int64_t InferenceDims::*, 2> kZeroAllowedMembers{
     &InferenceDims::startIndexLen,
+    &InferenceDims::specVerifyPhaseLen,
 };
 } // namespace detail
 

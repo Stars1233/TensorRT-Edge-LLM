@@ -331,7 +331,7 @@ int main(int argc, char** argv)
     LOG_INFO("Input File:     %s", args.inputFile.c_str());
 
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     // Initialize TTS Runtime (loads tokenizer, engines, and weights internally)
     std::unique_ptr<rt::Qwen3OmniTTSRuntime> ttsRuntime;

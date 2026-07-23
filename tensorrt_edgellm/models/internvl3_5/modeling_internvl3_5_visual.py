@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
 from ..linear import make_linear
 
 if TYPE_CHECKING:
@@ -144,12 +145,13 @@ class InternVL3_5VisionAttention(nn.Module):
                  hidden_size: int,
                  num_heads: int,
                  attention_bias: bool,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.embed_dim = hidden_size
         self.q_proj = make_linear(
             model_config,
@@ -185,8 +187,10 @@ class InternVL3_5VisionAttention(nn.Module):
                                                self.head_dim).transpose(1, 2)
         v = self.v_proj(hidden_states).reshape(B, N, self.num_heads,
                                                self.head_dim).transpose(1, 2)
-        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale,
-                         dim=-1)
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        if self.attention_scale != 1.0:
+            scores = scores * self.attention_scale
+        attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v).transpose(1, 2).contiguous().reshape(
             B, N, self.embed_dim)
         return self.projection_layer(out)
@@ -256,6 +260,7 @@ class InternVL3_5VisionLayer(nn.Module):
                  norm_type: str,
                  layer_norm_eps: float,
                  layer_scale_init: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -265,6 +270,7 @@ class InternVL3_5VisionLayer(nn.Module):
             hidden_size,
             num_heads,
             attention_bias,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.attention" if name_prefix else "")
         self.lambda_1 = nn.Parameter(layer_scale_init *
@@ -311,6 +317,7 @@ class InternVL3_5VisionEncoder(nn.Module):
                  norm_type: str,
                  layer_norm_eps: float,
                  layer_scale_init: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -324,6 +331,7 @@ class InternVL3_5VisionEncoder(nn.Module):
                 norm_type,
                 layer_norm_eps,
                 layer_scale_init,
+                attention_scale,
                 model_config,
                 name_prefix=f"{name_prefix}.layer.{i}" if name_prefix else "")
             for i in range(num_hidden_layers)
@@ -426,6 +434,9 @@ class InternVL3_5VisualModel(nn.Module):
             patch_size = patch_size[0]
 
         hidden_size: int = vc["hidden_size"]
+        head_dim = hidden_size // vc["num_attention_heads"]
+        attention_scale = config_module._get_attention_scaling(
+            vc, head_dim, 1.0 / (float(head_dim)**0.5))
         # Precompute spatial side length (patches per side) so the forward pass
         # never calls int(math.isqrt(N)) on a runtime tensor shape, which would
         # specialize the batch dimension during torch.export tracing.
@@ -453,6 +464,7 @@ class InternVL3_5VisualModel(nn.Module):
             norm_type=vc.get("norm_type", "layer_norm"),
             layer_norm_eps=vc.get("layer_norm_eps", 1e-6),
             layer_scale_init=float(vc.get("layer_scale_init_value", 0.1)),
+            attention_scale=attention_scale,
             model_config=model_config,
             name_prefix="vision_tower.encoder",
         )

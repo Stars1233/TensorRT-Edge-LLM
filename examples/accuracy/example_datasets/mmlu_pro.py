@@ -162,8 +162,7 @@ def convert_mmlu_pro_dataset(
                                                config=config,
                                                dev_dataset=dev_dataset,
                                                num_shot=num_shot,
-                                               output_dir=output_dir,
-                                               apply_chat_template=False)
+                                               output_dir=output_dir)
 
     print(f"Processing MMLU-Pro dataset with config: {config}")
     edge_llm_mmlu_pro_dataset.process_and_save_dataset("mmlu_pro_dataset.json")

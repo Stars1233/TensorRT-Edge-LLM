@@ -20,6 +20,7 @@
 #include "stringUtils.h"
 #include <NvInferRuntime.h>
 #include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -69,8 +70,32 @@ struct SourceLocation
 class EdgeLLMLogger : public nvinfer1::ILogger
 {
 public:
-    EdgeLLMLogger() noexcept = default;
-    ~EdgeLLMLogger() noexcept = default;
+    /*!
+     * @brief Access the process-wide logger singleton.
+     *
+     * The instance is intentionally never destroyed (immortal singleton). TensorRT retains a
+     * reference to this ILogger inside its global plugin registry, which is a process-lifetime
+     * singleton. If the logger were destroyed at static-destruction time (as a normal global
+     * object is), the registry could still emit through it from another thread during runtime
+     * teardown or plugin-creator lookup, causing a use-after-free. Never destructing the logger
+     * removes that race. The single fixed allocation is reclaimed by the OS at process exit; the
+     * pointer stays reachable, so it is not a growing leak.
+     *
+     * The function-local static also makes construction thread-safe and immune to the static
+     * initialization order fiasco (constructed on first use).
+     *
+     * @return Reference to the singleton logger
+     */
+    static EdgeLLMLogger& instance() noexcept
+    {
+        static EdgeLLMLogger* sInstance = new EdgeLLMLogger();
+        return *sInstance;
+    }
+
+    EdgeLLMLogger(EdgeLLMLogger const&) = delete;
+    EdgeLLMLogger& operator=(EdgeLLMLogger const&) = delete;
+    EdgeLLMLogger(EdgeLLMLogger&&) = delete;
+    EdgeLLMLogger& operator=(EdgeLLMLogger&&) = delete;
 
     /*!
      * @brief nvinfer1::ILogger interface implementation for TensorRT integration
@@ -196,6 +221,11 @@ public:
     }
 
 private:
+    // Construction is private: the only instance is created and owned by instance().
+    // The destructor is never invoked (immortal singleton); see instance() for rationale.
+    EdgeLLMLogger() noexcept = default;
+    ~EdgeLLMLogger() noexcept override = default;
+
     nvinfer1::ILogger::Severity mMinLevel = nvinfer1::ILogger::Severity::kINFO;
     bool mShowTimestamp = true;
     bool mShowLocation = true;
@@ -218,8 +248,12 @@ private:
             auto time_t = std::chrono::system_clock::to_time_t(now);
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
-            oss << "[" << std::put_time(std::localtime(&time_t), "%H:%M:%S") << "." << std::setfill('0') << std::setw(3)
-                << ms.count() << "] ";
+            // Use the reentrant localtime_r with a stack-local tm: std::localtime returns a pointer
+            // to a shared process-global buffer, which would race under concurrent logging.
+            std::tm tmBuf{};
+            localtime_r(&time_t, &tmBuf);
+            oss << "[" << std::put_time(&tmBuf, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3) << ms.count()
+                << "] ";
         }
 
         // Log level
@@ -310,22 +344,30 @@ private:
 
 } // namespace logger
 
-inline logger::EdgeLLMLogger gLogger{};
+// Backward-compatible reference alias to the immortal logger singleton.
+// NOTE: this alias is itself dynamically initialized, so do NOT use gLogger during static
+// initialization (e.g. from another static object's constructor); call EdgeLLMLogger::instance()
+// there instead. The logging macros below already do so.
+inline logger::EdgeLLMLogger& gLogger = logger::EdgeLLMLogger::instance();
 
 // Primary logging macros with automatic location tracking
 // Usage: LOG_DEBUG("Value: %d", value); LOG_INFO("Message: %s", msg);
 
 #define LOG_DEBUG(...)                                                                                                 \
-    gLogger.debug(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    trt_edgellm::logger::EdgeLLMLogger::instance().debug(                                                              \
+        format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 #define LOG_INFO(...)                                                                                                  \
-    gLogger.info(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    trt_edgellm::logger::EdgeLLMLogger::instance().info(                                                               \
+        format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 #define LOG_WARNING(...)                                                                                               \
-    gLogger.warning(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    trt_edgellm::logger::EdgeLLMLogger::instance().warning(                                                            \
+        format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 #define LOG_ERROR(...)                                                                                                 \
-    gLogger.error(format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    trt_edgellm::logger::EdgeLLMLogger::instance().error(                                                              \
+        format::fmtstr(__VA_ARGS__), trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 // Conditional logging macros for performance-critical code
 #define LOG_DEBUG_IF(condition, ...)                                                                                   \
@@ -366,7 +408,7 @@ inline logger::EdgeLLMLogger gLogger{};
 
 // Function tracing macro for automatic entry/exit logging
 #define LOG_TRACE_FUNCTION()                                                                                           \
-    trt_edgellm::logger::ScopedFunctionTracer gTracer(                                                                 \
-        gLogger, __FUNCTION__, trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
+    trt_edgellm::logger::ScopedFunctionTracer gTracer(trt_edgellm::logger::EdgeLLMLogger::instance(), __FUNCTION__,    \
+        trt_edgellm::logger::SourceLocation(__FILE__, __FUNCTION__, __LINE__))
 
 } // namespace trt_edgellm

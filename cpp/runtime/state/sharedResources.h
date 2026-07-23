@@ -48,23 +48,6 @@ struct SharedResources
     std::unique_ptr<ExternalWeightManager> externalWeightManager;
     Tensor zeroBuffer;
 
-    //! Split-K/V view cache. Only populated when `cfg.useTrtNativeOps == true`.
-    //! `KVCacheManager::getSeparateKVCache` returns views by value (built at call
-    //! time from a raw pointer + offset), so the split-KV bindings still need
-    //! stable addresses behind TensorMap entries. Outer index = engine index
-    //! (0 = base, 1 = draft); inner index = local attention-layer index.
-    //!
-    //! Growth contract:
-    //!   - Outer vector is grown per engine the first time `buildTensorMap` runs
-    //!     for that engine (0 -> 1 on base, 1 -> 2 on draft). At most 2 outer
-    //!     entries total.
-    //!   - Inner vectors are `clear()`ed and then `reserve(numAttn)`'d at the
-    //!     start of each `buildTensorMap` call. The subsequent `push_back`s
-    //!     stay within the reserved capacity, so no reallocation occurs and
-    //!     the addresses stored in TensorMap remain stable.
-    std::vector<std::vector<Tensor>> kCacheViews;
-    std::vector<std::vector<Tensor>> vCacheViews;
-
     //! Build SharedResources for the vanilla single-engine LLM runtime
     //! (KV cache, RoPE pool, LoRA manager, external weight manager, zero buffer).
     //!

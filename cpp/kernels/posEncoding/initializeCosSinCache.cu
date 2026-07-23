@@ -130,34 +130,11 @@ __global__ void initializeNormalRopeCosSinWithIdentityTailKernel(float* cosSinCa
     }
 }
 
-// Simple kernel to fill the identity tail of a RoPE cos/sin cache.
-// For positions where zid >= rotatedAngles: cos=1.0, sin=0.0.
-__global__ void fillRopeIdentityTailKernel(
-    float* cosSinCache, int32_t rotaryDim, int32_t rotatedAngles, int32_t maxPositions)
-{
-    int32_t const halfDim = rotaryDim / 2;
-    int32_t const tailSize = halfDim - rotatedAngles;
-    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int32_t const totalWork = maxPositions * tailSize;
-    if (idx >= totalWork)
-    {
-        return;
-    }
-    int32_t const posIdx = idx / tailSize;
-    int32_t const tailIdx = idx % tailSize;
-    int32_t const zid = rotatedAngles + tailIdx;
-    int32_t const offset = posIdx * rotaryDim;
-    cosSinCache[offset + zid] = 1.0F;
-    cosSinCache[offset + zid + halfDim] = 0.0F;
-}
-
 void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, float rotaryScale,
     float partialRotaryFactor, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream)
 {
     bool const useIdentityTail = partialRotaryFactor < 1.0F;
-    // For rotaryDim=512, always use the normal kernel (identity-tail template has device-link
-    // issues on some platforms). The identity tail is filled by a separate simple kernel.
-    bool const useHalfWarpKernel = (useIdentityTail && rotaryDim != 512) || rotaryDim == 32 || rotaryDim == 96;
+    bool const useHalfWarpKernel = useIdentityTail || rotaryDim == 32 || rotaryDim == 96;
     // blockDim.x threads cover rotaryDim/2 dimensions via an inner stride loop in the kernel
     // (e.g., 32 threads × 8 iterations = 256 dims for rotaryDim=512).
     dim3 block = useHalfWarpKernel ? dim3(16, 8) : dim3(32, 4);
@@ -183,7 +160,10 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
         kernelPtr = useHalfWarpKernel ? (void*) initializeNormalRopeCosSinWithIdentityTailKernel<256>
                                       : (void*) initializeNormalRopeCosSinKernel<256>;
         break;
-    case 512: kernelPtr = (void*) initializeNormalRopeCosSinKernel<512>; break;
+    case 512:
+        kernelPtr = useHalfWarpKernel ? (void*) initializeNormalRopeCosSinWithIdentityTailKernel<512>
+                                      : (void*) initializeNormalRopeCosSinKernel<512>;
+        break;
     default:
         throw std::runtime_error(
             "Un-implemented rotaryDim for initializeNormalRopeCosSin: " + std::to_string(rotaryDim));
@@ -204,27 +184,6 @@ void initializeNormalRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, f
         reinterpret_cast<void*>(&partialRotaryFactor), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)};
     CUDA_CHECK(
         cudaLaunchKernel(kernelPtr, grid, block, useHalfWarpKernel ? identityTailKernelArgs : kernelArgs, 0, stream));
-
-    // For rotaryDim=512 with partial rotation, overwrite the tail (positions >= rotatedAngles)
-    // with identity (cos=1, sin=0). The normal kernel above writes frequency values for ALL
-    // half-dim positions; this second kernel corrects the non-rotated tail on the same stream.
-    if (rotaryDim == 512 && useIdentityTail)
-    {
-        float const clampedFactor
-            = partialRotaryFactor < 0.0F ? 0.0F : (partialRotaryFactor > 1.0F ? 1.0F : partialRotaryFactor);
-        int32_t const rotatedAngles = static_cast<int32_t>(clampedFactor * static_cast<float>(rotaryDim / 2));
-        int32_t const halfDim = rotaryDim / 2;
-        int32_t const tailSize = halfDim - rotatedAngles;
-        if (tailSize > 0)
-        {
-            int32_t const totalWork = rotaryEmbeddingMaxPositions * tailSize;
-            int32_t const fillBlock = 256;
-            int32_t const fillGrid = (totalWork + fillBlock - 1) / fillBlock;
-            fillRopeIdentityTailKernel<<<fillGrid, fillBlock, 0, stream>>>(
-                cosSinCache, rotaryDim, rotatedAngles, rotaryEmbeddingMaxPositions);
-            CUDA_CHECK(cudaGetLastError());
-        }
-    }
 }
 
 template <int32_t RotaryDim>

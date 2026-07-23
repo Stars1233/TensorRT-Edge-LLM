@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,8 @@
 #include "gdnKernelUtils.cuh"
 
 #include <cuda_fp16.h>
+
+#include <cmath>
 
 namespace trt_edgellm
 {
@@ -99,6 +101,92 @@ void launchGdnL2NormQK(void* q, void* k, int32_t n, int32_t seqLen, int32_t h, i
 
     gdnL2NormQKKernel<<<numBlocksQ, threadsPerBlock, 0, stream>>>(static_cast<half*>(q), numRowsQ, headDim);
     gdnL2NormQKKernel<<<numBlocksK, threadsPerBlock, 0, stream>>>(static_cast<half*>(k), numRowsQ, headDim);
+}
+
+__device__ __forceinline__ float gdnSoftplus(float x)
+{
+    constexpr float kSoftplusThreshold{20.0F};
+    if (x <= kSoftplusThreshold)
+    {
+        return logf(1.0F + expf(x));
+    }
+    return x;
+}
+
+__global__ void gdnDDTreePrecomputeKernel(half const* __restrict__ q, half const* __restrict__ k,
+    half const* __restrict__ a, half const* __restrict__ b, float const* __restrict__ a_log,
+    half const* __restrict__ dtBias, float* __restrict__ qkScales, float* __restrict__ gateValues, int32_t seqLen,
+    int32_t h, int32_t hv, int32_t headDim, int32_t totalQKRows, int32_t totalGateRows, float qScale)
+{
+    (void) seqLen;
+    constexpr int32_t kWarpSize{32};
+    int32_t const lane = threadIdx.x % kWarpSize;
+    int32_t const warpIdx = threadIdx.x / kWarpSize;
+    int32_t const warpsPerBlock = blockDim.x / kWarpSize;
+    int32_t const row = blockIdx.x * warpsPerBlock + warpIdx;
+
+    if (row < totalQKRows)
+    {
+        int32_t const headIdx = row % h;
+        int32_t const tokenBatch = row / h;
+        int64_t const qkOffset = (static_cast<int64_t>(tokenBatch) * h + headIdx) * headDim;
+
+        float qSum = 0.0F;
+        float kSum = 0.0F;
+        for (int32_t d = lane; d < headDim; d += kWarpSize)
+        {
+            float const qVal = __half2float(q[qkOffset + d]);
+            float const kVal = __half2float(k[qkOffset + d]);
+            qSum += qVal * qVal;
+            kSum += kVal * kVal;
+        }
+
+        for (int32_t offset = kWarpSize / 2; offset > 0; offset >>= 1)
+        {
+            qSum += __shfl_xor_sync(0xFFFFFFFFU, qSum, offset);
+            kSum += __shfl_xor_sync(0xFFFFFFFFU, kSum, offset);
+        }
+
+        if (lane == 0)
+        {
+            qkScales[row * 2] = rsqrtf(qSum + 1.0e-6F) * qScale;
+            qkScales[row * 2 + 1] = rsqrtf(kSum + 1.0e-6F);
+        }
+    }
+
+    if (row < totalGateRows && lane == 0)
+    {
+        int32_t const hvIdx = row % hv;
+        int32_t const tokenBatch = row / hv;
+        int64_t const gateOffset = static_cast<int64_t>(tokenBatch) * hv + hvIdx;
+        float const x = __half2float(a[gateOffset]) + __half2float(dtBias[hvIdx]);
+        float const sp = gdnSoftplus(x);
+        float const g = expf(-expf(a_log[hvIdx]) * sp);
+        float const beta = 1.0F / (1.0F + expf(-__half2float(b[gateOffset])));
+        gateValues[row * 2] = g;
+        gateValues[row * 2 + 1] = beta;
+    }
+}
+
+void launchGdnDDTreePrecompute(void const* q, void const* k, void const* a, void const* b, void const* a_log,
+    void const* dtBias, void* qkScales, void* gateValues, int32_t n, int32_t seqLen, int32_t h, int32_t hv,
+    int32_t headDim, cudaStream_t stream)
+{
+    int32_t const totalQKRows = n * seqLen * h;
+    int32_t const totalGateRows = n * seqLen * hv;
+    int32_t const numBlocks = totalQKRows > totalGateRows ? totalQKRows : totalGateRows;
+    if (numBlocks <= 0)
+    {
+        return;
+    }
+    constexpr int32_t kThreadsPerBlock{256};
+    constexpr int32_t kWarpsPerBlock{kThreadsPerBlock / 32};
+    float const qScale = 1.0F / std::sqrt(static_cast<float>(headDim));
+    dim3 const grid((numBlocks + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    gdnDDTreePrecomputeKernel<<<grid, kThreadsPerBlock, 0, stream>>>(static_cast<half const*>(q),
+        static_cast<half const*>(k), static_cast<half const*>(a), static_cast<half const*>(b),
+        static_cast<float const*>(a_log), static_cast<half const*>(dtBias), static_cast<float*>(qkScales),
+        static_cast<float*>(gateValues), seqLen, h, hv, headDim, totalQKRows, totalGateRows, qScale);
 }
 
 /**

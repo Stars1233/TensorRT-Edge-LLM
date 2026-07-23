@@ -41,12 +41,16 @@ Checkpoint weight key prefix:
 
 Module member names match HuggingFace checkpoint keys directly (no remapping needed).
 
-ONNX Forward I/O:
+ONNX Forward I/O (with embedder, default):
     Inputs:
         input_features   [1, seq_len, num_mel_bins]  float16
         valid            [1, seq_len//4]  bool  (True for real tokens after downsample)
     Output:
-        last_hidden_state  [1, seq_len/4, output_proj_dims]  float16
+        last_hidden_state  [1, seq_len/4, text_hidden_size]  float16
+
+    The multimodal embedder (RMSNorm no-scale -> Linear) projects from
+    output_proj_dims (1536) to text_hidden_size (1536 for E2B, 2560 for E4B).
+    HF weight prefix: model.embed_audio.*
 """
 
 from __future__ import annotations
@@ -701,8 +705,10 @@ class Gemma4AudioModel(nn.Module):
 
     Output: [batch, encoded_seq_len, output_proj_dims]
 
-    The multimodal embedder (RMSNorm no-scale -> Linear) is NOT part of
-    this module; it lives in the language model and is handled separately.
+    This is the raw encoder only. For the full pipeline including the
+    multimodal embedder projection to text_hidden_size, use
+    :class:`Gemma4AudioWithEmbedder` (or ``build_gemma4_audio()`` which
+    uses it by default).
     """
 
     def __init__(self,
@@ -831,6 +837,74 @@ class Gemma4AudioModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Multimodal embedder (RMSNorm no-scale -> Linear projection to text dim)
+# ---------------------------------------------------------------------------
+
+
+class Gemma4AudioMultimodalEmbedder(nn.Module):
+    """Project Gemma4 audio encoder output to text hidden size.
+
+    Architecture: RMSNorm(no_scale) -> Linear(output_proj_dims -> text_hidden_size)
+    HF weight prefix: ``model.embed_audio.*``
+    """
+
+    def __init__(self, audio_config: Dict[str, Any], text_config: Dict[str,
+                                                                       Any],
+                 model_config: ModelConfig) -> None:
+        super().__init__()
+        multimodal_hidden_size = int(
+            audio_config.get("output_proj_dims", _ac.output_proj_dims))
+        text_hidden_size = int(text_config["hidden_size"])
+        eps = float(audio_config.get("rms_norm_eps", _RMS_NORM_EPS))
+        self.embedding_pre_projection_norm = Gemma4RMSNorm(
+            multimodal_hidden_size, eps=eps, with_scale=False)
+        self.embedding_projection = make_linear(
+            model_config,
+            multimodal_hidden_size,
+            text_hidden_size,
+            bias=False,
+            module_name="embed_audio.embedding_projection")
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.embedding_pre_projection_norm(hidden_states)
+        return self.embedding_projection(hidden_states.to(torch.float16))
+
+
+class Gemma4AudioWithEmbedder(nn.Module):
+    """Gemma4 audio encoder plus multimodal projection to text hidden size.
+
+    Output: [batch, encoded_seq_len, text_hidden_size]
+    """
+
+    def __init__(self,
+                 config: Dict[str, Any],
+                 *,
+                 model_config: ModelConfig,
+                 name_prefix: str = "audio_tower") -> None:
+        super().__init__()
+        audio_config = config.get("audio_config", config)
+        text_config = config.get("text_config") or {}
+        if "hidden_size" not in text_config:
+            raise ValueError(
+                "Gemma4 audio export with embedder requires text_config "
+                "with 'hidden_size'")
+        self.audio_tower = Gemma4AudioModel(config,
+                                            model_config=model_config,
+                                            name_prefix=name_prefix)
+        self.embed_audio = Gemma4AudioMultimodalEmbedder(
+            audio_config, text_config, model_config)
+
+    def forward(self, input_features: torch.Tensor,
+                valid: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.audio_tower(input_features, valid)
+        return self.embed_audio(hidden_states)
+
+    def get_onnx_export_args(self, config: Dict[str, Any], device: str):
+        """Return (args, input_names, output_names, dynamic_shapes)."""
+        return self.audio_tower.get_onnx_export_args(config, device)
+
+
+# ---------------------------------------------------------------------------
 # Weight loading
 # ---------------------------------------------------------------------------
 
@@ -841,37 +915,57 @@ _CANDIDATE_PREFIXES = (
 )
 
 
-def _load_audio_weights(model: Gemma4AudioModel,
+def _load_audio_weights(model: nn.Module,
                         weights: Dict[str, torch.Tensor],
                         prefix: Optional[str] = None) -> None:
-    """Load checkpoint weights into model, stripping prefix.
+    """Load checkpoint weights into model.
 
-    Module member names match HF checkpoint keys directly, so no key
-    remapping is needed.
+    Handles both Gemma4AudioModel (audio_tower only) and
+    Gemma4AudioWithEmbedder (audio_tower + embed_audio).
     """
     from ...checkpoint.loader import load_submodule_weights
 
-    if prefix is None:
-        for cand in _CANDIDATE_PREFIXES:
-            if cand == "" or any(k.startswith(cand) for k in weights.keys()):
-                prefix = cand
-                break
-        else:
-            prefix = ""
+    if isinstance(model, Gemma4AudioWithEmbedder):
+        # Combined model: remap HF keys to submodule paths
+        # model.audio_tower.* -> audio_tower.*
+        # model.embed_audio.* -> embed_audio.*
+        def _remap(key: str) -> "str | None":
+            for pfx in ("model.", ""):
+                candidate = key[len(pfx
+                                    ):] if pfx and key.startswith(pfx) else key
+                if (candidate.startswith("audio_tower.")
+                        or candidate.startswith("embed_audio.")):
+                    return candidate
+            return None
 
-    stripped: Dict[str, torch.Tensor] = {}
-    for k, v in weights.items():
-        if not k.startswith(prefix):
-            continue
-        stripped[k[len(prefix):]] = v
+        load_submodule_weights(model,
+                               weights,
+                               _remap,
+                               label="Gemma4AudioWithEmbedder",
+                               log=logger)
+    else:
+        if prefix is None:
+            for cand in _CANDIDATE_PREFIXES:
+                if cand == "" or any(
+                        k.startswith(cand) for k in weights.keys()):
+                    prefix = cand
+                    break
+            else:
+                prefix = ""
 
-    load_submodule_weights(
-        model,
-        stripped,
-        key_remap=lambda k: k,
-        label="Gemma4AudioModel",
-        log=logger,
-    )
+        stripped: Dict[str, torch.Tensor] = {}
+        for k, v in weights.items():
+            if not k.startswith(prefix):
+                continue
+            stripped[k[len(prefix):]] = v
+
+        load_submodule_weights(
+            model,
+            stripped,
+            key_remap=lambda k: k,
+            label="Gemma4AudioModel",
+            log=logger,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -887,8 +981,9 @@ def build_gemma4_audio(
     *,
     model_config: ModelConfig,
     name_prefix: str = "audio_tower",
-) -> Gemma4AudioModel:
-    """Build and return a :class:`Gemma4AudioModel` with loaded weights.
+    include_embedder: bool = True,
+) -> nn.Module:
+    """Build and return a Gemma4 audio model with loaded weights.
 
     Args:
         config:  Full parsed ``config.json`` dict (must contain ``audio_config``).
@@ -898,10 +993,23 @@ def build_gemma4_audio(
         model_config: Top-level :class:`ModelConfig` carrying the
                  :class:`QuantConfig` for ``make_linear`` dispatch.
         name_prefix: Module-name prefix for ``make_linear`` module paths.
+        include_embedder: If True (default), includes the multimodal embedder
+                 (RMSNorm + Linear) that projects to text_hidden_size.
+                 Requires ``text_config`` in config. If False, returns raw
+                 encoder output at ``output_proj_dims``.
+
+    Returns:
+        :class:`Gemma4AudioWithEmbedder` if include_embedder is True,
+        otherwise :class:`Gemma4AudioModel`.
     """
-    model = Gemma4AudioModel(config,
-                             model_config=model_config,
-                             name_prefix=name_prefix)
+    if include_embedder:
+        model: nn.Module = Gemma4AudioWithEmbedder(config,
+                                                   model_config=model_config,
+                                                   name_prefix=name_prefix)
+    else:
+        model = Gemma4AudioModel(config,
+                                 model_config=model_config,
+                                 name_prefix=name_prefix)
     model = model.to(dtype=dtype)
     _load_audio_weights(model, weights, prefix)
     # Sync plain-float clipping values from loaded buffers for ONNX export
@@ -914,5 +1022,7 @@ def build_gemma4_audio(
 
 __all__ = [
     "Gemma4AudioModel",
+    "Gemma4AudioMultimodalEmbedder",
+    "Gemma4AudioWithEmbedder",
     "build_gemma4_audio",
 ]

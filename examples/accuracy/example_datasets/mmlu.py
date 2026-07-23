@@ -108,9 +108,7 @@ class MMLUDataset(EdgeLLMDataset):
         return user_prompt
 
     def format_system_prompt(self, data: Dict[str, Any]) -> str:
-        """Short system prompt to constrain output to single letter."""
-        if self.apply_chat_template:
-            return "Reply with only the letter."
+        """No system prompt for MMLU."""
         return ""
 
     def extract_answer(self, data: Dict[str, Any]) -> Optional[str]:
@@ -159,8 +157,7 @@ def convert_mmlu_dataset(config: DatasetConfig,
                                         config=config,
                                         dev_dataset=dev_dataset,
                                         num_shot=num_shot,
-                                        output_dir=output_dir,
-                                        apply_chat_template=True)
+                                        output_dir=output_dir)
 
     print(f"Processing MMLU dataset with config: {config}")
     edge_llm_mmlu_dataset.process_and_save_dataset("mmlu_dataset.json")

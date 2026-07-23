@@ -72,7 +72,7 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
         totalBytes += recurrentBytes + convBytes;
     }
 
-    // Allocate MTP intermediate state buffers when enabled (maxIntermediateSeqLen > 0).
+    // Allocate spec-verify intermediate state buffers when enabled (maxIntermediateSeqLen > 0).
     if (mConfig.maxIntermediateSeqLen > 0)
     {
         mIntermediateRecurrentStates.reserve(mConfig.numRecurrentLayers);
@@ -104,7 +104,7 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
             totalBytes += intermRecBytes + intermConvBytes;
         }
 
-        // Build the MtpLayerInfo array for batched MTP scatter; pointers are stable, so
+        // Build the MtpLayerInfo array for batched spec-verify state scatter; pointers are stable, so
         // upload runs once.
         std::vector<kernel::MtpLayerInfo> hostInfos(mConfig.numRecurrentLayers);
         for (int32_t i = 0; i < mConfig.numRecurrentLayers; ++i)
@@ -124,7 +124,7 @@ MambaCacheManager::MambaCacheManager(Config const& config, cudaStream_t stream)
         // Sync before hostInfos goes out of scope.
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        LOG_INFO("MambaCacheManager: allocated MTP intermediate state buffers (%d layers, maxSeqLen=%d)",
+        LOG_INFO("MambaCacheManager: allocated spec-verify intermediate state buffers (%d layers, maxSeqLen=%d)",
             mConfig.numRecurrentLayers, mConfig.maxIntermediateSeqLen);
     }
 
@@ -280,7 +280,7 @@ MambaCacheManager::Config const& MambaCacheManager::getConfig() const noexcept
     return mConfig;
 }
 
-void MambaCacheManager::scatterMtpStates(rt::Tensor const& acceptLengths, cudaStream_t stream)
+void MambaCacheManager::scatterAcceptedLinearStates(rt::Tensor const& acceptLengths, cudaStream_t stream)
 {
     if (mIntermediateRecurrentStates.empty())
     {
@@ -299,6 +299,58 @@ void MambaCacheManager::scatterMtpStates(rt::Tensor const& acceptLengths, cudaSt
         layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifySize, recElements, acceptPtr, stream);
     kernel::mtpScatterConvStates(
         layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifySize, convElements, acceptPtr, stream);
+}
+
+void MambaCacheManager::scatterAcceptedTreeStates(
+    rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream)
+{
+    if (mIntermediateRecurrentStates.empty())
+    {
+        return;
+    }
+
+    check::check(!mIntermediateConvStates.empty(), "Intermediate conv states are not allocated.");
+    check::check(mConfig.recurrentStateType == DataType::kFLOAT,
+        "Accepted tree recurrent state scatter supports FP32 recurrent states only.");
+    check::check(
+        mConfig.convStateType == DataType::kHALF, "Accepted tree conv state scatter supports FP16 conv states only.");
+    check::check(
+        acceptedStateNodeIds.getDeviceType() == DeviceType::kGPU, "acceptedStateNodeIds must be a GPU tensor.");
+    check::check(acceptLengths.getDeviceType() == DeviceType::kGPU, "acceptLengths must be a GPU tensor.");
+    check::check(
+        acceptedStateNodeIds.getDataType() == DataType::kINT32, "acceptedStateNodeIds must have INT32 data type.");
+    check::check(acceptLengths.getDataType() == DataType::kINT32, "acceptLengths must have INT32 data type.");
+
+    auto const acceptedStateNodeIdsShape = acceptedStateNodeIds.getShape();
+    auto const acceptLengthsShape = acceptLengths.getShape();
+    check::check(
+        acceptedStateNodeIdsShape.getNumDims() == 2, "acceptedStateNodeIds must have shape [B, maxAcceptLen].");
+    check::check(acceptLengthsShape.getNumDims() == 1, "acceptLengths must have shape [B].");
+
+    int32_t const activeBatchSize = static_cast<int32_t>(acceptedStateNodeIdsShape[0]);
+    int32_t const maxAcceptLen = static_cast<int32_t>(acceptedStateNodeIdsShape[1]);
+    check::check(
+        acceptLengthsShape[0] == activeBatchSize, "acceptedStateNodeIds and acceptLengths batch sizes differ.");
+    if (activeBatchSize == 0 || maxAcceptLen == 0)
+    {
+        return;
+    }
+
+    auto const intermediateShape = mIntermediateRecurrentStates[0].getShape();
+    check::check(intermediateShape[0] == activeBatchSize,
+        "Intermediate recurrent states must be reshaped to the active batch size before accepted tree scatter.");
+    int32_t const verifyTreeSize = static_cast<int32_t>(intermediateShape[1]);
+    int32_t const recElements
+        = mConfig.recurrentStateNumHeads * mConfig.recurrentStateHeadDim * mConfig.recurrentStateSize;
+    int32_t const convElements = mConfig.convDim * mConfig.convKernel;
+    auto const* const layerInfos = static_cast<kernel::MtpLayerInfo const*>(mDeviceMtpLayerInfos.rawPointer());
+    int32_t const* const acceptedStateNodeIdsPtr = acceptedStateNodeIds.dataPointer<int32_t>();
+    int32_t const* const acceptLengthsPtr = acceptLengths.dataPointer<int32_t>();
+
+    kernel::mtpScatterAcceptedTreeRecurrentStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize,
+        verifyTreeSize, recElements, acceptedStateNodeIdsPtr, maxAcceptLen, acceptLengthsPtr, stream);
+    kernel::mtpScatterAcceptedTreeConvStates(layerInfos, mConfig.numRecurrentLayers, activeBatchSize, verifyTreeSize,
+        convElements, acceptedStateNodeIdsPtr, maxAcceptLen, acceptLengthsPtr, stream);
 }
 
 } // namespace rt

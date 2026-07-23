@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Export Tests - Blackwell small LLM and compact VLM exports
+# Focus: fp8, nvfp4, lm_head quantization, FP8 KV cache, and MXFP8 for SM100+ consumers.
+
+tests:
+  # LLM exports - fp8/nvfp4 baseline
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-nvfp4]
+
+  # LLM lm_head and FP8 KV variants used by Blackwell small-memory runners
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-fp8-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-fp8-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-nvfp4-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-nvfp4-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-fp8-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-fp8-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-nvfp4-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-nvfp4-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-7B-Instruct-fp8-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-nvfp4-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-nvfp4-fp8kv]
+
+  # Phi-4 base visual-language exports
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Phi-4-multimodal-instruct-nvfp4-merge_lora]
+
+  # Datacenter Blackwell / RTX5090 / Spark MXFP8 exports
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-8B-mxfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-mxfp8]
+
+  # Qwen3.5 LLM exports - fp8/nvfp4/lm_head/fp8kv
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-fp8-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-nvfp4-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-fp8-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-4B-nvfp4-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-fp8-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-nvfp4-fp8kv]
+
+  # Qwen3.5 LLM exports - MXFP8
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-9B-mxfp8]
+
+  # Llama-3.1-8B-Instruct - fp16/fp8 (restored)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-fp8-lmfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Llama-3.1-8B-Instruct-fp8-fp8kv]
+
+  # NVIDIA-Nemotron-3-Nano-4B-NVFP4
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4]
+
+  # NVIDIA-Nemotron-Nano-9B-v2-FP8
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[NVIDIA-Nemotron-Nano-9B-v2-FP8-fp8]
+
+  # NVIDIA-Nemotron-Nano-9B-v2-NVFP4
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[NVIDIA-Nemotron-Nano-9B-v2-NVFP4-nvfp4]
+
+  # Qwen2.5-0.5B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-mxfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-0.5B-Instruct-nvfp4-lmnvfp4]
+
+  # Qwen2.5-3B-Instruct
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-3B-Instruct-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-3B-Instruct-mxfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-3B-Instruct-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen2.5-3B-Instruct-nvfp4-lmnvfp4]
+
+  # Qwen3-0.6B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-fp16-rvs16384]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-int4_awq-rvs16384]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-mxfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-nvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-0.6B-nvfp4-rvs16384]
+
+  # Qwen3-1.7B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-mxfp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-1.7B-nvfp4-lmnvfp4]
+
+  # Qwen3-4B-Instruct-2507
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-4B-Instruct-2507-mxfp8]
+
+  # Qwen3.5-2B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-2B-mxfp8]

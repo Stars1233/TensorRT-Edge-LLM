@@ -22,8 +22,7 @@ Qwen3-TTS has NO audio encoder. Its components are:
 See ``modeling_code_predictor.py`` and ``modeling_qwen3_tts_code2wav.py``
 for details.
 """
-from .modeling_code_predictor import (CodePredictorCausalLM,
-                                      apply_code_predictor_mlp_war)
+from .modeling_code_predictor import CodePredictorCausalLM
 from .modeling_qwen3_tts_code2wav import export_qwen3_tts_code2wav
 from .modeling_qwen3_tts_talker import TalkerCausalLM
 from .modeling_qwen3_tts_text import Qwen3TTSLanguageModel
@@ -32,6 +31,5 @@ __all__ = [
     "Qwen3TTSLanguageModel",
     "TalkerCausalLM",
     "CodePredictorCausalLM",
-    "apply_code_predictor_mlp_war",
     "export_qwen3_tts_code2wav",
 ]

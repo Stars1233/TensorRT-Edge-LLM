@@ -27,8 +27,14 @@ tests:
   - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-0.8B-fp16]
   # Qwen3.5 MTP export (base + draft from single checkpoint)
   - tests/defs/test_checkpoint_export.py::test_checkpoint_mtp_export[Qwen3.5-0.8B-fp16-mtp]
+  # Gemma4 E2B FP16 checkpoint export
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[gemma-4-E2B-it-fp16]
+  # Gemma4 E2B FP16 paired MTP export (base + assistant draft)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_mtp_export[gemma-4-E2B-it-fp16-mtp]
   # Qwen3.5 DFlash export (FP16 base + FP16 DFlash draft checkpoint)
   - tests/defs/test_checkpoint_export.py::test_checkpoint_dflash_export[Qwen3.5-4B-fp16-dflash-b16]
+  # Qwen3.5 DFlash DDTree export (FP16 tree base + FP16 DFlash draft checkpoint)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_dflash_export[Qwen3.5-4B-fp16-dflash-b16-ddtree]
   # Qwen3.5 DFlash export (pre-quantized NVFP4 base + pre-quantized NVFP4 DFlash draft)
   - tests/defs/test_checkpoint_export.py::test_checkpoint_dflash_export[Qwen3.5-4B-NVFP4-nvfp4-dflash-b16-nvfp4]
   # EAGLE3 LLM - pre-quantized base + pre-quantized draft (skip quantization in CI)

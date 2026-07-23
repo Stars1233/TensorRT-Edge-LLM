@@ -54,6 +54,15 @@ constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non
 constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
 constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
 
+// CodePredictor sampling defaults (hardcoded across all Qwen3-Omni/TTS
+// families by ``code_predictor.generate(top_k=50, top_p=0.8)`` and HF
+// ``GenerationConfig``'s temperature default):
+//   https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni/modeling_qwen3_omni.py#L3408
+//   https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py#L3184
+constexpr float kCPSamplingTemperature = 1.0f;
+constexpr int32_t kCPSamplingTopK = 50;
+constexpr float kCPSamplingTopP = 0.8f;
+
 // Audio output constants (Qwen3-Omni codec: 12.5 Hz frame rate, 24 kHz mono PCM output)
 constexpr int32_t kAudioSampleRate = 24000;     //!< Output PCM sample rate (Hz)
 constexpr int32_t kAudioSamplesPerFrame = 1920; //!< Samples produced per codec frame (24000 / 12.5)
@@ -650,6 +659,10 @@ private:
     rt::Tensor mRawCodecEmbed;                  //!< Raw codec embed [1, 1, talkerHidden] FP16
     rt::Tensor mSmallToMtpProjectedHidden;      //!< Projected talker hidden [1, cpHidden] FP16
     rt::Tensor mHostSelectedCodeIds;            //!< Host selected codes [maxBS] INT32
+    rt::Tensor mHostGenCodeBuf;                 //!< Host pinned buffer for deferred CP gen-loop sample reads
+                                                //!< [mNumRvqLayers - 1, maxBS] INT32 — accumulates code_2..code_15
+                                                //!< for up to maxBS active batches so we can do one
+                                                //!< cudaStreamSynchronize per frame instead of one per step
     rt::Tensor mHostCodePredictorContextLength; //!< Host CodePredictor context length [maxBS] INT32
 
     // Residual + decode buffers (batched for Talker, batch=1 for CodePredictor)

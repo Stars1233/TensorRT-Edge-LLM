@@ -63,17 +63,10 @@ void StepPreparer::prepare(
         // -- selectTokenIndices: always zero for decode (single token) --
         CUDA_CHECK(cudaMemsetAsync(io.selectTokenIndices.rawPointer(), 0, batchSize * sizeof(int64_t), stream));
 
-        // -- contextLengths: KV cache lengths + 1 (plugin) or 0 + 1 (native) --
-        if (mConfig.useTrtNativeOps)
-        {
-            CUDA_CHECK(cudaMemsetAsync(io.contextLengths.rawPointer(), 0, batchSize * sizeof(int32_t), stream));
-        }
-        else
-        {
-            Tensor& kvLengths = kvCache.getKVCacheLengths();
-            CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), kvLengths.rawPointer(),
-                batchSize * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
-        }
+        // -- contextLengths: KV cache lengths + 1 --
+        Tensor& kvLengths = kvCache.getKVCacheLengths();
+        CUDA_CHECK(cudaMemcpyAsync(io.contextLengths.rawPointer(), kvLengths.rawPointer(), batchSize * sizeof(int32_t),
+            cudaMemcpyDeviceToDevice, stream));
         constexpr int32_t kDecodeIncrement{1};
         kernel::incrementLengthTensor(io.contextLengths, kDecodeIncrement, stream);
     }

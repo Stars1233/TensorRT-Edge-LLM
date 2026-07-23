@@ -25,6 +25,7 @@
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <mutex>
@@ -51,12 +52,17 @@ constexpr int32_t kIN_A_LOG_IDX{5};
 constexpr int32_t kIN_DT_BIAS_IDX{6};
 constexpr int32_t kIN_H0_SOURCE_IDX{7};
 constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{8};
+constexpr int32_t kIN_SPEC_VERIFY_PHASE_MARKER_IDX{9};
+constexpr int32_t kIN_TREE_PARENT_IDS_IDX{10};
+constexpr int32_t kIN_TREE_DEPTHS_IDX{11};
 constexpr int32_t kOUT_O_IDX{0};
 constexpr int32_t kOUT_H0_SOURCE_IDX{1};
 constexpr int32_t kOUT_INTERMEDIATE_STATES_IDX{2};
-constexpr int32_t kNUM_INPUTS{9};
+constexpr int32_t kNUM_REQUIRED_INPUTS{9};
+constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_INPUTS{1};
+constexpr int32_t kNUM_DDTREE_OPTIONAL_INPUTS{2};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
-constexpr int32_t kNUM_MTP_OPTIONAL_OUTPUTS{1};
+constexpr int32_t kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS{1};
 
 } // namespace
 
@@ -71,11 +77,13 @@ REGISTER_TENSORRT_PLUGIN(GatedDeltaNetPluginCreator);
 // the object can never be constructed; all other methods are shared.
 // ---------------------------------------------------------------------------
 #ifdef CUTE_DSL_GDN_ENABLED
-GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, int32_t vDim, bool useMTP)
+GatedDeltaNetPlugin::GatedDeltaNetPlugin(
+    std::string const& name, int32_t kDim, int32_t vDim, bool useSpecVerifyState, bool useDDTree)
     : mLayerName(name)
     , mKDim(kDim)
     , mVDim(vDim)
-    , mUseMTP(useMTP)
+    , mUseSpecVerifyState(useSpecVerifyState || useDDTree)
+    , mUseDDTree(useDDTree)
     , mSMVersion(getSMVersion())
 {
     if (!CuteDslGDNRunner::canImplement(mKDim, mVDim, mSMVersion))
@@ -98,11 +106,13 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, 
     }
 }
 #else
-GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, int32_t kDim, int32_t vDim, bool useMTP)
+GatedDeltaNetPlugin::GatedDeltaNetPlugin(
+    std::string const& name, int32_t kDim, int32_t vDim, bool useSpecVerifyState, bool useDDTree)
     : mLayerName(name)
     , mKDim(kDim)
     , mVDim(vDim)
-    , mUseMTP(useMTP)
+    , mUseSpecVerifyState(useSpecVerifyState || useDDTree)
+    , mUseDDTree(useDDTree)
 {
     LOG_ERROR("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
     throw std::runtime_error("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
@@ -114,7 +124,9 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, PluginFieldCol
 {
     mKDim = parsePluginScalarField<int32_t>("k_dim", fc).value_or(128);
     mVDim = parsePluginScalarField<int32_t>("v_dim", fc).value_or(128);
-    mUseMTP = parsePluginScalarField<int32_t>("use_mtp", fc).value_or(0) != 0;
+    mUseSpecVerifyState = parsePluginScalarField<int32_t>("use_mtp", fc).value_or(0) != 0;
+    mUseDDTree = parsePluginScalarField<int32_t>("use_ddtree", fc).value_or(0) != 0;
+    mUseSpecVerifyState = mUseSpecVerifyState || mUseDDTree;
 
 #ifdef CUTE_DSL_GDN_ENABLED
     mSMVersion = getSMVersion();
@@ -155,7 +167,7 @@ IPluginV3* GatedDeltaNetPlugin::clone() noexcept
 {
     try
     {
-        auto* p = new GatedDeltaNetPlugin(mLayerName, mKDim, mVDim, mUseMTP);
+        auto* p = new GatedDeltaNetPlugin(mLayerName, mKDim, mVDim, mUseSpecVerifyState, mUseDDTree);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -195,7 +207,7 @@ void GatedDeltaNetPlugin::setPluginNamespace(char const* pluginNamespace) noexce
 
 int32_t GatedDeltaNetPlugin::getNbOutputs() const noexcept
 {
-    return kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+    return kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
 }
 
 int32_t GatedDeltaNetPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_unused]] int32_t nbOutputs,
@@ -204,11 +216,11 @@ int32_t GatedDeltaNetPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_u
     try
     {
         [[maybe_unused]] int32_t const expectedNbOutputs
-            = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
+            = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
         assert(nbOutputs == expectedNbOutputs);
         outputTypes[kOUT_O_IDX] = inputTypes[kIN_Q_IDX];
         outputTypes[kOUT_H0_SOURCE_IDX] = inputTypes[kIN_H0_SOURCE_IDX];
-        if (mUseMTP)
+        if (mUseSpecVerifyState)
         {
             outputTypes[kOUT_INTERMEDIATE_STATES_IDX] = DataType::kFLOAT;
         }
@@ -227,14 +239,17 @@ int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_un
     try
     {
         [[maybe_unused]] int32_t const expectedNbOutputs
-            = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
-        assert(nbInputs == kNUM_INPUTS);
+            = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
+        [[maybe_unused]] int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS
+            + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+            + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
+        assert(nbInputs == expectedNbInputs);
         assert(nbOutputs == expectedNbOutputs);
         // o has same shape as v: [n, seq_len, hv, v]
         outputs[kOUT_O_IDX] = inputs[kIN_V_IDX];
         // h0_out has same shape as h0_source: [n, hv, k, v]
         outputs[kOUT_H0_SOURCE_IDX] = inputs[kIN_H0_SOURCE_IDX];
-        if (mUseMTP)
+        if (mUseSpecVerifyState)
         {
             // Per-token recurrent checkpoints: [n, seq_len, hv, k, v].
             outputs[kOUT_INTERMEDIATE_STATES_IDX].nbDims = 5;
@@ -255,8 +270,11 @@ int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_un
 bool GatedDeltaNetPlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    int32_t const expectedNbOutputs = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
-    if (nbInputs != kNUM_INPUTS || nbOutputs != expectedNbOutputs)
+    int32_t const expectedNbOutputs
+        = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+        + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
+    if (nbInputs != expectedNbInputs || nbOutputs != expectedNbOutputs)
         return false;
     if (inOut[pos].desc.format != TensorFormat::kLINEAR)
         return false;
@@ -264,10 +282,14 @@ bool GatedDeltaNetPlugin::supportsFormatCombination(
         return inOut[pos].desc.type == DataType::kFLOAT;
     if (pos == kIN_CONTEXT_LENGTHS_IDX)
         return inOut[pos].desc.type == DataType::kINT32;
+    if (mUseSpecVerifyState && pos == kIN_SPEC_VERIFY_PHASE_MARKER_IDX)
+        return inOut[pos].desc.type == DataType::kINT32;
+    if (mUseDDTree && (pos == kIN_TREE_PARENT_IDS_IDX || pos == kIN_TREE_DEPTHS_IDX))
+        return inOut[pos].desc.type == DataType::kINT32;
     // FP32 outputs: h0_out, intermediate_states (when present)
-    if (pos == kNUM_INPUTS + kOUT_H0_SOURCE_IDX)
+    if (pos == expectedNbInputs + kOUT_H0_SOURCE_IDX)
         return inOut[pos].desc.type == DataType::kFLOAT;
-    if (mUseMTP && pos == kNUM_INPUTS + kOUT_INTERMEDIATE_STATES_IDX)
+    if (mUseSpecVerifyState && pos == expectedNbInputs + kOUT_INTERMEDIATE_STATES_IDX)
         return inOut[pos].desc.type == DataType::kFLOAT;
     // Everything else: FP16
     return inOut[pos].desc.type == DataType::kHALF;
@@ -276,10 +298,13 @@ bool GatedDeltaNetPlugin::supportsFormatCombination(
 int32_t GatedDeltaNetPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
     [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    int32_t const expectedNbOutputs = kNUM_REQUIRED_OUTPUTS + (mUseMTP ? kNUM_MTP_OPTIONAL_OUTPUTS : 0);
-    if (nbInputs != kNUM_INPUTS)
+    int32_t const expectedNbOutputs
+        = kNUM_REQUIRED_OUTPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_OUTPUTS : 0);
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mUseSpecVerifyState ? kNUM_SPEC_VERIFY_OPTIONAL_INPUTS : 0)
+        + (mUseDDTree ? kNUM_DDTREE_OPTIONAL_INPUTS : 0);
+    if (nbInputs != expectedNbInputs)
     {
-        LOG_ERROR("gated_delta_net: expected %d inputs, got %d", kNUM_INPUTS, nbInputs);
+        LOG_ERROR("gated_delta_net: expected %d inputs, got %d", expectedNbInputs, nbInputs);
         return -1;
     }
     if (nbOutputs != expectedNbOutputs)
@@ -302,6 +327,21 @@ int32_t GatedDeltaNetPlugin::configurePlugin(DynamicPluginTensorDesc const* in, 
         LOG_ERROR("gated_delta_net: context_lengths must be 1D INT32");
         return -1;
     }
+    if (mUseSpecVerifyState
+        && (in[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].desc.type != DataType::kINT32
+            || in[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].desc.dims.nbDims != 1))
+    {
+        LOG_ERROR("gated_delta_net: spec_verify_phase_marker must be 1D INT32");
+        return -1;
+    }
+    if (mUseDDTree
+        && (in[kIN_TREE_PARENT_IDS_IDX].desc.type != DataType::kINT32
+            || in[kIN_TREE_DEPTHS_IDX].desc.type != DataType::kINT32
+            || in[kIN_TREE_PARENT_IDS_IDX].desc.dims.nbDims != 2 || in[kIN_TREE_DEPTHS_IDX].desc.dims.nbDims != 2))
+    {
+        LOG_ERROR("gated_delta_net: DDTree tree_parent_ids/tree_depths must be 2D INT32");
+        return -1;
+    }
     return 0;
 }
 
@@ -319,12 +359,25 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
 
     // cu_seqlens [maxN+1] int32, padded to 128-byte alignment.
     size_t const cuSeqBytes = static_cast<size_t>(maxN + 1) * sizeof(int32_t);
-    size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
+    size_t const cuSeqPadded = alignTensorSize(cuSeqBytes);
     // h0 scratch [maxN, maxHv, kDim, vDim] f32 — separate buffer for Blackwell h0_out.
     size_t const h0ScratchBytes = static_cast<size_t>(maxN) * maxHv * kDim * vDim * sizeof(float);
 
     total = cuSeqPadded + h0ScratchBytes;
 #endif
+
+    if (mUseDDTree)
+    {
+        int32_t const maxN = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[0]);
+        int32_t const maxSeqLen = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[1]);
+        int32_t const maxH = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[2]);
+        int32_t const maxHv = static_cast<int32_t>(inputs[kIN_V_IDX].max.d[2]);
+
+        size_t const qkScaleBytes = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxH * 2U * sizeof(float));
+        size_t const gateValueBytes
+            = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxHv * 2U * sizeof(float));
+        total = std::max(total, qkScaleBytes + gateValueBytes);
+    }
 
     return total;
 }
@@ -360,25 +413,55 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     int32_t const hv = static_cast<int32_t>(vDims[2]);
     int32_t const v_dim = static_cast<int32_t>(vDims[3]);
 
-    // Determine if this call should use MTP decode path.
-    // MTP mode activates only for short multi-token verification sequences (tree verify),
-    // not for normal prefill. The MTP kernel writes per-step intermediate states which adds
-    // minor overhead; small prefills (seq_len <= kMTPMaxSeqLen) that happen to pass through
-    // this path pay a small cost for the intermediate state writes, but it is harmless.
-    // TODO: refactor the dispatch logic to explicitly distinguish MTP tree-verify decoding
-    // from prefill when 1 < seq_len <= kMTPMaxSeqLen (e.g. pass an execution-phase flag
-    // from the runtime instead of relying solely on seq_len range heuristics).
-    constexpr int32_t kMTPMaxSeqLen = 16;
-    bool const mtpActive = mUseMTP && (seq_len > 1) && (seq_len <= kMTPMaxSeqLen);
+    constexpr int32_t kLinearSpecVerifyMaxSeqLen = 16;
+    // Shape-only phase marker: length 0 is ordinary prefill/decode, length 1 is speculative verify.
+    // The marker payload is ignored.
+    int32_t const phaseLen
+        = mUseSpecVerifyState ? static_cast<int32_t>(inputDesc[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].dims.d[0]) : 0;
+    if (phaseLen > 1)
+    {
+        LOG_ERROR("gated_delta_net: spec_verify_phase_marker length must be 0 or 1, got %d", phaseLen);
+        return -1;
+    }
+    bool const ddtreeActive = mUseDDTree && phaseLen > 0;
+    bool const mtpActive = mUseSpecVerifyState && phaseLen > 0 && !ddtreeActive;
+    if (mtpActive && (seq_len < 1 || seq_len > kLinearSpecVerifyMaxSeqLen))
+    {
+        LOG_ERROR("gated_delta_net: linear spec-verify kernel supports seq_len in [1, %d], got %d",
+            kLinearSpecVerifyMaxSeqLen, seq_len);
+        return -1;
+    }
+    if (ddtreeActive)
+    {
+        PluginTensorDesc const& parentDesc = inputDesc[kIN_TREE_PARENT_IDS_IDX];
+        PluginTensorDesc const& depthDesc = inputDesc[kIN_TREE_DEPTHS_IDX];
+        if (seq_len < 1 || parentDesc.dims.nbDims != 2 || depthDesc.dims.nbDims != 2 || parentDesc.dims.d[0] != n
+            || depthDesc.dims.d[0] != n || parentDesc.dims.d[1] != seq_len || depthDesc.dims.d[1] != seq_len)
+        {
+            LOG_ERROR(
+                "gated_delta_net: DDTree requires tree_parent_ids/tree_depths shape [n=%d, seq_len=%d]; got "
+                "parent nbDims=%d [%lld, %lld], depth nbDims=%d [%lld, %lld]",
+                n, seq_len, parentDesc.dims.nbDims,
+                parentDesc.dims.nbDims > 0 ? static_cast<long long>(parentDesc.dims.d[0]) : -1LL,
+                parentDesc.dims.nbDims > 1 ? static_cast<long long>(parentDesc.dims.d[1]) : -1LL, depthDesc.dims.nbDims,
+                depthDesc.dims.nbDims > 0 ? static_cast<long long>(depthDesc.dims.d[0]) : -1LL,
+                depthDesc.dims.nbDims > 1 ? static_cast<long long>(depthDesc.dims.d[1]) : -1LL);
+            return -1;
+        }
+    }
 
     // h0 is batch-dense [n, hv, k, v]
     size_t const h0Bytes = static_cast<size_t>(n) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
     void* h0Out = outputs[kOUT_H0_SOURCE_IDX];
 
-    // For MTP: the MTP kernel updates h0_source in-place, so we always need the copy
+    // DDTree verify keeps the committed recurrent state read-only and commits
+    // from intermediate_states after accept, so it does not need an h0_out copy.
+    void* h0State = ddtreeActive ? const_cast<void*>(inputs[kIN_H0_SOURCE_IDX]) : h0Out;
+
+    // For linear spec verify, the kernel updates h0_source in-place, so we always need the copy
     // (h0Out serves as the working state buffer that the kernel reads/writes).
     // For normal: same logic as before — copy if input != output.
-    if (h0Out != inputs[kIN_H0_SOURCE_IDX])
+    if (!ddtreeActive && h0Out != inputs[kIN_H0_SOURCE_IDX])
     {
         cudaMemcpyAsync(h0Out, inputs[kIN_H0_SOURCE_IDX], h0Bytes, cudaMemcpyDeviceToDevice, stream);
     }
@@ -391,7 +474,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.b = const_cast<void*>(inputs[kIN_B_IDX]);
     params.A_log = const_cast<void*>(inputs[kIN_A_LOG_IDX]);
     params.dt_bias = const_cast<void*>(inputs[kIN_DT_BIAS_IDX]);
-    params.h0_source = h0Out;
+    params.h0_source = h0State;
     params.context_lengths = const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]);
     params.o = outputs[kOUT_O_IDX];
     params.n = n;
@@ -402,7 +485,21 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.v_dim = v_dim;
     params.smVersion = mSMVersion;
 
-    if (mtpActive)
+    if (ddtreeActive)
+    {
+        params.use_ddtree = true;
+        params.tree_parent_ids = const_cast<void*>(inputs[kIN_TREE_PARENT_IDS_IDX]);
+        params.tree_depths = const_cast<void*>(inputs[kIN_TREE_DEPTHS_IDX]);
+        params.intermediate_states = outputs[kOUT_INTERMEDIATE_STATES_IDX];
+        if (workspace != nullptr)
+        {
+            size_t const qkScaleBytes = alignTensorSize(static_cast<size_t>(n) * seq_len * h * 2U * sizeof(float));
+            char* workspaceBase = static_cast<char*>(workspace);
+            params.ddtree_qk_scales = workspaceBase;
+            params.ddtree_gate_values = workspaceBase + qkScaleBytes;
+        }
+    }
+    else if (mtpActive)
     {
         // MTP decode: process all seq_len draft tokens with per-step state caching.
         params.use_mtp = true;
@@ -461,8 +558,10 @@ PluginFieldCollection const* GatedDeltaNetPlugin::getFieldsToSerialize() noexcep
     mDataToSerialize.clear();
     mDataToSerialize.emplace_back("k_dim", &mKDim, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("v_dim", &mVDim, PluginFieldType::kINT32, 1);
-    mUseMTPField = mUseMTP ? 1 : 0;
-    mDataToSerialize.emplace_back("use_mtp", &mUseMTPField, PluginFieldType::kINT32, 1);
+    mUseSpecVerifyStateField = mUseSpecVerifyState ? 1 : 0;
+    mDataToSerialize.emplace_back("use_mtp", &mUseSpecVerifyStateField, PluginFieldType::kINT32, 1);
+    mUseDDTreeField = mUseDDTree ? 1 : 0;
+    mDataToSerialize.emplace_back("use_ddtree", &mUseDDTreeField, PluginFieldType::kINT32, 1);
 
     mFCToSerialize.nbFields = mDataToSerialize.size();
     mFCToSerialize.fields = mDataToSerialize.data();
@@ -481,6 +580,7 @@ GatedDeltaNetPluginCreator::GatedDeltaNetPluginCreator()
     mPluginAttributes.emplace_back(PluginField("k_dim", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("v_dim", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("use_mtp", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("use_ddtree", nullptr, PluginFieldType::kINT32, 1));
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();
 }

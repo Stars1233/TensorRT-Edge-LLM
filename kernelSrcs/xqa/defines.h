@@ -112,25 +112,14 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define ALLOW_MULTI_BLOCK_MODE true
 #endif
 
-// For paged KV cache. Allowed values: 0, 16, 32, 64, 128
-// 0 means contiguous KV cache (non-paged).
 #ifndef TOKENS_PER_PAGE
-#define TOKENS_PER_PAGE 32
-#endif
-
-// don't modify
-#ifndef USE_PAGED_KV_CACHE
-#define USE_PAGED_KV_CACHE (TOKENS_PER_PAGE > 0)
-#endif
-
-#if XQA_2CTA_HEAD_DIM512
-static_assert(!USE_PAGED_KV_CACHE, "XQA_2CTA_HEAD_DIM512 supports contiguous KV cache only.");
+#define TOKENS_PER_PAGE 0
 #endif
 
 // Paged KV Cache Format
 // 0 - XQA Original
 // 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for VLLM/SGLang
-#ifdef USE_PAGED_KV_CACHE
+#if TOKENS_PER_PAGE != 0
 #ifndef PAGED_KV_CACHE_LAYOUT
 #define PAGED_KV_CACHE_LAYOUT 0
 #endif
@@ -190,7 +179,7 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
-#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && USE_PAGED_KV_CACHE && BEAM_WIDTH > 1)
+#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && TOKENS_PER_PAGE != 0 && BEAM_WIDTH > 1)
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER

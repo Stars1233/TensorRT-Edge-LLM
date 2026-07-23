@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/tensorMap.h"
@@ -126,6 +127,9 @@ public:
     //! @brief Return the name of the i-th I/O tensor.
     char const* getIOTensorName(int32_t index) const;
 
+    //! @brief Return whether the engine exposes a named I/O tensor.
+    bool hasIOTensor(char const* name) const;
+
     //! @brief Return the data type of a named binding.
     nvinfer1::DataType getBindingDataType(char const* name) const;
 
@@ -165,6 +169,7 @@ private:
      */
     EngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry);
 
+    AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;

@@ -29,7 +29,7 @@
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
 #include "runtime/config/llmEngineConfig.h"
-#include "runtime/decoding/specDecodeUtils.h"
+#include "runtime/decoding/decoderUtils.h"
 #include "sampler/sampling.h"
 
 #include <algorithm>
@@ -59,7 +59,7 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
     check::check(
         mRuntime.deployment.specConfig.has_value(), "SpecDecode drafting strategy requires a drafting config.");
 
-    mDraftExecutor = spec_decode_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
 
     int32_t const maxRuntimeBatchSize = mRuntime.maxRuntimeBatchSize;
     int32_t const effectiveMaxDraftProposalSize = mRuntime.deployment.effectiveMaxDraftProposalSize();
@@ -126,11 +126,6 @@ EagleDecoder::EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::pat
             "d2t tensor length should match draft vocab size");
         mDraftVocabMappingTable = std::move(d2tTensors[0]);
     }
-}
-
-char const* EagleDecoder::unsupportedReason(LLMGenerationRequest const& request) const noexcept
-{
-    return spec_decode_utils::isGreedyCompatible(request);
 }
 
 int64_t EagleDecoder::getRequiredContextMemorySize() const noexcept
@@ -545,8 +540,29 @@ bool EagleDecoder::runBaseModelVerification(DecodingInferenceContext& context)
         mRuntime.base.pipelineIO.baseHiddenStates.reshape({activeBatchSize, maxAcceptDepth, baseOutputHiddenDim}),
         "Tensor reshape failed");
 
-    spec_decode_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
+    // Enqueue logprobs device work + D2H before appendAcceptedTokens so everything rides
+    // that call's single round synchronization.
+    if (context.numLogprobs > 0)
+    {
+        int32_t const verifyTreeSize = mRuntime.deployment.specConfig->verifySize;
+        int32_t const vocabSize = mRuntime.deployment.base.outputVocabSize;
+        int32_t const gatheredRows = activeBatchSize * maxAcceptDepth;
+        check::check(mRuntime.logprobs.gatheredLogits.reshape({gatheredRows, vocabSize}), "Tensor reshape failed");
+        gatherSpecVerifyAcceptedLogitRows(mRuntime.base.pipelineIO.outputLogits, mAcceptedTokenIndices,
+            mRuntime.logprobs.gatheredLogits, activeBatchSize, verifyTreeSize, maxAcceptDepth, vocabSize,
+            context.stream);
+        decoder_utils::enqueueLogprobsD2H(
+            mRuntime.logprobs.gatheredLogits, gatheredRows, mRuntime, context.numLogprobs, context.stream);
+    }
+
+    decoder_utils::appendAcceptedTokens(context, mHostAcceptLengths, mHostAcceptedTokenIds, mAcceptLength,
         mAcceptedTokenIds, maxAcceptDepth, mRuntime.tokenizer, context.stream);
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectSpecLogprobsFromHost(mRuntime, context, activeBatchSize, maxAcceptDepth,
+            mHostAcceptLengths.dataPointer<int32_t>(), context.numLogprobs);
+    }
 
     return true;
 }

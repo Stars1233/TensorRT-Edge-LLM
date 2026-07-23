@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
 from ..linear import make_linear
 
 if TYPE_CHECKING:
@@ -132,12 +133,13 @@ class RADIOAttention(nn.Module):
     def __init__(self,
                  hidden_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.embed_dim = hidden_size
         self.qkv = make_linear(
             model_config,
@@ -158,8 +160,10 @@ class RADIOAttention(nn.Module):
                                               self.head_dim).permute(
                                                   2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale,
-                         dim=-1)
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        if self.attention_scale != 1.0:
+            scores = scores * self.attention_scale
+        attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v).transpose(1, 2).contiguous().reshape(
             B, N, self.embed_dim)
         return self.proj(out)
@@ -216,6 +220,7 @@ class RADIOBlock(nn.Module):
                  num_heads: int,
                  intermediate_size: int,
                  layer_norm_eps: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -223,6 +228,7 @@ class RADIOBlock(nn.Module):
         self.attn = RADIOAttention(
             hidden_size,
             num_heads,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.attn" if name_prefix else "")
         self.norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
@@ -255,6 +261,7 @@ class RADIOEncoder(nn.Module):
                  num_heads: int,
                  intermediate_size: int,
                  layer_norm_eps: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -264,6 +271,7 @@ class RADIOEncoder(nn.Module):
                 num_heads,
                 intermediate_size,
                 layer_norm_eps,
+                attention_scale,
                 model_config,
                 name_prefix=f"{name_prefix}.blocks.{i}" if name_prefix else "")
             for i in range(num_layers)
@@ -337,6 +345,9 @@ class NemotronOmniVisualModel(nn.Module):
         num_heads = hidden_size // 80  # ViT-H: 1280 / 80 = 16 heads
         intermediate_size = vc.get("intermediate_size", hidden_size * 4)
         layer_norm_eps = 1e-6
+        head_dim = hidden_size // num_heads
+        attention_scale = config_module._get_attention_scaling(
+            vc, head_dim, 1.0 / (float(head_dim)**0.5))
 
         self.patch_generator = RADIOEmbeddings(hidden_size, patch_size,
                                                image_size)
@@ -349,6 +360,7 @@ class NemotronOmniVisualModel(nn.Module):
             num_heads,
             intermediate_size,
             layer_norm_eps,
+            attention_scale,
             model_config,
             name_prefix="vision_model.radio_model.model")
 

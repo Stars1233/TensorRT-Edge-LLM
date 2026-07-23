@@ -49,7 +49,7 @@ public:
         int32_t recurrentStateSize{0};     //!< Recurrent state dimension
         int32_t convDim{0};                //!< Conv1d channel dimension
         int32_t convKernel{0};             //!< Conv1d kernel width
-        int32_t maxIntermediateSeqLen{0};  //!< MTP intermediate state seq dim (0 = disabled)
+        int32_t maxIntermediateSeqLen{0};  //!< Spec-verify intermediate state seq dim (0 = disabled)
         nvinfer1::DataType recurrentStateType{nvinfer1::DataType::kHALF}; //!< Recurrent state dtype
         nvinfer1::DataType convStateType{nvinfer1::DataType::kHALF};      //!< Conv state dtype
     };
@@ -122,20 +122,20 @@ public:
     //! @return Vector of device tensors with shape [1, convDim, convKernel].
     std::vector<rt::Tensor> captureConvStates(int32_t batchIdx, cudaStream_t stream);
 
-    //! Get MTP intermediate recurrent state tensor for a given layer.
+    //! Get spec-verify intermediate recurrent state tensor for a given layer.
     //! Shape: [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads, recurrentStateHeadDim, recurrentStateSize]
     //! @param recurrentLayerIdx The recurrent layer index.
     //! @return A reference to the owned device tensor.
     rt::Tensor& getIntermediateRecurrentState(int32_t recurrentLayerIdx) noexcept;
 
-    //! Get MTP intermediate conv state tensor for a given layer.
+    //! Get spec-verify intermediate conv state tensor for a given layer.
     //! Shape: [maxBatchSize, maxIntermediateSeqLen, convDim, convKernel]
     //! @param recurrentLayerIdx The recurrent layer index.
     //! @return A reference to the owned device tensor.
     rt::Tensor& getIntermediateConvState(int32_t recurrentLayerIdx) noexcept;
 
     /*!
-     * @brief Reshape MTP intermediate state tensors to actual runtime dimensions.
+     * @brief Reshape spec-verify intermediate state tensors to actual runtime dimensions.
      *
      * TRT writes intermediate state outputs contiguously as [activeBatchSize, seqLen, ...],
      * but the buffers are allocated at [maxBatchSize, maxIntermediateSeqLen, ...].
@@ -147,10 +147,10 @@ public:
      */
     void reshapeIntermediateStates(int32_t activeBatchSize, int32_t seqLen);
 
-    //! @brief Check if intermediate recurrent state buffers are allocated (MTP enabled)
+    //! @brief Check if intermediate recurrent state buffers are allocated (spec-verify enabled)
     bool hasIntermediateRecurrentStates() const noexcept;
 
-    //! @brief Check if intermediate conv state buffers are allocated (MTP enabled)
+    //! @brief Check if intermediate conv state buffers are allocated (spec-verify enabled)
     bool hasIntermediateConvStates() const noexcept;
 
     //! @brief Get the number of recurrent layers
@@ -161,19 +161,27 @@ public:
     //! @return Cache configuration
     Config const& getConfig() const noexcept;
 
-    //! Scatter MTP intermediate states to main state pools after verify (one
-    //! batched launch per state kind).  No-op when MTP is not enabled.
-    void scatterMtpStates(rt::Tensor const& acceptLengths, cudaStream_t stream);
+    //! Scatter spec-verify intermediate states to main state pools after verify (one
+    //! batched launch per state kind).  No-op when spec-verify intermediate states are not enabled.
+    void scatterAcceptedLinearStates(rt::Tensor const& acceptLengths, cudaStream_t stream);
+
+    //! Scatter DDTree base-verify intermediate states to persistent state pools.
+    //! acceptedStateNodeIds shape: [activeBatchSize, maxAcceptLen], INT32 GPU.
+    //! Entries with -1 are ignored. The ids should name the tree node whose
+    //! intermediate state represents each accepted token.
+    //! acceptLengths shape: [activeBatchSize], INT32 GPU.
+    void scatterAcceptedTreeStates(
+        rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream);
 
 private:
     Config mConfig{};                                     //!< Cache configuration
     std::vector<rt::Tensor> mRecurrentStates;             //!< Per-layer recurrent state tensors on device
     std::vector<rt::Tensor> mConvStates;                  //!< Per-layer conv state tensors on device
-    std::vector<rt::Tensor> mIntermediateRecurrentStates; //!< Per-layer MTP intermediate recurrent states
-    std::vector<rt::Tensor> mIntermediateConvStates;      //!< Per-layer MTP intermediate conv states
+    std::vector<rt::Tensor> mIntermediateRecurrentStates; //!< Per-layer spec-verify intermediate recurrent states
+    std::vector<rt::Tensor> mIntermediateConvStates;      //!< Per-layer spec-verify intermediate conv states
 
-    //! Device-resident MtpLayerInfo[numRecurrentLayers] for batched MTP scatter,
-    //! built once at construction.  Empty when MTP intermediate states are unallocated.
+    //! Device-resident MtpLayerInfo[numRecurrentLayers] for batched spec-verify state scatter,
+    //! built once at construction.  Empty when spec-verify intermediate states are unallocated.
     rt::Tensor mDeviceMtpLayerInfos;
 };
 

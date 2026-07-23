@@ -4702,8 +4702,12 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
     ph_valid_lens = _fdl(cp.zeros((batch,), dtype=cp.int32), assumed_align=16)
     ph_valid_lens = ph_valid_lens.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
 
-    hw = cutlass.utils.HardwareInfo()
-    mac = hw.get_max_active_clusters(1)
+    sm_count = cp.cuda.runtime.getDeviceProperties(cp.cuda.runtime.getDevice())["multiProcessorCount"]
+    # The AOT wrapper launches with cluster_size=1, where max active clusters
+    # equals SM count. Avoid HardwareInfo here because SM110 builds can target
+    # sm_110a for the SSD kernel compile, which makes HardwareInfo's dummy
+    # occupancy kernel invalid on Thor.
+    mac = sm_count
 
     compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
     compiled = cute.compile(ssd_blackwell_aot,

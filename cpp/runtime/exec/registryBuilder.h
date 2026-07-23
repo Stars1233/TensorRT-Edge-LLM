@@ -67,5 +67,14 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle);
  */
 TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle);
 
+/*!
+ * @brief Build a TensorRegistry for a Gemma4 MTP assistant draft engine.
+ *
+ * Gemma4 assistant engines read the target/base KV cache through
+ * `past_key_values_*` inputs and must not expose `present_key_values_*`,
+ * `hidden_states_from_draft`, or draft-owned `kvcache_start_index`.
+ */
+TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle);
+
 } // namespace rt
 } // namespace trt_edgellm

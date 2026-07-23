@@ -31,6 +31,7 @@
 #   fmha     — enable only the Blackwell FMHA group
 #   ffpa     — enable only the Ampere FFPA FMHA group
 #   gdn      — enable only the GDN group
+#   f16_moe  — enable the target-specific homogeneous-FP16 MoE group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
 #
 # Usage:
@@ -44,6 +45,7 @@
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
 #   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
+#   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
 #   CUTE_DSL_GEMM_ENABLED  — set when any gemm variant is active
 # ---------------------------------------------------------------------------
@@ -236,6 +238,7 @@ function(cute_dsl_setup)
   endif()
 
   set(_static_lib "${_artifact_dir}/libcutedsl_${_arch}.a")
+  set(_runtime_lib "${_artifact_dir}/libcute_dsl_runtime.so")
   set(_inc_dir "${_artifact_dir}/include")
   set(_metadata "${_artifact_dir}/metadata.json")
 
@@ -420,6 +423,19 @@ function(cute_dsl_setup)
     endforeach()
   endif()
 
+  # The FP16 MoE runner links one exact-SM artifact. Parse the artifact SM for
+  # its compile-time exact-SM guard.
+  if("f16_moe" IN_LIST _active_groups)
+    if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_([0-9]+)$")
+      set(_meta_sm "${CMAKE_MATCH_1}")
+    else()
+      message(
+        FATAL_ERROR
+          "CuTe DSL f16_moe metadata gpu_arch must have form sm_<NN>, got '${_meta_gpu_arch}' in ${_metadata}."
+      )
+    endif()
+  endif()
+
   # Apply compile definitions and include path to all targets.
   foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
     target_include_directories(${_tgt} SYSTEM PRIVATE "${_inc_dir}")
@@ -453,6 +469,30 @@ function(cute_dsl_setup)
     )
   endif()
 
+  list(FIND _variants "ffpa_d512_causal_gqa16" _ffpa_gqa16_idx)
+  if(NOT ${_ffpa_gqa16_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA16_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: ffpa_d512_causal_gqa16 variant found - CUTE_DSL_FFPA_GQA16_ENABLED set"
+    )
+  endif()
+
+  # FFPA vision-block overlay variant.
+  list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
+  if(NOT ${_ffpa_visionblock_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_FFPA_VISIONBLOCK_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: ffpa_d512_causal_visionblock variant found — CUTE_DSL_FFPA_VISIONBLOCK_ENABLED set"
+    )
+  endif()
+
   # Check for Blackwell GDN variant specifically and set a clean define.
   list(FIND _variants "gdn_prefill_blackwell" _bw_idx)
   if(NOT ${_bw_idx} EQUAL -1)
@@ -483,6 +523,52 @@ function(cute_dsl_setup)
     message(
       STATUS
         "CuTe DSL: Blackwell SSD prefill variant(s) found — CUTE_DSL_SSD_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  # Per-family definitions for the FP16 MoE grouped-GEMM modules. Each
+  # target-specific artifact pack contains exactly one of these variants.
+  if("f16_moe" IN_LIST _active_groups)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_ARTIFACT_SM=${_meta_sm}")
+    endforeach()
+  endif()
+
+  list(FIND _variants "f16_moe_ampere_grouped_fp16" _f16_moe_ampere_idx)
+  if(NOT ${_f16_moe_ampere_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_F16_MOE_AMPERE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: f16_moe Ampere grouped GEMM found — CUTE_DSL_F16_MOE_AMPERE_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "f16_moe_blackwell_grouped_fp16" _f16_moe_blackwell_idx)
+  if(NOT ${_f16_moe_blackwell_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(${_tgt}
+                                 PRIVATE "CUTE_DSL_F16_MOE_BLACKWELL_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: f16_moe Blackwell grouped GEMM found — CUTE_DSL_F16_MOE_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "f16_moe_blackwell_geforce_grouped_fp16"
+       _f16_moe_blackwell_geforce_idx)
+  if(NOT ${_f16_moe_blackwell_geforce_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: f16_moe Blackwell GeForce grouped GEMM found — CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED set"
     )
   endif()
 
@@ -699,6 +785,22 @@ function(cute_dsl_setup)
     )
   endif()
 
+  # Blackwell DC small-tile FP16-in/FP32-out variant (tile=64x128, FP32 C
+  # epilogue) for the parakeet mel GEMM (mel power spans ~17 orders of magnitude
+  # and must not flush to zero in FP16 before the natural-log stats).
+  list(FIND _variants "gemm_blackwell_small_fp16in_fp32out"
+       _gemm_blackwell_small_fp16in_fp32out_idx)
+  if(NOT ${_gemm_blackwell_small_fp16in_fp32out_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_small_fp16in_fp32out — CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED set"
+    )
+  endif()
+
   # Blackwell DC 2-CTA variants (tile=256x256 cluster=(2,1) use_2cta=True) for
   # low-SM-count GPUs (Thor) at M >= 256.
   list(FIND _variants "gemm_blackwell_2cta_fp16" _gemm_blackwell_2cta_idx)
@@ -765,12 +867,64 @@ function(cute_dsl_setup)
     )
   endif()
 
-  # Warp-specialised NVFP4 GEMM variants. The umbrella
-  # CUTE_DSL_GEMM_NVFP4_ENABLED comes for free from the per-group loop (active
-  # when ``gemm_nvfp4`` is in metadata.json "groups"). Per-variant defines
-  # follow the CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED
-  # pattern so callers can compile the FP16-output and FP8-output paths
-  # independently.
+  # NVFP4 GEMM variants. The umbrella CUTE_DSL_GEMM_NVFP4_ENABLED comes from the
+  # active gemm_nvfp4 group; these per-variant defines let callers compile only
+  # the AOT entry points present in the selected artifact.
+  list(FIND _variants "gemm_blackwell_nvfp4_fp16_tn64"
+       _gemm_bw_nvfp4_fp16_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp16_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp16_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_fp16_tn128"
+       _gemm_bw_nvfp4_fp16_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp16_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp16_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN128_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_fp8_tn64"
+       _gemm_bw_nvfp4_fp8_tn64_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp8_tn64_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN64_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp8_tn64 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN64_ENABLED set"
+    )
+  endif()
+
+  list(FIND _variants "gemm_blackwell_nvfp4_fp8_tn128"
+       _gemm_bw_nvfp4_fp8_tn128_idx)
+  if(NOT ${_gemm_bw_nvfp4_fp8_tn128_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN128_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: gemm_blackwell_nvfp4_fp8_tn128 — CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN128_ENABLED set"
+    )
+  endif()
+
+  # Warp-specialised NVFP4 GEMM variants. Per-variant defines follow the
+  # CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<OUT_DTYPE>_TN<N>_ENABLED pattern so
+  # callers can compile the FP16-output and FP8-output paths independently.
   list(FIND _variants "gemm_blackwell_nvfp4_ws_fp16_tn64"
        _gemm_bw_nvfp4_ws_fp16_tn64_idx)
   if(NOT ${_gemm_bw_nvfp4_ws_fp16_tn64_idx} EQUAL -1)
@@ -852,6 +1006,15 @@ function(cute_dsl_setup)
     _gemm_blackwell_idx
     _gemm_blackwell_bias_silu_idx
     _gemm_blackwell_bias_idx
+    _gemm_bw_nvfp4_fp16_tn64_idx
+    _gemm_bw_nvfp4_fp16_tn128_idx
+    _gemm_bw_nvfp4_fp8_tn64_idx
+    _gemm_bw_nvfp4_fp8_tn128_idx
+    _gemm_bw_nvfp4_ws_fp16_tn64_idx
+    _gemm_bw_nvfp4_ws_fp16_tn128_idx
+    _gemm_bw_nvfp4_ws_fp16_tn256_idx
+    _gemm_bw_nvfp4_ws_fp8_tn64_idx
+    _gemm_bw_nvfp4_ws_fp8_tn128_idx
     _gemm_bw_geforce_idx
     _gemm_bw_geforce_small_idx
     _gemm_bw_geforce_bias_silu_idx
@@ -872,12 +1035,17 @@ function(cute_dsl_setup)
   # For STATIC libraries, use PUBLIC so executables that link edgellmCore /
   # edgellmKernels also inherit the CuTe DSL archive. Otherwise unresolved AOT
   # wrapper symbols only show up at the final executable link step.
+  set(_link_libs "${_static_lib}")
+  if(EXISTS "${_runtime_lib}")
+    list(APPEND _link_libs "${_runtime_lib}")
+    message(STATUS "CuTe DSL: runtime library found: ${_runtime_lib}")
+  endif()
   foreach(_tgt ${ARG_LINK_TARGETS})
     get_target_property(_tgt_type ${_tgt} TYPE)
     if(_tgt_type STREQUAL "STATIC_LIBRARY")
-      target_link_libraries(${_tgt} PUBLIC "${_static_lib}")
+      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
     else()
-      target_link_libraries(${_tgt} PRIVATE "${_static_lib}"
+      target_link_libraries(${_tgt} PRIVATE ${_link_libs}
                                             trt_edgellm_cutedsl_cudart_shim)
     endif()
     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")

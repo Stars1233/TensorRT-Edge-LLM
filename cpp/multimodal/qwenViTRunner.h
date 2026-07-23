@@ -19,12 +19,46 @@
 
 #include "multimodalRunner.h"
 #include <cuda_fp16.h>
+#include <nlohmann/json.hpp>
 #include <vector>
 
 namespace trt_edgellm
 {
 namespace rt
 {
+
+//! \brief What the LLM token stream & MRoPE see for one vision span (HF `get_rope_index` `llm_grid_*` view).
+struct LlmVisionBlock
+{
+    int64_t numTokens{0};     //!< LLM tokens this span inserts (llmGridT * llmGridH * llmGridW)
+    int64_t llmGridT{0};      //!< HF llm_grid_t (== vit.gridT)
+    int64_t llmGridH{0};      //!< HF llm_grid_h (vit.gridH / mergeSize)
+    int64_t llmGridW{0};      //!< HF llm_grid_w (vit.gridW / mergeSize)
+    int64_t secondPerGrid{1}; //!< HF second_per_grid_t = int(temporalPatchSize / fps)
+};
+
+//! \brief What the ViT engine sees for one vision span (HF `grid_thw`; cu_seqlens / rotary / fast-pos-emb / window).
+struct VitFrameGrid
+{
+    int64_t gridT{0};      //!< HF grid_t — frames (each emits one per-frame gridH*gridW cu_seqlens block)
+    int64_t gridH{0};      //!< HF grid_h — patch-grid height (resizedHeight / patchSize)
+    int64_t gridW{0};      //!< HF grid_w — patch-grid width  (resizedWidth  / patchSize)
+    int64_t patchStart{0}; //!< Absolute ViT patch offset where this span begins (rotary / fast-pos base)
+
+    //! \brief Value equality: this is exactly the ViT-input cache key (cu_seqlens / rotary / extra inputs).
+    bool operator==(VitFrameGrid const& o) const
+    {
+        return gridT == o.gridT && gridH == o.gridH && gridW == o.gridW && patchStart == o.patchStart;
+    }
+};
+
+//! \brief A VisionSpan is one block of vision tokens — an image, or one video frame-group from a single
+//!        <|vision_start|> — held in both views: the LLM/MRoPE token view (llm) and the ViT patch view (vit).
+struct VisionSpan
+{
+    LlmVisionBlock llm{};
+    VitFrameGrid vit{};
+};
 
 //! \brief Configuration for Qwen-VL vision encoder
 struct QwenViTConfig
@@ -44,9 +78,6 @@ struct QwenViTConfig
     int64_t patchSize{0};              //!< Patch size in pixels
     int64_t temporalPatchSize{0};      //!< Temporal patch size for video
     int64_t mergeSize{0};              //!< Merge size for patches
-    int64_t windowSize{0};             //!< Window attention size used by Qwen2.5-VL
-    int64_t numGridPerSide{0};         //!< Number of grid per side for fast position embedding used by Qwen3-VL
-    int64_t numDeepstackFeatures{0};   //!< Number of deepstack features for Qwen3-VL
     int32_t mropeSectionH{0};          //!< MRoPE section: number of frequency pairs for height
     int32_t mropeSectionW{0};          //!< MRoPE section: number of frequency pairs for width
     bool mropeInterleaved{false};      //!< Whether MRoPE uses interleaved layout (from config)
@@ -75,6 +106,10 @@ public:
         std::string const& engineDir, int32_t llmMaxBatchSize, int32_t llmMaxSequenceLength, cudaStream_t stream);
 
     ~QwenViTRunner() noexcept = default;
+
+    //! \brief Load config + allocate buffers. Called by the factory AFTER construction (not from the constructor) so
+    //!        the per-model virtual hooks dispatch to the subclass. \throws std::runtime_error on failure.
+    void initialize(cudaStream_t stream);
 
     //! \brief Preprocess multimodal input including images and text
     //! \param[in] request LLM generation request containing images and text
@@ -125,79 +160,95 @@ public:
         return mMropeRopeDeltasPerBatch;
     }
 
-private:
+protected:
+    //! \name Per-model strategy hooks. Base implementations = Qwen2-VL (the simplest model: image-only, 2D resize,
+    //!       rotary+cu_seqlens only, incrementing pad, spatial-only MRoPE advance). Subclasses override what they add.
+    //! @{
+
+    //! \brief Read model-specific config fields into mConfig.
+    //! \return false on missing required fields.
+    virtual bool validateExtraConfig(nlohmann::json const& jsonConfig);
+
+    //! \brief Allocate model-specific I/O buffers beyond the shared ones.
+    //! \return false on failure.
+    virtual bool allocateExtraBuffers(int64_t maxImageTokens);
+
+    //! \brief Build the model-specific input tensors.
+    virtual void buildExtraInputs(
+        std::vector<VisionSpan> const& spans, int64_t totalSeqLength, int64_t totalImageTokens, cudaStream_t stream);
+
+    //! \brief Bind the model-specific input shapes before enqueue.
+    //! \return false on failure.
+    virtual bool bindExtraInputShapes();
+
+    //! \brief Append this image buffer's vision spans. \see VisionSpan.
+    //! \return {totalSeqLen, totalGridT} of the appended spans (Σ gridT*gridH*gridW, Σ gridT) for formatPatch.
+    virtual std::tuple<int64_t, int64_t> computeVisionSpans(
+        rt::imageUtils::ImageData const& image, int64_t patchBase, std::vector<VisionSpan>& spans);
+
+    //! \brief Fill MRoPE position ids — one standalone implementation per model, mirroring each HF get_rope_index.
+    virtual void getMRopePositionIds(
+        std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept;
+
     //! \brief Calculate resized image dimensions based on dynamic resolution constraints
+    //! \param[in] numFrames Source frame count (1 for still image, >1 for video; used only by the 3D override)
     //! \param[in] height Input image height
     //! \param[in] width Input image width
     //! \param[in] maxRatio Maximum aspect ratio (default: 200)
     //! \return Tuple of (resized_height, resized_width)
     //! \throws std::runtime_error if aspect ratio is invalid
-    std::tuple<int64_t, int64_t> getResizedImageSize(
-        int64_t const height, int64_t const width, int64_t const maxRatio = 200);
+    virtual std::tuple<int64_t, int64_t> getResizedImageSize(
+        int64_t numFrames, int64_t height, int64_t width, int64_t maxRatio = 200);
 
-    //! \brief Preprocess text portion of the request
+    //! \brief Preprocess text: expand each vision pad using the spans (in order).
     //! \param[in] request LLM generation request
     //! \param[out] batchInputIds Batch of input token IDs
-    //! \param[in] numImages Number of images per request
-    //! \param[in] imageTokenLengths Token lengths for each image
-    //! \param[in] tokenizer Tokenizer for text processing
-    //! \throws std::runtime_error if requests size incorrect
-    void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
-        std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
+    //! \param[in] spans Vision spans (flattened, global order) \param[in] tokenizer Tokenizer
+    virtual void textPreprocess(rt::LLMGenerationRequest const& request,
+        std::vector<std::vector<int32_t>>& batchInputIds, std::vector<VisionSpan> const& spans,
         trt_edgellm::tokenizer::Tokenizer const* tokenizer);
+    //! @}
 
-    //! \brief Compute window indices for window attention (Qwen2.5-VL)
-    //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
-    //! \param[in] curHW Current height * width
-    //! \param[in] stream CUDA stream for execution
-    //! \throws std::runtime_error if image dimensions invalid
-    void getWindowIndex(
-        std::vector<std::vector<int64_t>> const& imageGridTHWs, int64_t const curHW, cudaStream_t stream);
-
-    //! \brief Format and process a single image patch
-    //! \param[in] image Input image data
-    //! \param[out] imageGridTHWs Image grid dimensions for each image
-    //! \param[out] imageTokenLengths Token lengths for each image
-    //! \param[in,out] cuSeqlensData Pointer to cumulative sequence lengths data
-    //! \param[in,out] cuSeqlensSize Reference to current size of cumulative sequence lengths
-    //! \param[in,out] maxSeqLen Reference to current maximum sequence length in this request
+    //! \brief Format and process a single image buffer (or video frame stack): append its spans and
+    //!        copy/normalize/transpose its (padded) frames into the ViT input scratch.
+    //! \param[in] image Input media data (image with frames==1 or video with frames>1)
+    //! \param[in,out] spans Flat global-order span list to append this buffer's spans to
+    //! \param[in,out] patchBase Running ViT patch offset; read as this buffer's base, advanced by its patch count
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
-    //! range
+    //! range, or the padded frame stack overflows the device scratch buffer
     //! \throws std::runtime_error if a CUDA error occurs
-    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<std::vector<int64_t>>& imageGridTHWs,
-        std::vector<int64_t>& imageTokenLengths, int32_t* cuSeqlensData, int64_t& cuSeqlensSize, int64_t& maxSeqLen,
+    void formatPatch(rt::imageUtils::ImageData const& image, std::vector<VisionSpan>& spans, int64_t& patchBase,
         cudaStream_t stream);
 
-    //! \brief Get multi-dimensional RoPE position indices
-    //! \param[in] batchInputIds Batch of input token IDs
-    //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
-    void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
-        std::vector<std::vector<int64_t>> const& imageGridTHWs) noexcept;
+    //! \brief Build per-frame cumulative sequence lengths + max per-frame seq len for the whole batch.
+    //! \param[in] spans Finished flat global-order span list
+    //! \param[out] cuSeqlensData Host cu_seqlens buffer
+    //! \param[out] cuSeqlensSize Number of cu_seqlens entries written
+    //! \param[out] maxSeqLen Max per-frame seq length
+    void buildCuSeqlens(
+        std::vector<VisionSpan> const& spans, int32_t* cuSeqlensData, int64_t& cuSeqlensSize, int64_t& maxSeqLen) const;
 
     //! \brief Generate multi-dimensional RoPE parameters
     //! \param[in] batchInputIds Batch of input token IDs
-    //! \param[in] imageGridTHWs Image grid dimensions (Temporal, Height, Width)
+    //! \param[in] spans Vision spans (flattened, global order)
     //! \param[in,out] ropeRotaryCosSinDevice RoPE rotary position encoding cache
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if shape validation fails, or a CUDA operation fails
     void generateMropeParams(std::vector<std::vector<int32_t>> const& batchInputIds,
-        std::vector<std::vector<int64_t>> const& imageGridTHWs, rt::Tensor& ropeRotaryCosSinDevice,
-        cudaStream_t stream);
+        std::vector<VisionSpan> const& spans, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream);
 
-    //! \brief Preprocess all images in the request
+    //! \brief Preprocess all images in the request (populates spans + ViT-side tensors)
     //! \param[in] request LLM generation request containing images
-    //! \param[out] imageGridTHWs Image grid dimensions for each image
-    //! \param[out] imageTokenLengths Token lengths for each image
-    //! \param[out] numImages Number of images per request
+    //! \param[out] spans Vision spans (flattened, global order)
     //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if aspect ratio is invalid
     //! \throws std::runtime_error if image dimensions are incompatible with patch size, or sequence length is out of
     //! range
     //! \throws std::runtime_error if a CUDA error occurs
-    void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int64_t>>& imageGridTHWs,
-        std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
+    void imagePreprocess(
+        rt::LLMGenerationRequest const& request, std::vector<VisionSpan>& spans, bool doResize, cudaStream_t stream);
 
     QwenViTConfig mConfig{};             //!< Qwen-VL configuration
     rt::Tensor mVitInput{};              //!< Vision encoder input tensor
@@ -205,6 +256,7 @@ private:
     rt::Tensor mCuSeqlens{};             //!< Cumulative sequence lengths tensor
     rt::Tensor mCuSeqlensHost{};         //!< Cumulative sequence lengths host tensor
     rt::Tensor mKvLengths{};             //!< KV lengths for TRT-native attention (separate copy of cu_seqlens)
+    rt::Tensor mKvLengthsWindow{};       //!< KV lengths for Qwen2.5-VL window attention (TRT-native)
     rt::Tensor mMaxSeqLenCarrier{};      //!< Shape-only input carrying max sequence length for FMHA launch
     rt::Tensor mImageMean{};             //!< Image mean tensor
     rt::Tensor mImageStd{};              //!< Image standard deviation tensor
@@ -213,25 +265,17 @@ private:
     rt::imageUtils::ImageData mResizedImageHost{}; //!< Pre-allocated buffer for image resizing
     rt::Tensor mMropePositionIdsHost{};            //!< MRoPE position IDs host tensor
     rt::Tensor mMropePositionIdsDevice{};          //!< MRoPE position IDs device tensor
-    // Qwen2.5-VL
-    rt::Tensor mCuWindowSeqlens{};          //!< Cumulative window sequence lengths device tensor
-    rt::Tensor mCuWindowSeqlensHost{};      //!< Cumulative window sequence lengths host tensor
-    rt::Tensor mWindowIndexHost{};          //!< Window index host tensor for window attention
-    rt::Tensor mWindowIndexDevice{};        //!< Window index device tensor for window attention
-    rt::Tensor mReverseWindowIndexHost{};   //!< Reverse window index host tensor
-    rt::Tensor mReverseWindowIndexDevice{}; //!< Reverse window index device tensor
-    // Qwen3-VL
-    rt::Tensor mFastPosEmbIdx{};                  //!< Fast position embeddings index tensor
-    rt::Tensor mFastPosEmbWeight{};               //!< Fast position embeddings weight tensor
-    std::vector<rt::Tensor> mDeepstackFeatures{}; //!< Deepstack features tensors
+    // Model-specific ViT-input tensors live in the per-model subclasses.
 
+    std::string mEngineDir;           //!< Visual engine dir (kept for the deferred initialize() config load)
     int32_t mLLMMaxBatchSize{0};      //!< Maximum batch size from LLM engine
     int32_t mLLMMaxSequenceLength{0}; //!< Maximum sequence length from LLM engine
 
     bool mUseTrtNativeVitAttn{false}; //!< Use TRT IAttentionV2 (from config); requires kv_lengths binding in engine
+    bool mHasKvLengthsWindow{false};  //!< Whether the visual engine has kv_lengths_window binding
     bool mHasMaxSeqLenCarrier{false}; //!< Whether the visual engine has the max_seqlen_carrier binding
 
-    std::vector<std::vector<int64_t>> mLastImageGridTHWs; //!< Used to determine whether RoPE can be reused.
+    std::vector<VisionSpan> mLastSpans; //!< Last round's spans; ViT-input tensors are reused when vit geometry matches.
     std::vector<int64_t> mMropeRopeDeltasPerBatch{}; //!< Used by downstream runners like Alpamayo1ActionRunner to set
                                                      //!< base MRoPE positions so the action expert's RoPE continues
                                                      //!< coherently after the VLM sequence.

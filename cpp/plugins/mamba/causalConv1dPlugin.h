@@ -27,6 +27,12 @@ namespace trt_edgellm
 namespace plugins
 {
 
+//! \brief TensorRT plugin for depthwise causal conv1d with optional speculative-verify state checkpoints.
+//!
+//! Normal decode updates one persistent rolling conv state. Normal prefill consumes a linear sequence. For MTP/DDTree
+//! verification, the plugin emits intermediate conv states so runtime can commit only the accepted speculative path.
+//! DDTree additionally consumes tree parent/depth metadata because adjacent flattened verify nodes are not necessarily
+//! parent and child in the proposal tree.
 class CausalConv1dPlugin : public nvinfer1::IPluginV3,
                            public nvinfer1::IPluginV3OneCore,
                            public nvinfer1::IPluginV3OneBuildV2,
@@ -34,7 +40,7 @@ class CausalConv1dPlugin : public nvinfer1::IPluginV3,
 {
 public:
     CausalConv1dPlugin(std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups,
-        bool useMTP = false);
+        bool useSpecVerifyState = false, bool useDDTree = false);
     CausalConv1dPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     CausalConv1dPlugin() = delete;
@@ -82,8 +88,10 @@ private:
     int32_t mPadding{0};
     int32_t mDilation{1};
     int32_t mGroups{0};
-    bool mUseMTP{false}; //!< Enable MTP output (intermediate_conv_states as 3rd output)
-    int32_t mUseMTPField{0};
+    bool mUseSpecVerifyState{false}; //!< Enable spec-verify intermediate_conv_states output
+    bool mUseDDTree{false};          //!< Enable DDTree parent/depth metadata inputs for tree-state execution.
+    int32_t mUseSpecVerifyStateField{0};
+    int32_t mUseDDTreeField{0};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

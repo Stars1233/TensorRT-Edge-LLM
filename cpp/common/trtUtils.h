@@ -22,9 +22,12 @@
 #include <NvInfer.h>
 #include <NvInferVersion.h>
 #include <dlfcn.h>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 namespace trt_edgellm
 {
 
@@ -68,7 +71,9 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
         pluginPath = "build/libNvInfer_edgellm_plugin.so";
     }
 
-    auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY));
+    // RTLD_NODELETE: TensorRT engines keep using plugin code after dlclose, so the
+    // library must stay mapped for the process lifetime to avoid teardown crashes.
+    auto handle = std::unique_ptr<void, DlDeleter>(dlopen(pluginPath, RTLD_LAZY | RTLD_NODELETE));
     if (!handle)
     {
         LOG_ERROR("Cannot open plugin library: %s", dlerror());
@@ -91,6 +96,72 @@ inline std::unique_ptr<void, DlDeleter> loadEdgellmPluginLib(void) noexcept
 std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
     nvinfer1::IExecutionContext* context, cudaStream_t stream);
 
+//! RAII owner for the non-blocking auxiliary streams passed to
+//! IExecutionContext::setAuxStreams(). Declare it before the context member so the
+//! context is destroyed first (the streams must outlive it).
+class AuxStreamSet
+{
+public:
+    AuxStreamSet() = default;
+    ~AuxStreamSet() noexcept
+    {
+        destroy();
+    }
+    AuxStreamSet(AuxStreamSet const&) = delete;
+    AuxStreamSet& operator=(AuxStreamSet const&) = delete;
+    AuxStreamSet(AuxStreamSet&& other) noexcept
+        : mStreams(std::move(other.mStreams))
+    {
+        other.mStreams.clear();
+    }
+    AuxStreamSet& operator=(AuxStreamSet&& other) noexcept
+    {
+        if (this != &other)
+        {
+            destroy();
+            mStreams = std::move(other.mStreams);
+            other.mStreams.clear();
+        }
+        return *this;
+    }
+
+    void add(cudaStream_t stream)
+    {
+        mStreams.push_back(stream);
+    }
+
+    //! Number of streams currently held.
+    size_t size() const noexcept
+    {
+        return mStreams.size();
+    }
+
+    //! Pointer to the contiguous stream storage, for passing to setAuxStreams().
+    //! Only valid until the next add(); read it after all add() calls.
+    cudaStream_t* data() noexcept
+    {
+        return mStreams.data();
+    }
+
+private:
+    void destroy() noexcept
+    {
+        for (cudaStream_t stream : mStreams)
+        {
+            cudaStreamDestroy(stream);
+        }
+        mStreams.clear();
+    }
+
+    std::vector<cudaStream_t> mStreams;
+};
+
+//! Create non-blocking auxiliary streams for the context, register them via
+//! IExecutionContext::setAuxStreams(), and append them to @p out (which owns them).
+//! No-op when the engine reports zero aux streams.
+void setNonBlockingAuxStreams(
+    nvinfer1::IExecutionContext* context, nvinfer1::ICudaEngine const* engine, AuxStreamSet& out);
+
 //! Convert TensorRT dimensions to a string representation.
 std::string dimsToString(nvinfer1::Dims const& dims) noexcept;
 
@@ -105,6 +176,10 @@ bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tenso
 
 //! Print the engine information for a specific profile index.
 std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profileIndex) noexcept;
+
+//! Deserialize a TensorRT engine plan from disk without mapping the full plan into process memory.
+std::unique_ptr<nvinfer1::ICudaEngine> deserializeCudaEngineFromFile(
+    nvinfer1::IRuntime& runtime, std::filesystem::path const& enginePath);
 
 //! Short, human-readable name for a TensorRT data type (e.g. "FLOAT16").
 //! Used in logs and error messages; not intended for serialization.

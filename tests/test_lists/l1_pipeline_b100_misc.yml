@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Pipeline Tests - B100 VLMEvalKit (Nemotron Omni + Cosmos)
+# Focus: Full MMMU benchmark via VLMEvalKit on Nemotron-Omni + Cosmos-Reason2-8B.
+
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  # Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 - nvfp4 full MMMU via VLMEvalKit
+  - tests/defs/test_omni_pipeline.py::TestOmniPipeline::test_engine_build[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl30000-mxbs1-mxil21000-mnit128-mxit19600-mxpiit3920-mnts10-mxts6000]
+  - tests/defs/test_vlm_vlmevalkit.py::TestVLMVLMEvalKit::test_vlmevalkit_mmmu[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4-mxsl30000-mxbs1-mxil21000-mnit128-mxit19600-mxpiit3920-mnts10-mxts6000-mmmu_vlmevalkit-bs1]
+
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Cosmos-Reason2-8B-nvfp4-mxsl30000-mxbs1-mxil21000-mnit128-mxit19600-mxpiit3920]
+  - tests/defs/test_vlm_vlmevalkit.py::TestVLMVLMEvalKit::test_vlmevalkit_mmmu[Cosmos-Reason2-8B-nvfp4-mxsl30000-mxbs1-mxil21000-mnit128-mxit19600-mxpiit3920-mmmu_vlmevalkit-bs1]

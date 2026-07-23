@@ -39,6 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors_file
 
+from ... import config as config_module
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["Qwen3TTSCode2WavDecoder", "export_qwen3_tts_code2wav"]
@@ -67,7 +69,21 @@ class Qwen3TTSCode2WavConfig:
     decoder_dim: int = 1536
     attention_dropout: float = 0.0
     head_dim: int | None = None
+    attention_scaling: float | None = None
     codebook_dim: int = 512
+
+    def __post_init__(self) -> None:
+        """Resolve and validate the directly supplied attention scale.
+
+        Raises:
+            ValueError: If the head dimension or explicit scale is invalid.
+        """
+        scale_config = ({} if self.attention_scaling is None else {
+            "attention_scaling": self.attention_scaling
+        })
+        self.attention_scaling = config_module._get_attention_scaling(
+            scale_config, self.attention_head_dim,
+            1.0 / (float(self.attention_head_dim)**0.5))
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "Qwen3TTSCode2WavConfig":
@@ -77,7 +93,11 @@ class Qwen3TTSCode2WavConfig:
             kwargs["upsample_rates"] = tuple(kwargs["upsample_rates"])
         if "upsampling_ratios" in kwargs:
             kwargs["upsampling_ratios"] = tuple(kwargs["upsampling_ratios"])
-        return cls(**kwargs)
+        resolved = cls(**kwargs)
+        resolved.attention_scaling = config_module._get_attention_scaling(
+            config, resolved.attention_head_dim,
+            1.0 / (float(resolved.attention_head_dim)**0.5))
+        return resolved
 
     @property
     def layer_types(self) -> list[str]:
@@ -239,7 +259,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = (config.num_attention_heads //
                                      config.num_key_value_heads)
-        self.scaling = self.head_dim**-0.5
+        self.attention_scale = float(config.attention_scaling)
         self.q_proj = nn.Linear(config.hidden_size,
                                 config.num_attention_heads * self.head_dim,
                                 bias=config.attention_bias)
@@ -276,7 +296,10 @@ class Attention(nn.Module):
         key = _repeat_kv(key, self.num_key_value_groups)
         value = _repeat_kv(value, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scaling
+        attn_weights = torch.matmul(query, key.transpose(2, 3))
+        if self.attention_scale != 1.0:
+            attn_weights = attn_weights * attn_weights.new_tensor(
+                self.attention_scale)
         attn_weights = attn_weights + attention_mask[:, :, :, :key.shape[-2]]
         attn_weights = F.softmax(attn_weights, dim=-1,
                                  dtype=torch.float32).to(query.dtype)

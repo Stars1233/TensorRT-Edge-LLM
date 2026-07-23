@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "common/tensor.h"
 #include "kernels/contextAttentionKernels/utilKernels.h"
+#include "testUtils.h"
 #include <gtest/gtest.h>
 
 using namespace trt_edgellm;
@@ -162,4 +163,42 @@ TEST(UtilKernelTest, seqLens_chunkedPrefillVaryingLengths)
         .expectedKvCacheEndIdxs = {150, 50},
         .expectedPaddedCuKVSeqLens = {0, 150, 200},
     });
+}
+
+// launchBuildVisionBlockRanges: image-run intervals expand per position; text and
+// padding rows get the -1/-1 sentinel (empty interval).
+TEST(UtilKernelTest, visionBlockRanges_runsSentinelsAndPadding)
+{
+    int32_t constexpr batchSize = 2;
+    int32_t constexpr seqLen = 12;
+    // Batch 0: block 0 = [1, 5], block 1 = [7, 9]; full context.
+    // Batch 1: block 0 = [0, 1]; block 1 = [4, 8] but contextLength = 7 clips
+    //          the run to [4, 6]; positions >= 7 are padding.
+    std::vector<int32_t> const blockIds{-1, 0, 0, 0, 0, 0, -1, 1, 1, 1, -1, -1, //
+        0, 0, -1, -1, 1, 1, 1, 1, 1, -1, -1, -1};
+    std::vector<int32_t> const contextLengths{seqLen, 7};
+    std::vector<int32_t> const expectedBegin{-1, 1, 1, 1, 1, 1, -1, 7, 7, 7, -1, -1, //
+        0, 0, -1, -1, 4, 4, 4, -1, -1, -1, -1, -1};
+    std::vector<int32_t> const expectedEnd{-1, 5, 5, 5, 5, 5, -1, 9, 9, 9, -1, -1, //
+        1, 1, -1, -1, 6, 6, 6, -1, -1, -1, -1, -1};
+
+    rt::Tensor idsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor lengthsTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor beginTensor({batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor endTensor({batchSize, seqLen}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(idsTensor, blockIds);
+    copyHostToDevice(lengthsTensor, contextLengths);
+
+    cudaStream_t stream{nullptr};
+    kernel::launchBuildVisionBlockRanges(idsTensor.dataPointer<int32_t>(), lengthsTensor.dataPointer<int32_t>(),
+        beginTensor.dataPointer<int32_t>(), endTensor.dataPointer<int32_t>(), batchSize, seqLen, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto const begin = copyDeviceToHost<int32_t>(beginTensor);
+    auto const end = copyDeviceToHost<int32_t>(endTensor);
+    for (size_t i = 0; i < expectedBegin.size(); ++i)
+    {
+        EXPECT_EQ(begin[i], expectedBegin[i]) << "blockBegin mismatch at flat index " << i;
+        EXPECT_EQ(end[i], expectedEnd[i]) << "blockEnd mismatch at flat index " << i;
+    }
 }

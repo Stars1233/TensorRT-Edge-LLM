@@ -31,6 +31,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["Code2WavModel", "build_code2wav"]
@@ -227,12 +229,13 @@ class Attention(nn.Module):
     """Multi-head attention with ONNX-friendly sliding window mask."""
 
     def __init__(self, hidden_size: int, num_heads: int, head_dim: int,
-                 sliding_window: int, rope_theta: float) -> None:
+                 sliding_window: int, rope_theta: float,
+                 attention_scale: float) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window
-        self.scale = head_dim**-0.5
+        self.attention_scale = attention_scale
 
         self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
@@ -278,9 +281,14 @@ class Attention(nn.Module):
                          dtype=dtype,
                          device=hidden_states.device))
 
-        # Attention (scale as tensor to avoid FP32 upcast in ONNX graph)
-        scale = torch.tensor(self.scale, dtype=q.dtype, device=q.device)
-        attn = (q @ k.transpose(-2, -1)) * scale + mask
+        attn = q @ k.transpose(-2, -1)
+        if self.attention_scale != 1.0:
+            # Keep the scale in the model dtype to avoid an FP32 upcast.
+            attention_scale = torch.tensor(self.attention_scale,
+                                           dtype=q.dtype,
+                                           device=q.device)
+            attn = attn * attention_scale
+        attn = attn + mask
         attn = F.softmax(attn, dim=-1)
         out = (attn @ v).transpose(1, 2).reshape(B, L, -1)
         return self.o_proj(out)
@@ -291,11 +299,11 @@ class TransformerLayer(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, head_dim: int,
                  intermediate_size: int, sliding_window: int,
                  rope_theta: float, rms_norm_eps: float,
-                 layer_scale_init: float) -> None:
+                 layer_scale_init: float, attention_scale: float) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(hidden_size, rms_norm_eps)
         self.self_attn = Attention(hidden_size, num_heads, head_dim,
-                                   sliding_window, rope_theta)
+                                   sliding_window, rope_theta, attention_scale)
         self.self_attn_layer_scale = LayerScale(hidden_size, layer_scale_init)
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
         self.mlp_gate_proj = nn.Linear(hidden_size,
@@ -361,11 +369,13 @@ class Code2WavModel(nn.Module):
         rope_theta = config.get("rope_theta", 10000.0)
         rms_norm_eps = config.get("rms_norm_eps", 1e-5)
         layer_scale_init = config.get("layer_scale_initial_scale", 0.01)
+        attention_scale = config_module._get_attention_scaling(
+            config, head_dim, 1.0 / (float(head_dim)**0.5))
 
         self.layers = nn.ModuleList([
             TransformerLayer(hidden_size, num_heads, head_dim,
                              intermediate_size, sliding_window, rope_theta,
-                             rms_norm_eps, layer_scale_init)
+                             rms_norm_eps, layer_scale_init, attention_scale)
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(hidden_size, rms_norm_eps)

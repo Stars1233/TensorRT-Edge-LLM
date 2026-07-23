@@ -40,7 +40,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from .engine import SamplingParams, finish_reason_name
+from .engine import (SamplingParams, _normalize_logit_bias,
+                     _validate_logit_bias_spec_decode, finish_reason_name)
 from .tool_calling import (ToolConfig, parse_assistant_output,
                            validate_tool_request)
 
@@ -114,6 +115,36 @@ def _create_app(llm_instance):
         disable_spec_decode = body.get("disable_spec_decode", False)
         tools = body.get("tools")
         tool_choice = body.get("tool_choice")
+        try:
+            logit_bias = _normalize_logit_bias(body.get("logit_bias"))
+            _validate_logit_bias_spec_decode(
+                logit_bias,
+                disable_spec_decode=disable_spec_decode,
+                has_draft_model=llm_instance.has_draft_model,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        # OpenAI logprobs: "logprobs": bool, "top_logprobs": int (0-50, mirrors
+        # kMaxLogprobsK). "logprobs": true alone returns the chosen token's
+        # logprob per step (num_logprobs=1); top_logprobs raises K. Absent or
+        # false disables regardless of top_logprobs.
+        req_logprobs_flag = body.get("logprobs", False)
+        req_top_logprobs = body.get("top_logprobs")
+        num_logprobs = 0
+        if req_logprobs_flag:
+            if req_top_logprobs is None:
+                num_logprobs = 1
+            elif (isinstance(req_top_logprobs, bool)
+                  or not isinstance(req_top_logprobs, int)
+                  or not 0 <= req_top_logprobs <= 50):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "'top_logprobs' must be an integer in [0, 50]"
+                    })
+            else:
+                num_logprobs = max(1, req_top_logprobs)
 
         # OpenAI-compatible "stop": null | str | list[str]. Reject other types with 400.
         stop_raw = body.get("stop")
@@ -149,7 +180,13 @@ def _create_app(llm_instance):
             enable_thinking=enable_thinking,
             disable_spec_decode=disable_spec_decode,
             stop=stop,
+            logit_bias=logit_bias,
+            num_logprobs=num_logprobs,
         )
+
+        # OpenAI: "logprobs": true without "top_logprobs" returns the chosen
+        # token's logprob with an empty top_logprobs list.
+        include_top_logprobs = req_top_logprobs is not None
 
         if stream:
             return StreamingResponse(
@@ -160,6 +197,7 @@ def _create_app(llm_instance):
                     response_id,
                     enable_thinking,
                     tool_config=tool_config,
+                    include_top_logprobs=include_top_logprobs,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -205,6 +243,9 @@ def _create_app(llm_instance):
         # ``completion_tokens``. SDKs that validate the schema (existence of
         # the three fields) succeed; consumers that compute cost from
         # ``prompt_tokens`` will see 0 until the runtime is extended.
+        logprobs_obj = _format_logprobs(
+            response,
+            include_top=include_top_logprobs) if num_logprobs > 0 else None
         return {
             "id":
             response_id,
@@ -217,6 +258,7 @@ def _create_app(llm_instance):
             "choices": [{
                 "index": 0,
                 "message": message_body,
+                "logprobs": logprobs_obj,
                 "finish_reason": finish_reason,
             }],
             "usage": {
@@ -291,7 +333,8 @@ def _generate_stream_sse(llm_instance,
                          params,
                          response_id,
                          enable_thinking,
-                         tool_config: Optional[ToolConfig] = None):
+                         tool_config: Optional[ToolConfig] = None,
+                         include_top_logprobs: bool = True):
     """Yield real SSE chunks via StreamChannel streaming."""
     yield _sse_chunk(response_id, {"role": "assistant"})
 
@@ -311,9 +354,40 @@ def _generate_stream_sse(llm_instance,
                 params,
                 tools=stream_tools,
                 tool_choice=stream_tool_choice):
+            lp_obj: Optional[Dict[str, Any]] = None
+            if delta.logprobs:
+                # OpenAI streaming schema: choices[0].logprobs = {"content": [...]},
+                # one entry per generated token, mirroring the non-streaming _format_logprobs.
+                content = []
+                for token_id, step in zip(delta.token_ids, delta.logprobs):
+                    top = [{
+                        "token": e.token,
+                        "token_id": e.token_id,
+                        "bytes": e.bytes,
+                        "logprob": float(e.logprob),
+                    } for e in step]
+                    chosen = next(
+                        (t for t in top if t["token_id"] == token_id), None)
+                    content.append({
+                        "token":
+                        chosen["token"] if chosen else "",
+                        "token_id":
+                        token_id,
+                        "bytes":
+                        chosen["bytes"] if chosen else [],
+                        "logprob":
+                        chosen["logprob"] if chosen else None,
+                        "top_logprobs":
+                        top if include_top_logprobs else [],
+                    })
+                lp_obj = {"content": content}
             if delta.text:
                 for field, text in sm.feed(delta.text):
-                    yield _sse_chunk(response_id, {field: text})
+                    yield _sse_chunk(response_id, {field: text},
+                                     logprobs=lp_obj)
+                    lp_obj = None  # logprobs only on the first chunk per delta
+            if lp_obj is not None:
+                yield _sse_chunk(response_id, {}, logprobs=lp_obj)
             if delta.finished:
                 finish_reason = delta.finish_reason or "stop"
     except Exception:
@@ -385,6 +459,57 @@ def _generate_tool_stream_sse(llm_instance, messages, params, response_id,
     yield "data: [DONE]\n\n"
 
 
+def _entry_to_openai(entry) -> Dict[str, Any]:
+    """Convert one native (pybind) LogprobEntry into an OpenAI-style dict.
+
+    ``entry.piece`` is raw token bytes: ``token`` is the UTF-8-sanitized string
+    (invalid/partial bytes -> U+FFFD) and ``bytes`` carries the raw bytes so
+    clients can losslessly reconstruct tokens split across multi-byte chars.
+    """
+    piece = entry.piece  # bytes
+    return {
+        "token": piece.decode("utf-8", "replace"),
+        "token_id": entry.token_id,
+        "bytes": list(piece),
+        "logprob": float(entry.logprob),
+    }
+
+
+def _format_logprobs(response,
+                     include_top: bool = True) -> Optional[Dict[str, Any]]:
+    """Format C++ logprobs into an OpenAI-compatible logprobs object, or None.
+
+    Each entry carries ``token`` (decoded string), ``bytes`` (raw token bytes),
+    ``token_id`` (kept as a superset for internal callers) and ``logprob``.
+    ``include_top=False`` emits ``top_logprobs: []`` per entry — OpenAI's shape
+    for requests with ``logprobs: true`` but no ``top_logprobs``.
+
+    Note: with non-greedy sampling the sampled token may not appear in the
+    top-K candidates (logprobs are computed at temperature=1.0). In that case
+    ``token``/``bytes`` are empty and ``logprob`` is ``null`` for the chosen
+    token; ``top_logprobs`` still lists the candidates. Greedy is unaffected.
+    """
+    if not response.logprobs:
+        return None
+    output_ids = response.output_ids[0] if response.output_ids else []
+    step_logprobs = response.logprobs[0]
+    if not step_logprobs:
+        return None
+
+    content = []
+    for token_id, step_topk in zip(output_ids, step_logprobs):
+        top = [_entry_to_openai(e) for e in step_topk]
+        chosen = next((d for d in top if d["token_id"] == token_id), None)
+        content.append({
+            "token": chosen["token"] if chosen else "",
+            "token_id": token_id,
+            "bytes": chosen["bytes"] if chosen else [],
+            "logprob": chosen["logprob"] if chosen else None,
+            "top_logprobs": top if include_top else [],
+        })
+    return {"content": content}
+
+
 def _build_message_body(output_text: str, tool_config: ToolConfig,
                         model_dir: str) -> Tuple[Dict[str, Any], bool]:
     if not tool_config.parse_output:
@@ -410,10 +535,13 @@ def _build_message_body(output_text: str, tool_config: ToolConfig,
 
 def _sse_chunk(response_id: str,
                delta: dict,
-               finish_reason: Optional[str] = None):
+               finish_reason: Optional[str] = None,
+               logprobs: Optional[Dict[str, Any]] = None):
     choice: Dict[str, Any] = {"delta": delta, "index": 0}
     if finish_reason:
         choice["finish_reason"] = finish_reason
+    if logprobs:
+        choice["logprobs"] = logprobs
     payload = {"id": response_id, "choices": [choice]}
     return f"data: {json.dumps(payload)}\n\n"
 

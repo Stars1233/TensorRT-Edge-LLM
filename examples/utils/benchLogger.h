@@ -18,7 +18,6 @@
 #pragma once
 
 #include "common/logger.h"
-#include "common/mmapReader.h"
 #include "common/trtUtils.h"
 #include "profiling/layerProfiler.h"
 

@@ -1013,6 +1013,7 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
         mChatTemplate.generationPromptThinking = jsonData.value("generation_prompt_thinking", "");
         mChatTemplate.defaultSystemPrompt = jsonData.value("default_system_prompt", mChatTemplate.defaultSystemPrompt);
         mChatTemplate.trimContent = jsonData.value("trim_content", false);
+        mChatTemplate.promptPrefix = jsonData.value("prompt_prefix", mChatTemplate.promptPrefix);
     }
     catch (std::exception const& e)
     {
@@ -1074,12 +1075,13 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
             auto roleIt = mChatTemplate.roles.find(kRoleSystem);
             if (roleIt != mChatTemplate.roles.end())
             {
-                formattedPrefixSystemPrompt = roleIt->second.prefix + systemPrompt + roleIt->second.suffix;
+                formattedPrefixSystemPrompt
+                    = mChatTemplate.promptPrefix + roleIt->second.prefix + systemPrompt + roleIt->second.suffix;
             }
             else
             {
                 LOG_WARNING("System role not found in chat template. Using raw content.");
-                formattedPrefixSystemPrompt = systemPrompt;
+                formattedPrefixSystemPrompt = mChatTemplate.promptPrefix + systemPrompt;
             }
         }
         else
@@ -1087,6 +1089,10 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
             formattedPrefixSystemPrompt = systemPrompt;
         }
         formattedCompleteRequest = formattedPrefixSystemPrompt;
+    }
+    else if (applyChatTemplate && !mChatTemplate.promptPrefix.empty())
+    {
+        formattedCompleteRequest = mChatTemplate.promptPrefix;
     }
 
     // Process messages

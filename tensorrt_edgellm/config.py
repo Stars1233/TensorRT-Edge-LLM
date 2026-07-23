@@ -52,7 +52,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -91,6 +91,12 @@ _VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
 
 def _is_gemma4_model_type(model_type: str) -> bool:
     return str(model_type).startswith("gemma4")
+
+
+def _check_num_attention_heads(num_attn_heads: int) -> None:
+    if num_attn_heads <= 0:
+        raise ValueError("num_attention_heads must be a positive integer, "
+                         f"got {num_attn_heads!r}")
 
 
 def _get_rope_theta(llm_dict: Dict[str, Any]) -> float:
@@ -216,19 +222,41 @@ def _parse_attention_layer_types(config: dict, num_hidden_layers: int,
     return attention_layer_types
 
 
-def _get_attention_scaling(llm_dict: Dict[str, Any], model_type: str,
-                           head_dim: int) -> float:
-    """Return the scale applied to QK^T before softmax."""
+def _get_attention_scaling(llm_dict: Dict[str, Any], head_dim: int,
+                           default_val: float) -> float:
+    """Resolve the absolute multiplier applied to QK^T before softmax.
+
+    Args:
+        llm_dict: Checkpoint configuration containing an optional supported
+            attention-scale alias.
+        head_dim: Per-head query/key dimension.
+        default_val: Required model-family fallback.
+
+    Returns:
+        The finite, positive attention scale supplied by the checkpoint, or
+        the caller-selected fallback.
+
+    Raises:
+        ValueError: If an explicit checkpoint scale is not finite and
+            positive, or if ``head_dim`` is not positive.
+    """
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive; got {head_dim}")
+
     for key in ("attention_scaling", "qk_scale", "scaling"):
         if llm_dict.get(key) is not None:
-            return float(llm_dict[key])
+            attention_scale = float(llm_dict[key])
+            if not math.isfinite(attention_scale) or attention_scale <= 0.0:
+                raise ValueError(
+                    f"{key} must be finite and positive; got {llm_dict[key]!r}"
+                )
+            return attention_scale
 
-    # Gemma4 uses unscaled QK attention in HF even when the checkpoint config
-    # omits an explicit scale field.
-    if str(model_type) in {"gemma4", "gemma4_text"}:
-        return 1.0
-
-    return 1.0 / (float(head_dim)**0.5)
+    attention_scale = float(default_val)
+    if not math.isfinite(attention_scale) or attention_scale <= 0.0:
+        raise ValueError(
+            f"default_val must be finite and positive; got {default_val!r}")
+    return attention_scale
 
 
 def _get_rms_norm_eps(llm_dict: Dict[str, Any], model_type: str) -> float:
@@ -247,7 +275,7 @@ def _get_embedding_scale(llm_dict: Dict[str, Any], model_type: str,
         if llm_dict.get(key) is not None:
             return float(llm_dict[key])
 
-    if str(model_type) in {"gemma4", "gemma4_text"}:
+    if _is_gemma4_model_type(model_type):
         return math.sqrt(float(hidden_size))
 
     return 1.0
@@ -259,7 +287,7 @@ def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
         if llm_dict.get(key) is not None:
             return bool(llm_dict[key])
 
-    return str(model_type) in {"gemma4", "gemma4_text"}
+    return _is_gemma4_model_type(model_type)
 
 
 @dataclass
@@ -295,6 +323,7 @@ class ActionConfig:
     num_attention_heads: int = 0
     num_key_value_heads: int = 0
     head_dim: int = 128
+    attention_scaling: Optional[float] = None
     hidden_size: int = 0
     intermediate_size: int = 0
     rms_norm_eps: float = 1e-6
@@ -305,6 +334,18 @@ class ActionConfig:
     in_proj_num_enc_layers: int = 2
     in_proj_max_freq: float = 100.0
     in_proj_num_fourier_feats: int = 20
+
+    def __post_init__(self) -> None:
+        """Resolve and validate attention scaling for direct construction.
+
+        Raises:
+            ValueError: If the head dimension or explicit scale is invalid.
+        """
+        scale_config = ({} if self.attention_scaling is None else {
+            "attention_scaling": self.attention_scaling
+        })
+        self.attention_scaling = _get_attention_scaling(
+            scale_config, self.head_dim, 1.0 / (float(self.head_dim)**0.5))
 
 
 @dataclass
@@ -441,6 +482,7 @@ class ModelConfig:
     vocab_size: int
     rope_theta: float
     max_position_embeddings: int
+    default_attention_scale: float
     # RoPE scaling config (e.g. {"type": "dynamic", "factor": 2.0} for Qwen2).
     # None means no scaling (standard RoPE).
     rope_scaling: Optional[dict] = None
@@ -467,8 +509,8 @@ class ModelConfig:
     has_value_norm: bool = False
     # Bias on q/k/v projections.  Read from config.json "attention_bias".
     attention_bias: bool = False
-    # Multiplicative scale applied to QK^T before softmax.
-    attention_scaling: float = 0.0
+    # Explicit multiplicative scale applied to QK^T before softmax.
+    attention_scaling: Optional[float] = None
     # Gemma4 full/global attention can use a different per-head dimension
     # from sliding attention.
     global_head_dim: Optional[int] = None
@@ -488,6 +530,10 @@ class ModelConfig:
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
     sliding_window_size: int = -1
+    # Gemma4 Unified 12B+: image placeholder runs use block-causal
+    # attention during prefill (bidirectional inside each contiguous vision
+    # run, causal everywhere else).  Audio placeholders remain causal.
+    use_vision_bidirectional_attention: bool = False
     # ------------------------------------------ per-layer block types
     # One entry per hidden layer: LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, or LAYER_MOE.
     layer_types: List[str] = field(default_factory=list)
@@ -530,6 +576,23 @@ class ModelConfig:
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output.
     mtp_base: bool = False
+    # ------------------------------------------ Gemma4 MTP config
+    root_model_type: str = ""
+    raw_layer_types: List[str] = field(default_factory=list)
+    rope_parameters: Optional[dict] = None
+    backbone_hidden_size: int = 0
+    gemma4_mtp_base: bool = False
+    gemma4_mtp_draft: bool = False
+    assistant_hidden_size: int = 0
+    shares_target_kv: bool = False
+    has_own_kv_cache: bool = True
+    constant_draft_positions: bool = False
+    returns_feedback_hidden: bool = False
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 0
+    centroid_intermediate_top_k: int = 0
+    sparse_logits_enabled: bool = False
+    kv_sharing_map: List[dict] = field(default_factory=list)
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
@@ -542,6 +605,9 @@ class ModelConfig:
     # When True, export the standard Qwen3.5 model as the DFlash base with
     # tree-attention verify inputs and multi-layer hidden_states output.
     dflash_base: bool = False
+    # When True, DFlash base export also exposes DDTree parent/depth metadata
+    # for Qwen3.5 hybrid causal-conv/GDN tree-state execution.
+    dflash_tree_base: bool = False
     is_dflash_draft_flag: bool = False
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
@@ -587,14 +653,40 @@ class ModelConfig:
     num_kv_shared_layers: int = 0
     # When True, KV-shared layers use 2× intermediate_size for their MLP.
     use_double_wide_mlp: bool = False
+    # Gemma4 26B-A4B MoE: when True, each decoder layer has a routed MoE
+    # block in addition to the dense MLP (parallel experts + router).
+    enable_moe_block: bool = False
     # ------------------------------------------ tensor parallel
     # ``mapping`` is the single source of truth for parallel placement.
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
     mapping: Mapping = field(default_factory=Mapping)
 
+    def __post_init__(self):
+        # For standalone models, num_kv_shared_layers < num_hidden_layers is
+        # required so that at least one non-shared donor layer exists.
+        # Gemma4 assistant models (shares_target_kv=True) share KV from the
+        # *target* model, so num_kv_shared_layers == num_hidden_layers is valid
+        # — the donor-index logic is skipped at runtime for those.
+        if (self.num_kv_shared_layers > 0
+                and self.num_kv_shared_layers >= self.num_hidden_layers
+                and not self.shares_target_kv):
+            raise ValueError(
+                f"num_kv_shared_layers ({self.num_kv_shared_layers}) must be "
+                f"less than num_hidden_layers ({self.num_hidden_layers})")
+
     # ------------------------------------------------------------------
     # Derived properties
     # ------------------------------------------------------------------
+
+    def __post_init__(self) -> None:
+        """Resolve and validate the model family's attention scale."""
+        self.default_attention_scale = _get_attention_scaling(
+            {}, self.head_dim, self.default_attention_scale)
+        scale_config = ({} if self.attention_scaling is None else {
+            "attention_scaling": self.attention_scaling
+        })
+        self.attention_scaling = _get_attention_scaling(
+            scale_config, self.head_dim, self.default_attention_scale)
 
     @property
     def tp_size(self) -> int:
@@ -614,6 +706,11 @@ class ModelConfig:
         return bool(self.mtp_num_hidden_layers is not None
                     and self.gdn_cfg is None and not self.mtp_base
                     and not self.is_eagle3_draft and not self.is_dflash_draft)
+
+    @property
+    def is_gemma4_mtp_draft(self) -> bool:
+        """True for a paired Gemma4 assistant draft checkpoint."""
+        return self.gemma4_mtp_draft
 
     @property
     def is_dflash_draft(self) -> bool:
@@ -684,7 +781,9 @@ class ModelConfig:
         carries per-rank shapes.
 
         Usage:
-            cfg = ModelConfig.from_pretrained(path).for_rank(rank, world)
+            cfg = ModelConfig.from_pretrained(
+                path, lambda head_dim: 1.0 / (float(head_dim)**0.5)
+            ).for_rank(rank, world)
             model = CausalLM(cfg)
             load_weights(model, path, mapping=cfg.mapping)
         """
@@ -710,7 +809,9 @@ class ModelConfig:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_pretrained(cls, model_dir: str) -> "ModelConfig":
+    def from_pretrained(
+            cls, model_dir: str,
+            default_attention_scale: Callable[[int], float]) -> "ModelConfig":
         """Load a ModelConfig from a checkpoint directory.
 
         Loads architecture hyper-parameters via ``AutoConfig`` (see
@@ -719,20 +820,27 @@ class ModelConfig:
         block to determine
         the quantisation scheme.
 
-        ``has_qk_norm`` is auto-detected by scanning the safetensors key index
-        for ``.q_norm.weight`` entries - no model-type assumptions are made.
+        ``default_attention_scale`` is a required model-family callable
+        accepting ``head_dim``. ``has_qk_norm`` is auto-detected by scanning
+        the safetensors key index for ``.q_norm.weight`` entries; no
+        model-type assumptions are made here.
         """
         root, llm_dict = load_checkpoint_config_dicts(model_dir)
 
+        root_model_type = root.get("model_type", "")
         model_type = llm_dict.get("model_type", "llama")
+        if root_model_type == "gemma4_assistant":
+            model_type = root_model_type
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
+        _check_num_attention_heads(num_attn_heads)
         head_dim = llm_dict.get("head_dim", hidden_size // num_attn_heads)
         global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
         num_global_kv_heads = int(
             llm_dict.get("num_global_key_value_heads", 0) or 0)
 
         quant = _parse_quant(model_dir, llm_dict)
+        raw_layer_types = _parse_raw_layer_types(llm_dict)
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
             llm_dict, llm_dict["num_hidden_layers"], model_type)
@@ -743,8 +851,10 @@ class ModelConfig:
         gdn_cfg = _parse_gdn_cfg(llm_dict, layer_types)
         has_qk_norm = _detect_has_qk_norm(model_dir)
         has_value_norm = _get_has_value_norm(llm_dict, model_type)
-        attention_scaling = _get_attention_scaling(llm_dict, model_type,
-                                                   head_dim)
+        default_attention_scale_value = float(
+            default_attention_scale(head_dim))
+        attention_scaling = _get_attention_scaling(
+            llm_dict, head_dim, default_attention_scale_value)
         embedding_scale = _get_embedding_scale(llm_dict, model_type,
                                                hidden_size)
 
@@ -763,14 +873,16 @@ class ModelConfig:
         # EAGLE3 draft model fields
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
-        # Sliding window: active when use_sliding_window=True, OR when
+        # Sliding window: active when use_sliding_window=True, or when
         # layer_types contains "sliding_attention" (Gemma4 convention).
-        use_sw = llm_dict.get("use_sliding_window", False)
-        layer_types_raw = llm_dict.get("layer_types", [])
-        if not use_sw and "sliding_attention" in layer_types_raw:
-            use_sw = True
+        use_sw = llm_dict.get("use_sliding_window", False) or any(
+            layer_type == "sliding_attention"
+            for layer_type in raw_layer_types)
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+        use_vision_bidirectional_attention = bool(
+            model_type in ("gemma4_unified", "gemma4_unified_text")
+            and llm_dict.get("use_bidirectional_attention") == "vision")
 
         # Sparse MoE fields.  HF uses "num_local_experts" as the internal key
         # and maps "num_experts" → "num_local_experts" via attribute_map.
@@ -829,6 +941,7 @@ class ModelConfig:
             rope_theta=_get_rope_theta(llm_dict),
             max_position_embeddings=llm_dict.get("max_position_embeddings",
                                                  4096),
+            default_attention_scale=default_attention_scale_value,
             rope_scaling=_select_rope_scaling(llm_dict),
             original_max_position_embeddings=llm_dict.get(
                 "original_max_position_embeddings", None),
@@ -849,6 +962,8 @@ class ModelConfig:
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
+            use_vision_bidirectional_attention=
+            use_vision_bidirectional_attention,
             layer_types=layer_types,
             attention_layer_types=attention_layer_types,
             quant=quant,
@@ -858,7 +973,24 @@ class ModelConfig:
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
+            root_model_type=root_model_type,
+            raw_layer_types=raw_layer_types,
+            rope_parameters=llm_dict.get("rope_parameters", None),
+            backbone_hidden_size=int(
+                llm_dict.get("backbone_hidden_size", 0) or 0),
+            assistant_hidden_size=(hidden_size if root_model_type
+                                   == "gemma4_assistant" else 0),
+            shares_target_kv=(root_model_type == "gemma4_assistant"),
+            has_own_kv_cache=(root_model_type != "gemma4_assistant"),
+            constant_draft_positions=(root_model_type == "gemma4_assistant"),
+            returns_feedback_hidden=(root_model_type == "gemma4_assistant"),
+            use_ordered_embeddings=bool(
+                llm_dict.get("use_ordered_embeddings", False)),
+            num_centroids=int(llm_dict.get("num_centroids", 0) or 0),
+            centroid_intermediate_top_k=int(
+                llm_dict.get("centroid_intermediate_top_k", 0) or 0),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
+            dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,
@@ -886,6 +1018,7 @@ class ModelConfig:
                 llm_dict.get("num_kv_shared_layers", 0) or 0),
             use_double_wide_mlp=bool(llm_dict.get("use_double_wide_mlp",
                                                   False)),
+            enable_moe_block=bool(llm_dict.get("enable_moe_block", False)),
         )
 
 
@@ -983,7 +1116,9 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
     )
 
 
-def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
+def make_dflash_draft_config(
+        draft_dir: str,
+        default_attention_scale: Callable[[int], float]) -> ModelConfig:
     """Build a DFlash draft ModelConfig from the draft checkpoint directory.
 
     Now quantization-aware: if the draft directory contains
@@ -998,17 +1133,22 @@ def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
     # For FP16 draft checkpoints this returns QuantConfig() (no quant).
     quant = _parse_quant(draft_dir, llm_dict)
 
+    model_type = llm_dict.get("model_type", "qwen3")
+    _check_num_attention_heads(llm_dict["num_attention_heads"])
+    head_dim = llm_dict.get(
+        "head_dim", llm_dict["hidden_size"] // llm_dict["num_attention_heads"])
+
+    default_attention_scale_value = float(default_attention_scale(head_dim))
+
     return ModelConfig(
-        model_type=llm_dict.get("model_type", "qwen3"),
+        model_type=model_type,
         hidden_size=llm_dict["hidden_size"],
         num_hidden_layers=llm_dict["num_hidden_layers"],
         num_attention_heads=llm_dict["num_attention_heads"],
         num_key_value_heads=llm_dict.get("num_key_value_heads",
                                          llm_dict["num_attention_heads"]),
         intermediate_size=llm_dict["intermediate_size"],
-        head_dim=llm_dict.get(
-            "head_dim",
-            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]),
+        head_dim=head_dim,
         rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
         vocab_size=llm_dict["vocab_size"],
         rope_theta=_get_rope_theta(llm_dict),
@@ -1017,6 +1157,9 @@ def make_dflash_draft_config(draft_dir: str) -> ModelConfig:
                       or llm_dict.get("rope_parameters") or None),
         partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
         has_qk_norm=True,
+        attention_scaling=_get_attention_scaling(
+            llm_dict, head_dim, default_attention_scale_value),
+        default_attention_scale=default_attention_scale_value,
         torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
         tie_word_embeddings=False,
         layer_types=[LAYER_ATTN] * int(llm_dict["num_hidden_layers"]),
@@ -1115,6 +1258,14 @@ def _validate_mtp_constraints(
     if mtp_use_dedicated_embeddings:
         raise NotImplementedError(
             "Dedicated MTP embeddings are not supported for Qwen3.5 MTP.")
+
+
+def _parse_raw_layer_types(config: dict) -> List[str]:
+    """Return checkpoint layer type strings without canonicalization."""
+    raw = config.get("layers_block_type") or config.get("layer_types")
+    if raw is None:
+        return []
+    return [str(layer_type) for layer_type in raw]
 
 
 def _parse_layer_types(config: dict) -> List[str]:

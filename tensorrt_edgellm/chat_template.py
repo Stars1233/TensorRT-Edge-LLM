@@ -56,8 +56,13 @@ _HARDCODED_TEMPLATE_MAP: Dict[str, str] = {
     "qwen3_omni_moe_talker": "qwen3_omni.json",
     # Gemma4 uses <bos><|turn>system/user/model tokens; Jinja extraction
     # fails when tokenizer.json is absent from standalone checkpoints.
+    # The Unified variants share the same turn structure; without the map
+    # entry they fall through to Jinja extraction, whose template emits the
+    # thought channel unconditionally in generation_prompt.
     "gemma4_text": "gemma4.json",
     "gemma4": "gemma4.json",
+    "gemma4_unified": "gemma4.json",
+    "gemma4_unified_text": "gemma4.json",
 }
 
 
@@ -561,24 +566,52 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             for ctype, cplaceholder in [
                 ("image", "<placeholder_image_path>"),
                 ("video", "<placeholder_video_path>"),
+                ("audio", "<placeholder_audio_path>"),
             ]:
-                pattern = _extract_content_pattern(tokenizer, system_prompt,
-                                                   ctype, cplaceholder,
-                                                   text_only_formatted,
-                                                   placeholder_text)
+                try:
+                    pattern = _extract_content_pattern(tokenizer,
+                                                       system_prompt, ctype,
+                                                       cplaceholder,
+                                                       text_only_formatted,
+                                                       placeholder_text)
+                except Exception:
+                    # Some tokenizer templates raise TemplateError for
+                    # unsupported content types (e.g. audio on VLM-only
+                    # models).  Skip gracefully.
+                    pattern = None
                 if pattern:
                     content_types[ctype] = {"format": pattern}
+            # Fallback: if _extract_content_pattern failed for image/audio
+            # (e.g. tokenizer chat template doesn't handle multimodal content
+            # items), detect known special tokens and construct the format
+            # string from begin/placeholder/end token triplets.
+            if "image" not in content_types:
+                boi = getattr(tokenizer, "boi_token", None)
+                eoi = getattr(tokenizer, "eoi_token", None)
+                img = getattr(tokenizer, "image_token", None)
+                if boi and eoi and img:
+                    content_types["image"] = {"format": f"{boi}{img}{eoi}"}
+                elif img:
+                    content_types["image"] = {"format": img}
+            if "audio" not in content_types:
+                boa = getattr(tokenizer, "boa_token", None)
+                eoa = getattr(tokenizer, "eoa_token", None)
+                aud = getattr(tokenizer, "audio_token", None)
+                if boa and eoa and aud:
+                    content_types["audio"] = {"format": f"{boa}{aud}{eoa}"}
+                elif aud:
+                    content_types["audio"] = {"format": aud}
         elif _is_qwen3_omni_family_model(model_dir) or _is_qwen3_asr_model(
                 model_dir):
             content_types = {
                 "audio": {
-                    "format": "<|audio_pad|>"
+                    "format": "<|audio_start|><|audio_pad|><|audio_end|>"
                 },
                 "image": {
-                    "format": "<|image_pad|>"
+                    "format": "<|vision_start|><|image_pad|><|vision_end|>"
                 },
                 "video": {
-                    "format": "<|video_pad|>"
+                    "format": "<|vision_start|><|video_pad|><|vision_end|>"
                 },
             }
 
@@ -605,6 +638,36 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                         # where no explicit system message is provided (e.g. the sweep test).
                         user_prefix = system_prefix + system_suffix + user_prefix
 
+        bos_token = getattr(tokenizer, "bos_token", None) or getattr(
+            getattr(tokenizer, "tokenizer", None), "bos_token", None)
+        bos_token = str(bos_token) if bos_token else ""
+        prompt_prefix = ""
+        if bos_token and (system_prefix.startswith(bos_token)
+                          or user_prefix.startswith(bos_token)):
+            prompt_prefix = bos_token
+            if system_prefix.startswith(bos_token):
+                system_prefix = system_prefix[len(bos_token):]
+            if user_prefix.startswith(bos_token):
+                user_prefix = user_prefix[len(bos_token):]
+            if assistant_prefix.startswith(bos_token):
+                assistant_prefix = assistant_prefix[len(bos_token):]
+
+        # Detect whether the template trims message content (e.g. Gemma
+        # applies ``| trim`` to every text item).  Render a user message with
+        # whitespace-padded content: if the padding is stripped from the
+        # output, the C++ renderer must trim too, or prompts whose messages
+        # carry leading/trailing whitespace tokenize differently from HF.
+        trim_content = False
+        try:
+            padded_prompt = UserMessage()
+            padded_prompt.content = "  " + padded_prompt.content + "  "
+            padded_formatted = _format_messages(tokenizer, [padded_prompt])
+            if (padded_prompt.content not in padded_formatted
+                    and padded_prompt.content.strip() in padded_formatted):
+                trim_content = True
+        except Exception:
+            pass
+
         data: Dict[str, Any] = {
             "model_path": model_dir,
             "roles": {
@@ -625,6 +688,10 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             "generation_prompt": generation_prompt,
             "default_system_prompt": default_system_prompt,
         }
+        if prompt_prefix:
+            data["prompt_prefix"] = prompt_prefix
+        if trim_content:
+            data["trim_content"] = True
         if generation_prompt_thinking is not None:
             data["generation_prompt_thinking"] = generation_prompt_thinking
 

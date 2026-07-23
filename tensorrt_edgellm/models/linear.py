@@ -38,7 +38,7 @@ from ..config import (QUANT_FP8, QUANT_FP16, QUANT_INT4_AWQ,
                       QUANT_INT4_AWQ_MODELOPT, QUANT_INT4_GPTQ, QUANT_INT8_SQ,
                       QUANT_MXFP8, QUANT_NVFP4, Mapping, ModelConfig,
                       module_quant_type)
-from .ops import (fp8_dequantize, fp8_quantize, fused_gemm_allreduce,
+from .ops import (fp8_dequantize, fp8_quantize, fused_nvfp4_gemm_allreduce,
                   int4_groupwise_gemm, int8_sq_act_qdq, int8_sq_weight_dq,
                   mxfp8_act_qdq, mxfp8_weight_dq, nvfp4_act_qdq,
                   nvfp4_dequantize)
@@ -228,7 +228,7 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     Owns the NVFP4 buffer layout (weight + per-group fp8 scale +
     global scale + activation scale), the dequant+matmul forward, the
-    FusedGemmAllReduce row-parallel forward, and the per-mode shard
+    FusedNvfp4GemmAllReduce row-parallel forward, and the per-mode shard
     declaration. Used by both :class:`ColumnParallelLinear` and
     :class:`RowParallelLinear` via composition.
     """
@@ -272,15 +272,14 @@ class NVFP4LinearMethod(LinearMethodBase):
                                x: torch.Tensor) -> torch.Tensor:
         _require_fp16_input(x, type(module).__name__)
         # Single op: TRT_FP4DynamicQuantize + DequantizeLinear +
-        # FusedGemmAllReducePlugin. Output is FP16, already AllReduced.
-        out = fused_gemm_allreduce(
+        # FusedNvfp4GemmAllReducePlugin. Output is FP16, already AllReduced.
+        out = fused_nvfp4_gemm_allreduce(
             x,
             module.input_scale,
             module.weight,
             module.weight_scale,
             module.weight_scale_2,
             tp_size=module.tp_size,
-            fuse_residual_rmsnorm=0,
         )
         if module.bias is not None:
             out = out + module.bias.to(torch.float16)

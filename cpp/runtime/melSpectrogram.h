@@ -22,6 +22,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -109,6 +110,10 @@ enum class FramePadding
                       //!< (audio_utils.spectrogram(center=True, pad_mode="reflect")).
     kCenterZero,      //!< HF Parakeet: zero-pad nFFT/2 each side, then frame
                       //!< (torch.stft(pad_mode="constant"), default for HF Parakeet).
+    kSemicausalZero,  //!< HF Gemma4 (sl.STFT time_padding='semicausal'): zero-pad
+                      //!< winLength/2 on the left only; frames unfold with size
+                      //!< winLength+1 (the trailing sample is dropped before the
+                      //!< window when preemphasis is off).
 };
 
 //! Time-axis padding policy.
@@ -154,6 +159,10 @@ struct MelExtractorConfig
     //! (unfold + rfft(n=nFFT)) maps source ``[start, start+winLen)`` ->
     //! buffer ``[0, winLen)`` with trailing zeros. Ignored when winLen == nFFT.
     bool windowCentredInFft{true};
+    //! When true, feed the mel filter bank the magnitude spectrum ``|stft|``
+    //! (HF Gemma4) instead of the power spectrum ``|stft|^2``.
+    bool magnitudeSpectrum{false};
+
     MelScale melScale{MelScale::kHtk};
     MelNorm melNorm{MelNorm::kSlaney};
     //! When true, build triangle filters with their slopes linear in *mel*
@@ -226,6 +235,17 @@ public:
         return mConfig;
     }
 
+    //! Internally built mel filter bank: row-major ``[nMel x (nFFT/2 + 1)]``
+    //! weights, valid for the extractor's lifetime. Empty for a
+    //! default-constructed extractor or when a precomputed ``melFilter`` was
+    //! supplied in the config.
+    std::vector<float> const& melFilterBank() const noexcept;
+
+    //! Analysis window used by ``extract()``: ``winLength`` float taps, valid
+    //! for the extractor's lifetime. Empty for a default-constructed (empty)
+    //! extractor.
+    std::vector<float> const& window() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> mImpl;
@@ -237,6 +257,9 @@ private:
 //! normalize, ``[n_mel, T]`` layout, HF centre-reflect framing). Used by
 //! Qwen3-Omni and Qwen3-ASR.
 MelExtractor makeWhisperExtractor();
+
+//! Gemma4 / USM-style extractor matching HF Gemma4FeatureExtractor defaults.
+MelExtractor makeGemma4AudioExtractor();
 
 //! Build a Parakeet-compatible extractor (16 kHz, n_fft=512, hop=160,
 //! n_mel=128, slaney scale + slaney norm, Hann non-periodic window,

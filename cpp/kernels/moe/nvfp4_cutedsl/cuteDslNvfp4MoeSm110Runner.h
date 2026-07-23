@@ -116,6 +116,7 @@ private:
 
     static nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_t sFC1Relu2N128;
     static nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_t sFC1SwiGLUN128;
+    static nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_t sFC1GeGLUN128;
     static nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_t sFC2N128Fp16;
 
     static bool sLoaded;

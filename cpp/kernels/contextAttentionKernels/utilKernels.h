@@ -29,6 +29,89 @@ namespace trt_edgellm
 namespace kernel
 {
 
+//! FMHA_v2 packed-mask layout constants (must match the CUSTOM_MASK cubins and
+//! TRT-LLM's fmhaPackedMask.cu reference implementation).
+//!
+//! The packed mask is a bitmask consumed by the flash-attention CUSTOM_MASK
+//! kernels (fmha_v2 src/fmha/mask.h, MASK_VERSION 5).  Geometry:
+//!  - The Q (row) dimension is padded per sequence to a multiple of 128
+//!    (FLASH_ATTEN_PACKED_MASK_M_ALIGNMENT).  `cu_mask_rows[b]` carries the
+//!    per-batch prefix sum of padded rows.
+//!  - The KV (col) dimension is padded to a multiple of 256
+//!    (FLASH_ATTEN_PACKED_MASK_N_ALIGNMENT); the row stride in bytes is
+//!    paddedKvLen / 8 (one bit per position).
+//!  - Bits are laid out per MMA tile: a CTA warp-group of 128 threads covers a
+//!    64-row x 64-col tile with one uint32 per thread.  For thread t
+//!    (warp = t/32, warpM = warp%4, lane = t%32) the base position within the
+//!    tile is row = warpM*16 + lane/4, col = (lane%4)*2, and bit (4*ni + b)
+//!    covers (row + 8*(b>>1), col + 8*ni + (b&1)) for ni in [0, 8).
+//!  - uint32 words are ordered [mmaM][mmaN][128 threads] where mmaM indexes
+//!    64-row tiles (globally, across the padded rows of all sequences) and
+//!    mmaN indexes 64-col tiles.
+constexpr int32_t kFMHA_PACKED_MASK_M_ALIGNMENT = 128;
+constexpr int32_t kFMHA_PACKED_MASK_N_ALIGNMENT = 256;
+constexpr int32_t kFMHA_PACKED_MASK_MMA_M = 64;
+constexpr int32_t kFMHA_PACKED_MASK_MMA_N = 64;
+constexpr int32_t kFMHA_PACKED_MASK_THREADS_PER_WARP_GROUP = 128;
+
+//! Padded number of packed-mask rows for one sequence of length seqLen.
+constexpr int64_t getPackedMaskRowsPerSeq(int64_t seqLen)
+{
+    return (seqLen + kFMHA_PACKED_MASK_M_ALIGNMENT - 1) / kFMHA_PACKED_MASK_M_ALIGNMENT * kFMHA_PACKED_MASK_M_ALIGNMENT;
+}
+
+//! Packed-mask row stride in bytes for a KV length of kvSeqLen (one bit per
+//! position, KV dimension padded to a multiple of 256).
+constexpr int64_t getPackedMaskRowStrideInBytes(int64_t kvSeqLen)
+{
+    return (kvSeqLen + kFMHA_PACKED_MASK_N_ALIGNMENT - 1) / kFMHA_PACKED_MASK_N_ALIGNMENT
+        * kFMHA_PACKED_MASK_N_ALIGNMENT / 8;
+}
+
+//! Total packed-mask size in uint32 words for a batch of batchSize sequences,
+//! each padded to seqLen rows and kvSeqLen cols.
+constexpr int64_t getPackedMaskSizeInWords(int64_t batchSize, int64_t seqLen, int64_t kvSeqLen)
+{
+    return batchSize * getPackedMaskRowsPerSeq(seqLen) * getPackedMaskRowStrideInBytes(kvSeqLen)
+        / static_cast<int64_t>(sizeof(uint32_t));
+}
+
+//! \brief Build the FMHA_v2 CUSTOM_MASK packed mask for Gemma4 vision-block prefill.
+//!
+//! Allowed(q, k) for q, k < contextLengths[b]:
+//!   sliding-causal:  k <= q and (slidingWindowSize <= 0 or k > q - slidingWindowSize), OR
+//!   vision block:    visionBlockIds[b][q] >= 0 and visionBlockIds[b][q] == visionBlockIds[b][k]
+//! All other positions (including rows/cols >= contextLength and padded
+//! rows/cols) have their bits cleared.
+//!
+//! \param[in]  visionBlockIds     int32_t [B, S]; -1 for text/audio/pad, non-negative
+//!                                per contiguous image run.
+//! \param[in]  contextLengths     int32_t [B]; actual token count per sequence.
+//! \param[out] packedMask         uint32_t [getPackedMaskSizeInWords(B, S, S)] packed mask.
+//! \param[out] cuMaskRows         int32_t [B+1]; prefix sum of padded mask rows
+//!                                (i * getPackedMaskRowsPerSeq(S)).  Consumed by the kernels
+//!                                via params.cu_mask_rows.
+//! \param[in]  batchSize          Number of sequences B.
+//! \param[in]  seqLen             Padded runtime sequence length S (Q length == KV length).
+//! \param[in]  slidingWindowSize  Sliding window size counting the query itself
+//!                                (<= 0 means plain causal).
+//! \param[in]  stream             CUDA stream.
+//! \throws std::runtime_error on invalid arguments.
+void launchBuildVisionPackedMask(int32_t const* visionBlockIds, int32_t const* contextLengths, uint32_t* packedMask,
+    int32_t* cuMaskRows, int32_t batchSize, int32_t seqLen, int32_t slidingWindowSize, cudaStream_t stream);
+
+//! Expand [B, S] vision-block IDs into per-position [blockBegin, blockEnd]
+//! interval tensors for the FFPA vision-block overlay prefill kernel.
+//!
+//! Each contiguous run of an identical non-negative ID inside the per-batch
+//! valid prefix (contextLengths[b], clamped to seqLen) yields
+//! blockBegin = run start and blockEnd = run end for every position in the
+//! run.  Text/audio positions (ID < 0) and padding positions receive the
+//! -1/-1 sentinel (empty interval).  All tensors are [B, S] int32 device
+//! buffers.
+void launchBuildVisionBlockRanges(int32_t const* visionBlockIds, int32_t const* contextLengths, int32_t* blockBegin,
+    int32_t* blockEnd, int32_t batchSize, int32_t seqLen, cudaStream_t stream);
+
 //! \brief Host-side wrapper that launches a lightweight CUDA kernel to compute prefix-sum of sequence lengths
 //! and KV cache end indices.
 //!

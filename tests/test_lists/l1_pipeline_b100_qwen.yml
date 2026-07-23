@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Pipeline Tests - B100 VLMEvalKit (Qwen family)
+# Focus: Full MMMU benchmark via VLMEvalKit on Qwen3-VL-8B + Qwen3.5-9B.
+
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-8B-Instruct-nvfp4-mxsl30000-mxbs1-mxil21000-mnit980-mxit19600-mxpiit3920]
+  - tests/defs/test_vlm_vlmevalkit.py::TestVLMVLMEvalKit::test_vlmevalkit_mmmu[Qwen3-VL-8B-Instruct-nvfp4-mxsl30000-mxbs1-mxil21000-mnit980-mxit19600-mxpiit3920-mmmu_vlmevalkit-bs1]
+
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-nvfp4-mxsl30000-mxbs1-mxil21000-mnit128-mxit19600-mxpiit3920]
+  - tests/defs/test_vlm_vlmevalkit.py::TestVLMVLMEvalKit::test_vlmevalkit_mmmu[Qwen3.5-9B-nvfp4-mxsl30000-mxbs1-mxil21000-mnit128-mxit19600-mxpiit3920-mmmu_vlmevalkit-bs1]
+
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-mxsl30000-mxbs1-mxil21000-mnit980-mxit19600-mxpiit3920-mmmu_reuse_kvcache-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-8B-Instruct-nvfp4-mxsl30000-mxbs1-mxil21000-mnit980-mxit19600-mxpiit3920-mmmu_not_reuse_kvcache-bs1]

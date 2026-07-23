@@ -43,6 +43,11 @@ struct AudioData
     //! runner's MelExtractor expectation (16 kHz for whisper / parakeet).
     std::shared_ptr<rt::audio::AudioPCM> pcm;
 
+    //! \brief Path to pre-computed mel-spectrogram file (e.g. safetensors).
+    //! Used by Gemma4 audio runner which bypasses PCM decoding.
+    std::string melSpectrogramPath;
+    std::string melSpectrogramFormat; //!< Format of mel file (e.g. "safetensors")
+
     // For audio output: generated waveform
     std::shared_ptr<Tensor> waveform; //!< Waveform samples [1, numSamples], FP16, range [-1, 1], CPU
     int32_t sampleRate{24000};        //!< Sample rate in Hz

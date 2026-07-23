@@ -22,6 +22,29 @@ from typing import Any, Dict, List, Optional
 
 from conftest import RemoteConfig
 
+_SENSITIVE_ENV_KEY_PARTS = ("TOKEN", "PASSWORD", "SECRET", "API_KEY")
+
+
+def _quote_env_assignment(key: str, value: str, mask_sensitive: bool) -> str:
+    display_value = "***" if mask_sensitive and any(
+        part in key.upper() for part in _SENSITIVE_ENV_KEY_PARTS) else value
+    return f"{key}={shlex.quote(str(display_value))}"
+
+
+def _format_command_for_display(
+    cmd: List[str],
+    env_vars: Optional[Dict[str, str]] = None,
+    mask_sensitive_env: bool = True,
+) -> str:
+    cmd_display = ' '.join(shlex.quote(arg) for arg in cmd)
+    if not env_vars:
+        return cmd_display
+
+    env_display = ' '.join(
+        _quote_env_assignment(key, value, mask_sensitive_env)
+        for key, value in env_vars.items())
+    return f"{env_display} {cmd_display}"
+
 
 def _tee_line_to_process_stdout(text: str) -> None:
     """Send one line to the real OS stdout (fd 1) so the outer edge-llm-qa
@@ -63,16 +86,20 @@ def run_command(cmd: List[str],
                 env_parts.append(f"export {key}={shlex.quote(value)}")
             env_prefix = " && ".join(env_parts) + " && "
 
+        base_cmd_display = _format_command_for_display(cmd, env_vars)
         if remote_config.remote_workspace:
             cmd_str = f"{env_prefix}cd {shlex.quote(remote_config.remote_workspace)} && {' '.join(shlex.quote(arg) for arg in cmd)}"
+            cmd_display = (
+                f"[REMOTE] cd {shlex.quote(remote_config.remote_workspace)} && "
+                f"{base_cmd_display}")
         else:
             cmd_str = f"{env_prefix}{' '.join(shlex.quote(arg) for arg in cmd)}"
+            cmd_display = f"[REMOTE] {base_cmd_display}"
         ssh_cmd.append(cmd_str)
         final_cmd = ssh_cmd
-        cmd_display = f"[REMOTE] {' '.join(cmd)}"
     else:
         final_cmd = cmd
-        cmd_display = ' '.join(cmd)
+        cmd_display = _format_command_for_display(cmd, env_vars)
 
     if logger:
         logger.info(f"Running with timeout {timeout}s: {cmd_display}")

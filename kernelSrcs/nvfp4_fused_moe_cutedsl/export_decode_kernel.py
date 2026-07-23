@@ -291,9 +291,9 @@ def export_decode_moe_variant(args):
 
     sm_count = get_num_sm()
     # The AOT wrapper launches with cluster_size=1, where max active clusters
-    # equals SM count. Avoid HardwareInfo here because SM120/SM121 builds can
-    # target sm_120a for the fused kernel compile, which makes HardwareInfo's
-    # dummy occupancy kernel invalid on SM121.
+    # equals SM count. Avoid HardwareInfo here because SM121 builds can target
+    # sm_120a for the fused kernel compile, which makes HardwareInfo's dummy
+    # occupancy kernel invalid on GB10.
     mac = sm_count
 
     ab_dtype = cutlass.Float4E2M1FN
@@ -427,7 +427,7 @@ def main():
     )
     parser.add_argument(
         "--activation", type=str, default="swiglu",
-        choices=["identity", "silu", "swiglu", "gelu", "relu2"],
+        choices=["identity", "silu", "swiglu", "gelu", "geglu", "relu2"],
         help="Activation function (default: swiglu)"
     )
     parser.add_argument(

@@ -450,3 +450,170 @@ TEST(MambaCausalConv1dDecodeMTP, LargeDim)
 {
     runCausalConv1dDecodeMTPTest(/*batch=*/4, /*dim=*/512, /*width=*/4, /*T=*/4);
 }
+
+// ---------------------------------------------------------------------------
+// invokeCausalConv1dDecodeDDTree tests
+// ---------------------------------------------------------------------------
+
+void runCausalConv1dDecodeDDTreeReference(int32_t batch, int32_t dim, int32_t width, int32_t verifySeq,
+    std::vector<half> const& convState, std::vector<half> const& newCols, std::vector<half> const& weight,
+    std::vector<half> const& bias, std::vector<int32_t> const& parentIds, std::vector<int32_t> const& depths,
+    std::vector<half>& convStateOut, std::vector<half>& outRef, std::vector<half>& intermRef)
+{
+    convStateOut = convState;
+    for (int32_t b = 0; b < batch; ++b)
+    {
+        for (int32_t node = 0; node < verifySeq; ++node)
+        {
+            int32_t const parent = parentIds[b * verifySeq + node];
+            int32_t const depth = depths[b * verifySeq + node];
+            bool const isRoot = node == 0 && parent < 0 && depth == 0;
+            bool const isValidChild = node > 0 && parent >= 0 && parent < node && depth > 0;
+            bool const isValidNode = isRoot || isValidChild;
+
+            for (int32_t d = 0; d < dim; ++d)
+            {
+                int64_t const rowOff = (static_cast<int64_t>(b) * dim + d) * width;
+                float state[8];
+                if (!isValidNode)
+                {
+                    for (int32_t k = 0; k < width; ++k)
+                    {
+                        state[k] = __half2float(convState[rowOff + k]);
+                    }
+                    outRef[(static_cast<int64_t>(b) * verifySeq + node) * dim + d] = __float2half(0.0F);
+                }
+                else
+                {
+                    int32_t pathNodes[8];
+                    int32_t pathLen = 0;
+                    int32_t const maxPathLen = (depth + 1 < width) ? depth + 1 : width;
+                    int32_t currentNode = node;
+                    while (pathLen < maxPathLen && currentNode >= 0 && currentNode < verifySeq)
+                    {
+                        pathNodes[pathLen++] = currentNode;
+                        if (currentNode == 0)
+                        {
+                            break;
+                        }
+                        currentNode = parentIds[b * verifySeq + currentNode];
+                    }
+
+                    for (int32_t k = 0; k < width; ++k)
+                    {
+                        state[k] = (k + pathLen < width) ? __half2float(convState[rowOff + k + pathLen]) : 0.0F;
+                    }
+                    for (int32_t pathOffset = 0; pathOffset < pathLen; ++pathOffset)
+                    {
+                        int32_t const pathNode = pathNodes[pathOffset];
+                        int64_t const newColIdx = (static_cast<int64_t>(b) * verifySeq + pathNode) * dim + d;
+                        state[width - 1 - pathOffset] = __half2float(newCols[newColIdx]);
+                    }
+
+                    float acc = __half2float(bias[d]);
+                    for (int32_t k = 0; k < width; ++k)
+                    {
+                        acc += state[k] * __half2float(weight[static_cast<int64_t>(d) * width + k]);
+                    }
+                    outRef[(static_cast<int64_t>(b) * verifySeq + node) * dim + d] = __float2half(acc);
+                }
+
+                int64_t const intermBase = ((static_cast<int64_t>(b) * verifySeq + node) * dim + d) * width;
+                for (int32_t k = 0; k < width; ++k)
+                {
+                    intermRef[intermBase + k] = __float2half(state[k]);
+                }
+            }
+        }
+    }
+}
+
+TEST(MambaCausalConv1dDecodeDDTree, RootToNodeState)
+{
+    constexpr int32_t batch = 2;
+    constexpr int32_t dim = 64;
+    constexpr int32_t width = 4;
+    constexpr int32_t verifySeq = 6;
+
+    std::vector<half> convStateHost(batch * dim * width);
+    std::vector<half> weightHost(dim * width);
+    std::vector<half> biasHost(dim);
+    std::vector<half> newColsHost(batch * verifySeq * dim);
+    uniformFloatInitialization<half>(convStateHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(weightHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(biasHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(newColsHost, -0.5F, 0.5F);
+
+    std::vector<int32_t> parentIds{
+        -1, 0, 1, 1, 3, -1, // batch 0: root, chain 0->1->2, branch 1->3->4, padding node 5
+        -1, 0, 0, 2, 3, -1  // batch 1: root, two depth-1 children, chain 2->3->4, padding node 5
+    };
+    std::vector<int32_t> depths{
+        0,
+        1,
+        2,
+        2,
+        3,
+        0,
+        0,
+        1,
+        1,
+        2,
+        3,
+        0,
+    };
+
+    std::vector<half> convStateRef(convStateHost.size());
+    std::vector<half> outRef(batch * verifySeq * dim);
+    std::vector<half> intermRef(batch * verifySeq * dim * width);
+    runCausalConv1dDecodeDDTreeReference(batch, dim, width, verifySeq, convStateHost, newColsHost, weightHost, biasHost,
+        parentIds, depths, convStateRef, outRef, intermRef);
+
+    auto convStateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto convStateOutDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto weightDevice = rt::Tensor({dim, 1, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto biasDevice = rt::Tensor({dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto newColsDevice = rt::Tensor({batch, verifySeq, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto outDevice = rt::Tensor({batch, verifySeq, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto intermDevice = rt::Tensor({batch, verifySeq, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto parentDevice = rt::Tensor({batch, verifySeq}, rt::DeviceType::kGPU, DataType::kINT32);
+    auto depthDevice = rt::Tensor({batch, verifySeq}, rt::DeviceType::kGPU, DataType::kINT32);
+
+    copyHostToDevice(convStateDevice, convStateHost);
+    copyHostToDevice(weightDevice, weightHost);
+    copyHostToDevice(biasDevice, biasHost);
+    copyHostToDevice(newColsDevice, newColsHost);
+    CUDA_CHECK(cudaMemcpy(
+        parentDevice.rawPointer(), parentIds.data(), parentIds.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(depthDevice.rawPointer(), depths.data(), depths.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasDevice));
+    mamba_ssm::invokeCausalConv1dDecodeDDTree(convStateDevice, newColsDevice, weightDevice, biasOpt, outDevice,
+        convStateOutDevice, intermDevice, parentDevice, depthDevice, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const outHost = copyDeviceToHost<half>(outDevice);
+    for (size_t i = 0; i < outRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(outHost[i], outRef[i], 1e-3F, 1e-3F))
+            << "DDTree output mismatch at index " << i << ": got " << __half2float(outHost[i]) << ", expected "
+            << __half2float(outRef[i]);
+    }
+
+    auto const stateOutHost = copyDeviceToHost<half>(convStateOutDevice);
+    for (size_t i = 0; i < convStateRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(stateOutHost[i], convStateRef[i], 1e-3F, 1e-3F))
+            << "DDTree convStateOut mismatch at index " << i << ": got " << __half2float(stateOutHost[i])
+            << ", expected " << __half2float(convStateRef[i]);
+    }
+
+    auto const intermHost = copyDeviceToHost<half>(intermDevice);
+    for (size_t i = 0; i < intermRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(intermHost[i], intermRef[i], 1e-3F, 1e-3F))
+            << "DDTree intermediate state mismatch at index " << i << ": got " << __half2float(intermHost[i])
+            << ", expected " << __half2float(intermRef[i]);
+    }
+}

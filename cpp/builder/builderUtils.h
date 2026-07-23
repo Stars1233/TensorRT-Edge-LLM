@@ -118,5 +118,8 @@ bool loadJsonConfig(std::string const& configPath, nlohmann::json& outConfig);
 bool saveConfigWithBuilderInfo(
     std::filesystem::path const& engineDir, nlohmann::json const& modelConfig, nlohmann::json const& builderConfig);
 
+//! Log TRT-native attention path selection at engine build time.
+void logTrtNativeAttentionPath(char const* component) noexcept;
+
 } // namespace builder
 } // namespace trt_edgellm

@@ -57,13 +57,11 @@ template std::vector<__nv_fp8_e4m3> sliceKVWindow(std::vector<__nv_fp8_e4m3> con
 
 template <typename T>
 std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> const& k, std::vector<T> const& v,
-    int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
+    int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads, int32_t headSize, float attentionScale,
     std::optional<std::vector<int32_t>> const& treeAttnMask, float const kScaleQuantOrig, float const vScaleQuantOrig)
 {
     assert(qlen <= kvlen);
     int32_t const numQheadPerKV = numQHeads / numKVHeads;
-    float qkScale = 1.0f / std::sqrt(static_cast<float>(headSize));
-
     auto qoIndexer = [numQHeads, headSize](int32_t tokenIdx, int32_t qHeadIdx, int32_t valIdx) {
         // Q and Out Tensor has layout of [QToken, Qhead, featureVal]
         return tokenIdx * numQHeads * headSize + qHeadIdx * headSize + valIdx;
@@ -98,7 +96,7 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
                     {
                         kvVal = __half2float(k[kvIndexer(kvIdx, kvHeadIdx, valIdx)]); // half -> FP32
                     }
-                    attnScores[kvIdx] += qVal * kvVal * qkScale;
+                    attnScores[kvIdx] += qVal * kvVal * attentionScale;
                 }
 
                 maxVal = std::max(maxVal, attnScores[kvIdx]);
@@ -162,14 +160,14 @@ std::vector<half> casualAttentionRef(std::vector<half> const& q, std::vector<T> 
 // Explicit template instantiations for attention reference used in unit tests
 template std::vector<half> casualAttentionRef<half>(std::vector<half> const& q, std::vector<half> const& k,
     std::vector<half> const& v, int32_t const qlen, int32_t kvlen, int32_t numQHeads, int32_t numKVHeads,
-    int32_t headSize, std::optional<std::vector<int32_t>> const& treeAttnMask, float const kScaleQuantOrig,
-    float const vScaleQuantOrig);
+    int32_t headSize, float attentionScale, std::optional<std::vector<int32_t>> const& treeAttnMask,
+    float const kScaleQuantOrig, float const vScaleQuantOrig);
 
 #if SUPPORTS_FP8
 template std::vector<half> casualAttentionRef<__nv_fp8_e4m3>(std::vector<half> const& q,
     std::vector<__nv_fp8_e4m3> const& k, std::vector<__nv_fp8_e4m3> const& v, int32_t const qlen, int32_t kvlen,
-    int32_t numQHeads, int32_t numKVHeads, int32_t headSize, std::optional<std::vector<int32_t>> const& treeAttnMask,
-    float const kScaleQuantOrig, float const vScaleQuantOrig);
+    int32_t numQHeads, int32_t numKVHeads, int32_t headSize, float attentionScale,
+    std::optional<std::vector<int32_t>> const& treeAttnMask, float const kScaleQuantOrig, float const vScaleQuantOrig);
 #endif
 
 std::vector<half> ropeRef(std::vector<half> const& input, int32_t const numHeads, int32_t const headSize,

@@ -454,4 +454,155 @@ void invokeCausalConv1dDecodeMTP(trt_edgellm::rt::Tensor& convState, trt_edgellm
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
+// DDTree decode kernel: each node independently reconstructs its conv window by walking
+// parent_ids back to root and appending the full root-to-node token path. This avoids
+// cross-node synchronization and still executes all tree nodes in one launch.
+template <typename T>
+__global__ void causalConv1dDecodeDDTreeKernel(T const* __restrict__ convState, T const* __restrict__ newCols,
+    T const* __restrict__ weight, T const* __restrict__ bias, T* __restrict__ output, T* __restrict__ convStateOut,
+    T* __restrict__ intermediateConvStates, int32_t const* __restrict__ treeParentIds,
+    int32_t const* __restrict__ treeDepths, int32_t dim, int32_t width, int32_t verifySeq)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const nodeIdx = blockIdx.y;
+    int32_t const dimIdx = static_cast<int32_t>(blockIdx.z * blockDim.x + threadIdx.x);
+    if (dimIdx >= dim)
+    {
+        return;
+    }
+
+    int64_t const treeOffset = static_cast<int64_t>(batchIdx) * verifySeq;
+    int64_t const stateRowOffset = (static_cast<int64_t>(batchIdx) * dim + dimIdx) * width;
+    int64_t const weightOffset = static_cast<int64_t>(dimIdx) * width;
+
+    int32_t const parentIdx = treeParentIds[treeOffset + nodeIdx];
+    int32_t const depth = treeDepths[treeOffset + nodeIdx];
+    bool const isRoot = nodeIdx == 0 && parentIdx < 0 && depth == 0;
+    bool const isValidChild = nodeIdx > 0 && parentIdx >= 0 && parentIdx < nodeIdx && depth > 0;
+    bool const isValidNode = isRoot || isValidChild;
+
+    float state[8];
+    if (!isValidNode)
+    {
+        for (int32_t k = 0; k < width; ++k)
+        {
+            state[k] = conversion::toFloat(convState[stateRowOffset + k]);
+        }
+
+        int64_t const outIdx = (treeOffset + nodeIdx) * dim + dimIdx;
+        conversion::convertAndStore(&output[outIdx], 0.0F);
+        int64_t const intermediateOffset = ((treeOffset + nodeIdx) * dim + dimIdx) * width;
+        for (int32_t k = 0; k < width; ++k)
+        {
+            conversion::convertAndStore(&intermediateConvStates[intermediateOffset + k], state[k]);
+        }
+        return;
+    }
+
+    int32_t pathNodes[8];
+    int32_t pathLen{0};
+    // The conv window only depends on the latest `width` tokens.  For deeper
+    // tree nodes, truncate from the root side and keep the most recent path.
+    int32_t const maxPathLen = (depth + 1 < width) ? depth + 1 : width;
+    int32_t currentNode = nodeIdx;
+    while (pathLen < maxPathLen && currentNode >= 0 && currentNode < verifySeq)
+    {
+        pathNodes[pathLen] = currentNode;
+        ++pathLen;
+        if (currentNode == 0)
+        {
+            break;
+        }
+        currentNode = treeParentIds[treeOffset + currentNode];
+    }
+
+    for (int32_t k = 0; k < width; ++k)
+    {
+        if (k + pathLen < width)
+        {
+            state[k] = conversion::toFloat(convState[stateRowOffset + k + pathLen]);
+        }
+        else
+        {
+            state[k] = 0.0F;
+        }
+    }
+    for (int32_t pathOffset = 0; pathOffset < pathLen; ++pathOffset)
+    {
+        int32_t const pathNode = pathNodes[pathOffset];
+        int64_t const newColIdx = (treeOffset + pathNode) * dim + dimIdx;
+        state[width - 1 - pathOffset] = conversion::toFloat(newCols[newColIdx]);
+    }
+
+    float acc = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
+    for (int32_t k = 0; k < width; ++k)
+    {
+        acc += state[k] * conversion::toFloat(weight[weightOffset + k]);
+    }
+    int64_t const outIdx = (treeOffset + nodeIdx) * dim + dimIdx;
+    conversion::convertAndStore(&output[outIdx], acc);
+
+    int64_t const intermediateOffset = ((treeOffset + nodeIdx) * dim + dimIdx) * width;
+    for (int32_t k = 0; k < width; ++k)
+    {
+        conversion::convertAndStore(&intermediateConvStates[intermediateOffset + k], state[k]);
+    }
+
+    // Only the root Y-slice copies convStateOut.  grid.z covers every dim, so
+    // this is a single race-free copy of [batch, dim, width] per batch item.
+    if (nodeIdx == 0)
+    {
+        for (int32_t k = 0; k < width; ++k)
+        {
+            convStateOut[stateRowOffset + k] = convState[stateRowOffset + k];
+        }
+    }
+}
+
+void invokeCausalConv1dDecodeDDTree(trt_edgellm::rt::Tensor const& convState, trt_edgellm::rt::Tensor const& newCols,
+    trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
+    trt_edgellm::rt::Tensor& convStateOut, trt_edgellm::rt::Tensor& intermediateConvStates,
+    trt_edgellm::rt::Tensor const& treeParentIds, trt_edgellm::rt::Tensor const& treeDepths, cudaStream_t stream)
+{
+    int32_t const batch = static_cast<int32_t>(convState.getShape()[0]);
+    int32_t const dim = static_cast<int32_t>(convState.getShape()[1]);
+    int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
+    int32_t const verifySeq = static_cast<int32_t>(newCols.getShape()[1]);
+
+    ELLM_CHECK(width <= 8, "kernel_size > 8 not supported.");
+    ELLM_CHECK(convState.getDataType() == nvinfer1::DataType::kHALF
+            && newCols.getDataType() == nvinfer1::DataType::kHALF && weight.getDataType() == nvinfer1::DataType::kHALF
+            && out.getDataType() == nvinfer1::DataType::kHALF && convStateOut.getDataType() == nvinfer1::DataType::kHALF
+            && intermediateConvStates.getDataType() == nvinfer1::DataType::kHALF,
+        "only FP16 (half) is supported.");
+    ELLM_CHECK(treeParentIds.getDataType() == nvinfer1::DataType::kINT32
+            && treeDepths.getDataType() == nvinfer1::DataType::kINT32,
+        "tree_parent_ids/tree_depths must be INT32.");
+    ELLM_CHECK(newCols.getShape()[0] == batch && newCols.getShape()[2] == dim, "newCols must be [B, S, D].");
+    ELLM_CHECK(weight.getShape()[0] == dim && weight.getShape()[2] == width, "weight must be [D, 1, W].");
+    ELLM_CHECK(out.getShape()[0] == batch && out.getShape()[1] == verifySeq && out.getShape()[2] == dim,
+        "out must be [B, S, D].");
+    ELLM_CHECK(
+        convStateOut.getShape()[0] == batch && convStateOut.getShape()[1] == dim && convStateOut.getShape()[2] == width,
+        "convStateOut must be [B, D, W].");
+    ELLM_CHECK(intermediateConvStates.getShape()[0] == batch && intermediateConvStates.getShape()[1] == verifySeq
+            && intermediateConvStates.getShape()[2] == dim && intermediateConvStates.getShape()[3] == width,
+        "intermediateConvStates must be [B, S, D, W].");
+    ELLM_CHECK(treeParentIds.getShape()[0] == batch && treeParentIds.getShape()[1] == verifySeq,
+        "treeParentIds must be [B, S].");
+    ELLM_CHECK(
+        treeDepths.getShape()[0] == batch && treeDepths.getShape()[1] == verifySeq, "treeDepths must be [B, S].");
+
+    int32_t constexpr kThreads = 256;
+    dim3 const block(kThreads);
+    dim3 const grid(batch, verifySeq, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
+    half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
+
+    causalConv1dDecodeDDTreeKernel<half><<<grid, block, 0, stream>>>(convState.dataPointer<half>(),
+        newCols.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(),
+        convStateOut.dataPointer<half>(), intermediateConvStates.dataPointer<half>(),
+        treeParentIds.dataPointer<int32_t>(), treeDepths.dataPointer<int32_t>(), dim, width, verifySeq);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 } // namespace mamba_ssm

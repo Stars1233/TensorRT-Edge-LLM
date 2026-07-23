@@ -23,10 +23,14 @@
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
+#include "runtime/debug/layerDebugger.h"
+#include "runtime/decoding/decoderUtils.h"
+#include "runtime/decoding/logitBias.h"
 #include "sampler/sampling.h"
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace trt_edgellm
 {
@@ -35,7 +39,8 @@ namespace rt
 namespace
 {
 constexpr int32_t kDecodeProfile{1};
-}
+
+} // namespace
 
 VanillaDecoder::VanillaDecoder(DecodingRuntimeContext& runtime)
     : mRuntime(runtime)
@@ -103,6 +108,8 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         return false;
     }
 
+    applyLogitBias(mRuntime.logitBias, mRuntime.base.pipelineIO.outputLogits, context, context.stream);
+
     check::check(mRuntime.sampling.indices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
     if (shouldUseNonGreedySampling(context.temperature, context.topK, context.topP))
     {
@@ -123,16 +130,47 @@ bool VanillaDecoder::decodeStep(DecodingInferenceContext& context)
         mapReducedVocabToFullVocab(mRuntime.sampling.indices, mRuntime.sampling.baseVocabMappingTable, context.stream);
     }
 
+    // Enqueue logprobs extraction + D2H before the round's single synchronization so the
+    // copies ride the same sync as the sampled-token D2H below.
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::enqueueLogprobsD2H(
+            mRuntime.base.pipelineIO.outputLogits, activeBatchSize, mRuntime, context.numLogprobs, context.stream);
+    }
+
     check::check(mRuntime.sampling.hostSelectedTokenIds.reshape({activeBatchSize}), "Tensor reshape failed");
     int32_t* hostSelectedTokenIdsData = mRuntime.sampling.hostSelectedTokenIds.dataPointer<int32_t>();
     CUDA_CHECK(cudaMemcpyAsync(hostSelectedTokenIdsData, mRuntime.sampling.indices.rawPointer(),
         activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, context.stream));
     CUDA_CHECK(cudaStreamSynchronize(context.stream));
 
+    // Few-layer-validation debug: dump this decode round. The KV cache is committed (line above) so
+    // tokenIds[i].size() == the committed cache length for this round.
+    if (context.layerDebugger != nullptr)
+    {
+        std::vector<int32_t> validLengths(activeBatchSize);
+        for (int32_t i = 0; i < activeBatchSize; ++i)
+        {
+            validLengths[i] = static_cast<int32_t>(context.tokenIds[i].size());
+        }
+        context.layerDebugger->dumpRound(mRuntime.base.cacheManager, mRuntime.base.pipelineIO.outputLogits,
+            validLengths, hostSelectedTokenIdsData, activeBatchSize, context.stream);
+
+        // Teacher-forcing — feed the golden's tokens instead of our own (no-op unless
+        // EDGELLM_FORCE_TOKENS_FILE is set). After the dump, so the dump keeps our own sampled token.
+        context.layerDebugger->applyForcedTokens(
+            context.currentGenerateLengths, hostSelectedTokenIdsData, activeBatchSize);
+    }
+
     for (int32_t i = 0; i < activeBatchSize; ++i)
     {
         context.tokenIds[i].push_back(hostSelectedTokenIdsData[i]);
         context.currentGenerateLengths[i] += 1;
+    }
+
+    if (context.numLogprobs > 0)
+    {
+        decoder_utils::collectLogprobsFromHost(mRuntime, context, activeBatchSize, context.numLogprobs);
     }
 
     return true;

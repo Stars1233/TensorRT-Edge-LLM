@@ -37,8 +37,11 @@ enum class ModelType
     INTERNVL,                     //!< InternVL model
     PHI4MM,                       //!< Phi-4MM model
     GEMMA4_VISION,                //!< Gemma4 vision encoder
+    GEMMA4_UNIFIED_VISION,        //!< Encoder-free Gemma4 Unified vision embedder
+    GEMMA4_UNIFIED_AUDIO,         //!< Encoder-free Gemma4 Unified audio embedder
     NEMOTRON_OMNI_VISION_ENCODER, //!< Nemotron-Omni vision encoder
     NEMOTRON_OMNI_AUDIO_ENCODER,  //!< Nemotron-Omni audio encoder
+    GEMMA4_AUDIO_ENCODER,         //!< Gemma4 audio encoder
     UNKNOWN                       //!< Unknown or unsupported model type
 };
 
@@ -68,10 +71,16 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::PHI4MM;
     if (modelTypeStr == "gemma4" || modelTypeStr == "gemma4_vision")
         return ModelType::GEMMA4_VISION;
+    if (modelTypeStr == "gemma4_unified_vision")
+        return ModelType::GEMMA4_UNIFIED_VISION;
+    if (modelTypeStr == "gemma4_unified_audio")
+        return ModelType::GEMMA4_UNIFIED_AUDIO;
     if (modelTypeStr == "nemotron_omni_vision_encoder")
         return ModelType::NEMOTRON_OMNI_VISION_ENCODER;
     if (modelTypeStr == "parakeet")
         return ModelType::NEMOTRON_OMNI_AUDIO_ENCODER;
+    if (modelTypeStr == "gemma4_audio")
+        return ModelType::GEMMA4_AUDIO_ENCODER;
     return ModelType::UNKNOWN;
 }
 

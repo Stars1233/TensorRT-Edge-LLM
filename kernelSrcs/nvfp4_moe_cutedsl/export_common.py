@@ -43,6 +43,7 @@ def resolve_activation_type(name):
     mapping = {
         "relu2": ActivationType.Relu2,
         "swiglu": ActivationType.Swiglu,
+        "geglu": ActivationType.Geglu,
     }
     if name not in mapping:
         raise ValueError(f"Unsupported activation {name!r}; expected one of {sorted(mapping)}")

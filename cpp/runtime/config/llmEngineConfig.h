@@ -43,6 +43,15 @@ enum class SpecDecodeMode : int32_t
     kEAGLE,
     kMTP,
     kDFlash,
+    kGemma4MTP,
+};
+
+//! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
+struct Gemma4MTPKVSharingEntry
+{
+    int32_t assistantLayerIdx{-1};       //!< Assistant local attention-layer index.
+    int32_t targetAttentionLayerIdx{-1}; //!< Target local attention-layer index.
+    int32_t targetAbsoluteLayerIdx{-1};  //!< Target absolute decoder-layer index, derived during validation.
 };
 
 //! Unified configuration for base, vanilla decode, and SpecDecode draft engines.
@@ -67,7 +76,6 @@ struct LLMEngineConfig
     int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
 
     // --- Feature flags ---
-    bool useTrtNativeOps{false};  //!< Use TRT native ops instead of custom plugin
     bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
@@ -101,14 +109,16 @@ struct LLMEngineConfig
     int32_t pleHiddenSize{0};        //!< Hidden dimension of each PLE tensor (0 = disabled)
     int32_t maxSupportedLoraRank{0}; //!< Maximum LoRA rank (0 = no LoRA)
 
-    // --- Multimodal token IDs ---
-    int32_t imageTokenId{-1}; //!< Special token ID for image (-1 = unused)
-    int32_t audioTokenId{-1}; //!< Special token ID for audio (-1 = unused)
-
     //! Additional EOS token IDs parsed from config.json `eos_token_id` array.
     //! Models like Gemma4 have multiple EOS tokens (e.g. [1, 106] for <eos> and <turn|>).
     //! Empty if `eos_token_id` is absent or scalar.
     std::vector<int32_t> eosTokenIds{};
+
+    // --- Multimodal token IDs ---
+    int32_t imageTokenId{-1}; //!< Special token ID for image (-1 = unused)
+    int32_t audioTokenId{-1}; //!< Special token ID for audio (-1 = unused)
+    //! Gemma4 Unified prefill uses block-causal image attention.
+    bool useVisionBidirectionalAttention{false};
 
     // --- Hybrid model (Mamba/GDN) state dimensions ---
     int32_t numLinearAttnLayers{0};    //!< Number of linear attention / recurrent layers
@@ -150,6 +160,15 @@ struct LLMEngineConfig
     //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
     std::vector<int32_t> dflashTargetLayerIds{};
 
+    // --- Gemma4 MTP shared-target-KV metadata ---
+    std::string modelType;              //!< Top-level model type string, if exported.
+    bool sharesTargetKV{false};         //!< Draft assistant reads target KV cache.
+    bool hasOwnKVCache{true};           //!< Draft assistant owns/writes its own KV cache.
+    bool constantDraftPositions{false}; //!< Assistant draft position IDs stay constant through a chain.
+    bool returnsFeedbackHidden{false};  //!< Assistant emits backbone-space feedback hidden states.
+    int32_t assistantHiddenSize{0};     //!< Assistant internal hidden dim, when distinct from hiddenSize.
+    std::vector<Gemma4MTPKVSharingEntry> gemma4MTPKVSharingMap{}; //!< Assistant -> target KV sharing map.
+
     // --- Per-layer type routing (hybrid cache) ---
 
     //! Absolute decoder-layer -> attention|mamba. Populated either from the
@@ -176,7 +195,7 @@ struct LLMEngineConfig
     //
     // Every `InferenceDims` the runtime hands to `EngineExecutor::prepare` should be
     // produced by one of these methods. Each returns a fully-specified
-    // struct with all six fields set — no implicit defaults.
+    // struct with all fields set — no implicit defaults.
     //
     // The second parameter (where present) is named for the caller-side
     // concept, not a destination field, because each input fans out to
@@ -187,9 +206,8 @@ struct LLMEngineConfig
     //! Prefill dims (vanilla LLM, SpecDecode base, and SpecDecode draft).
     //! seqLen is the prompt length being processed this step.
     //! kvCacheAllEmpty signals whether this is the initial prefill of an empty
-    //! KV cache — for plugin-path engines, this drives the `kvcache_start_index`
-    //! shape to `[0]` (engine's "initial prefill" sentinel) instead of `[batch]`.
-    //! TRT-native-ops engines always use `[batch]` regardless.
+    //! KV cache — this drives the `kvcache_start_index` shape to `[0]` (engine's
+    //! "initial prefill" sentinel) instead of `[batch]`.
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
 
     //! Vanilla single-token decode dims.

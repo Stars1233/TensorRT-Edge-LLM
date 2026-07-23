@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/inputLimits.h"
 #include "common/trtUtils.h"
+#include "common/utf8.h"
 #include "memoryMonitor.h"
 #include "multimodal/code2WavRunner.h"
 #include "profileFormatter.h"
@@ -70,7 +71,9 @@ enum LLMInferenceOptionId : int
     TALKER_ENGINE_DIR = 917,
     CODE2WAV_ENGINE_DIR = 918,
     OUTPUT_AUDIO_DIR = 919,
-    ENABLE_THINKER_TALKER_STREAMING = 920
+    ENABLE_THINKER_TALKER_STREAMING = 920,
+    DFLASH_BLOCK_SIZE = 921,
+    NUM_LOGPROBS = 922
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -89,6 +92,9 @@ struct SpecDecodeArgs
 
     // Number of proposal tokens to select for base model verification.
     int32_t verifySize{60};
+
+    // DFlash-only draft horizon. 0 means infer from the engine config.
+    int32_t dflashBlockSize{0};
 };
 
 struct LLMInferenceArgs
@@ -103,10 +109,11 @@ struct LLMInferenceArgs
     bool dumpProfile{false};
     int32_t warmup{0};
     bool dumpOutput{false};
-    // Override parameters (only batchSize and maxGenerateLength can be overridden via CLI)
+    // Override parameters (only batchSize, maxGenerateLength, and numLogprobs can be overridden via CLI)
     // For other sampling parameters (temperature, top_p, top_k), please specify them in the input JSON file
     int32_t batchSize{-1};         // -1 means use value from input file
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
+    int32_t numLogprobs{-1};       // -1 means use value from input file
     SpecDecodeArgs specDecodeArgs;
 
     // Qwen3-Omni audio output options
@@ -139,7 +146,7 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifySize=<number>]"
+                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -156,12 +163,19 @@ void printUsage(char const* programName)
     std::cerr << "  --maxGenerateLength       Override max generate length from input file" << std::endl;
     std::cerr << "                            NOTE: For sampling parameters (temperature, top_p, top_k)," << std::endl;
     std::cerr << "                            please specify them in the input JSON file instead of CLI" << std::endl;
-    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE or MTP)" << std::endl;
+    std::cerr
+        << "  --numLogprobs             Number of top log-probabilities to return per token (0 = disabled, max 50)"
+        << std::endl;
+    std::cerr << "  --specDecode              Enable speculative decoding (EAGLE, MTP, or DFlash)" << std::endl;
     std::cerr << "  --specDraftTopK           Number of tokens selected per drafting step (default: 10)" << std::endl;
-    std::cerr << "                            Controls candidate count per draft expansion step" << std::endl;
+    std::cerr << "                            For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree"
+              << std::endl;
     std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
-    std::cerr << "                            Each step extends the current draft proposal" << std::endl;
+    std::cerr << "                            DFlash requires this to be 1; use dflashBlockSize for proposal horizon"
+              << std::endl;
     std::cerr << "  --specVerifySize          Number of proposal tokens for base verification (default: 60)"
+              << std::endl;
+    std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
               << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
@@ -191,8 +205,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"specVerifySize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
         {"specVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE},
         {"eagleVerifyTreeSize", required_argument, 0, LLMInferenceOptionId::SPEC_VERIFY_SIZE}, // deprecated alias
+        {"dflashBlockSize", required_argument, 0, LLMInferenceOptionId::DFLASH_BLOCK_SIZE},
         {"batchSize", required_argument, 0, LLMInferenceOptionId::BATCH_SIZE},
         {"maxGenerateLength", required_argument, 0, LLMInferenceOptionId::MAX_GENERATE_LENGTH},
+        {"numLogprobs", required_argument, 0, LLMInferenceOptionId::NUM_LOGPROBS},
         {"enableAudioOutput", no_argument, 0, LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT},
         {"talkerEngineDir", required_argument, 0, LLMInferenceOptionId::TALKER_ENGINE_DIR},
         {"code2wavEngineDir", required_argument, 0, LLMInferenceOptionId::CODE2WAV_ENGINE_DIR},
@@ -279,6 +295,22 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
                 return false;
             }
             break;
+        case LLMInferenceOptionId::DFLASH_BLOCK_SIZE:
+            try
+            {
+                args.specDecodeArgs.dflashBlockSize = std::stoi(optarg);
+                if (args.specDecodeArgs.dflashBlockSize < 0)
+                {
+                    LOG_ERROR("Invalid dflashBlockSize value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dflashBlockSize value: %s", optarg);
+                return false;
+            }
+            break;
         case LLMInferenceOptionId::BATCH_SIZE:
             try
             {
@@ -316,6 +348,22 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
         case LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING: args.enableThinkerTalkerStreaming = true; break;
+        case LLMInferenceOptionId::NUM_LOGPROBS:
+            try
+            {
+                args.numLogprobs = std::stoi(optarg);
+                if (args.numLogprobs < 0)
+                {
+                    LOG_ERROR("Invalid numLogprobs value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid numLogprobs value: %s", optarg);
+                return false;
+            }
+            break;
         default: return false;
         }
     }
@@ -370,6 +418,7 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Spec draft topK: %d", args.specDecodeArgs.draftTopK);
         LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
         LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
+        LOG_INFO("DFlash block size: %d", args.specDecodeArgs.dflashBlockSize);
     }
 
     if (args.enableAudioOutput)
@@ -417,9 +466,10 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 // Thin wrapper around the shared parser in examples/utils/requestFileParser.h.
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
     std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1, int64_t maxGenerateLengthOverride = -1,
-    LLMInferenceArgs* argsOut = nullptr)
+    int32_t numLogprobsOverride = -1, LLMInferenceArgs* argsOut = nullptr)
 {
-    auto result = exampleUtils::parseRequestFile(inputFilePath, batchSizeOverride, maxGenerateLengthOverride);
+    auto result = exampleUtils::parseRequestFile(
+        inputFilePath, batchSizeOverride, maxGenerateLengthOverride, numLogprobsOverride);
 
     if (argsOut != nullptr && argsOut->enableAudioOutput)
     {
@@ -490,7 +540,7 @@ int main(int argc, char* argv[])
     try
     {
         std::tie(loraWeightsMap, batchedRequests)
-            = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength, &args);
+            = parseInputFile(args.inputFile, args.batchSize, args.maxGenerateLength, args.numLogprobs, &args);
         LOG_INFO("Successfully parsed %zu LoRA weights from input file.", loraWeightsMap.size());
         LOG_INFO("Successfully parsed %zu batches of requests from input file.", batchedRequests.size());
     }
@@ -509,12 +559,15 @@ int main(int argc, char* argv[])
     // Create unified runtime (handles both vanilla and speculative decoding modes)
     std::unique_ptr<rt::LLMInferenceRuntime> runtime{nullptr};
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     if (args.specDecodeArgs.enabled)
     {
-        rt::SpecDecodeDraftingConfig draftingConfig{
-            args.specDecodeArgs.draftTopK, args.specDecodeArgs.draftStep, args.specDecodeArgs.verifySize};
+        rt::SpecDecodeDraftingConfig draftingConfig;
+        draftingConfig.draftingTopK = args.specDecodeArgs.draftTopK;
+        draftingConfig.draftingStep = args.specDecodeArgs.draftStep;
+        draftingConfig.verifySize = args.specDecodeArgs.verifySize;
+        draftingConfig.dflashBlockSize = args.specDecodeArgs.dflashBlockSize;
         try
         {
             runtime = std::make_unique<rt::LLMInferenceRuntime>(
@@ -628,6 +681,10 @@ int main(int argc, char* argv[])
     bool hasFailedRequest = false;
     std::string errorMessage = "TensorRT Edge LLM cannot handle this request. Fails.";
     size_t failedCount = 0;
+    // Index of the request in the input file's flat "requests" array. Batching packs
+    // batchSize consecutive requests into one batched request, so downstream consumers
+    // (e.g. calculate_wer_score.py) must receive the flat index, not the batch index.
+    size_t flatRequestIdx = 0;
 
     // Process each request with progress indication
     LOG_INFO("Processing %zu batched requests...", batchedRequests.size());
@@ -937,7 +994,7 @@ int main(int argc, char* argv[])
             // Validate UTF-8 for output text (inputs are always valid)
             // If invalid UTF-8 detected, error message is returned and original text is logged
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
-            responseJson["request_idx"] = requestIdx;
+            responseJson["request_idx"] = flatRequestIdx++;
             responseJson["batch_idx"] = batchIdx;
             responseJson["finish_reason"] = (requestStatus && batchIdx < response.finishReasons.size())
                 ? rt::finishReasonName(response.finishReasons[batchIdx])
@@ -974,6 +1031,32 @@ int main(int argc, char* argv[])
             responseJson["formatted_system_prompt"] = formattedRequest ? formattedRequest->formattedSystemPrompt : "";
             responseJson["formatted_complete_request"]
                 = formattedRequest ? formattedRequest->formattedCompleteRequest : "";
+            // Serialize logprobs if present: logprobs[step] = [{token_id, token, bytes, logprob}, ...]
+            // `token` is the UTF-8-sanitized piece string (invalid bytes -> U+FFFD, required so
+            // nlohmann::json::dump does not throw); `bytes` carries the raw token bytes losslessly.
+            if (requestStatus && batchIdx < response.logprobs.size() && !response.logprobs[batchIdx].empty())
+            {
+                nlohmann::json logprobsJson = nlohmann::json::array();
+                for (auto const& stepEntries : response.logprobs[batchIdx])
+                {
+                    nlohmann::json stepJson = nlohmann::json::array();
+                    for (auto const& entry : stepEntries)
+                    {
+                        std::string pending;
+                        std::string token = utf8::sanitizeUtf8Streaming(entry.piece, pending);
+                        token += utf8::sanitizeUtf8Flush(pending);
+                        nlohmann::json bytesJson = nlohmann::json::array();
+                        for (unsigned char b : entry.piece)
+                        {
+                            bytesJson.push_back(static_cast<int>(b));
+                        }
+                        stepJson.push_back({{"token_id", entry.tokenId}, {"token", std::move(token)},
+                            {"bytes", std::move(bytesJson)}, {"logprob", entry.logprob}});
+                    }
+                    logprobsJson.push_back(std::move(stepJson));
+                }
+                responseJson["logprobs"] = std::move(logprobsJson);
+            }
             outputData["responses"].push_back(responseJson);
         }
     }

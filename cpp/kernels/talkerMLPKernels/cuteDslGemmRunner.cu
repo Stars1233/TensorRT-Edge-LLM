@@ -77,6 +77,9 @@ gemm_blackwell_small_bias_silu_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwel
 #ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
 gemm_blackwell_small_bias_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwellSmallBiasModule = {};
 #endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED
+gemm_blackwell_small_fp16in_fp32out_Kernel_Module_t CuteDslGemmRunner::sBlackwellSmallFp16inFp32outModule = {};
+#endif
 
 #ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
 gemm_blackwell_2cta_fp16_Kernel_Module_t CuteDslGemmRunner::sBlackwell2ctaModule = {};
@@ -199,6 +202,9 @@ bool CuteDslGemmRunner::loadKernelModule()
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
         gemm_blackwell_small_bias_fp16_Kernel_Module_Load(&sBlackwellSmallBiasModule);
+#endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED
+        gemm_blackwell_small_fp16in_fp32out_Kernel_Module_Load(&sBlackwellSmallFp16inFp32outModule);
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
         gemm_blackwell_2cta_fp16_Kernel_Module_Load(&sBlackwell2ctaModule);
@@ -331,6 +337,9 @@ void CuteDslGemmRunner::unloadKernelModule()
 #ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_BIAS_ENABLED
         gemm_blackwell_small_bias_fp16_Kernel_Module_Unload(&sBlackwellSmallBiasModule);
 #endif
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED
+        gemm_blackwell_small_fp16in_fp32out_Kernel_Module_Unload(&sBlackwellSmallFp16inFp32outModule);
+#endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_2CTA_ENABLED
         gemm_blackwell_2cta_fp16_Kernel_Module_Unload(&sBlackwell2ctaModule);
 #endif
@@ -362,6 +371,46 @@ void CuteDslGemmRunner::unloadKernelModule()
     sLoaded = false;
     sActiveVariant = 0;
 }
+
+namespace
+{
+
+// Helper to dispatch a Blackwell/BW-GeForce 3D plain-GEMM kernel (a, b, c).
+// 3D tensor ABI: (mode0, mode1, L=1) with strides (mode1, 1, mode0*mode1).
+// Bias-free twin of dispatch3dFused in the fused-epilogue section below.
+template <typename ModuleT, typename TensorA, typename TensorB, typename TensorC, typename WrapFn>
+bool dispatch3d(ModuleT& mod, WrapFn wrapperFn, void const* aPtr, void const* bPtr, void* cPtr, int32_t M, int32_t N,
+    int32_t K, cudaStream_t stream)
+{
+    TensorA tensorA{};
+    tensorA.data = const_cast<void*>(aPtr);
+    tensorA.dynamic_shapes[0] = M;
+    tensorA.dynamic_shapes[1] = K;
+    tensorA.dynamic_shapes[2] = 1;
+    tensorA.dynamic_strides[0] = K;
+    tensorA.dynamic_strides[1] = static_cast<int64_t>(M) * K;
+
+    TensorB tensorB{};
+    tensorB.data = const_cast<void*>(bPtr);
+    tensorB.dynamic_shapes[0] = N;
+    tensorB.dynamic_shapes[1] = K;
+    tensorB.dynamic_shapes[2] = 1;
+    tensorB.dynamic_strides[0] = K;
+    tensorB.dynamic_strides[1] = static_cast<int64_t>(N) * K;
+
+    TensorC tensorC{};
+    tensorC.data = cPtr;
+    tensorC.dynamic_shapes[0] = M;
+    tensorC.dynamic_shapes[1] = N;
+    tensorC.dynamic_shapes[2] = 1;
+    tensorC.dynamic_strides[0] = N;
+    tensorC.dynamic_strides[1] = static_cast<int64_t>(M) * N;
+
+    wrapperFn(&mod, &tensorA, &tensorB, &tensorC, stream);
+    return true;
+}
+
+} // namespace
 
 bool CuteDslGemmRunner::run(
     void const* aPtr, void const* bPtr, void* cPtr, int32_t M, int32_t N, int32_t K, cudaStream_t stream)
@@ -528,32 +577,9 @@ bool CuteDslGemmRunner::run(
 #ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_ENABLED
         if (M <= sBlackwellSmallTileMaxM)
         {
-            gemm_blackwell_small_fp16_Tensor_a_t tensorA{};
-            tensorA.data = const_cast<void*>(aPtr);
-            tensorA.dynamic_shapes[0] = M;
-            tensorA.dynamic_shapes[1] = K;
-            tensorA.dynamic_shapes[2] = 1;
-            tensorA.dynamic_strides[0] = K;
-            tensorA.dynamic_strides[1] = static_cast<int64_t>(M) * K;
-
-            gemm_blackwell_small_fp16_Tensor_b_t tensorB{};
-            tensorB.data = const_cast<void*>(bPtr);
-            tensorB.dynamic_shapes[0] = N;
-            tensorB.dynamic_shapes[1] = K;
-            tensorB.dynamic_shapes[2] = 1;
-            tensorB.dynamic_strides[0] = K;
-            tensorB.dynamic_strides[1] = static_cast<int64_t>(N) * K;
-
-            gemm_blackwell_small_fp16_Tensor_c_t tensorC{};
-            tensorC.data = cPtr;
-            tensorC.dynamic_shapes[0] = M;
-            tensorC.dynamic_shapes[1] = N;
-            tensorC.dynamic_shapes[2] = 1;
-            tensorC.dynamic_strides[0] = N;
-            tensorC.dynamic_strides[1] = static_cast<int64_t>(M) * N;
-
-            cute_dsl_gemm_blackwell_small_fp16_wrapper(&sBlackwellSmallModule, &tensorA, &tensorB, &tensorC, stream);
-            return true;
+            return dispatch3d<gemm_blackwell_small_fp16_Kernel_Module_t, gemm_blackwell_small_fp16_Tensor_a_t,
+                gemm_blackwell_small_fp16_Tensor_b_t, gemm_blackwell_small_fp16_Tensor_c_t>(
+                sBlackwellSmallModule, cute_dsl_gemm_blackwell_small_fp16_wrapper, aPtr, bPtr, cPtr, M, N, K, stream);
         }
 #endif
 
@@ -684,6 +710,36 @@ bool CuteDslGemmRunner::run(
 
     default: LOG_ERROR("CuteDslGemmRunner: No active variant (variant=%d)", sActiveVariant); return false;
     }
+}
+
+bool CuteDslGemmRunner::runFp16inFp32out(
+    void const* aPtr, void const* bPtr, void* cPtr, int32_t M, int32_t N, int32_t K, cudaStream_t stream)
+{
+    if (!sLoaded)
+    {
+        LOG_ERROR("CuteDslGemmRunner: Kernel module not loaded. Call loadKernelModule() first.");
+        return false;
+    }
+
+    // FP32-C-output path: a single AOT variant with the same Blackwell 3D L=1 row-major
+    // ABI as run()'s FP16-out variants (the ABI does not encode the C element type —
+    // data is void* — so only the dispatched module and symbols differ). No M-based
+    // tile dispatch: the small (64x128) tile is the only FP32-out variant and covers
+    // the parakeet mel GEMM's fixed M=nMel. Shares the dispatch3d helper with run().
+#ifdef CUTE_DSL_GEMM_BLACKWELL_SMALL_FP16IN_FP32OUT_ENABLED
+    if (sActiveVariant == static_cast<int32_t>(Variant::kBlackwell))
+    {
+        return dispatch3d<gemm_blackwell_small_fp16in_fp32out_Kernel_Module_t,
+            gemm_blackwell_small_fp16in_fp32out_Tensor_a_t, gemm_blackwell_small_fp16in_fp32out_Tensor_b_t,
+            gemm_blackwell_small_fp16in_fp32out_Tensor_c_t>(sBlackwellSmallFp16inFp32outModule,
+            cute_dsl_gemm_blackwell_small_fp16in_fp32out_wrapper, aPtr, bPtr, cPtr, M, N, K, stream);
+    }
+#endif
+    LOG_ERROR(
+        "CuteDslGemmRunner::runFp16inFp32out: no FP16-in/FP32-out Blackwell variant compiled / active "
+        "(variant=%d). Build the gemm_blackwell_small_fp16in_fp32out AOT variant and run on Blackwell DC.",
+        sActiveVariant);
+    return false;
 }
 
 // ---------------------------------------------------------------------------

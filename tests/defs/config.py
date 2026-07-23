@@ -38,6 +38,9 @@ PRE_QUANTIZED_MODELS: frozenset = frozenset({
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "Qwen3-30B-A3B-NVFP4",
+    "nvidia-Qwen3-30B-A3B-NVFP4",
+    "nvidia-Gemma-4-31B-IT-NVFP4",
+    "nvidia-Gemma-4-26B-A4B-NVFP4",
 })
 
 
@@ -125,6 +128,19 @@ _HF_CHECKPOINT_FILES = [
     ["*.safetensors", "*.bin"],
 ]
 
+_NVFP4_MOE_TARGET_ENV = "EDGELLM_NVFP4_MOE_TARGET"
+_NVFP4_MOE_TARGET_TOKENS = frozenset(
+    ("sm100", "sm101", "sm110", "sm12x", "sm120", "sm121", "geforce"))
+
+
+def _normalize_nvfp4_moe_target(target: str) -> str:
+    """Normalize testcase tokens for the NVFP4 MoE export target."""
+    target = target.strip().lower()
+    if target in ("sm120", "sm121", "geforce"):
+        return "sm12x"
+    return target
+
+
 _QUANT_SUFFIX_BY_PRECISION = {
     "int4_awq": "INT4-AWQ",
     "int8_sq": "INT8-SQ",
@@ -180,6 +196,32 @@ class ModelType(enum.Enum):
     VLA = "vla"  # Vision-Language-Action (e.g. Alpamayo-R1-10B)
 
 
+def infer_checkpoint_export_model_type(param_str: str) -> ModelType:
+    """Infer model type for pre-quantized checkpoint export tests."""
+    parts = param_str.split('-')
+    model_parts: list[str] = []
+    for i, part in enumerate(parts):
+        if part in VALID_LLM_PRECISIONS:
+            model_parts = parts[:i]
+            break
+    model_name = '-'.join(model_parts) if model_parts else param_str
+    base = strip_model_quant_suffixes(model_name)
+
+    if base.startswith("Alpamayo"):
+        return ModelType.VLA
+    if base.startswith("Qwen3-ASR"):
+        return ModelType.ASR
+    if base.startswith("Qwen3-TTS"):
+        return ModelType.TTS
+    if "Omni" in base:
+        return ModelType.OMNI
+    if ("-VL-" in base or base.startswith("InternVL")
+            or base.startswith("Cosmos-Reason")
+            or "multimodal" in base.lower()):
+        return ModelType.VLM
+    return ModelType.LLM
+
+
 class TaskType(enum.Enum):
     """Supported task types"""
     EXPORT = "export"
@@ -187,6 +229,7 @@ class TaskType(enum.Enum):
     E2E_BENCH = "e2e_bench"
     INFERENCE = "inference"
     KERNEL_BENCH = "kernel_bench"
+    VLMEVALKIT = "vlmevalkit"
 
 
 @dataclass
@@ -198,9 +241,16 @@ class ParameterSpec:
     valid_for: Set[ModelType]
     is_required: bool = True
 
+    @staticmethod
+    def _effective_task_type(task_type: TaskType) -> TaskType:
+        if task_type == TaskType.VLMEVALKIT:
+            return TaskType.INFERENCE
+        return task_type
+
     def is_valid_for_task_and_model(self, task_type: TaskType,
                                     model_type: ModelType) -> bool:
         """Check if this parameter is valid for the given task and model type"""
+        task_type = self._effective_task_type(task_type)
         return task_type in self.required_for and model_type in self.valid_for
 
     def is_required_for_task_and_model(self, task_type: TaskType,
@@ -211,40 +261,88 @@ class ParameterSpec:
 
 
 LLM_MODELS_DIR_MAP = {
-    "Qwen2.5-0.5B-Instruct": "Qwen2.5-0.5B-Instruct",
-    "Qwen2.5-1.5B-Instruct": "Qwen2.5-1.5B-Instruct",
-    "Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
-    "Qwen2.5-7B-Instruct": "Qwen2.5-7B-Instruct",
-    "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-3B-Instruct",
-    "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B-Instruct",
-    "Qwen2-VL-2B-Instruct": "Qwen2-VL-2B-Instruct",
-    "InternVL3-1B": "InternVL3-1B-hf",
-    "InternVL3-2B": "InternVL3-2B-hf",
-    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
-    "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
-    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
-    "Qwen3-1.7B": "Qwen3/Qwen3-1.7B",
-    "Qwen3-8B": "Qwen3/Qwen3-8B",
-    "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
-    "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
-    "Qwen3-VL-4B-Instruct": "Qwen3/Qwen3-VL-4B-Instruct",
-    "Qwen3-VL-8B-Instruct": "Qwen3/Qwen3-VL-8B-Instruct",
-    "Qwen3.5-0.8B": "Qwen3.5-0.8B",
-    "Qwen3.5-2B": "Qwen3.5-2B",
-    "Qwen3.5-4B": "Qwen3.5-4B",
-    "Qwen3.5-9B": "Qwen3.5-9B",
-    "Qwen3.5-27B": "Qwen3.5-27B",
-    "Qwen3.6-27B": "Qwen3.6-27B",
-    "Phi-4-multimodal-instruct": "Phi-4-multimodal-instruct",
-    "Alpamayo-R1-10B": "Alpamayo-R1-10B",
+    "Qwen2.5-0.5B-Instruct":
+    "Qwen2.5-0.5B-Instruct",
+    "Qwen2.5-1.5B-Instruct":
+    "Qwen2.5-1.5B-Instruct",
+    "Qwen2.5-3B-Instruct":
+    "Qwen2.5-3B-Instruct",
+    "Qwen2.5-7B-Instruct":
+    "Qwen2.5-7B-Instruct",
+    "Qwen2.5-VL-3B-Instruct":
+    "Qwen2.5-VL-3B-Instruct",
+    "Qwen2.5-VL-7B-Instruct":
+    "Qwen2.5-VL-7B-Instruct",
+    "Qwen2-VL-2B-Instruct":
+    "Qwen2-VL-2B-Instruct",
+    "InternVL3-1B":
+    "InternVL3-1B-hf",
+    "InternVL3-2B":
+    "InternVL3-2B-hf",
+    "Llama-3.1-8B-Instruct":
+    "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "Llama-3.2-1B":
+    "llama-3.2-models/Llama-3.2-1B",
+    "Llama-3.2-3B":
+    "llama-3.2-models/Llama-3.2-3B",
+    "Qwen3-0.6B":
+    "Qwen3/Qwen3-0.6B",
+    "Qwen3-1.7B":
+    "Qwen3/Qwen3-1.7B",
+    "Qwen3-8B":
+    "Qwen3/Qwen3-8B",
+    "Qwen3-4B-Instruct-2507":
+    "Qwen3/Qwen3-4B-Instruct-2507",
+    "Qwen3-VL-2B-Instruct":
+    "Qwen3/Qwen3-VL-2B-Instruct",
+    "Qwen3-VL-4B-Instruct":
+    "Qwen3/Qwen3-VL-4B-Instruct",
+    "Qwen3-VL-8B-Instruct":
+    "Qwen3/Qwen3-VL-8B-Instruct",
+    "Qwen3.5-0.8B":
+    "Qwen3.5-0.8B",
+    "Qwen3.5-2B":
+    "Qwen3.5-2B",
+    "Qwen3.5-4B":
+    "Qwen3.5-4B",
+    "Qwen3.5-9B":
+    "Qwen3.5-9B",
+    "Qwen3.5-27B":
+    "Qwen3.5-27B",
+    "Qwen3.6-27B":
+    "Qwen3.6-27B",
+    # Gemma4 E-models. CI runners may see the public base checkpoint under
+    # /scratch.trt_llm_data/llm-models/gemma, while paired MTP assistant
+    # checkpoints are usually staged under /scratch.edge_llm_cache/source_models.
+    "gemma-4-E2B-it": [
+        "gemma/gemma-4-E2B-it",
+        "source_models/gemma-4-E2B-it",
+        "gemma-4-E2B-it",
+    ],
+    "gemma-4-E4B-it":
+    "gemma/gemma-4-E4B-it",
+    "gemma-4-12B-it":
+    "gemma/gemma-4-12B-it",
+    "gemma-4-31B-it":
+    "gemma/gemma-4-31B-it",
+    "gemma-4-26B-A4B-it":
+    "gemma/gemma-4-26B-A4B-it",
+    "Phi-4-multimodal-instruct":
+    "Phi-4-multimodal-instruct",
+    "Alpamayo-R1-10B":
+    "Alpamayo-R1-10B",
     # Pre-quantized models in llm_models_dir
-    "Llama-3.2-1B-FP8": "llama-3.2-models/Llama-3.2-1B-FP8",
-    "Phi-4-FP8": "Phi-4-FP8",
-    "Phi-4-multimodal-instruct-FP8": "Phi-4-multimodal-instruct-FP8",
+    "Llama-3.2-1B-FP8":
+    "llama-3.2-models/Llama-3.2-1B-FP8",
+    "Phi-4-FP8":
+    "Phi-4-FP8",
+    "Phi-4-multimodal-instruct-FP8":
+    "Phi-4-multimodal-instruct-FP8",
     # ASR and TTS models
-    "Qwen3-ASR-0.6B": "Qwen3/Qwen3-ASR-0.6B",
-    "Qwen3-TTS-12Hz-0.6B-CustomVoice": "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "Qwen3-ASR-0.6B":
+    "Qwen3/Qwen3-ASR-0.6B",
+    "Qwen3-TTS-12Hz-0.6B-CustomVoice":
+    "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     # Nemotron-H 30B (BF16 base + pre-quantized NVFP4)
     "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
     "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
@@ -253,20 +351,31 @@ LLM_MODELS_DIR_MAP = {
     "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4":
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-    "NVIDIA-Nemotron-3-Nano-4B-BF16": "NVIDIA-Nemotron-3-Nano-4B-BF16",
-    "NVIDIA-Nemotron-3-Nano-4B-FP8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
+    "NVIDIA-Nemotron-3-Nano-4B-BF16":
+    "NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "NVIDIA-Nemotron-3-Nano-4B-FP8":
+    "NVIDIA-Nemotron-3-Nano-4B-FP8",
     # Nemotron-Nano 9B v2 family (BF16 base + FP8/NVFP4 pre-quantized
     # variants all live under llm_models_dir/, not edge_llm_cache/).
-    "NVIDIA-Nemotron-Nano-9B-v2": "NVIDIA-Nemotron-Nano-9B-v2",
-    "NVIDIA-Nemotron-Nano-9B-v2-FP8": "NVIDIA-Nemotron-Nano-9B-v2-FP8",
-    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4": "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
+    "NVIDIA-Nemotron-Nano-9B-v2":
+    "NVIDIA-Nemotron-Nano-9B-v2",
+    "NVIDIA-Nemotron-Nano-9B-v2-FP8":
+    "NVIDIA-Nemotron-Nano-9B-v2-FP8",
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4":
+    "NVIDIA-Nemotron-Nano-9B-v2-NVFP4",
     # Cosmos VLM
-    "Cosmos-Reason2-8B": "Cosmos-Reason2-8B",
-    # Qwen3.5 35B-A3B (BF16 base; GPTQ-Int4 variant lives in GPTQ map)
-    "Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
+    "Cosmos-Reason2-8B":
+    "Cosmos-Reason2-8B",
+    # Qwen3.5/3.6 35B-A3B (BF16 base; GPTQ-Int4 / NVFP4 variants in GPTQ map)
+    "Qwen3.5-35B-A3B":
+    "Qwen3.5-35B-A3B",
+    "Qwen3.6-35B-A3B":
+    "Qwen3.6-35B-A3B",
     # ASR / TTS larger variants (1.7B family)
-    "Qwen3-ASR-1.7B": "Qwen3/Qwen3-ASR-1.7B",
-    "Qwen3-TTS-12Hz-1.7B-CustomVoice": "Qwen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "Qwen3-ASR-1.7B":
+    "Qwen3/Qwen3-ASR-1.7B",
+    "Qwen3-TTS-12Hz-1.7B-CustomVoice":
+    "Qwen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
 }
 
 GPTQ_MODELS_DIR_MAP = {
@@ -276,8 +385,11 @@ GPTQ_MODELS_DIR_MAP = {
     "Qwen3-30B-A3B-GPTQ-Int4": "Qwen3-30B-A3B-GPTQ-Int4",
     # NVFP4 MoE (pre-quantized, no quantization step needed)
     "Qwen3-30B-A3B-NVFP4": "Qwen3-30B-A3B-NVFP4",
+    "nvidia-Qwen3-30B-A3B-NVFP4": "Qwen3/nvidia-Qwen3-30B-A3B-NVFP4",
     "Qwen3.5-35B-A3B-GPTQ-Int4": "Qwen3.5-35B-A3B-GPTQ-Int4",
     "Qwen3.6-35B-A3B-NVFP4": "Qwen3.6-35B-A3B-NVFP4",
+    "nvidia-Gemma-4-31B-IT-NVFP4": "nvidia-Gemma-4-31B-IT-NVFP4",
+    "nvidia-Gemma-4-26B-A4B-NVFP4": "nvidia-Gemma-4-26B-A4B-NVFP4",
     # Multimodal pre-quantized NVFP4 (LLM + visual + audio).  Test list
     # uses ``Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`` as the
     # canonical name; verify the on-disk dir matches before running.
@@ -297,7 +409,7 @@ GPTQ_MODELS_DIR_MAP = {
     "Qwen3-VL-2B-Instruct-INT4-AWQ": "Qwen3-VL-2B-Instruct-INT4-AWQ",
 }
 
-# Base model + EAGLE/DFlash ``draft_model_id`` -> draft checkpoint folder name.
+# Base model + EAGLE ``draft_model_id`` -> draft checkpoint folder name.
 # Single source of truth shared by ``_draft_model_dir_name`` (torch dir lookup)
 # and ``get_quantized_draft_checkpoint_dir_name`` (hub pre-quant folder name) so
 # the two cannot diverge.
@@ -334,6 +446,61 @@ MODEL_NAME_TO_DRAFT_MODELS_MAP = {
     },
 }
 
+# Base model + DFlash ``draft_model_id`` -> draft checkpoint folder name.
+MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
+    "Qwen3-4B-Instruct-2507": {
+        "zlab": "Qwen3-4B-DFlash-b16",
+    },
+    "Qwen3-8B": {
+        "zlab": "Qwen3-8B-DFlash-b16",
+    },
+    "Qwen3.5-4B": {
+        "b16": "Qwen3.5-4B-DFlash",
+    },
+    "Qwen3.5-4B-NVFP4": {
+        "b16": "Qwen3.5-4B-DFlash-NVFP4",
+    },
+    "Qwen3.5-9B": {
+        "zlab": "Qwen3.5-9B-DFlash",
+    },
+    "Qwen3.5-27B": {
+        "zlab": "Qwen3.5-27B-DFlash",
+    },
+    # MoE models: NVFP4 base + FP16 DFlash draft, except
+    # Qwen3.5-35B-A3B which is currently supported as GPTQ-Int4 base.
+    "Qwen3.5-35B-A3B-GPTQ-Int4": {
+        "zlab": "Qwen3.5-35B-A3B-DFlash",
+    },
+    "Qwen3.6-35B-A3B": {
+        "zlab": "Qwen3.6-35B-A3B-DFlash",
+    },
+    "Qwen3.6-35B-A3B-NVFP4": {
+        "zlab": "Qwen3.6-35B-A3B-DFlash",
+    },
+    "gemma-4-31B-it": {
+        "zlab": "gemma-4-31B-it-DFlash",
+    },
+    "gemma-4-26B-A4B-it": {
+        "zlab": "gemma-4-26B-A4B-it-DFlash",
+    },
+}
+
+# Paired Gemma4 MTP uses a separate assistant checkpoint. The test parameter
+# remains ``...-mtp`` so runtime naming is shared with Qwen-style MTP; only
+# export needs this model-family-specific assistant lookup.
+GEMMA4_MTP_ASSISTANT_MODELS_MAP = {
+    "gemma-4-E2B-it": [
+        "source_models/gemma-4-E2B-it-assistant",
+        "gemma-4-E2B-it-assistant",
+        "gemma/gemma-4-E2B-it-assistant",
+    ],
+    "nvidia-Gemma-4-26B-A4B": [
+        "gemma-4-26B-A4B-it-assistant",
+        "google/gemma-4-26B-A4B-it-assistant",
+        "gemma/gemma-4-26B-A4B-it-assistant",
+    ],
+}
+
 
 @dataclass
 class TestConfig:
@@ -364,10 +531,12 @@ class TestConfig:
     is_eagle: Optional[bool] = None
     is_mtp: Optional[bool] = None
     is_dflash: Optional[bool] = None
+    is_dflash_tree: Optional[bool] = None
 
     # Directory paths
     llm_models_dir: Optional[str] = None
     edgellm_data_dir: Optional[str] = None
+    vlmevalkit_data_dir: Optional[str] = None
     onnx_dir: Optional[str] = None
     engine_dir: Optional[str] = None
     test_log_dir: Optional[str] = None
@@ -442,8 +611,11 @@ class TestConfig:
     input_len: Optional[int] = None
     past_kv_len: Optional[int] = None
 
-    # Use TRT-native VIT attention (TRT >= 11) instead of ViTAttentionPlugin
-    trt_native_vit_attn: Optional[bool] = None
+    # Use TRT-native ragged attention (TRT >= 11) instead of plugin
+    trt_native_attn: Optional[bool] = None
+
+    # Export NVFP4 MoE graph for a specific plugin target (for example sm12x).
+    nvfp4_moe_target: Optional[str] = None
 
     # Debug flag for verbose output
     debug: Optional[bool] = None
@@ -521,6 +693,12 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("is_dflash",
                       "dflash", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("is_dflash_tree",
+                      "ddtree", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM},
@@ -642,8 +820,14 @@ class TestConfig:
             "vrms", {TaskType.EXPORT},
             {ModelType.LLM, ModelType.VLM, ModelType.TTS, ModelType.ASR},
             is_required=False),
-        ParameterSpec("trt_native_vit_attn",
+        ParameterSpec("trt_native_attn",
                       "trt11", {
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
+                          TaskType.INFERENCE
+                      }, {ModelType.LLM, ModelType.VLM, ModelType.OMNI},
+                      is_required=False),
+        ParameterSpec("nvfp4_moe_target",
+                      "sm12x", {
                           TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM, ModelType.OMNI},
@@ -680,6 +864,8 @@ class TestConfig:
                 env_config.validate_for_export_tests()
             else:
                 env_config.validate_for_pipeline_tests()
+                if task_type == TaskType.VLMEVALKIT:
+                    env_config.validate_for_vlmevalkit_tests()
 
         # Parse parameter string
         parts = param_str.split('-')
@@ -766,6 +952,8 @@ class TestConfig:
                             'draft_lm_head_precision'] = draft_lm_precision
                 else:
                     parsed_params['draft_llm_precision'] = llm_precision
+            elif part == "ddtree":
+                parsed_params['is_dflash_tree'] = True
             elif part == "eagle":
                 parsed_params['is_eagle'] = True
                 # Parse eagle-{draft_id}-{draft_precision}[-lm{draft_lm_head}]
@@ -871,7 +1059,10 @@ class TestConfig:
             elif part.startswith('pkv') and part[3:].isdigit():
                 parsed_params['past_kv_len'] = int(part[3:])
             elif part == 'trt11':
-                parsed_params['trt_native_vit_attn'] = True
+                parsed_params['trt_native_attn'] = True
+            elif part.lower() in _NVFP4_MOE_TARGET_TOKENS:
+                parsed_params['nvfp4_moe_target'] = (
+                    _normalize_nvfp4_moe_target(part))
             else:
                 parsed_params['test_case'] = part
 
@@ -894,6 +1085,7 @@ class TestConfig:
                      llm_models_dir=env_config.llm_models_dir
                      if task_type == TaskType.EXPORT else None,
                      edgellm_data_dir=env_config.edgellm_data_dir,
+                     vlmevalkit_data_dir=env_config.vlmevalkit_data_dir,
                      onnx_dir=env_config.onnx_dir,
                      engine_dir=env_config.engine_dir
                      if task_type != TaskType.EXPORT else None,
@@ -966,6 +1158,8 @@ class TestConfig:
                     self.is_mtp = False
                 if self.is_dflash is None:
                     self.is_dflash = False
+                if self.is_dflash_tree is None:
+                    self.is_dflash_tree = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.reduced_vocab_size is not None:
@@ -996,6 +1190,8 @@ class TestConfig:
                     self.is_mtp = False
                 if self.is_dflash is None:
                     self.is_dflash = False
+                if self.is_dflash_tree is None:
+                    self.is_dflash_tree = False
                 if self.draft_llm_precision is not None and self.draft_lm_head_precision is None:
                     self.draft_lm_head_precision = "fp16"
                 if self.eagle_draft_top_k is None:
@@ -1064,17 +1260,28 @@ class TestConfig:
             raise ValueError(
                 f"Missing required parameters for {task_desc}: {', '.join(missing_params)}"
             )
+        if self.nvfp4_moe_target and self.llm_precision != "nvfp4":
+            raise ValueError(
+                "nvfp4_moe_target is only valid for nvfp4 LLM precision.")
 
         # Set defaults after validation
         set_defaults()
 
-    def check_trt_native_vit_attn(self) -> None:
+        if self.is_dflash_tree and not self.is_dflash:
+            raise ValueError("ddtree can only be used with DFlash tests")
+        if (self.is_dflash_tree
+                and self.task_type in (TaskType.E2E_BENCH, TaskType.INFERENCE)
+                and self.eagle_draft_top_k <= 1):
+            raise ValueError("DFlash DDTree runtime tests require edtk > 1; "
+                             "use linear DFlash without ddtree for edtk=1")
+
+    def check_trt_native_attn(self) -> None:
         """Skip -trt11 tests when TRT < 11.
 
         l0_jedha and l0_jedha_trt11 share the same test list but run
         different TRT versions. The CI job sets TRT_VERSION.
         """
-        if not self.trt_native_vit_attn:
+        if not self.trt_native_attn:
             return
         trt_ver = os.environ.get('TRT_VERSION', '')
         try:
@@ -1104,9 +1311,17 @@ class TestConfig:
             model_id += "-FP8-KV"
         if self.reduced_vocab_size:
             model_id += f"-rvs{self.reduced_vocab_size}"
-        if self.trt_native_vit_attn:
+        if self.trt_native_attn:
             model_id += "-trt11"
+        if self.nvfp4_moe_target:
+            model_id += f"-{self.nvfp4_moe_target}"
         return model_id
+
+    def get_export_env_vars(self) -> dict:
+        """Environment variables that affect ONNX export for this config."""
+        if self.nvfp4_moe_target:
+            return {_NVFP4_MOE_TARGET_ENV: self.nvfp4_moe_target}
+        return {}
 
     def get_onnx_model_id(self) -> str:
         """Backward-compatible alias for quantized model id."""
@@ -1159,6 +1374,22 @@ class TestConfig:
                 model_id += "-FP8-KV"
         return model_id
 
+    @staticmethod
+    def _append_quant_suffix_once(model_dir_name: str,
+                                  quant_suffix: str) -> str:
+        """Append only the missing part of a derived quant suffix."""
+        full_suffix = f"-{quant_suffix}"
+        if model_dir_name.upper().endswith(full_suffix.upper()):
+            return model_dir_name
+
+        base_quant, sep, remaining = quant_suffix.partition("-")
+        if sep and model_dir_name.upper().endswith(f"-{base_quant.upper()}"):
+            return f"{model_dir_name}-{remaining}"
+        if not sep and model_dir_name.upper().endswith(
+                f"-{base_quant.upper()}"):
+            return model_dir_name
+        return f"{model_dir_name}{full_suffix}"
+
     def get_quantized_checkpoint_dir_name(self) -> Optional[str]:
         """Directory name for a pre-quantized checkpoint on the model hub."""
         base_model_name = self._strip_model_quant_suffixes(self.model_name)
@@ -1205,34 +1436,55 @@ class TestConfig:
         return f"{base_model_name}-{'-'.join(pieces)}"
 
     def get_quantized_draft_checkpoint_dir_name(self) -> Optional[str]:
-        """Hub folder name for a pre-quantized EAGLE draft checkpoint."""
-        if not self.is_eagle or self.is_mtp or self.draft_llm_precision == "fp16":
+        """Hub folder name for a pre-quantized EAGLE or DFlash draft checkpoint."""
+        if (self.is_mtp or self.draft_llm_precision == "fp16"
+                or not (self.is_eagle or self.is_dflash)):
+            return None
+        if self.draft_model_id is None or self.draft_llm_precision is None:
             return None
 
         parts = self.param_str.split('-')
-        eagle_idx = -1
-        for i, part in enumerate(parts):
-            if part.lower() == "eagle":
-                eagle_idx = i
-                break
-        if eagle_idx < 0 or eagle_idx + 2 >= len(parts):
-            return None
+        draft_dir_name = None
+        draft_modifiers: list = []
 
-        draft_precision = parts[eagle_idx + 2]
-        if draft_precision not in VALID_LLM_PRECISIONS:
-            return None
+        if self.is_dflash:
+            dflash_idx = -1
+            for i, part in enumerate(parts):
+                if part.lower() == "dflash":
+                    dflash_idx = i
+                    break
+            if dflash_idx < 0:
+                return None
+            draft_modifiers = parts[dflash_idx + 3:]
+            draft_models = self._dflash_draft_models_for_base()
+            if not draft_models or self.draft_model_id not in draft_models:
+                return None
+            draft_dir_name = draft_models[self.draft_model_id]
+        else:
+            eagle_idx = -1
+            for i, part in enumerate(parts):
+                if part.lower() == "eagle":
+                    eagle_idx = i
+                    break
+            if eagle_idx < 0 or eagle_idx + 2 >= len(parts):
+                return None
 
-        draft_modifiers = parts[eagle_idx + 3:]
+            draft_precision = parts[eagle_idx + 2]
+            if draft_precision not in VALID_LLM_PRECISIONS:
+                return None
+
+            draft_modifiers = parts[eagle_idx + 3:]
+            base_model_name = self._strip_model_quant_suffixes(self.model_name)
+            draft_models = MODEL_NAME_TO_DRAFT_MODELS_MAP.get(base_model_name)
+            if not draft_models or self.draft_model_id not in draft_models:
+                return None
+            draft_dir_name = draft_models[self.draft_model_id]
+
         quant_suffix = self._llm_precision_to_quant_suffix(
-            draft_precision, draft_modifiers)
+            self.draft_llm_precision, draft_modifiers)
         if not quant_suffix:
             return None
-
-        base_model_name = self._strip_model_quant_suffixes(self.model_name)
-        draft_models = MODEL_NAME_TO_DRAFT_MODELS_MAP.get(base_model_name)
-        if not draft_models or self.draft_model_id not in draft_models:
-            return None
-        return f"{draft_models[self.draft_model_id]}-{quant_suffix}"
+        return self._append_quant_suffix_once(draft_dir_name, quant_suffix)
 
     def get_torch_model_dir(self) -> str:
         """Resolve torch/hub checkpoint; prefers hub pre-quantized when present."""
@@ -1347,54 +1599,36 @@ class TestConfig:
         return self._canonical_quant_suffix(
             self.llm_precision).upper() in self.model_name.upper()
 
+    def _dflash_draft_models_for_base(self) -> Optional[dict]:
+        """Resolve DFlash draft map for fp16 or pre-quant base model names."""
+        draft_models = MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP.get(
+            self.model_name)
+        if draft_models is not None:
+            return draft_models
+        base_name = self._strip_model_quant_suffixes(self.model_name)
+        return MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP.get(base_name)
+
     def get_dflash_draft_model_dir(self) -> str:
         """Get DFlash draft checkpoint directory using draft_model_id."""
-        # Draft id "zlab" identifies the z-lab released DFlash drafts.
-        MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP = {
-            "Qwen3-4B-Instruct-2507": {
-                "zlab": "Qwen3-4B-DFlash-b16",
-            },
-            "Qwen3-8B": {
-                "zlab": "Qwen3-8B-DFlash-b16",
-            },
-            "Qwen3.5-4B": {
-                "b16": "Qwen3.5-4B-DFlash",
-            },
-            "Qwen3.5-4B-NVFP4": {
-                "b16": "Qwen3.5-4B-DFlash-NVFP4",
-            },
-            "Qwen3.5-9B": {
-                "zlab": "Qwen3.5-9B-DFlash",
-            },
-            "Qwen3.5-27B": {
-                "zlab": "Qwen3.5-27B-DFlash",
-            },
-            # MoE models: NVFP4 base + FP16 DFlash draft, except
-            # Qwen3.5-35B-A3B which is currently supported as GPTQ-Int4 base.
-            "Qwen3.5-35B-A3B-GPTQ-Int4": {
-                "zlab": "Qwen3.5-35B-A3B-DFlash",
-            },
-            "Qwen3.6-35B-A3B-NVFP4": {
-                "zlab": "Qwen3.6-35B-A3B-DFlash",
-            },
-        }
-
-        if self.model_name not in MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP:
+        draft_models = self._dflash_draft_models_for_base()
+        if not draft_models:
             raise ValueError(
                 f"Unsupported base model for DFlash: '{self.model_name}'. "
                 f"Supported models: {', '.join(MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP.keys())}"
             )
 
-        draft_models = MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP[self.model_name]
+        lookup_name = (self.model_name if self.model_name
+                       in MODEL_NAME_TO_DFLASH_DRAFT_MODELS_MAP else
+                       self._strip_model_quant_suffixes(self.model_name))
 
         if not self.draft_model_id:
             raise ValueError(
-                f"draft_model_id not set. Available DFlash drafts for {self.model_name}: "
+                f"draft_model_id not set. Available DFlash drafts for {lookup_name}: "
                 f"{', '.join(draft_models.keys())}")
 
         if self.draft_model_id not in draft_models:
             raise ValueError(
-                f"Unsupported DFlash draft_model_id '{self.draft_model_id}' for {self.model_name}. "
+                f"Unsupported DFlash draft_model_id '{self.draft_model_id}' for {lookup_name}. "
                 f"Available: {', '.join(draft_models.keys())}")
 
         model_dir_name = draft_models[self.draft_model_id]
@@ -1509,6 +1743,22 @@ class TestConfig:
         return self._resolve_draft_model_dir(candidates,
                                              self._draft_hub_search_roots())
 
+    def get_gemma4_mtp_assistant_model_dir(self) -> str:
+        """Resolve the paired Gemma4 assistant checkpoint for MTP export."""
+        base_model_name = self._strip_model_quant_suffixes(self.model_name)
+        if base_model_name not in GEMMA4_MTP_ASSISTANT_MODELS_MAP:
+            raise ValueError(
+                f"Unsupported Gemma4 MTP model: '{self.model_name}'. "
+                f"Supported models: {', '.join(GEMMA4_MTP_ASSISTANT_MODELS_MAP.keys())}"
+            )
+
+        entry = GEMMA4_MTP_ASSISTANT_MODELS_MAP[base_model_name]
+        candidates = [entry] if isinstance(entry, str) else list(entry)
+        return self._resolve_draft_model_dir(
+            candidates,
+            self._draft_torch_search_roots(),
+        )
+
     def get_onnx_base_dir(self) -> str:
         """Get ONNX model base directory.
 
@@ -1535,23 +1785,30 @@ class TestConfig:
             raise ValueError("engine_dir not set")
         return os.path.join(self.engine_dir, self.model_name)
 
-    def get_llm_onnx_dir(self) -> str:
-        """Get LLM ONNX model directory. For TTS this contains talker/ and code_predictor/."""
-        if self.is_mtp:
-            prefix = "llm-base-mtp"
-        elif self.is_dflash:
-            prefix = "llm-base-dflash"
-        elif self.is_eagle:
-            prefix = "llm-base"
-        else:
-            prefix = "llm"
+    def _get_llm_onnx_model_id(self) -> str:
+        """Generate the LLM ONNX subdirectory identifier."""
         onnx_model_id = f"{self.llm_precision.lower()}-{self.lm_head_precision.lower()}"
         if self.fp8_kv_cache:
             onnx_model_id += "-fp8kv"
         if self.reduced_vocab_size:
             onnx_model_id += f"-rvs{self.reduced_vocab_size}"
+        if self.nvfp4_moe_target:
+            onnx_model_id += f"-{self.nvfp4_moe_target}"
+        return onnx_model_id
+
+    def get_llm_onnx_dir(self) -> str:
+        """Get LLM ONNX model directory. For TTS this contains talker/ and code_predictor/."""
+        if self.is_mtp:
+            prefix = "llm-base-mtp"
+        elif self.is_dflash:
+            mode = "ddtree" if self.is_dflash_tree else "linear"
+            prefix = f"llm-base-dflash-{mode}"
+        elif self.is_eagle:
+            prefix = "llm-base"
+        else:
+            prefix = "llm"
         return os.path.join(self.get_onnx_base_dir(),
-                            f"{prefix}-{onnx_model_id}")
+                            f"{prefix}-{self._get_llm_onnx_model_id()}")
 
     def get_tts_tokenizer_dir(self) -> str:
         """
@@ -1617,15 +1874,8 @@ class TestConfig:
     def get_draft_onnx_dir(self) -> str:
         """Get draft model ONNX directory"""
         if self.is_mtp:
-            onnx_model_id = (
-                f"{self.llm_precision.lower()}-{self.lm_head_precision.lower()}"
-            )
-            if self.fp8_kv_cache:
-                onnx_model_id += "-fp8kv"
-            if self.reduced_vocab_size:
-                onnx_model_id += f"-rvs{self.reduced_vocab_size}"
             return os.path.join(self.get_onnx_base_dir(),
-                                f"mtp-draft-{onnx_model_id}")
+                                f"mtp-draft-{self._get_llm_onnx_model_id()}")
         if self.is_dflash:
             return os.path.join(
                 self.get_onnx_base_dir(),
@@ -1634,7 +1884,7 @@ class TestConfig:
                             f"draft-{self.get_draft_onnx_model_id()}")
 
     def get_quantized_draft_model_dir(self) -> str:
-        """Local output dir for a quantized EAGLE draft (matches hub folder name)."""
+        """Local output dir for a quantized EAGLE/DFlash draft (hub folder name)."""
         if self.draft_llm_precision == "fp16":
             if self.is_dflash:
                 return self.get_dflash_draft_model_dir()
@@ -1687,7 +1937,7 @@ class TestConfig:
     def get_visual_onnx_dir(self, precision: str) -> str:
         """Get visual ONNX model directory"""
         name = f"visual-{precision}"
-        if self.trt_native_vit_attn:
+        if self.trt_native_attn:
             name += "-trt11"
         return os.path.join(self.get_onnx_base_dir(), name)
 
@@ -1710,8 +1960,10 @@ class TestConfig:
             if self.draft_llm_precision is None:
                 raise ValueError(
                     "draft_llm_precision not set for DFlash engine")
+            mode = "ddtree" if self.is_dflash_tree else "linear"
             prefix = (
-                f"llm-dflash-{self.draft_model_id}-{self.draft_llm_precision}")
+                f"llm-dflash-{mode}-{self.draft_model_id}-{self.draft_llm_precision}"
+            )
         elif self.is_eagle:
             if self.draft_model_id is None:
                 raise ValueError("draft_model_id not set for EAGLE engine")
@@ -1743,7 +1995,7 @@ class TestConfig:
                 f"-mnit{self.min_image_tokens}"
                 f"-mxit{self.max_image_tokens}"
                 f"-mxpiit{self.max_image_tokens_per_image}")
-        if self.trt_native_vit_attn:
+        if self.trt_native_attn:
             name += "-trt11"
         return os.path.join(self.get_engine_base_dir(), name)
 
@@ -1801,10 +2053,6 @@ class TestConfig:
             "tests/test_cases/asr_basic.json",
             "librispeech_clean_test":
             f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test/librispeech_clean_test.json",
-            "librispeech_clean_test_parakeet":
-            f"{self.edgellm_data_dir}/updated_datasets/librispeech_clean_test_parakeet/librispeech_clean_test_parakeet.json",
-            "OmniBench_parakeet":
-            f"{self.edgellm_data_dir}/updated_datasets/OmniBench_parakeet/omnibench_dataset.json",
             "tts_basic":
             "tests/test_cases/tts_basic.json",
             "SeedTTS_en_meta":
@@ -1821,6 +2069,8 @@ class TestConfig:
             f"{self.edgellm_data_dir}/updated_datasets/updated_MTBench/{mtbench_dataset}",
             "mmmu":
             f"{self.edgellm_data_dir}/updated_datasets/mmmu/mmmu_dataset.json",
+            "mmmu_vlmevalkit":
+            f"{self.vlmevalkit_data_dir or self.edgellm_data_dir}/updated_datasets/MMMU_VLMEvalKit/mmmu_dataset.json",
             "mmmu_pro_4":
             f"{self.edgellm_data_dir}/updated_datasets/MMMU_Pro_4/mmmu_pro_4_dataset.json",
             "mmmu_pro_10":
@@ -1829,6 +2079,8 @@ class TestConfig:
             f"{self.edgellm_data_dir}/updated_datasets/MMMU_Pro_vision/mmmu_pro_vision_dataset.json",
             "coco":
             f"{self.edgellm_data_dir}/updated_datasets/coco/dataset.json",
+            "OmniBench":
+            f"{self.edgellm_data_dir}/updated_datasets/OmniBench/omnibench_dataset.json",
             "mmlu_0":
             f"{self.edgellm_data_dir}/updated_datasets/MMLU_zero_shot/mmlu_dataset.json",
             "mmlu_5":
@@ -1900,9 +2152,33 @@ class TestConfig:
         """
         return os.path.join(self.test_log_dir, self.param_str)
 
+    def get_vlmevalkit_tsv_file(self) -> str:
+        """Return the VLMEvalKit MMMU TSV generated by dataset preparation."""
+        data_root = self.vlmevalkit_data_dir or self.edgellm_data_dir
+        return os.path.join(data_root, "updated_datasets", "MMMU_VLMEvalKit",
+                            "mmmu_dataset.tsv")
+
     def get_lora_weights_dir(self) -> str:
         """Get LoRA weights directory"""
         return os.path.join(self.get_onnx_base_dir(), "lora_weights")
+
+    def find_lora_adapter_weights_dir(self,
+                                      lora_model_name: str) -> Optional[str]:
+        """Find LoRA adapter checkpoint under data or model roots."""
+        search_roots: list[str] = []
+        for root in (self.edgellm_data_dir, os.environ.get("EDGELLM_DATA_DIR"),
+                     self.llm_models_dir):
+            if root and root not in search_roots:
+                search_roots.append(root)
+        if not search_roots:
+            search_roots.append("/scratch.edge_llm_cache")
+
+        for root in search_roots:
+            found = _find_directory(root, lora_model_name,
+                                    DEFAULT_SEARCH_DEPTH)
+            if found:
+                return found
+        return None
 
     def get_lora_adapter_dir(self) -> str:
         """

@@ -47,7 +47,7 @@ reference, **fp32 / fp16 / bf16** shape/mask sweep).
 
 - fp32 softmax over the M context slots (inputs may be fp16/bf16).
 - Exact relative shift index map: `aSrc = (a*M+m)/(M+1)`, `tSrc = (a*M+m)%(M+1)`.
-- Exact mask: `local & j_within_seq & i_within_seq & valid[b,j]`, horizon `L = attention_context_left-1`.
+- Exact mask: `local & jIn & iIn & valid[b,j]`, horizon `L = attention_context_left-1`.
 - Soft-cap before mask before softmax; masked slots contribute 0 to the value
   mix; a fully-masked live row (e.g. a padding query) softmaxes to uniform, as
   in the HF reference (masked-but-live slots use the finite fill `-1e9`, padded

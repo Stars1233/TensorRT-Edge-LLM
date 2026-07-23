@@ -89,5 +89,20 @@ void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int3
     int32_t* packedAttentionMask, int32_t* attentionPosId, int64_t* selectTokenIndices, int32_t* contextLengths,
     int32_t batchSize, cudaStream_t stream);
 
+/// Launch kernel to build DFlash linear verification inputs for EAGLE accept.
+///
+/// verifyTokenIds[b, 0] = lastAcceptedTokens[b], verifyTokenIds[b, j] = draftTokenIds[b, j] for j >= 1.
+/// verifyTreeMask is an unpacked causal tree mask where row i attends to [0, i].
+///
+/// @param lastAcceptedTokens [B] INT32 — last committed token per batch
+/// @param draftTokenIds [B, BS] INT32 — DFlash draft argmax token IDs
+/// @param verifyTokenIds [B, BS] INT32 — output base verify token IDs
+/// @param verifyTreeMask [B, BS, BS] INT8 — output EAGLE-style causal tree mask
+/// @param batchSize batch size
+/// @param blockSize DFlash block size
+/// @param stream CUDA stream
+void launchDFlashBuildLinearVerifyInputs(int32_t const* lastAcceptedTokens, int32_t const* draftTokenIds,
+    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t blockSize, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

@@ -27,12 +27,14 @@ Visual encoders — I/O spec via ``model.get_onnx_export_args(config, device)``:
     - InternVL3 HF     (model_type ``internvl``)
     - Phi-4 Multimodal (model_type ``phi4mm``, ``phi4_multimodal``)
     - Gemma4            (model_type ``gemma4``)
+    - Gemma4 Unified    (model_type ``gemma4_unified``)
     - Nemotron-Omni    (model_type ``NemotronH_Nano_VL_V2`` or
       ``NemotronH_Nano_Omni_Reasoning_V3``)
 
 Audio encoders — I/O spec defined internally or via ``model.get_onnx_export_args``:
     - Qwen3-ASR    (model_type ``qwen3_asr``)
     - Qwen3-Omni   (model_type ``qwen3_omni``, ``qwen3_omni_thinker``)
+    - Gemma4 Unified (model_type ``gemma4_unified``)
     - Nemotron-Omni (model_type ``NemotronH_Nano_VL_V2`` or
       ``NemotronH_Nano_Omni_Reasoning_V3``)
 
@@ -92,6 +94,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "phi4mm": "phi4mm",
     "phi4_multimodal": "phi4mm",
     "gemma4": "gemma4",
+    "gemma4_unified": "gemma4_unified",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
 }
@@ -114,6 +117,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.phi4mm.modeling_phi4mm_visual",
     "gemma4":
     "tensorrt_edgellm.models.gemma4.modeling_gemma4_visual",
+    "gemma4_unified":
+    "tensorrt_edgellm.models.gemma4.modeling_gemma4_unified_visual",
     "nemotron_omni":
     "tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual",
 }
@@ -128,6 +133,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "internvl3_5": "build_internvl3_5_visual",
     "phi4mm": "build_phi4mm_visual",
     "gemma4": "build_gemma4_visual",
+    "gemma4_unified": "build_gemma4_unified_visual",
     "nemotron_omni": "build_nemotron_omni_visual",
 }
 
@@ -141,6 +147,8 @@ _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
     "qwen3_omni_thinker",
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
+    "gemma4",
+    "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
 ])
@@ -154,6 +162,7 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
     "qwen3_omni_thinker": "thinker.audio_tower.",
     "qwen3_omni_moe": "thinker.audio_tower.",
     "qwen3_omni_moe_thinker": "thinker.audio_tower.",
+    "gemma4": "model.audio_tower.",
 }
 
 # ---------------------------------------------------------------------------
@@ -170,7 +179,7 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if (model_type in ("internvl", "internvl_chat", "gemma4")
+    if (model_type in ("internvl", "internvl_chat", "gemma4", "gemma4_unified")
             or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
         # InternVL / Gemma4 / Nemotron-Omni need the full config
         # (vision + text + projection/runtime fields).
@@ -199,22 +208,36 @@ def _get_visual_config(model_type: str, config: dict) -> dict:
 
 def _run_dynamo_export(
     model: nn.Module,
-    args: tuple,
+    dynamo_inputs: tuple | dict[str, torch.Tensor],
     output_path: str,
-    input_names: list[str],
+    onnx_input_names: list[str],
     output_names: list[str],
     dynamic_shapes: dict,
 ) -> None:
     model.eval()
     translation_table = build_custom_translation_table()
+
+    assert len(dynamo_inputs) == len(onnx_input_names) and \
+        len(dynamo_inputs) == len(dynamic_shapes), \
+        f"dynamo_inputs: {len(dynamo_inputs)}, onnx_input_names: {len(onnx_input_names)}, dynamic_shapes: {len(dynamic_shapes)}"
+
+    if isinstance(dynamo_inputs, dict):
+        args = ()
+        kwargs = dynamo_inputs
+    else:
+        assert isinstance(dynamo_inputs, tuple)
+        args = dynamo_inputs
+        kwargs = {}
+
     logger.info("Exporting ONNX to %s (opset %d) ...", output_path,
                 _OPSET_VERSION)
     with _permissive_inline_opset():
         prog = torch.onnx.export(
             model,
             args,
+            kwargs=kwargs,
             dynamo=True,
-            input_names=input_names,
+            input_names=onnx_input_names,
             output_names=output_names,
             dynamic_shapes=dynamic_shapes,
             opset_version=_OPSET_VERSION,
@@ -281,11 +304,11 @@ def export_visual_onnx(
     visual_model.eval()
 
     # I/O spec is provided by the model class
-    args, input_names, output_names, dynamic_shapes = (
+    dynamo_inputs, onnx_input_names, output_names, dynamic_shapes = (
         visual_model.get_onnx_export_args(vcfg, device))
 
-    _run_dynamo_export(visual_model, args, output_path, input_names,
-                       output_names, dynamic_shapes)
+    _run_dynamo_export(visual_model, dynamo_inputs, output_path,
+                       onnx_input_names, output_names, dynamic_shapes)
 
     # TRT-compat post-processing for quantized weights — same passes the LLM
     # path runs in ``export.py``.  Without these, NVFP4 weights stay as INT8
@@ -317,54 +340,6 @@ def export_visual_onnx(
 # ---------------------------------------------------------------------------
 
 
-def _make_audio_dummy_inputs(
-        model: nn.Module, audio_config: dict,
-        device: str) -> tuple[tuple, list[str], list[str], dict]:
-    """Build dummy (padded_feature, indices, mask) tensors for audio tracing."""
-    num_mel_bins = audio_config.get("num_mel_bins", 128)
-    n_window = audio_config.get("n_window", 100)
-    num_chunks = 3
-    t_out = n_window * 2 // 8  # after 3× stride-2 CNN layers
-    num_attention_elems = num_chunks * t_out - 1
-
-    padded_feature = torch.zeros(num_chunks,
-                                 num_mel_bins,
-                                 n_window * 2,
-                                 dtype=torch.float16,
-                                 device=device)
-    padded_mask_after_cnn_indices = torch.zeros(num_attention_elems,
-                                                2,
-                                                dtype=torch.int64,
-                                                device=device)
-    attention_mask = torch.zeros(num_attention_elems,
-                                 num_attention_elems,
-                                 dtype=torch.float16,
-                                 device=device)
-
-    args = (padded_feature, padded_mask_after_cnn_indices, attention_mask)
-    input_names = [
-        "padded_feature",
-        "padded_mask_after_cnn_indices",
-        "attention_mask",
-    ]
-    output_names = ["last_hidden_state"]
-
-    T = torch.export.Dim("num_attention_elems")
-    dynamic_shapes = {
-        "padded_feature": {
-            0: torch.export.Dim("num_chunks")
-        },
-        "padded_mask_after_cnn_indices": {
-            0: T
-        },
-        "attention_mask": {
-            0: T,
-            1: T
-        },
-    }
-    return args, input_names, output_names, dynamic_shapes
-
-
 def export_audio_onnx(
     model_dir: str,
     output_path: str,
@@ -393,31 +368,65 @@ def export_audio_onnx(
                          f"Supported: {sorted(_AUDIO_MODEL_TYPES)}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+    # Gemma4 Unified is encoder-free: it builds its own module and export
+    # arguments, so it bypasses the build_fn registry below entirely.
+    if model_type == "gemma4_unified":
+        from ..models.gemma4.modeling_gemma4_unified_audio import \
+            build_gemma4_unified_audio
+        if model_config is None:
+            from ..config import ModelConfig
+            model_config = ModelConfig.from_pretrained(model_dir)
+        logger.info("Building Gemma4 Unified encoder-free audio model ...")
+        audio_model = build_gemma4_unified_audio(config,
+                                                 weights,
+                                                 model_config=model_config,
+                                                 dtype=dtype)
+        audio_model = audio_model.to(device).eval()
+        args, input_names, output_names, dynamic_shapes = (
+            audio_model.get_onnx_export_args(config, device))
+        _run_dynamo_export(audio_model, args, output_path, input_names,
+                           output_names, dynamic_shapes)
+        return
+
+    build_fn = None
+    extra_kwargs = {}
     if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")
-        audio_model = build_nemotron_omni_audio(config, weights, dtype)
-        audio_model = audio_model.to(device).eval()
-        args, input_names, output_names, dynamic_shapes = (
-            audio_model.get_onnx_export_args(config, device))
+        build_fn = build_nemotron_omni_audio
+    elif model_type == "gemma4":
+        from ..models.gemma4.modeling_gemma4_audio import build_gemma4_audio
+        if model_config is None:
+            from ..model import load_model_config
+            model_config = load_model_config(model_dir)
+        key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
+        logger.info("Building Gemma4 audio encoder (prefix=%r) ...",
+                    key_prefix)
+        build_fn = build_gemma4_audio
+        extra_kwargs = {
+            "prefix": key_prefix,
+            "model_config": model_config,
+        }
     else:
         from ..models.qwen3_asr.modeling_qwen3_asr_audio import \
             build_qwen_audio
-        audio_config = config.get("thinker_config",
-                                  {}).get("audio_config",
-                                          config.get("audio_config", config))
+        config = config.get("thinker_config",
+                            {}).get("audio_config",
+                                    config.get("audio_config", config))
         key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
         logger.info("Building %s audio encoder (prefix=%r) ...", model_type,
                     key_prefix)
-        audio_model = build_qwen_audio(audio_config,
-                                       weights,
-                                       dtype,
-                                       prefix=key_prefix,
-                                       model_config=model_config)
-        audio_model = audio_model.to(device).eval()
-        args, input_names, output_names, dynamic_shapes = (
-            _make_audio_dummy_inputs(audio_model, audio_config, device))
+        build_fn = build_qwen_audio
+        extra_kwargs = {
+            "prefix": key_prefix,
+            "model_config": model_config,
+        }
+
+    audio_model = build_fn(config, weights, dtype, **extra_kwargs)
+    audio_model = audio_model.to(device).eval()
+    args, input_names, output_names, dynamic_shapes = (
+        audio_model.get_onnx_export_args(config, device))
 
     _run_dynamo_export(audio_model, args, output_path, input_names,
                        output_names, dynamic_shapes)
@@ -455,11 +464,11 @@ def export_action_onnx(
     model = model.to(device)
     model.eval()
 
-    args, input_names, output_names, dynamic_shapes = (
+    dynamo_inputs, onnx_input_names, output_names, dynamic_shapes = (
         model.get_onnx_export_args(max_kv_cache_capacity, device))
 
-    _run_dynamo_export(model, args, output_path, input_names, output_names,
-                       dynamic_shapes)
+    _run_dynamo_export(model, dynamo_inputs, output_path, onnx_input_names,
+                       output_names, dynamic_shapes)
 
 
 def write_action_config(config: "ActionConfig", max_kv_cache_capacity: int,

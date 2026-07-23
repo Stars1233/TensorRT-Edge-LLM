@@ -116,7 +116,8 @@ private:
     bool runChunkedInference(
         std::vector<std::vector<int32_t>> const& codes, rt::Tensor& outputWaveform, cudaStream_t stream);
 
-    Code2WavConfig mConfig{};                                      //!< Code2Wav vocoder configuration
+    Code2WavConfig mConfig{}; //!< Code2Wav vocoder configuration
+    AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                  //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mCode2WavEngine;        //!< Code2Wav TensorRT engine
     std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Code2Wav execution context

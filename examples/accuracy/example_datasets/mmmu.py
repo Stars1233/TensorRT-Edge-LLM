@@ -25,6 +25,12 @@ from datasets import (Dataset, concatenate_datasets, get_dataset_config_names,
                       load_dataset)
 from edgellm_dataset import DatasetConfig, EdgeLLMDataset
 
+_MMMU_PRO_OUTPUT_FILES = {
+    "vision": "mmmu_pro_vision_dataset.json",
+    "standard (10 options)": "mmmu_pro_10_dataset.json",
+    "standard (4 options)": "mmmu_pro_4_dataset.json",
+}
+
 
 class MMMUDataset(EdgeLLMDataset):
     """
@@ -169,9 +175,8 @@ def convert_mmmu_pro_dataset(
                                         output_dir=output_dir)
 
     print(f"Processing MMMU_Pro dataset with config: {config}")
-    subset_name = subset.replace(' ', '_').replace('(', '_').replace(')', '_')
     edge_llm_mmmu_dataset.process_and_save_dataset(
-        f"mmmu_pro_{subset_name}_dataset.json")
+        _MMMU_PRO_OUTPUT_FILES[subset])
 
     print(f"Successfully converted MMMU_Pro dataset to {output_dir}")
     return edge_llm_mmmu_dataset

@@ -175,7 +175,7 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--activation", choices=["relu2", "swiglu"], required=True)
+    parser.add_argument("--activation", choices=["relu2", "swiglu", "geglu"], required=True)
     parser.add_argument("--mma_tiler_n", type=int, choices=[128, 256], required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--file_name", required=True)

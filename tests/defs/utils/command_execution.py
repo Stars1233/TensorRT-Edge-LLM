@@ -22,11 +22,12 @@ unnecessary abstraction layers.
 
 import json
 import os
+import subprocess
 from typing import Any, Dict, Optional
 
 import pytest
 from conftest import EnvironmentConfig, RemoteConfig
-from pytest_helpers import check_file_exists, run_with_trt_env
+from pytest_helpers import check_file_exists, run_command, run_with_trt_env
 
 from ..config import ModelType, TaskType, TestConfig
 from .accuracy import check_accuracy_with_dataset
@@ -36,9 +37,45 @@ from .baseline import (get_baseline, map_accuracy_result_to_csv,
 from .command_generation import (generate_build_commands,
                                  generate_e2e_bench_commands,
                                  generate_inference_commands,
-                                 generate_kernel_bench_commands)
+                                 generate_kernel_bench_commands,
+                                 generate_vlmevalkit_commands)
 
 _ALPAMAYO_DATASET_PLACEHOLDER = "$ALPAMAYO_DATASET_DIR"
+
+
+def _sync_remote_output_file(filepath: str,
+                             remote_config: Optional[RemoteConfig],
+                             logger) -> str:
+    if remote_config is None or os.path.exists(filepath):
+        return filepath
+
+    local_dir = os.path.dirname(filepath)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+
+    remote_host = f"{remote_config.user}@{remote_config.host}"
+    env = os.environ.copy()
+    env["SSHPASS"] = remote_config.password
+    cmd = [
+        "sshpass", "-e", "rsync", "-a", "-e",
+        "ssh -o StrictHostKeyChecking=no", f"{remote_host}:{filepath}",
+        filepath
+    ]
+
+    if logger:
+        logger.info("Copying remote output file back for metrics: %s",
+                    filepath)
+
+    result = subprocess.run(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to copy remote output file {filepath}: {result.stdout}")
+
+    return filepath
 
 
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
@@ -380,10 +417,12 @@ def execute_e2e_bench_test(
         # Use model-specific reference if available, fallback to generic test case file
         reference_file = config.get_reference_json_file(
         ) or config.get_test_case_file()
+        output_file = _sync_remote_output_file(config.get_output_json_file(),
+                                               remote_config, logger)
         # Pass file paths directly to the accuracy checker (runs on host only)
-        metrics_result = check_accuracy_with_dataset(
-            config.get_output_json_file(), reference_file, config.test_case,
-            logger)
+        metrics_result = check_accuracy_with_dataset(output_file,
+                                                     reference_file,
+                                                     config.test_case, logger)
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
@@ -460,10 +499,12 @@ def execute_inference_test(
         # Use model-specific reference if available, fallback to generic test case file
         reference_file = config.get_reference_json_file(
         ) or config.get_test_case_file()
+        output_file = _sync_remote_output_file(config.get_output_json_file(),
+                                               remote_config, logger)
         # Pass file paths directly to the accuracy checker (runs on host only)
-        metrics_result = check_accuracy_with_dataset(
-            config.get_output_json_file(), reference_file, config.test_case,
-            logger)
+        metrics_result = check_accuracy_with_dataset(output_file,
+                                                     reference_file,
+                                                     config.test_case, logger)
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
@@ -512,4 +553,67 @@ def execute_kernel_bench_test(
         'error': None,
         'output': '\n'.join(all_outputs),
         'test_type': TaskType.KERNEL_BENCH.value
+    }
+
+
+def execute_vlmevalkit_test(
+        config: TestConfig, executable_files: Dict[str, str],
+        remote_config: Optional[RemoteConfig], logger,
+        env_config: Optional[EnvironmentConfig]) -> Dict[str, Any]:
+    """Run VLM inference, then convert and score with VLMEvalKit."""
+    all_outputs = []
+
+    if logger:
+        logger.info("VLMEvalKit step 1: running inference")
+
+    inference_commands = generate_inference_commands(config, executable_files)
+    for i, (cmd, timeout) in enumerate(inference_commands):
+        task_name = f"Inference step {i+1}/{len(inference_commands)}"
+        if logger:
+            logger.info(f"Starting {task_name}: {' '.join(cmd)}")
+
+        result = run_with_trt_env(cmd, remote_config, timeout, logger,
+                                  env_config)
+        all_outputs.append(result.get('output', ''))
+
+        if not result['success']:
+            return {
+                'success': False,
+                'error':
+                f"{task_name} failed: {result.get('error', 'Unknown error')}",
+                'output': '\n'.join(all_outputs),
+                'test_type': TaskType.VLMEVALKIT.value
+            }
+
+    if logger:
+        logger.info("VLMEvalKit step 2: preparing xlsx and running evaluation")
+
+    vlmevalkit_commands = generate_vlmevalkit_commands(config, env_config)
+    total_steps = len(inference_commands) + len(vlmevalkit_commands)
+
+    for i, (cmd, timeout) in enumerate(vlmevalkit_commands):
+        step_num = len(inference_commands) + i + 1
+        task_name = f"VLMEvalKit step {step_num}/{total_steps}"
+        if logger:
+            logger.info(f"Starting {task_name}: {' '.join(cmd)}")
+
+        # These commands are host-side Python post-processing and scoring,
+        # so they do not need TensorRT library path setup.
+        result = run_command(cmd, remote_config, timeout, logger)
+        all_outputs.append(result.get('output', ''))
+
+        if not result['success']:
+            return {
+                'success': False,
+                'error':
+                f"{task_name} failed: {result.get('error', 'Unknown error')}",
+                'output': '\n'.join(all_outputs),
+                'test_type': TaskType.VLMEVALKIT.value
+            }
+
+    return {
+        'success': True,
+        'error': None,
+        'output': '\n'.join(all_outputs),
+        'test_type': TaskType.VLMEVALKIT.value
     }

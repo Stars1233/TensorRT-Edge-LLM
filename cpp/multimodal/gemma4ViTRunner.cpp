@@ -88,6 +88,22 @@ bool Gemma4ViTRunner::validateAndFillConfig(std::string const& engineDir)
         return false;
     }
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
+    // boi/eoi delimit each image's soft-token span so the model can tell
+    // adjacent images apart (mirrors the HF processor layout).
+    mConfig.beginImageTokenId = jsonConfig.value("boi_token_id", -1);
+    mConfig.endImageTokenId = jsonConfig.value("eoi_token_id", -1);
+    if (mConfig.beginImageTokenId < 0 || mConfig.endImageTokenId < 0)
+    {
+        std::string missingKeys = mConfig.beginImageTokenId < 0 ? "boi_token_id" : "";
+        if (mConfig.endImageTokenId < 0)
+        {
+            missingKeys += missingKeys.empty() ? "eoi_token_id" : " and eoi_token_id";
+        }
+        LOG_WARNING(
+            "Gemma4 visual config is missing %s; image spans will not be delimited and multi-image prompts may be "
+            "misread. Re-export the model to add it.",
+            missingKeys.c_str());
+    }
 
     auto const& visionConfig = jsonConfig["vision_config"];
     mConfig.patchSize = visionConfig.value("patch_size", 16);
@@ -154,6 +170,19 @@ bool Gemma4ViTRunner::validateAndFillConfig(std::string const& engineDir)
     {
         LOG_ERROR("Gemma4 visual engine is missing rotary_pos_emb head dimension");
         return false;
+    }
+
+    // Clamp per-image patch budget to the engine profile capacity so that
+    // gemma4ResizeTarget never produces an image exceeding the inputPatches buffer.
+    if (mConfig.maxPatchesPerImage > mConfig.maxPatches)
+    {
+        LOG_WARNING(
+            "Gemma4 max_image_tokens_per_image (%ld patches) exceeds engine profile capacity (%ld patches); "
+            "clamping per-image budget to engine capacity",
+            mConfig.maxPatchesPerImage, mConfig.maxPatches);
+        mConfig.maxPatchesPerImage = mConfig.maxPatches;
+        int64_t const k2 = mConfig.poolingKernelSize * mConfig.poolingKernelSize;
+        mConfig.maxImageTokensPerImage = mConfig.maxPatches / k2;
     }
 
     return true;
@@ -235,14 +264,14 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
     CUDA_CHECK(
         cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
 
-    int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize * channels;
-    rt::Tensor resizeBuffer({1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
+    int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize;
+    rt::Tensor resizeBuffer({1, maxImagePixels, 1, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
         "Gemma4ViTRunner::resizeBuffer");
     mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice = rt::Tensor(
-        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
-    mNormalizedImageDevice = rt::Tensor(
-        {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Gemma4ViTRunner::mNormalizedImageDevice");
+        {maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
+    mNormalizedImageDevice = rt::Tensor({maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
+        "Gemma4ViTRunner::mNormalizedImageDevice");
 
     return true;
 }
@@ -319,8 +348,8 @@ void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
         mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
 
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
-    kernel::transposeToPatchQwenViT(
-        mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, 1, mConfig.patchSize, 1, stream);
+    kernel::transposeToPatchGemma4ViT(
+        mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, mConfig.patchSize, stream);
 
     int64_t* positionIds = mPixelPositionIdsHost.dataPointer<int64_t>();
     for (int64_t y = 0; y < patchHeight; ++y)
@@ -357,6 +386,11 @@ void Gemma4ViTRunner::generatePoolingWeights(
 void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
     std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
 {
+    // Restore mVitInput to full engine-profile capacity before writing patches.
+    // imagePreprocess shrinks it to {totalPatches, inputDim} at the end (for engine execution),
+    // so a subsequent call would see a reduced shape and fail the capacity check in the kernel.
+    check::check(mVitInput.reshape({mConfig.maxPatches, mConfig.inputDim}), "Tensor reshape failed");
+
     int32_t* cuSeqlensData = mCuSeqlensHost.dataPointer<int32_t>();
     cuSeqlensData[0] = 0;
     int64_t cuSeqlensSize = 1;
@@ -420,6 +454,8 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         cudaMemcpyHostToDevice, stream));
     if (mUseTrtNativeVitAttn)
     {
+        // TRT native attention expects kv_lengths in cumulative format (same as cu_seqlens),
+        // e.g. [0, 256, 512] for two 256-patch images. The naming is historical.
         CUDA_CHECK(cudaMemcpyAsync(mKvLengths.rawPointer(), mCuSeqlensHost.rawPointer(),
             cuSeqlensSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     }
@@ -454,15 +490,39 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             check::check(!ids.empty(), "Gemma4ViTRunner::textPreprocess() Failed to encode text");
         }
 
+        bool const wrapImages = mConfig.beginImageTokenId >= 0 && mConfig.endImageTokenId >= 0;
         std::vector<int32_t> newIds;
+        // Compute expanded size: non-image tokens + sum of image token lengths
+        // (+2 boundary tokens per image when wrapping).
+        size_t expandedSize = 0;
+        int64_t imgIdx = imageIndex;
         for (auto tokenId : ids)
         {
+            expandedSize
+                += (tokenId == mConfig.imageTokenId) ? imageTokenLengths.at(imgIdx++) + (wrapImages ? 2 : 0) : 1;
+        }
+        newIds.reserve(expandedSize);
+        for (size_t tokenIndex = 0; tokenIndex < ids.size(); ++tokenIndex)
+        {
+            int32_t const tokenId = ids[tokenIndex];
             if (tokenId == mConfig.imageTokenId)
             {
+                bool const alreadyHasBegin
+                    = wrapImages && tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginImageTokenId;
+                bool const alreadyHasEnd
+                    = wrapImages && tokenIndex + 1 < ids.size() && ids[tokenIndex + 1] == mConfig.endImageTokenId;
+                if (wrapImages && !alreadyHasBegin)
+                {
+                    newIds.push_back(mConfig.beginImageTokenId);
+                }
                 int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
                     newIds.push_back(tokenId);
+                }
+                if (wrapImages && !alreadyHasEnd)
+                {
+                    newIds.push_back(mConfig.endImageTokenId);
                 }
                 ++imageIndex;
             }

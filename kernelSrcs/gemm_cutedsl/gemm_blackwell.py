@@ -59,6 +59,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from common import (
     create_bias_tensor,
     create_row_major_3d_gemm_tensors,
+    create_row_major_3d_tensor,
     export_compiled_kernel,
     mark_3d_row_major_dynamic,
     parse_comma_separated_ints,
@@ -900,22 +901,26 @@ def run(
     mma_tiler_mn: Tuple[int, int] = (64, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 2),
     use_2cta: bool = False,
+    c_dtype: str = "float16",
 ):
     m, n, k = mnk
     _tag = f"[{file_name}]"
 
     if fused_epilogue not in ("none", "bias", "bias_silu"):
         raise ValueError(f"Unknown fused_epilogue={fused_epilogue!r}")
+    if c_dtype not in ("float16", "float32"):
+        raise ValueError(f"Unknown c_dtype={c_dtype!r} (expected float16/float32)")
+    c_cp_dtype = cp.float16 if c_dtype == "float16" else cp.float32
 
     epilogue_str = f" +{fused_epilogue}" if fused_epilogue != "none" else ""
 
     if export_only:
         print(f"{_tag} AOT compile: M={m}, N={n}, K={k}{epilogue_str} "
-              f"tile={mma_tiler_mn} cluster={cluster_shape_mn}")
+              f"tile={mma_tiler_mn} cluster={cluster_shape_mn} c_dtype={c_dtype}")
     else:
         print(f"{_tag} Running Blackwell GEMM (C = A @ B^T) test:")
         print(f"{_tag}   M={m}, N={n}, K={k}{epilogue_str}")
-        print(f"{_tag}   FP16 in/out, FP32 accumulation")
+        print(f"{_tag}   FP16 in, {c_dtype} out, FP32 accumulation")
         print(f"{_tag}   mma_tiler={mma_tiler_mn}, cluster={cluster_shape_mn}, TMA store")
 
     if cp.cuda.runtime.getDeviceCount() == 0:
@@ -930,9 +935,14 @@ def run(
     # A: (M, K, L) row-major  => a_major="k"
     # B: (N, K, L) row-major  => b_major="k"  (kernel computes C = A @ B^T)
     # C: (M, N, L) row-major  => c_major="n"
-    a_cp, b_cp, c_cp = create_row_major_3d_gemm_tensors(
+    # A and B are FP16 tensor-core operands; C is allocated separately because
+    # its dtype is configurable (float16 or float32). C's row-major
+    # (L, mode0, mode1) layout is the same for either dtype, so the dynamic
+    # layout markup below applies unchanged.
+    a_cp, b_cp, _ = create_row_major_3d_gemm_tensors(
         m, n, k, batch=l, fill_random=not export_only, dtype=cp.float16
     )
+    c_cp = create_row_major_3d_tensor(m, n, l, fill_random=False, dtype=c_cp_dtype)
 
     a_dyn = mark_3d_row_major_dynamic(to_cute_tensor(a_cp))
     b_dyn = mark_3d_row_major_dynamic(to_cute_tensor(b_cp))
@@ -979,18 +989,21 @@ def run(
         compiled_gemm(a_dyn, b_dyn, c_dyn, current_stream)
         cp.cuda.get_current_stream().synchronize()
 
-        # Reference: C_ref = A @ B^T, squeezing the L=1 batch dim
+        # Reference: C_ref = A @ B^T, squeezing the L=1 batch dim. Cast the
+        # reference to the C output tensor's dtype so both sides are compared at
+        # the same precision.
+        _np_c = c_cp.dtype
         a_f32 = cp.asnumpy(a_cp[:, :, 0]).astype(np.float32)
         b_f32 = cp.asnumpy(b_cp[:, :, 0]).astype(np.float32)
-        c_ref = (a_f32 @ b_f32.T).astype(np.float16)
+        c_ref = (a_f32 @ b_f32.T).astype(_np_c)
 
         if fused_epilogue in ("bias", "bias_silu"):
             bias_f32 = cp.asnumpy(bias_cp).astype(np.float32)
-            c_ref = (c_ref.astype(np.float32) + bias_f32).astype(np.float16)
+            c_ref = (c_ref.astype(np.float32) + bias_f32).astype(_np_c)
 
         if fused_epilogue == "bias_silu":
             c_ref_f32 = c_ref.astype(np.float32)
-            c_ref = (c_ref_f32 * (1.0 / (1.0 + np.exp(-c_ref_f32)))).astype(np.float16)
+            c_ref = (c_ref_f32 * (1.0 / (1.0 + np.exp(-c_ref_f32)))).astype(_np_c)
 
         c_result = cp.asnumpy(c_cp[:, :, 0])
         max_err = np.max(np.abs(c_result.astype(np.float32) - c_ref.astype(np.float32)))
@@ -1050,6 +1063,11 @@ def _parse_args(argv=None):
              "(128, 128) better for M >= 1024.")
     p.add_argument("--cluster_shape_mn", type=parse_comma_separated_ints, default=(1, 2),
         help="Cluster shape (M_clusters, N_clusters) for TMA multicast.")
+    p.add_argument("--c_dtype", type=str, default="float16",
+        choices=["float16", "float32"],
+        help="Output (C) dtype. A/B stay FP16 (tensor-core inputs); float32 emits "
+             "an FP16-in/FP32-out kernel (tcgen05 already accumulates in FP32). "
+             "Default float16 = unchanged behavior.")
     p.add_argument("--use_2cta", action="store_true",
         help="Pair two CTAs along M for a 2x M tile per tcgen05.mma op. "
              "Requires cluster_shape[0] >= 2 so the leader CTA can drive the "
@@ -1080,6 +1098,7 @@ if __name__ == "__main__":
         mma_tiler_mn=tuple(args.mma_tiler_mn),
         cluster_shape_mn=tuple(args.cluster_shape_mn),
         use_2cta=args.use_2cta,
+        c_dtype=args.c_dtype,
     )
     if not args.export_only:
         print("PASS")

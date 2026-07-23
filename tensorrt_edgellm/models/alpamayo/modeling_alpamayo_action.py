@@ -156,6 +156,7 @@ class ActionAttention(nn.Module):
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.hidden_size = cfg.hidden_size
+        self.attention_scale = float(cfg.attention_scaling)
 
         self.q_proj = nn.Linear(cfg.hidden_size,
                                 self.num_heads * self.head_dim,
@@ -171,7 +172,6 @@ class ActionAttention(nn.Module):
                                 bias=False)
         self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self.qk_scale = 1.0 / math.sqrt(self.head_dim)
 
     def forward(
         self,
@@ -212,9 +212,6 @@ class ActionAttention(nn.Module):
         k = k.to(io_type)
         v = v.to(io_type)
 
-        # Scale Q
-        q = q * self.qk_scale
-
         # KV cache update
         present_k = kv_cache_update_onnx(k_cache, k, kvcache_start_index)
         present_v = kv_cache_update_onnx(v_cache, v, kvcache_start_index)
@@ -226,7 +223,7 @@ class ActionAttention(nn.Module):
             present_v,
             attn_mask=attention_mask,
             is_causal=False,
-            scale=1.0,
+            scale=self.attention_scale,
         )
 
         # Reshape and project

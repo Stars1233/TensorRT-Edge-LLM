@@ -22,8 +22,8 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
 # CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
-pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x
-# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.5.2'
+pip install 'nvidia-cutlass-dsl[cu13]==4.6.0'  # CUDA 13.x
+# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.0'
 ```
 
 **2. Compile all kernel variants into a static library**
@@ -43,7 +43,7 @@ This produces the following artifacts under
 `sm_121`).
 
 ```
-libcutedsl_{arch}.a          — all 8 kernel .o files + libcuda_dialect_runtime_static.a merged in
+libcutedsl_{arch}.a          — all FMHA kernel .o files + libcuda_dialect_runtime_static.a merged in
 metadata.json                — build provenance (CUDA ver, DSL ver, date, groups)
 include/
     cutedsl_all.h            — umbrella header
@@ -109,18 +109,23 @@ Local modifications are captured in `fmha.patch`.
 
 ## 1. Kernel Variants
 
-The build produces eight AOT-compiled kernel objects (`.o` + `.h` pairs):
+`fmha.py` contains two independently compiled kernel classes. The generic class
+handles D32-D128, while `BlackwellFusedMultiHeadAttentionForwardD256` uses a
+D256-specific TMEM and pipeline layout. The host selects the class before
+`cute.compile`, so the generated hot kernels contain no head-dimension branch.
 
-| Variant | Head Dim | SWA | Mode | Causal |
-|---|---|---|---|---|
-| `fmha_d64` | 64 | No | LLM | Yes |
-| `fmha_d128` | 128 | No | LLM | Yes |
-| `fmha_d64_sw` | 64 | Yes | LLM | Yes |
-| `fmha_d128_sw` | 128 | Yes | LLM | Yes |
-| `vit_fmha_d64` | 64 | No | ViT | No |
-| `vit_fmha_d72` | 72 | No | ViT | No |
-| `vit_fmha_d80` | 80 | No | ViT | No |
-| `vit_fmha_d128` | 128 | No | ViT | No |
+| Input / KV dtype | KV layout | Head dims | Variants per head dim |
+|---|---|---|---|
+| FP16 | Contiguous | 64, 128, 256 | regular, sliding window |
+| FP8 E4M3 | Contiguous | 64, 128, 256 | regular, sliding window |
+| FP16 | Paged | 64, 128, 256 | regular, sliding window |
+| FP8 E4M3 | Paged | 64, 128, 256 | regular, sliding window |
+| FP16 | Packed ViT | 64, 72, 80, 128 | bidirectional |
+
+The eight D256 AOT names are `fmha_d256`, `fmha_d256_sw`,
+`fmha_d256_fp8`, `fmha_d256_sw_fp8`, `fmha_d256_paged`,
+`fmha_d256_sw_paged`, `fmha_d256_paged_fp8`, and
+`fmha_d256_sw_paged_fp8`. D256 ViT is not supported.
 
 **LLM variants** use a fused KV cache layout `[B, 2, H_kv, S_k, D]` with causal
 masking and bottom-right alignment (`WINDOW_MASK_INFERENCE`).
@@ -144,7 +149,7 @@ python kernelSrcs/build_cutedsl.py --kernels fmha --gpu_arch sm_100 [--clean] [-
 
 | Dependency | Version | Notes |
 |---|---|---|
-| `nvidia-cutlass-dsl` | 4.5.2 | CUDA 13: `[cu13]` extra; CUDA 12: base package |
+| `nvidia-cutlass-dsl` | 4.6.0 | CUDA 13: `[cu13]` extra; CUDA 12: base package |
 | `cupy-cuda12x` | 12.3.0 | CUDA 12.x |
 | `cupy-cuda13x` | 13.6.0 | CUDA 13.x |
 
@@ -320,12 +325,128 @@ and integration into TensorRT Edge-LLM:
   separate Q/K/V and bidirectional (non-causal) attention for vision
   transformer workloads.
 
-## 5. File Map
+
+## 5. Skip-Softmax (BLASST) Threshold Calibration
+
+The kernel implements BLASST skip-softmax ([arXiv:2512.12087](https://arxiv.org/abs/2512.12087)):
+with `skip_softmax_threshold` (lambda) set at construction, a KV tile whose local
+row max falls below the running max by more than `ln(lambda)` is skipped whole
+(exp / row-sum / P*V elided). `None` (default) compiles the feature out — the
+kernel is bit-identical to the dense build. Restricted to plain causal attention
+(constructor assert; no sliding window, no ViT/bidirectional) and used by the
+prefill/context path only.
+
+`calibrate_skip_softmax.py` covers the full lambda lifecycle with two
+subcommands and staged, verbose output:
+
+```
+calibrate (default) ── ModelOpt official calibration ──▶ a, b, deploy lambda
+      │                                                        │
+      │                                    bake lambda into build_cutedsl.py,
+      │                                    rebuild artifact + relink (manual)
+      ▼                                                        ▼
+evaluate ── RULER accuracy of the deployed engine ──▶ PASS/FAIL + recommendation
+```
+
+### `calibrate` — lambda via ModelOpt (official)
+
+A fixed lambda yields wildly different sparsity across context lengths, so the
+threshold follows `lambda = scale_factor / L` with a model-specific scale
+factor. The subcommand wraps the official calibration in
+`modelopt.torch.sparsity.attention_sparsity` (the same machinery behind
+TensorRT-LLM's `threshold_scale_factor`): ModelOpt auto-generates a RULER
+calibration set (default 24 samples across power-of-2 length bins), runs one
+forward pass evaluating 20 built-in threshold trials at once, and fits
+`scale_factor = a * exp(b * sparsity)` with scipy. Requires `torch`,
+`transformers`, `nvidia-modelopt`, `scipy`, `wonderwords`; the model loads
+with `attn_implementation="eager"`.
+
+```bash
+python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py calibrate \
+    --model-dir /path/to/Qwen3-1.7B --max-seqlen 4096 \
+    --target-sparsity 0.3 0.5 --max-context 4096 \
+    --cache-dir /path/with/room/modelopt-cache   # RULER gen cache; ModelOpt
+                                                 # defaults to ~/.cache (quota!)
+# [calibrate 1/3] load model ... [calibrate 2/3] ModelOpt calibration
+#   (library output is dim and '│'-indented, this tool's lines are plain)
+# [calibrate 3/3] fitted parameters and deployment thresholds
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ a = 115.037   b = 4.6992   R^2 = 0.733   (278 points)         ┃
+# ┃ observed sparsity range: [10.3%, 74.7%]  (beyond = extrapolated)
+# ┃ target  30%  max_ctx 4096    lambda = 0.115008  (log2 -3.12)  ┃
+# ┃ target  50%  max_ctx 4096    lambda = 0.294372  (log2 -1.76)  ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+ModelOpt's sparsity is a simulated, all-layers-pooled metric — the deployed
+kernel's per-layer skip ratio at the same lambda can differ substantially.
+Treat the calibrated lambda as the ecosystem-consistent starting point and let
+`evaluate` arbitrate which target actually deploys.
+
+### Deploying a candidate lambda
+
+`lambda` is baked at AOT-compile time (there is no runtime knob): add
+`--skip_softmax_threshold <lambda>` to the `fmha_d64`/`fmha_d128` variant args
+in `kernelSrcs/build_cutedsl.py`, rebuild the artifact
+(`build_cutedsl.py --kernels fmha`), and relink with `ENABLE_CUTE_DSL=fmha`.
+
+### `evaluate` — RULER accuracy verdict for the deployed engine
+
+The paper's accuracy instrument is RULER (its ~50%-sparsity safe-zone
+conclusions come from it; retrieval-style tasks degrade first). The subcommand
+samples real RULER items (HF `simonjegou/ruler`, tokenizer-filtered to the
+engine's max input length), runs the deployed engine greedily, scores by
+exact-answer matching per task, and — given a baseline — prints a PASS/FAIL
+verdict plus a deployment recommendation (exit code follows, so it can gate
+CI). Pair with `llm_bench --mode prefill` for TTFT.
+
+```bash
+# 1) dense baseline: save its scores
+python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py evaluate \
+    --model-dir /path/to/Qwen3-1.7B \
+    --engine-dir engines/qwen3-1.7b --llm-inference build/examples/llm/llm_inference \
+    --max-context 4096 --save-results ruler_dense.json
+
+# 2) each skip build: compare, get the verdict
+python kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py evaluate \
+    --model-dir /path/to/Qwen3-1.7B \
+    --engine-dir engines/qwen3-1.7b --llm-inference build/examples/llm/llm_inference \
+    --max-context 4096 --baseline ruler_dense.json --label "lambda=0.115"
+# ...per-task score table with baseline/delta columns...
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ 
+# ┃ VERDICT: PASS [lambda=0.115]                          ┃
+# ┃ overall  0.7685 -> 0.7653   drop +0.0032  (gate 0.03) ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# 
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ VERDICT: FAIL [lambda=0.294]                          ┃
+# ┃ overall  0.7685 -> 0.7147   drop +0.0537  (gate 0.03) ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+# RECOMMENDATION: this build [lambda=0.115] is validated for deployment. ...
+```
+
+### Reference result (Qwen3-1.7B NVFP4, max_context 4096, B200)
+
+Calibrated `a = 115.0, b = 4.70` (R² 0.73). RULER 200 samples x 10 tasks,
+gate 0.03; TTFT from `llm_bench --mode prefill --inputLen 4096`:
+
+| build | RULER overall | verdict | TTFT S=4096 |
+|---|---|---|---|
+| dense | 0.7685 | baseline | 12.18 ms |
+| lambda=0.115 (target 30%) | 0.7653 (-0.003) | **PASS** | 11.70 ms (1.04x) |
+| lambda=0.294 (target 50%) | 0.7147 (-0.054, qa/multiquery collapse) | **FAIL** | 11.68 ms (1.04x) |
+
+Kernel time is threshold-insensitive at these shapes, so deploy the SMALLEST
+lambda that passes the gate — a larger lambda buys no speed and only spends
+accuracy margin.
+
+## 6. File Map
 
 | File | Description |
 |---|---|
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha.py` | CuTe DSL kernel source (LLM + ViT variants) |
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha_helpers.py` | Helper utilities from CUTLASS |
+| `kernelSrcs/fmha_cutedsl_blackwell/calibrate_skip_softmax.py` | Skip-softmax threshold scale-factor calibration tool |
 | `kernelSrcs/fmha_cutedsl_blackwell/fmha.patch` | Diff against upstream CUTLASS example |
 | `kernelSrcs/fmha_cutedsl_blackwell/fp8_prescale.patch` | FP8 pre-scaling patch (future) |
 | `kernelSrcs/build_cutedsl.py` | Unified pre-build script: compiles all CuTe DSL variants (FMHA + GDN) |

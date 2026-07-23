@@ -240,10 +240,65 @@ FP8_AUDIO = {
     )
 }
 
-_TTS_PATTERNS = (
-    "*code_predictor.*",
-    "*code2wav.*",
-)
+# Qwen3-Omni Talker CodePredictor — 5-layer Qwen3 decoder under
+# ``talker.code_predictor.*`` emitting residual codec tokens.
+_CP_PREFIXES = ("code_predictor", )
+_CP_PATTERNS = tuple(f"*{p}.*" for p in _CP_PREFIXES)
+
+# Linear submodules where FP8 loses precision: down_proj (silu*up ∈
+# [-39, 72] → per-tensor amax quantizes to garbage) and lm_head[0..14]
+# (each codebook sees 1/15 of calib signal, amax undertrained).
+_CP_LINEAR_EXCLUDES = ("lm_head", "down_proj")
+
+# Attention KV-cache BMM quantizers (mixed-precision KV rejected by ONNX
+# export). Named differently from Linear quantizers — a single
+# ``q_bmm_quantizer`` attribute, not ``*_quantizer/input`` sub-selectors.
+_CP_BMM_EXCLUDES = ("q_bmm", "k_bmm", "v_bmm")
+
+# Qwen3-Omni Code2Wav — codec→waveform decoder. Always disabled today.
+_CODE2WAV_PATTERNS = ("*code2wav.*", )
+
+
+def _cp_quant_cfg(input_cfg: Optional[Dict[str, Any]],
+                  weight_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Expand ``input_cfg`` / ``weight_cfg`` into CP wildcard patterns and
+    layer disables for :data:`_CP_LINEAR_EXCLUDES` / :data:`_CP_BMM_EXCLUDES`.
+
+    Mirrors :func:`_visual_quant_cfg` / :func:`_audio_quant_cfg`; disables are
+    emitted after generic enables so specific patterns win (ModelOpt matches
+    in insertion order — last-writer wins).
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for prefix in _CP_PREFIXES:
+        out[f"*{prefix}*weight_quantizer"] = weight_cfg
+        if input_cfg is not None:
+            out[f"*{prefix}*input_quantizer"] = input_cfg
+    for prefix in _CP_PREFIXES:
+        for sub in _CP_LINEAR_EXCLUDES:
+            out[f"*{prefix}*{sub}*weight_quantizer"] = {"enable": False}
+            out[f"*{prefix}*{sub}*input_quantizer"] = {"enable": False}
+        for sub in _CP_BMM_EXCLUDES:
+            out[f"*{prefix}*{sub}_quantizer"] = {"enable": False}
+    return out
+
+
+# CP FP8 recipe. Per-channel weight (axis=0) + per-tensor static input
+# (axis=None); see :data:`_CP_SUBMODULE_EXCLUDES` for disabled submodules.
+FP8_CP = {
+    "quant_cfg":
+    _cp_quant_cfg(
+        input_cfg={
+            "num_bits": (4, 3),
+            "axis": None,
+            "enable": True,
+        },
+        weight_cfg={
+            "num_bits": (4, 3),
+            "axis": 0,
+            "enable": True,
+        },
+    )
+}
 
 _BACKBONE_CFG_MAP = {
     "fp8": mtq.FP8_DEFAULT_CFG,
@@ -266,6 +321,10 @@ _VISUAL_CFG_MAP = {
 
 _AUDIO_CFG_MAP = {
     "fp8": FP8_AUDIO,
+}
+
+_CP_CFG_MAP = {
+    "fp8": FP8_CP,
 }
 
 
@@ -379,6 +438,7 @@ def build_quant_config(
     kv_cache_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
     audio_quantization: Optional[str] = None,
+    cp_quantization: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a composite ModelOpt quantization config from method names.
 
@@ -400,6 +460,12 @@ def build_quant_config(
                                ``visual_quantization`` for ``audio_tower.*`` /
                                ``audio_embed.*`` paths. Only ``fp8`` is exposed
                                today.
+        cp_quantization:       Optional Qwen3-Omni CodePredictor precision
+                               (``fp8`` only today).  When ``None`` the CP is
+                               left untouched (``*code_predictor.*`` disabled);
+                               when set, the CP backbone is quantized but
+                               ``*code_predictor*down_proj*`` is explicitly
+                               kept unquantized to preserve the FP32 MLP WAR.
     """
     if quantization is None:
         cfg = {"quant_cfg": {"default": {"enable": False}}, "algorithm": "max"}
@@ -432,8 +498,11 @@ def build_quant_config(
                                             FP8_ATTN["quant_cfg"])
 
     # Disable every non-LLM group by default. Re-enable the ones the user
-    # explicitly asked to quantize.
-    groups_to_disable = [_TTS_PATTERNS]
+    # explicitly asked to quantize.  ``_CODE2WAV_PATTERNS`` is always disabled
+    # today; ``_CP_PATTERNS`` only when ``cp_quantization is None``.
+    groups_to_disable = [_CODE2WAV_PATTERNS]
+    if cp_quantization is None:
+        groups_to_disable.append(_CP_PATTERNS)
     if visual_quantization is None:
         groups_to_disable.append(_VISUAL_PATTERNS)
     if audio_quantization is None:
@@ -442,6 +511,17 @@ def build_quant_config(
         cfg["quant_cfg"],
         _disable_groups(*groups_to_disable),
     )
+
+    # CP override layered AFTER the generic disables so specific patterns win.
+    if cp_quantization is not None:
+        if cp_quantization not in _CP_CFG_MAP:
+            raise ValueError(
+                f"Unsupported cp_quantization: {cp_quantization}. "
+                f"Choose from: {list(_CP_CFG_MAP)}")
+        cfg["quant_cfg"] = _merge_quant_cfg(
+            cfg["quant_cfg"],
+            _CP_CFG_MAP[cp_quantization]["quant_cfg"],
+        )
 
     # When visual != backbone, layer an explicit override. When visual ==
     # backbone we don't need overrides — the backbone's generic wildcards

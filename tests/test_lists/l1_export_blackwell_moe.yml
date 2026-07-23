@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Export Tests - Blackwell MoE exports
+# Focus: supported MoE exports and adjacent large Blackwell export paths.
+
+tests:
+  # Qwen3.5 large Blackwell export paths
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-27B-nvfp4]
+  # Qwen3.5-35B-A3B: use GPTQ-Int4 (the NVFP4 checkpoint is not staged; only 3.6 NVFP4 exists)
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-35B-A3B-GPTQ-Int4-int4_gptq]
+
+  # Qwen3.5 27B full precision exports
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-27B-fp8]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-27B-nvfp4-lmnvfp4]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-27B-fp8-fp8kv]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-27B-nvfp4-fp8kv]
+
+  # NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4-nvfp4]
+
+  # Qwen3-30B-A3B MoE
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-30B-A3B-GPTQ-Int4-int4_gptq]
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3-30B-A3B-NVFP4-nvfp4]
+
+  # Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4-nvfp4]
+
+  # Qwen3.5-27B
+  - tests/defs/test_checkpoint_export.py::test_checkpoint_export[Qwen3.5-27B-int4_awq]

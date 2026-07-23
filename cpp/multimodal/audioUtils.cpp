@@ -19,6 +19,7 @@
 
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "kernels/preprocessKernels/audioFbankKernels.h"
 #include <algorithm>
 #include <cmath>
 #include <cuda_fp16.h>
@@ -51,6 +52,82 @@ bool uploadHostMelFp32ToFp16Gpu(
     CUDA_CHECK(cudaMemcpyAsync(devOut.rawPointer(), halfBuf.data(), static_cast<size_t>(numel) * sizeof(__half),
         cudaMemcpyHostToDevice, stream));
     return true;
+}
+
+bool uploadHostPcmF32ToGpu(std::vector<float> const& hostPcm, rt::Tensor& devOut, cudaStream_t stream)
+{
+    if (hostPcm.empty())
+    {
+        LOG_ERROR("uploadHostPcmF32ToGpu: empty PCM.");
+        return false;
+    }
+    int64_t const numSamples = static_cast<int64_t>(hostPcm.size());
+    if (!devOut.reshape({numSamples}))
+    {
+        LOG_ERROR("uploadHostPcmF32ToGpu: PCM (%ld samples) exceeds the pre-allocated staging capacity.",
+            static_cast<long>(numSamples));
+        return false;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(devOut.rawPointer(), hostPcm.data(), static_cast<size_t>(numSamples) * sizeof(float),
+        cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
+bool fillMelFilterFp16Kmajor(
+    float const* melFilterF32, int32_t nMel, int32_t nFreq, int32_t kPad, rt::Tensor& out, cudaStream_t stream)
+{
+    if (melFilterF32 == nullptr || nMel <= 0 || nFreq <= 0 || nFreq > kPad)
+    {
+        LOG_ERROR("fillMelFilterFp16Kmajor: bad mel filter (nMel=%d, nFreq=%d, kPad=%d).", nMel, nFreq, kPad);
+        return false;
+    }
+    Coords const& osh = out.getShape();
+    if (out.getDeviceType() != rt::DeviceType::kGPU || out.getDataType() != nvinfer1::DataType::kHALF
+        || osh.getNumDims() != 2 || osh[0] != nMel || osh[1] != kPad)
+    {
+        LOG_ERROR("fillMelFilterFp16Kmajor: out must be a pre-allocated [%d, %d] Half GPU tensor.", nMel, kPad);
+        return false;
+    }
+    // Cast + K-pad [nMel, nFreq] F32 → [nMel, kPad] F16 (row-major, K
+    // contiguous), matching the AOT CuTe DSL GEMM A-matrix ABI. Trailing
+    // kPad − nFreq cols stay zero; the matching cols in mag (GEMM B) are
+    // zeroed by fbankWhisper's memset, so the dot product is invariant on the
+    // active [nMel, T_out] window.
+    std::vector<__half> melFp16Host(static_cast<size_t>(nMel) * kPad, __half(0.0f));
+    for (int32_t m = 0; m < nMel; ++m)
+    {
+        for (int32_t k = 0; k < nFreq; ++k)
+        {
+            melFp16Host[static_cast<size_t>(m) * kPad + k]
+                = __float2half_rn(melFilterF32[static_cast<size_t>(m) * nFreq + k]);
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        out.rawPointer(), melFp16Host.data(), melFp16Host.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
+void makeFftTwiddleHost(int32_t nFft, std::vector<float>& twoChan)
+{
+    constexpr double kTwoPiNeg = -2.0 * 3.14159265358979323846;
+    twoChan.resize(static_cast<size_t>(nFft) * 2);
+    for (int32_t k = 0; k < nFft; ++k)
+    {
+        double const ang = kTwoPiNeg * static_cast<double>(k) / static_cast<double>(nFft);
+        twoChan[2 * k + 0] = static_cast<float>(std::cos(ang));
+        twoChan[2 * k + 1] = static_cast<float>(std::sin(ang));
+    }
+}
+
+void makeCentredWindowHost(std::vector<float> const& window, int32_t nFft, std::vector<float>& out)
+{
+    int32_t const winLength = static_cast<int32_t>(window.size());
+    out.assign(static_cast<size_t>(nFft), 0.0f);
+    int32_t const offset = (nFft - winLength) / 2;
+    for (int32_t i = 0; i < winLength; ++i)
+    {
+        out[static_cast<size_t>(offset + i)] = window[static_cast<size_t>(i)];
+    }
 }
 
 int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow)
@@ -390,6 +467,177 @@ bool createChunkwiseAttentionMask(std::vector<int64_t> const& afterCNNLens, int3
         attentionMask.rawPointer(), maskHost.data(), maskHost.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
 
     return true;
+}
+
+int32_t computeNumMelFrames(int64_t numPcmSamples, int32_t nFft, int32_t hopLength, int32_t padLength)
+{
+    int64_t const nPadded = numPcmSamples + 2 * padLength;
+    int32_t const T_full = static_cast<int32_t>((nPadded - nFft) / hopLength + 1);
+    return T_full - 1;
+}
+
+bool fbankWhisper(rt::Tensor const& pcmF32, FbankResources& resources, rt::Tensor& melOutF16, cudaStream_t stream)
+{
+    try
+    {
+        if (pcmF32.getShape().getNumDims() != 1)
+        {
+            LOG_ERROR("fbankWhisper: pcmF32 must be [N] mono FP32; got %d dims.", pcmF32.getShape().getNumDims());
+            return false;
+        }
+        // STFT/mel params from the runner-populated resources (derived from
+        // MelExtractorConfig — single source of truth, no constants here).
+        int32_t const nFft = resources.nFft;
+        int32_t const hopLength = resources.hopLength;
+        int32_t const padLength = resources.padLength;
+        int32_t const nMel = resources.nMel;
+        float const melFloor = resources.melFloor;
+
+        int64_t const N = pcmF32.getShape()[0];
+        int64_t const nPadded = N + 2 * padLength;
+        if (nPadded < nFft)
+        {
+            LOG_ERROR(
+                "fbankWhisper: PCM too short for fbank (N=%ld, need >= %d after pad).", static_cast<long>(N), nFft);
+            return false;
+        }
+        // Reuse computeNumMelFrames — the same call the runner uses to size
+        // melSpec — so the kernel output width cannot drift from the
+        // pre-allocated melSpec. T_full = T_out + 1 restores the trailing frame
+        // that the HF `stft[..., :-1]` trim drops.
+        int32_t const T_out = computeNumMelFrames(N, nFft, hopLength, padLength);
+        if (T_out <= 0)
+        {
+            LOG_ERROR("fbankWhisper: T_out non-positive (N=%ld).", static_cast<long>(N));
+            return false;
+        }
+        int32_t const T_full = T_out + 1;
+        int32_t const N_pad = fbankNPad(T_out);
+
+        // Metadata-only reshape of the pre-allocated workspace to this clip's
+        // size; maxLogScalar stays [1] and is not reshaped.
+        check::check(resources.framedF32.reshape({static_cast<int64_t>(T_full), nFft}),
+            "fbankWhisper: framedF32 exceeds pre-allocated capacity.");
+        check::check(resources.magFp16.reshape({static_cast<int64_t>(N_pad), kFbankKPad}),
+            "fbankWhisper: magFp16 exceeds pre-allocated capacity.");
+        // melPowerFp16 (GEMM C) needs no pre-zeroing: the downstream
+        // log10MaxReduce / logMelNormalize kernels bound-check t < T_out and
+        // never read the padding columns [T_out, N_pad).
+        check::check(resources.melPowerFp16.reshape({nMel, static_cast<int64_t>(N_pad)}),
+            "fbankWhisper: melPowerFp16 exceeds pre-allocated capacity.");
+
+        // Zero the whole padded mag buffer. Stage 4 of stftR2C400FusedMagsq
+        // writes only [0, T_out) × [0, nFreq); rows [T_out, N_pad) and cols
+        // [nFreq, K_pad) must stay zero so the AOT GEMM (no residue handling)
+        // produces correct values on the [nMel, T_out] active subset (the
+        // zero rows/cols sum to 0 in the dot product).
+        CUDA_CHECK(cudaMemsetAsync(
+            resources.magFp16.rawPointer(), 0, static_cast<size_t>(N_pad) * kFbankKPad * sizeof(__half), stream));
+
+        // Pipeline. Each wrapper validates its tensor contracts via check::check
+        // and throws on mismatch — the surrounding try/catch turns that into a
+        // logged false return.
+        kernel::pcmToFramesAndWindow(
+            pcmF32, resources.hannWindow, resources.framedF32, nFft, hopLength, padLength, stream);
+        kernel::stftR2C400FusedMagsq(
+            resources.framedF32, resources.fftTwiddle, resources.magFp16, T_out, kFbankKPad, stream);
+        kernel::melLinearGemmFp16TC(resources.melFilterFp16Kmajor, resources.magFp16, resources.melPowerFp16, stream);
+        kernel::log10MaxReduce(resources.melPowerFp16, T_out, resources.maxLogScalar, melFloor, stream);
+        kernel::logMelNormalizeAndCastF16(
+            resources.melPowerFp16, T_out, resources.maxLogScalar, melOutF16, melFloor, stream);
+        return true;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("fbankWhisper failed: %s", e.what());
+        return false;
+    }
+}
+
+int32_t computeNumMelFramesParakeet(int64_t numPcmSamples, int32_t hopLength)
+{
+    if (numPcmSamples <= 0 || hopLength <= 0)
+    {
+        return 0;
+    }
+    // Plain floor — HF ParakeetFeatureExtractor features length (center=True).
+    return static_cast<int32_t>(numPcmSamples / hopLength);
+}
+
+bool fbankParakeet(
+    rt::Tensor const& pcmF32, FbankResourcesParakeet& resources, rt::Tensor& melOutF16, cudaStream_t stream)
+{
+    try
+    {
+        if (pcmF32.getShape().getNumDims() != 1)
+        {
+            LOG_ERROR("fbankParakeet: pcmF32 must be [N] mono FP32; got %d dims.", pcmF32.getShape().getNumDims());
+            return false;
+        }
+        // STFT/mel params from the runner-populated resources (derived from
+        // MelExtractorConfig, except normEps == kParakeetZScoreEps).
+        int32_t const nFft = resources.nFft;
+        int32_t const hopLength = resources.hopLength;
+        int32_t const centerPad = resources.centerPad;
+        int32_t const nMel = resources.nMel;
+        float const preemph = resources.preemph;
+        float const logGuard = resources.logGuard;
+        float const normEps = resources.normEps;
+
+        int64_t const N = pcmF32.getShape()[0];
+        // T_out = floor(N / hop) (no Whisper drop-last). Virtual center zero-pad,
+        // so the only length requirement is N >= hop (T_out >= 1).
+        int32_t const T_out = computeNumMelFramesParakeet(N, hopLength);
+        if (T_out <= 0)
+        {
+            LOG_ERROR("fbankParakeet: T_out non-positive (N=%ld, hop=%d).", static_cast<long>(N), hopLength);
+            return false;
+        }
+        int32_t const N_pad = fbankNPad(T_out);
+        int32_t const kPad = fbankKPadParakeet(resources.nFreq);
+
+        // Reshape the init-time pre-allocated workspace to this clip (metadata
+        // only — capacity was sized at the maxFrames bound in initFbankResources;
+        // the runner gates clip length against maxFrames before calling). framedF32
+        // is [T_out, nFft] — parakeet frames exactly T_out (no trailing drop-last
+        // frame, unlike Whisper). melPowerF32 (GEMM C) is FP32 — the parakeet
+        // deviation from Whisper's FP16 C — and needs no pre-zeroing: the stats /
+        // normalize kernels bound-check t < T_out and never read the padding cols
+        // [T_out, N_pad). mean / invDenom stay [nMel] for every clip.
+        check::check(resources.framedF32.reshape({static_cast<int64_t>(T_out), nFft}),
+            "fbankParakeet: framedF32 exceeds pre-allocated capacity.");
+        check::check(resources.magFp16.reshape({static_cast<int64_t>(N_pad), kPad}),
+            "fbankParakeet: magFp16 exceeds pre-allocated capacity.");
+        check::check(resources.melPowerF32.reshape({nMel, static_cast<int64_t>(N_pad)}),
+            "fbankParakeet: melPowerF32 exceeds pre-allocated capacity.");
+
+        // No per-clip mag memset. magFp16's K-pad columns [nFreq, K_pad) and unused
+        // rows [T_out, N_pad) were zeroed ONCE over the full [nPadMax, K_pad] buffer
+        // at init (initFbankResources). stftR2C512FusedMagsq writes only
+        // [0, T_out) × [0, nFreq) and never touches the pad region, and the reshape
+        // above only shrinks the view (no re-allocation), so those zeros persist
+        // across clips — the AOT GEMM (no K-residue handling) stays exact on the
+        // [nMel, T_out] active subset without a per-clip memset.
+
+        // Pipeline. Each wrapper validates its tensor contracts via check::check
+        // and throws on mismatch — the surrounding try/catch turns that into a
+        // logged false return.
+        kernel::pcmPreemphFramesAndWindow(
+            pcmF32, resources.windowF32, resources.framedF32, nFft, hopLength, centerPad, preemph, T_out, stream);
+        kernel::stftR2C512FusedMagsq(resources.framedF32, resources.fftTwiddle, resources.magFp16, T_out, kPad, stream);
+        kernel::melLinearGemmFp16inFp32out(
+            resources.melFilterFp16Kmajor, resources.magFp16, resources.melPowerF32, stream);
+        kernel::melStatsLnPerFeature(
+            resources.melPowerF32, T_out, logGuard, normEps, resources.mean, resources.invDenom, stream);
+        kernel::melNormalizeZScoreTimeFirst(
+            resources.melPowerF32, T_out, logGuard, resources.mean, resources.invDenom, melOutF16, stream);
+        return true;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("fbankParakeet failed: %s", e.what());
+        return false;
+    }
 }
 
 } // namespace audioUtils

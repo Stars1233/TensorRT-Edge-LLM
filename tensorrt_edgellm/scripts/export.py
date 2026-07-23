@@ -41,12 +41,12 @@ VLMs (LLM + visual encoder):
     internvl_chat                 (InternVL3)
     internvl                      (InternVL3.5)
     phi4mm, phi4_multimodal       (Phi-4 Multimodal)
-    gemma4                        (Gemma4 multimodal checkpoints)
+    gemma4, gemma4_unified        (Gemma4 multimodal checkpoints)
     NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
                                  (Nemotron-Omni)
 
 Audio models (LLM + audio encoder):
-    qwen3_asr, qwen3_omni, qwen3_omni_thinker
+    qwen3_asr, qwen3_omni, qwen3_omni_thinker, gemma4_unified
     NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3
                                  (Nemotron-Omni)
 
@@ -92,6 +92,8 @@ _NEMOTRON_OMNI_MODEL_TYPES = frozenset([
 _GEMMA4_MODEL_TYPES = frozenset([
     "gemma4",
     "gemma4_text",
+    "gemma4_unified",
+    "gemma4_unified_text",
 ])
 
 _VLM_MODEL_TYPES = frozenset([
@@ -106,16 +108,19 @@ _VLM_MODEL_TYPES = frozenset([
     "phi4mm",
     "phi4_multimodal",
     "gemma4",
+    "gemma4_unified",
     "alpamayo_r1",
     *_NEMOTRON_OMNI_MODEL_TYPES,
 ])
 
 _AUDIO_MODEL_TYPES = frozenset([
+    "gemma4",
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
+    "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
     # Its Talker and CodePredictor are LLM decoders exported via the LLM pipeline.
@@ -126,7 +131,8 @@ _AUDIO_MODEL_TYPES = frozenset([
 # Excludes Nemotron-Omni, which has its own field names
 # (``img_context_token_id`` / ``sound_context_token_id``) at the source-config
 # root and is handled by ``_collect_tokens_from_nemotron_root``.
-_ASR_LLM_MODEL_TYPES = _AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES
+_ASR_LLM_MODEL_TYPES = (_AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES -
+                        {"gemma4_unified"})
 
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
@@ -154,6 +160,19 @@ def _has_visual(model_type: str) -> bool:
 
 def _has_audio(model_type: str) -> bool:
     return model_type in _AUDIO_MODEL_TYPES
+
+
+def _checkpoint_audio_config(config: dict) -> "dict | None":
+    """Locate the audio-encoder config wherever the checkpoint stores it.
+
+    Gemma4 / Gemma4-Unified keep ``audio_config`` at the root; Qwen3-ASR /
+    Qwen3-Omni nest it under ``thinker_config``; Nemotron-Omni names it
+    ``sound_config``. Returns ``None`` when the checkpoint genuinely has no
+    audio encoder (e.g. Gemma4 dense with ``"audio_config": null``).
+    """
+    return (config.get("audio_config")
+            or (config.get("thinker_config") or {}).get("audio_config")
+            or config.get("sound_config"))
 
 
 def _has_action(model_type: str) -> bool:
@@ -233,6 +252,15 @@ def _resolve_model_dir(model: str) -> str:
     return snapshot_download(model)
 
 
+def _resolve_mtp_draft_dir(mtp_draft_dir: str) -> str:
+    """Resolve a user-provided paired MTP draft checkpoint path or HF repo ID."""
+    if os.path.isdir(mtp_draft_dir):
+        return os.path.abspath(mtp_draft_dir)
+    if os.path.isabs(mtp_draft_dir) or mtp_draft_dir.startswith("."):
+        return os.path.abspath(mtp_draft_dir)
+    return _resolve_model_dir(mtp_draft_dir)
+
+
 def _load_config(model_dir: str) -> dict:
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(cfg_path):
@@ -255,6 +283,219 @@ def _has_mtp(config: dict) -> bool:
     """Return True when the checkpoint exposes the MTP branch."""
     text_cfg = _get_llm_text_config(config)
     return bool(text_cfg.get("mtp_num_hidden_layers") is not None)
+
+
+def _normalize_gemma4_layer_type(layer_type: str) -> str:
+    if layer_type in ("sliding_attention", "full_attention"):
+        return layer_type
+    raise ValueError(
+        f"Unsupported Gemma4 assistant layer type {layer_type!r}; "
+        "expected sliding_attention or full_attention.")
+
+
+def _assert_tokenizers_match(target_dir: str, assistant_dir: str) -> None:
+
+    def _token_id_map(tokenizer_path: str) -> dict:
+        with open(tokenizer_path) as f:
+            tokenizer = json.load(f)
+        token_ids = {}
+        vocab = tokenizer.get("model", {}).get("vocab", {})
+        if isinstance(vocab, dict):
+            token_ids.update({
+                str(token): int(idx)
+                for token, idx in vocab.items()
+            })
+        for entry in tokenizer.get("added_tokens", []):
+            content = entry.get("content")
+            idx = entry.get("id")
+            if content is not None and idx is not None:
+                token_ids[str(content)] = int(idx)
+        return token_ids
+
+    target_tok = os.path.join(target_dir, "tokenizer.json")
+    assistant_tok = os.path.join(assistant_dir, "tokenizer.json")
+    if not os.path.exists(target_tok) or not os.path.exists(assistant_tok):
+        raise ValueError(
+            "Gemma4 MTP pairing requires tokenizer.json in both target and assistant checkpoints."
+        )
+    if _token_id_map(target_tok) != _token_id_map(assistant_tok):
+        raise ValueError(
+            "Gemma4 MTP target and assistant tokenizer token-id maps differ; "
+            "paired export requires identical token IDs.")
+
+
+def _build_gemma4_kv_sharing_map(target_config: dict,
+                                 assistant_config: dict) -> list[dict]:
+    target_text = _get_llm_text_config(target_config)
+    assistant_text = _get_llm_text_config(assistant_config)
+    target_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in target_text.get("layer_types", [])
+    ]
+    assistant_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in assistant_text.get("layer_types", [])
+    ]
+    num_shared_target_layers_value = target_text.get("num_kv_shared_layers")
+    num_shared_target_layers = (len(target_types)
+                                if num_shared_target_layers_value is None else
+                                int(num_shared_target_layers_value))
+    num_shared_target_layers = min(num_shared_target_layers, len(target_types))
+    target_share_start = len(target_types) - num_shared_target_layers
+    target_donor_types = target_types[:target_share_start]
+
+    kv_sharing_map = []
+    # Gemma4 assistant layers read target KV from the nearest compatible donor
+    # before the shared-KV suffix. Layers with the same attention type may
+    # intentionally share the same target donor.
+    for assistant_layer, assistant_type in enumerate(assistant_types):
+        matched_target = None
+        for target_layer in range(len(target_donor_types) - 1, -1, -1):
+            if target_types[target_layer] == assistant_type:
+                matched_target = target_layer
+                break
+        if matched_target is None:
+            raise ValueError(
+                "Gemma4 MTP assistant layer %d (%s) cannot be mapped to a "
+                "compatible donor layer before the target shared-KV suffix of %d layers."
+                % (assistant_layer, assistant_type, num_shared_target_layers))
+        kv_sharing_map.append({
+            "assistant_layer": assistant_layer,
+            "target_attention_layer": matched_target,
+            "target_layer": matched_target,
+            "target_layer_type": assistant_type,
+        })
+    return kv_sharing_map
+
+
+def _gemma4_head_dim_for_layer(text_config: dict, layer_type: str) -> int:
+    if layer_type == "full_attention" and text_config.get("global_head_dim"):
+        return int(text_config["global_head_dim"])
+    return int(text_config.get("head_dim", 0))
+
+
+def _gemma4_num_kv_heads_for_layer(text_config: dict, layer_type: str) -> int:
+    if (layer_type == "full_attention" and text_config.get("attention_k_eq_v")
+            and text_config.get("num_global_key_value_heads")):
+        return int(text_config["num_global_key_value_heads"])
+    return int(text_config.get("num_key_value_heads", 0))
+
+
+def _validate_gemma4_kv_sharing_contract(target_config: dict,
+                                         assistant_config: dict,
+                                         kv_sharing_map: list[dict]) -> None:
+    target_text = _get_llm_text_config(target_config)
+    assistant_text = _get_llm_text_config(assistant_config)
+    target_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in target_text.get("layer_types", [])
+    ]
+    assistant_types = [
+        _normalize_gemma4_layer_type(str(layer_type))
+        for layer_type in assistant_text.get("layer_types", [])
+    ]
+    if len(assistant_types) != int(assistant_text.get("num_hidden_layers", 0)):
+        raise ValueError(
+            "Gemma4 MTP assistant layer_types length must match num_hidden_layers."
+        )
+    if len(target_types) != int(target_text.get("num_hidden_layers", 0)):
+        raise ValueError(
+            "Gemma4 MTP target layer_types length must match num_hidden_layers."
+        )
+    if len(kv_sharing_map) != len(assistant_types):
+        raise ValueError(
+            "Gemma4 MTP kv_sharing_map length must match assistant layer count."
+        )
+
+    seen_layers = set()
+    for entry in kv_sharing_map:
+        assistant_layer = int(entry["assistant_layer"])
+        target_layer = int(entry["target_attention_layer"])
+        if assistant_layer in seen_layers:
+            raise ValueError(
+                "Gemma4 MTP kv_sharing_map has duplicate assistant layer %d." %
+                assistant_layer)
+        seen_layers.add(assistant_layer)
+        if assistant_layer < 0 or assistant_layer >= len(assistant_types):
+            raise ValueError(
+                "Gemma4 MTP assistant layer %d is outside the assistant layer range."
+                % assistant_layer)
+        if target_layer < 0 or target_layer >= len(target_types):
+            raise ValueError(
+                "Gemma4 MTP target donor layer %d is outside the target layer range."
+                % target_layer)
+
+        assistant_type = assistant_types[assistant_layer]
+        target_type = target_types[target_layer]
+        if assistant_type != target_type:
+            raise ValueError(
+                "Gemma4 MTP layer type mismatch: assistant layer %d is %s, target donor layer %d is %s."
+                % (assistant_layer, assistant_type, target_layer, target_type))
+
+        assistant_head_dim = _gemma4_head_dim_for_layer(
+            assistant_text, assistant_type)
+        target_head_dim = _gemma4_head_dim_for_layer(target_text, target_type)
+        if assistant_head_dim != target_head_dim:
+            raise ValueError(
+                "Gemma4 MTP KV head_dim mismatch: assistant layer %d head_dim=%d, target donor layer %d head_dim=%d."
+                % (assistant_layer, assistant_head_dim, target_layer,
+                   target_head_dim))
+
+        assistant_kv_heads = _gemma4_num_kv_heads_for_layer(
+            assistant_text, assistant_type)
+        target_kv_heads = _gemma4_num_kv_heads_for_layer(
+            target_text, target_type)
+        if assistant_kv_heads != target_kv_heads:
+            raise ValueError(
+                "Gemma4 MTP KV head mismatch: assistant layer %d num_kv_heads=%d, target donor layer %d num_kv_heads=%d."
+                % (assistant_layer, assistant_kv_heads, target_layer,
+                   target_kv_heads))
+
+    expected_layers = set(range(len(assistant_types)))
+    if seen_layers != expected_layers:
+        missing = sorted(expected_layers - seen_layers)
+        raise ValueError(
+            "Gemma4 MTP kv_sharing_map is missing assistant layers: %s." %
+            missing)
+
+
+def _validate_gemma4_mtp_pair(target_dir: str,
+                              assistant_dir: str) -> list[dict]:
+    target_config = _load_config(target_dir)
+    assistant_config = _load_config(assistant_dir)
+    target_text = _get_llm_text_config(target_config)
+    assistant_text = _get_llm_text_config(assistant_config)
+
+    if target_text.get("model_type") not in ("gemma4", "gemma4_text"):
+        raise ValueError(
+            "Gemma4 MTP target must have model_type gemma4/gemma4_text in text_config."
+        )
+    if assistant_config.get("model_type") != "gemma4_assistant":
+        raise ValueError(
+            "Gemma4 MTP assistant must have root model_type gemma4_assistant.")
+    if int(target_text.get("hidden_size", 0)) != int(
+            assistant_config.get("backbone_hidden_size", 0)):
+        raise ValueError(
+            "Gemma4 MTP hidden mismatch: target hidden_size=%s, assistant backbone_hidden_size=%s"
+            % (target_text.get("hidden_size"),
+               assistant_config.get("backbone_hidden_size")))
+    if int(target_text.get("vocab_size",
+                           0)) != int(assistant_text.get("vocab_size", 0)):
+        raise ValueError(
+            "Gemma4 MTP vocab mismatch: target vocab_size=%s, assistant vocab_size=%s"
+            %
+            (target_text.get("vocab_size"), assistant_text.get("vocab_size")))
+    if int(assistant_text.get("num_kv_shared_layers", 0)) != int(
+            assistant_text.get("num_hidden_layers", 0)):
+        raise ValueError(
+            "Gemma4 MTP assistant requires num_kv_shared_layers == num_hidden_layers."
+        )
+    _assert_tokenizers_match(target_dir, assistant_dir)
+    kv_sharing_map = _build_gemma4_kv_sharing_map(target_config,
+                                                  assistant_config)
+    _validate_gemma4_kv_sharing_contract(target_config, assistant_config,
+                                         kv_sharing_map)
+    return kv_sharing_map
 
 
 def _find_token_id(model_dir: str, token_str: str) -> "Optional[int]":
@@ -402,21 +643,32 @@ def _collect_tokens_from_tokenizer_fallback(model_dir: str) -> dict:
     return out
 
 
-def _collect_gemma4_tokenizer_fallback(model_dir: str) -> dict:
+def _collect_gemma4_tokenizer_fallback(model_dir: str,
+                                       model_type: str = "") -> dict:
     """Gemma4 fallback for multimodal placeholders.
 
     Gemma4's PLE preprocessor uses image/audio token IDs to zero-fill the token
     identity component at multimodal positions. Prefer structured config fields
     when present, but resolve the standard placeholder tokens from tokenizer
-    assets when the source config is flat or incomplete.
+    assets when the source config is flat or incomplete.  Gemma4 Unified
+    checkpoints name the placeholders ``<|image|>`` / ``<|audio|>``.
     """
+    unified = str(model_type).startswith("gemma4_unified")
+    image_tokens = ("<|image|>",
+                    "<|image_pad|>") if unified else ("<|image_pad|>", )
+    audio_tokens = ("<|audio|>",
+                    "<|audio_pad|>") if unified else ("<|audio_pad|>", )
     out: dict = {}
-    image_id = _find_token_id(model_dir, "<|image_pad|>")
-    if image_id is not None:
-        out["image_token_id"] = image_id
-    audio_id = _find_token_id(model_dir, "<|audio_pad|>")
-    if audio_id is not None:
-        out["audio_token_id"] = audio_id
+    for token in image_tokens:
+        image_id = _find_token_id(model_dir, token)
+        if image_id is not None:
+            out["image_token_id"] = image_id
+            break
+    for token in audio_tokens:
+        audio_id = _find_token_id(model_dir, token)
+        if audio_id is not None:
+            out["audio_token_id"] = audio_id
+            break
     return out
 
 
@@ -470,8 +722,9 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
     # Gemma4 PLE needs multimodal placeholder IDs for zero-filling PLE token
     # identity at image/audio positions.
     if model_type in _GEMMA4_MODEL_TYPES:
-        fallback = _collect_gemma4_tokenizer_fallback(llm_out_dir)
-        fallback.update(_collect_gemma4_tokenizer_fallback(model_dir))
+        fallback = _collect_gemma4_tokenizer_fallback(llm_out_dir, model_type)
+        fallback.update(
+            _collect_gemma4_tokenizer_fallback(model_dir, model_type))
         for key in ("image_token_id", "audio_token_id"):
             if key not in collected and key in fallback:
                 collected[key] = fallback[key]
@@ -500,6 +753,34 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
 # ---------------------------------------------------------------------------
 
 
+def _is_nvfp4_checkpoint(model_dir: str) -> bool:
+    """Return True if *model_dir* contains an NVFP4-quantized checkpoint.
+
+    Checks ``hf_quant_config.json`` and ``config.json`` for FP4/NVFP4
+    quantization indicators.
+    """
+    for fname in ("hf_quant_config.json", "config.json"):
+        path = os.path.join(model_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        # hf_quant_config.json nests under "quantization"
+        quant_section = cfg.get("quantization", {})
+        # config.json embeds under "quantization_config"
+        qcfg = cfg.get("quantization_config", {})
+        # Check all known algo key names across both sections
+        for section in (cfg, quant_section, qcfg):
+            for key in ("algorithm", "quant_algo", "quant_method"):
+                algo = section.get(key, "")
+                if isinstance(algo, str) and "FP4" in algo.upper():
+                    return True
+    return False
+
+
 def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
     """Remap ``vlm.lm_head.*`` → ``lm_head.*`` (not covered by prefix detection)."""
     if key.startswith("vlm.lm_head."):
@@ -515,9 +796,12 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
                 dflash_base: bool = False,
+                dflash_tree_base: bool = False,
                 dflash_draft_dir: str = "",
+                gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
-                tp_size: int = 1) -> None:
+                tp_size: int = 1,
+                num_decoder_layers: "int | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -544,6 +828,24 @@ def _export_llm(model_dir: str,
         from ..models.qwen3_moe import MODELOPT_KEY_REMAP
         key_remap = MODELOPT_KEY_REMAP
 
+    # Gemma4 NVFP4 MoE: checkpoint stores router/experts at layer level but
+    # model tree nests them under moe_block with _experts indirection.
+    # Only activate when the checkpoint is NVFP4-quantized (otherwise the
+    # FP16 dense path uses router/experts directly on the layer).
+    if key_remap is None and model_type in _GEMMA4_MODEL_TYPES:
+        if _is_nvfp4_checkpoint(model_dir):
+            config_path = os.path.join(model_dir, "config.json")
+            with open(config_path) as f:
+                _cfg = json.load(f)
+            _llm = _cfg.get("text_config", _cfg)
+            # Only MoE checkpoints (e.g. 26B-A4B) nest router/experts under
+            # moe_block and need the remap; dense NVFP4 checkpoints (E2B/E4B/
+            # 31B) have enable_moe_block=False and export directly.
+            if _llm.get("enable_moe_block", False):
+                from ..models.gemma4.modeling_gemma4_text import \
+                    GEMMA4_NVFP4_KEY_REMAP
+                key_remap = GEMMA4_NVFP4_KEY_REMAP
+
     if tp_size <= 1:
         ranks = [(0, 1)]
         out_paths = [os.path.join(llm_out_dir, "model.onnx")]
@@ -569,9 +871,12 @@ def _export_llm(model_dir: str,
                 reduced_vocab_dir=reduced_vocab_dir or None,
                 mtp_base=mtp_base,
                 dflash_base=dflash_base,
+                dflash_tree_base=dflash_tree_base,
                 dflash_draft_dir=dflash_draft_dir or None,
+                gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
                 tp_rank=rank,
+                num_decoder_layers=num_decoder_layers,
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
@@ -653,9 +958,49 @@ def _export_mtp_draft(model_dir: str,
     logger.info("[MTP Draft] Done: %s", output_path)
 
 
-def _export_dflash_draft(model_dir: str, draft_out_dir: str,
-                         dflash_draft_dir: str) -> None:
-    """Export the DFlash draft model."""
+def _export_gemma4_mtp_draft(target_dir: str, draft_out_dir: str,
+                             assistant_dir: str,
+                             kv_sharing_map: list[dict]) -> None:
+    """Export the paired Gemma4 assistant draft model."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+    logger.info("[Gemma4 MTP Draft] Target checkpoint: %s", target_dir)
+    logger.info("[Gemma4 MTP Draft] Loading assistant checkpoint from %s",
+                assistant_dir)
+    try:
+        from ..checkpoint.checkpoint_utils import write_runtime_artifacts
+        from ..model import AutoModel, load_model_config
+        target_model_config = load_model_config(target_dir)
+        model = AutoModel.from_pretrained(
+            assistant_dir,
+            device="cpu",
+            gemma4_mtp_draft=True,
+            gemma4_kv_sharing_map=kv_sharing_map,
+            gemma4_target_kv_cache_quant=target_model_config.quant.
+            kv_cache_quant,
+        )
+        write_runtime_artifacts(model, assistant_dir, draft_out_dir)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[Gemma4 MTP Draft] Failed to load assistant")
+        raise SystemExit(1) from exc
+
+    logger.info("[Gemma4 MTP Draft] Exporting assistant ONNX to %s",
+                output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=assistant_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[Gemma4 MTP Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    logger.info("[Gemma4 MTP Draft] Done: %s", output_path)
+
+
+def _export_dflash_draft(model_dir: str,
+                         draft_out_dir: str,
+                         dflash_draft_dir: str,
+                         draft_reduced_vocab_dir: str = "") -> None:
+    """Export the DFlash draft model, optionally with reduced vocabulary."""
     os.makedirs(draft_out_dir, exist_ok=True)
     output_path = os.path.join(draft_out_dir, "model.onnx")
 
@@ -670,6 +1015,23 @@ def _export_dflash_draft(model_dir: str, draft_out_dir: str,
         logger.exception("[DFlash Draft] Failed to load checkpoint")
         raise SystemExit(1) from exc
 
+    # --- Optional: reduce draft lm_head vocabulary ---
+    full_size = model.config.vocab_size
+    reduced_size = None
+    if draft_reduced_vocab_dir:
+        logger.info("[DFlash Draft] Applying vocab reduction from %s",
+                    draft_reduced_vocab_dir)
+        try:
+            from ..vocab_reduction.onnx_export import \
+                apply_reduced_vocab_from_dir
+            apply_reduced_vocab_from_dir(model, draft_reduced_vocab_dir)
+            reduced_size = model.config.reduced_vocab_size
+            logger.info("[DFlash Draft] lm_head reduced: %d → %d", full_size,
+                        reduced_size)
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            logger.exception("[DFlash Draft] Vocab reduction failed")
+            raise SystemExit(1) from exc
+
     logger.info("[DFlash Draft] Exporting to %s", output_path)
     try:
         from ..onnx.export import export_onnx
@@ -681,6 +1043,31 @@ def _export_dflash_draft(model_dir: str, draft_out_dir: str,
     # FP16/FP32 RoPE fix is handled automatically by export_onnx() which
     # reads DFlashDraftModel.match_fp32_elementwise_initializers = True
     # and passes it to _fix_initializer_dtypes().
+
+    # --- Save draft vocab map sidecar for C++ runtime ---
+    if draft_reduced_vocab_dir:
+        from safetensors.torch import save_file as _save_safetensors
+
+        from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
+                                                 DRAFT_VOCAB_MAP_NAME)
+        vocab_map = model._reduced_vocab_map_for_runtime
+
+        map_path = os.path.join(draft_out_dir, DRAFT_VOCAB_MAP_NAME)
+        _save_safetensors({"vocab_map": vocab_map.cpu().to(torch.int32)},
+                          map_path)
+        logger.info("[DFlash Draft] Wrote draft vocab map: %s (%d tokens)",
+                    map_path, vocab_map.numel())
+
+        with open(os.path.join(draft_out_dir, DRAFT_VOCAB_INFO_NAME),
+                  "w") as fh:
+            json.dump(
+                {
+                    "vocab_size": full_size,
+                    "reduced_vocab_size": reduced_size,
+                    "source": draft_reduced_vocab_dir
+                },
+                fh,
+                indent=2)
 
     logger.info("[DFlash Draft] Done: %s", output_path)
 
@@ -742,6 +1129,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # same C++ runner enum the dense Qwen3-Omni visual engine registers.
         "qwen3_omni_moe": "qwen3_omni_vision_encoder",
         "gemma4": "gemma4_vision",
+        "gemma4_unified": "gemma4_unified_vision",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
     vis_cfg_out: dict = {
@@ -797,23 +1185,51 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         if _rope_scaling:
             vis_cfg_out["rope_scaling"] = normalize_rope_scaling_for_runtime(
                 _rope_scaling)
-    if model_type == "gemma4":
+    if model_type in ("gemma4", "gemma4_unified"):
         vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
-        vis_cfg_out["vision_config"]["model_type"] = "gemma4_vision"
+        visual_model_type = ("gemma4_unified_vision" if model_type
+                             == "gemma4_unified" else "gemma4_vision")
+        vis_cfg_out["model_type"] = visual_model_type
+        vis_cfg_out["vision_config"]["model_type"] = visual_model_type
         text_cfg = config.get("text_config") or {}
         if text_cfg:
             vis_cfg_out["text_config"] = text_cfg
-        for key in ("image_token_id", "audio_token_id"):
+        for key in ("image_token_id", "audio_token_id", "boi_token_id",
+                    "eoi_token_id", "boa_token_id", "eoa_token_index"):
             if key in config:
                 vis_cfg_out[key] = config[key]
         if "image_token_id" not in vis_cfg_out:
-            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+            image_token = ("<|image|>" if model_type == "gemma4_unified" else
+                           "<|image_pad|>")
+            image_token_id = _find_token_id(model_dir, image_token)
             if image_token_id is not None:
                 vis_cfg_out["image_token_id"] = image_token_id
         if "audio_token_id" not in vis_cfg_out:
-            audio_token_id = _find_token_id(model_dir, "<|audio_pad|>")
+            audio_token = ("<|audio|>" if model_type == "gemma4_unified" else
+                           "<|audio_pad|>")
+            audio_token_id = _find_token_id(model_dir, audio_token)
             if audio_token_id is not None:
                 vis_cfg_out["audio_token_id"] = audio_token_id
+        if model_type == "gemma4_unified":
+            # Unified images have a fixed upper bound on the number of soft
+            # tokens produced for each image.  Persist that bound in the
+            # exporter sidecar so both visualBuilder's optimization profile
+            # and the runtime runner agree before the engine config is
+            # generated.
+            max_soft_tokens = vis_cfg_out["vision_config"].get(
+                "num_soft_tokens")
+            processor_path = os.path.join(model_dir, "processor_config.json")
+            if os.path.exists(processor_path):
+                with open(processor_path) as f:
+                    processor_config = json.load(f)
+                image_processor = processor_config.get("image_processor") or {}
+                max_soft_tokens = image_processor.get("max_soft_tokens",
+                                                      max_soft_tokens)
+            if max_soft_tokens is not None:
+                max_soft_tokens = int(max_soft_tokens)
+                vis_cfg_out["builder_config"] = {
+                    "max_image_tokens_per_image": max_soft_tokens,
+                }
     if model_type == "qwen3_omni_moe":
         # HF Qwen3-Omni-MoE 30B-A3B-Instruct vision_config omits the
         # ``num_position_embeddings`` field that QwenViTRunner reads, but
@@ -832,11 +1248,35 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 vc_out = dict(vc_out)
                 vc_out["num_position_embeddings"] = _grid * _grid
                 vis_cfg_out["vision_config"] = vc_out
+        if model_type == "qwen3_omni":
+            # Qwen3-Omni video temporal MRoPE scale. HF keeps it at thinker_config
+            # level (not vision_config), so copy it into vision_config where the C++
+            # Qwen3OmniViTRunner reads it.
+            _pips = _thinker_cfg.get("position_id_per_seconds",
+                                     config.get("position_id_per_seconds"))
+            if _pips is not None:
+                vis_cfg_out["vision_config"] = dict(
+                    vis_cfg_out["vision_config"])
+                vis_cfg_out["vision_config"]["position_id_per_seconds"] = _pips
+
+    if model_type == "gemma4":
+        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
+        vis_cfg_out["vision_config"]["model_type"] = "gemma4_vision"
+        text_cfg = config.get("text_config") or {}
+        if text_cfg:
+            vis_cfg_out["text_config"] = text_cfg
+        if "image_token_id" in config:
+            vis_cfg_out["image_token_id"] = config["image_token_id"]
+        else:
+            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+            if image_token_id is not None:
+                vis_cfg_out["image_token_id"] = image_token_id
     # Copy preprocessor_config.json to the visual output dir so the C++
     # runtime can find patch_size, image_mean, image_std, etc.  Applies to
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual
     # runners all read from this file.
     import shutil
+    proc_src = os.path.join(model_dir, "processor_config.json")
     pp_src = os.path.join(model_dir, "preprocessor_config.json")
     if os.path.exists(pp_src):
         shutil.copy2(pp_src, visual_out_dir)
@@ -846,7 +1286,6 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # Newer quantized checkpoints store image processor config inside
         # processor_config.json under the "image_processor" key.  Extract
         # it and write a standalone preprocessor_config.json.
-        proc_src = os.path.join(model_dir, "processor_config.json")
         if os.path.exists(proc_src):
             with open(proc_src) as _pf:
                 proc_cfg = json.load(_pf)
@@ -924,7 +1363,7 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                     "norm_std", "patch_size", "downsample_ratio"):
             if key in config:
                 vis_cfg_out[key] = config[key]
-    if os.environ.get("USE_TRT_NATIVE_VIT_ATTN") == "1":
+    if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
         vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
@@ -977,7 +1416,37 @@ def _export_audio(model_dir: str,
     logger.info("[Audio] Done: %s", output_path)
 
     # Write config.json for the C++ runtime
-    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
+    if model_type == "gemma4_unified":
+        audio_cfg = dict(config.get("audio_config") or {})
+        audio_cfg["model_type"] = "gemma4_unified_audio"
+        audio_cfg_out = {
+            "model_type": "gemma4_unified_audio",
+            "audio_config": audio_cfg,
+        }
+        text_cfg = config.get("text_config") or {}
+        if text_cfg:
+            audio_cfg_out["text_config"] = text_cfg
+        for key in ("audio_token_id", "image_token_id", "boi_token_id",
+                    "eoi_token_id", "boa_token_id", "eoa_token_index"):
+            if key in config:
+                audio_cfg_out[key] = config[key]
+
+        # The source checkpoint keeps raw-waveform framing metadata in the
+        # nested feature_extractor section of processor_config.json.  Copy it
+        # into the runtime sidecar so the C++ Unified runner does not have to
+        # parse an unrelated Hugging Face processor file.
+        processor_path = os.path.join(model_dir, "processor_config.json")
+        if os.path.exists(processor_path):
+            with open(processor_path) as f:
+                processor_config = json.load(f)
+            feature_extractor = processor_config.get("feature_extractor") or {}
+            if feature_extractor:
+                audio_cfg_out["feature_extractor"] = feature_extractor
+                for key in ("audio_samples_per_token", "sampling_rate",
+                            "feature_size", "padding_value"):
+                    if key in feature_extractor and key not in audio_cfg:
+                        audio_cfg[key] = feature_extractor[key]
+    elif model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         # Nemotron-Omni carries ``sound_config`` at the root with its own
         # encoder model_type; keep the full root config alongside so the
         # builder sees everything it needs.
@@ -987,6 +1456,43 @@ def _export_audio(model_dir: str,
             raise ValueError(
                 "sound_config.model_type not found in config.json")
         audio_cfg_out["model_type"] = sound_model_type
+    elif model_type == "gemma4":
+        # Gemma4 audio encoder config lives at ``config["audio_config"]``.
+        # The C++ audioBuilder requires ``num_mel_bins`` inside audio_config;
+        # HF config may omit it (defaults to 128 in Python model code).
+        audio_cfg = dict(config.get("audio_config", {}))
+        if "num_mel_bins" not in audio_cfg:
+            audio_cfg["num_mel_bins"] = 128
+        audio_cfg_out = {
+            "model_type": "gemma4_audio",
+            "audio_config": audio_cfg,
+            "builder_config": {
+                "max_code_len": 2000,
+                "max_time_steps": 6000,
+                "min_code_len": 1,
+                "min_time_steps": 100,
+                "opt_code_len": 300,
+            },
+        }
+        # Propagate audio_token_id from top-level config.
+        audio_token_id = config.get("audio_token_id")
+        if audio_token_id is None:
+            audio_token_id = _find_token_id(model_dir, "<|audio_pad|>")
+        if audio_token_id is not None:
+            audio_cfg_out["audio_token_id"] = audio_token_id
+        # boa/eoa delimiters: gemma4AudioRunner wraps each audio span with
+        # them to mirror the HF processor layout (boa + N soft tokens + eoa).
+        boa_token_id = config.get("boa_token_id")
+        if boa_token_id is None:
+            boa_token_id = _find_token_id(model_dir, "<|audio>")
+        if boa_token_id is not None:
+            audio_cfg_out["boa_token_id"] = boa_token_id
+        eoa_token_id = config.get("eoa_token_index",
+                                  config.get("eoa_token_id"))
+        if eoa_token_id is None:
+            eoa_token_id = _find_token_id(model_dir, "<audio|>")
+        if eoa_token_id is not None:
+            audio_cfg_out["eoa_token_id"] = eoa_token_id
     else:
         # Qwen3-family: read the nested ``audio_config`` and map top-level
         # model_type to the encoder-specific enum the C++ builder expects
@@ -1024,6 +1530,8 @@ def _export_audio(model_dir: str,
         rope_theta = text_cfg.get("rope_theta")
         if rope_theta is not None:
             audio_cfg_out["text_config"] = {"rope_theta": rope_theta}
+    if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
+        audio_cfg_out["use_trt_native_audio_attn"] = True
     cfg_out_path = os.path.join(audio_out_dir, "config.json")
     with open(cfg_out_path, "w") as f:
         json.dump(audio_cfg_out, f, indent=2)
@@ -1230,7 +1738,7 @@ def _make_talker_sub_config(model_dir: str, sub_path) -> "ModelConfig":
     """
     import tempfile
 
-    from ..config import ModelConfig
+    from ..model import load_model_config
 
     cfg = _load_config(model_dir)
     for key in sub_path:
@@ -1251,7 +1759,7 @@ def _make_talker_sub_config(model_dir: str, sub_path) -> "ModelConfig":
         tmp_cfg_path = os.path.join(tmp_dir, "config.json")
         with open(tmp_cfg_path, "w") as f:
             json.dump(cfg, f)
-        return ModelConfig.from_pretrained(tmp_dir)
+        return load_model_config(tmp_dir)
 
 
 def _patch_tts_config(model_dir: str, out_dir: str) -> None:
@@ -1385,7 +1893,7 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
                 model_dir, model_type)
     try:
         from ..checkpoint.loader import load_weights
-        from ..config import ModelConfig
+        from ..model import load_model_config
         from ..models.qwen3_tts import TalkerCausalLM
 
         if model_type in ("qwen3_omni", "qwen3_omni_moe"):
@@ -1393,7 +1901,7 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
                                              ["talker_config", "text_config"])
             extract_sidecars = _extract_omni_talker_sidecars
         else:  # qwen3_tts and any other future dense-talker variants
-            config = ModelConfig.from_pretrained(model_dir)
+            config = load_model_config(model_dir)
             extract_sidecars = _extract_tts_weights
 
         model = TalkerCausalLM(config)
@@ -1460,13 +1968,25 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     os.makedirs(cp_out_dir, exist_ok=True)
     output_path = os.path.join(cp_out_dir, "model.onnx")
 
-    # Build CodePredictor config from the checkpoint's code_predictor sub-config
+    # ``code_predictor_config`` lives at either root.talker_config.* (full Omni
+    # HF root) or root.* (Talker-only submodule export). Support both.
     root_config = _load_config(model_dir)
     talker_cfg = root_config.get("talker_config", {})
     cp_cfg = talker_cfg.get("code_predictor_config", {})
+    talker_is_root = False
     if not cp_cfg.get("hidden_size"):
-        logger.error("code_predictor_config not found in talker_config")
+        cp_cfg = root_config.get("code_predictor_config", {})
+        talker_cfg = root_config
+        talker_is_root = bool(cp_cfg.get("hidden_size"))
+    if not cp_cfg.get("hidden_size"):
+        logger.error(
+            "code_predictor_config not found in %s/config.json (checked both "
+            "talker_config.code_predictor_config and top-level "
+            "code_predictor_config)", model_dir)
         sys.exit(1)
+    # Match either the full-Omni-root prefix or the Talker-only prefix.
+    load_key_prefix = ("code_predictor."
+                       if talker_is_root else "talker.code_predictor.")
 
     # Write a temporary config.json for the CodePredictor so ModelConfig can
     # parse it.  The CP sub-config is a valid standalone Qwen3 config.
@@ -1480,33 +2000,57 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
                 dst = os.path.join(tmp_dir, fname)
                 if not os.path.exists(dst):
                     os.symlink(src, dst)
+        # Rewrite ``hf_quant_config.json`` into the CP-relative namespace:
+        # strip the CP subtree prefix from exclude entries and drop everything
+        # outside CP so ``make_linear`` in the standalone graph resolves.
+        hf_quant_src = os.path.join(model_dir, "hf_quant_config.json")
+        cp_only_excludes: list = []
+        if os.path.exists(hf_quant_src):
+            with open(hf_quant_src) as f:
+                hf_q = json.load(f)
+            q = hf_q.get("quantization", {})
+            # Strip either the full-Omni CP prefix or the Talker-only CP
+            # prefix; drop entries outside the CP subtree (Talker body,
+            # Thinker, code2wav — none exist inside the standalone CP graph).
+            cp_prefix = load_key_prefix
+            for ex in q.get("exclude_modules", []):
+                if ex.startswith(cp_prefix):
+                    cp_only_excludes.append(ex[len(cp_prefix):])
+            q["exclude_modules"] = cp_only_excludes
+            hf_q["quantization"] = q
+            with open(os.path.join(tmp_dir, "hf_quant_config.json"), "w") as f:
+                json.dump(hf_q, f, indent=2)
         # Write the CP config
         tmp_cfg_path = os.path.join(tmp_dir, "config.json")
         with open(tmp_cfg_path, "w") as f:
             json.dump(cp_cfg, f)
 
-        from ..config import ModelConfig
-        config = ModelConfig.from_pretrained(tmp_dir)
+        from ..config import _normalize_module_name
+        from ..model import load_model_config
+        config = load_model_config(tmp_dir)
+
+    # ``_parse_quant`` auto-detects unquantized weights from the whole
+    # checkpoint. Post-normalization those thinker/encoder module names
+    # collide with CP paths and force every CP Linear to FP16. Overwrite
+    # ``excluded`` with only the CP-scoped entries.
+    if config.quant is not None:
+        config.quant.excluded = [
+            _normalize_module_name(ex) for ex in cp_only_excludes
+        ]
 
     # Override model_type for runtime identification
     config.model_type = _CP_RUNTIME_MODEL_TYPE.get(model_type,
                                                    "qwen3_tts_code_predictor")
 
-    # Create CodePredictorCausalLM and load weights
-    from ..models.qwen3_tts import (CodePredictorCausalLM,
-                                    apply_code_predictor_mlp_war)
-
+    # CP's MLP path is the same for FP16 and FP8: FP32 silu*up + FP32
+    # down_proj matmul.  down_proj is always FP16Linear (excluded from FP8
+    # quant by ``FP8_CP``), so the FP32 matmul is safe in either mode.
+    from ..models.qwen3_tts import CodePredictorCausalLM
     model = CodePredictorCausalLM(config)
     model.to("cpu")
 
     from ..checkpoint.loader import load_weights
-    load_weights(model,
-                 model_dir,
-                 device="cpu",
-                 key_prefix="talker.code_predictor.")
-
-    # Apply MLP FP16 overflow WAR
-    apply_code_predictor_mlp_war(model)
+    load_weights(model, model_dir, device="cpu", key_prefix=load_key_prefix)
 
     logger.info("[CodePredictor] Exporting ONNX to %s", output_path)
     try:
@@ -1516,9 +2060,16 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
         logger.exception("[CodePredictor] ONNX export failed")
         raise SystemExit(1) from exc
 
+    # ``torch.onnx.export`` drops ``axis=0`` from per-channel DequantizeLinear
+    # nodes → TRT engine build fails with ``K == scaleSize``. Restore it.
+    _patch_cp_dq_axis(output_path)
+
     # Extract CodePredictor-specific weight files
     logger.info("[CodePredictor] Extracting weight files ...")
-    _extract_code_predictor_weights(model_dir, cp_out_dir, talker_cfg)
+    _extract_code_predictor_weights(model_dir,
+                                    cp_out_dir,
+                                    talker_cfg,
+                                    key_prefix=load_key_prefix)
 
     # Patch config.json with use_embeddings_input and num_code_groups
     cfg_path = os.path.join(cp_out_dir, "config.json")
@@ -1538,19 +2089,79 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     logger.info("[CodePredictor] Done: %s", output_path)
 
 
+def _patch_cp_dq_axis(onnx_path: str) -> None:
+    """Restore ``axis=0`` on per-channel DequantizeLinear nodes.
+
+    ``torch.onnx.export`` (dynamo, opset 24) silently drops the ``axis``
+    attribute that ModelOpt configures via ``axis=0`` on the weight
+    quantizer. The result is that every per-channel DQ node defaults to
+    axis=1 at import time, and TRT then fails engine build with
+    ``K == scaleSize`` because it interprets the scale vector along the
+    wrong dim.
+
+    Set ``axis=0`` on every DQ node whose scale initializer is 1-D and
+    matches the FIRST dim of the weight initializer (ModelOpt's ``axis=0``
+    convention for ``[out_features, in_features]`` layout). Per-tensor
+    (scalar) DQ nodes are left alone.
+    """
+    import onnx
+    from onnx import helper
+
+    m = onnx.load(onnx_path, load_external_data=False)
+    inits = {i.name: i for i in m.graph.initializer}
+    patched = 0
+    for n in m.graph.node:
+        if n.op_type != "DequantizeLinear" or len(n.input) < 2:
+            continue
+        weight, scale = n.input[0], n.input[1]
+        if weight not in inits or scale not in inits:
+            continue
+        s_dims = list(inits[scale].dims)
+        if len(s_dims) == 0 or (len(s_dims) == 1 and s_dims[0] == 1):
+            continue  # per-tensor
+        if len(s_dims) != 1:
+            continue
+        w_dims = list(inits[weight].dims)
+        if not w_dims or s_dims[0] != w_dims[0]:
+            continue
+        existing = [a for a in n.attribute if a.name == "axis"]
+        if existing:
+            if existing[0].i != 0:
+                existing[0].i = 0
+                patched += 1
+            continue
+        n.attribute.append(helper.make_attribute("axis", 0))
+        patched += 1
+    if patched:
+        onnx.save(m,
+                  onnx_path,
+                  save_as_external_data=True,
+                  all_tensors_to_one_file=True,
+                  location=os.path.basename(onnx_path) + ".data",
+                  size_threshold=1024)
+        logger.info(
+            "[CodePredictor] Patched axis=0 on %d DequantizeLinear nodes",
+            patched)
+
+
 def _extract_code_predictor_weights(model_dir: str, out_dir: str,
-                                    talker_cfg: dict) -> None:
-    """Extract codec_embeddings, lm_heads, and small_to_mtp_projection."""
+                                    talker_cfg: dict, key_prefix: str) -> None:
+    """Extract codec_embeddings, lm_heads, and small_to_mtp_projection.
+
+    ``key_prefix`` is either ``talker.code_predictor.`` (full-Omni HF root
+    layout) or ``code_predictor.`` (Talker-only submodule layout produced by
+    ``qwen3_omni._export_submodel`` for MoE CP-only exports).
+    """
     from safetensors.torch import save_file
 
     weights = _load_all_weights(model_dir)
 
-    # codec_embeddings: talker.code_predictor.model.codec_embedding.{i}.weight
+    # codec_embeddings: <prefix>model.codec_embedding.{i}.weight
     num_code_groups = talker_cfg.get("num_code_groups", 16)
     num_embeddings = num_code_groups - 1  # 15 for TTS (16-1=15)
     embedding_dict = {}
     for i in range(num_embeddings):
-        key = f"talker.code_predictor.model.codec_embedding.{i}.weight"
+        key = f"{key_prefix}model.codec_embedding.{i}.weight"
         if key not in weights:
             logger.error("Key %r not found in checkpoint", key)
             sys.exit(1)
@@ -1562,10 +2173,10 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
         "(%d embeddings, shape %s)", num_embeddings,
         list(embedding_dict["embedding_0"].shape))
 
-    # lm_heads: talker.code_predictor.lm_head.{i}.weight
+    # lm_heads: <prefix>lm_head.{i}.weight
     lm_head_dict = {}
     for i in range(num_embeddings):
-        key = f"talker.code_predictor.lm_head.{i}.weight"
+        key = f"{key_prefix}lm_head.{i}.weight"
         if key not in weights:
             logger.error("Key %r not found in checkpoint", key)
             sys.exit(1)
@@ -1577,9 +2188,9 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
         "(%d heads, shape %s)", num_embeddings,
         list(lm_head_dict["lm_head_0.weight"].shape))
 
-    # small_to_mtp_projection: talker.code_predictor.small_to_mtp_projection
-    proj_w_key = "talker.code_predictor.small_to_mtp_projection.weight"
-    proj_b_key = "talker.code_predictor.small_to_mtp_projection.bias"
+    # small_to_mtp_projection: <prefix>small_to_mtp_projection.{weight,bias}
+    proj_w_key = f"{key_prefix}small_to_mtp_projection.weight"
+    proj_b_key = f"{key_prefix}small_to_mtp_projection.bias"
     proj_dict = {}
     if proj_w_key in weights:
         proj_dict["weight"] = weights[proj_w_key].cpu()
@@ -1600,11 +2211,12 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
 # ---------------------------------------------------------------------------
 
 
-def _build_action_config(root_cfg: dict, weights: dict) -> "ActionConfig":
+def _build_action_config(root_cfg: dict, weights: dict):
     """Build an ActionConfig from the Alpamayo root config and weight dict."""
-    from ..config import ActionConfig
+    from .. import config as config_module
 
     expert_cfg = root_cfg.get("expert_cfg", {})
+    head_dim = expert_cfg.get("head_dim", 128)
 
     # Infer num_hidden_layers by counting expert.layers.N keys.
     layer_indices = set()
@@ -1619,7 +2231,7 @@ def _build_action_config(root_cfg: dict, weights: dict) -> "ActionConfig":
     num_kv_heads = expert_cfg.get("num_attention_heads", 0)
     for k, v in weights.items():
         if k.endswith("expert.layers.0.self_attn.k_proj.weight"):
-            num_kv_heads = v.shape[0] // expert_cfg.get("head_dim", 128)
+            num_kv_heads = v.shape[0] // head_dim
             break
 
     traj_token_start_idx = root_cfg.get("traj_token_start_idx", 0)
@@ -1629,14 +2241,16 @@ def _build_action_config(root_cfg: dict, weights: dict) -> "ActionConfig":
 
     in_proj_cfg = root_cfg.get("action_in_proj_cfg", {})
 
-    return ActionConfig(
+    return config_module.ActionConfig(
         rope_theta=5_000_000.0,
         mrope_section=[24, 20, 20],
         mrope_interleaved=True,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=expert_cfg.get("num_attention_heads", 0),
         num_key_value_heads=num_kv_heads,
-        head_dim=expert_cfg.get("head_dim", 128),
+        head_dim=head_dim,
+        attention_scaling=config_module._get_attention_scaling(
+            expert_cfg, head_dim, 1.0 / (float(head_dim)**0.5)),
         hidden_size=expert_cfg.get("hidden_size", 0),
         intermediate_size=expert_cfg.get("intermediate_size", 0),
         rms_norm_eps=1e-6,
@@ -1811,8 +2425,8 @@ def main() -> None:
         help=
         ("Comma-separated allow-list of components to export. Default (empty) "
          "exports every component the checkpoint supports. Recognized values: "
-         "thinker, talker, code_predictor, visual, audio, code2wav, action. "
-         "Useful for re-running a single stage, e.g. "
+         "thinker, mtp_draft, talker, code_predictor, visual, audio, "
+         "code2wav, action. Useful for re-running a single stage, e.g. "
          "``--components code_predictor`` to refresh only the CodePredictor."),
     )
     p.add_argument(
@@ -1838,16 +2452,52 @@ def main() -> None:
         "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
     )
     p.add_argument(
+        "--draft-reduced-vocab-dir",
+        dest="draft_reduced_vocab_dir",
+        default="",
+        metavar="DIR",
+        help=
+        ("Directory containing vocab_map.safetensors for the DFlash draft model "
+         "(from tensorrt_edgellm/scripts/reduce_vocab.py). "
+         "Reduces the DFlash draft lm_head output dimension."),
+    )
+    p.add_argument(
         "--mtp",
         action="store_true",
         help=
-        ("Export MTP components from a single checkpoint (llm/ as mtp_base + mtp_draft/)."
+        ("Export MTP components. Qwen-style checkpoints use checkpoint-internal "
+         "MTP weights; paired MTP models such as Gemma4 require --mtp-draft-dir."
          ),
+    )
+    p.add_argument(
+        "--mtp-draft-dir",
+        "--mtp_draft_dir",
+        dest="mtp_draft_dir",
+        default="",
+        help=(
+            "Path to a paired MTP draft checkpoint. Required for Gemma4 MTP; "
+            "not used by Qwen-style checkpoint-internal MTP."),
+    )
+    p.add_argument(
+        "--mtpDraftModelDir",
+        dest="mtp_draft_dir",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--gemma4-mtp-assistant-dir",
+        default="",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--dflash-base",
         action="store_true",
         help="Export as DFlash base model (adds DFlash hidden_states output).",
+    )
+    p.add_argument(
+        "--dflash-tree-base",
+        action="store_true",
+        help="Export DFlash base with DDTree hybrid state metadata inputs.",
     )
     p.add_argument(
         "--dflash-draft",
@@ -1903,6 +2553,20 @@ def main() -> None:
             "Used when exporting a standalone NVFP4 Talker checkpoint whose "
             "model.safetensors omits these projection weights."),
     )
+    p.add_argument(
+        "--num-decoder-layer",
+        "--num_decoder_layer",
+        dest="num_decoder_layer",
+        type=int,
+        default=None,
+        help=(
+            "Accuracy-debugging only: export only the first N decoder layers "
+            "of the LLM backbone. The runtime config.json and the ONNX KV "
+            "in/out count follow N automatically. Supported for the plain "
+            "default model path (e.g. Qwen3) and hybrid base models (e.g. "
+            "Qwen3.5, Nemotron-H); not for eagle/mtp/dflash "
+            "speculative-decoding variants."),
+    )
     args = p.parse_args()
 
     model_dir = _resolve_model_dir(args.model)
@@ -1910,6 +2574,11 @@ def main() -> None:
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
     has_mtp_draft = _has_mtp(config)
+    is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
+    mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir
+    gemma4_mtp_requested = args.mtp and is_gemma4_target
+    gemma4_mtp_assistant_dir = ""
+    gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
 
     if (model_type == "qwen3_tts"
@@ -1919,6 +2588,14 @@ def main() -> None:
 
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.mtp_draft_dir and args.gemma4_mtp_assistant_dir:
+        p.error("Use only one MTP draft checkpoint directory option")
+    if mtp_draft_dir_arg and args.eagle_base:
+        p.error("--mtp-draft-dir cannot be combined with --eagle-base")
+    if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft):
+        p.error("--mtp-draft-dir cannot be combined with DFlash export")
+    if args.dflash_tree_base:
+        args.dflash_base = True
     if args.dflash_base and (args.eagle_base or args.mtp):
         p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and (args.eagle_base or args.mtp):
@@ -1927,18 +2604,43 @@ def main() -> None:
         p.error("--dflash-draft requires --dflash-draft-dir")
     if args.mtp and args.skip_llm:
         p.error("--mtp requires LLM export; remove --skip-llm")
+    if mtp_draft_dir_arg and args.skip_llm:
+        p.error("--mtp-draft-dir requires LLM export; remove --skip-llm")
     if args.dflash_base and args.skip_llm:
         p.error("--dflash-base requires LLM export; remove --skip-llm")
     if args.dflash_draft and args.skip_llm:
         logger.info(
             "--dflash-draft implies --skip-llm (draft export is independent)")
-    if args.mtp and not has_mtp_draft:
+    if mtp_draft_dir_arg and not args.mtp:
+        p.error("--mtp-draft-dir requires --mtp")
+    if args.mtp and is_gemma4_target and not mtp_draft_dir_arg:
+        p.error("Gemma4 --mtp requires --mtp-draft-dir <assistant checkpoint>")
+    if args.mtp and not is_gemma4_target and mtp_draft_dir_arg:
+        p.error("--mtp-draft-dir is currently only supported for Gemma4 MTP")
+    if args.mtp and not is_gemma4_target and not has_mtp_draft:
         p.error("--mtp was requested, but the checkpoint does not expose "
                 "MTP weights/config")
+    if gemma4_mtp_requested:
+        try:
+            gemma4_mtp_assistant_dir = _resolve_mtp_draft_dir(
+                mtp_draft_dir_arg)
+            if not os.path.isdir(gemma4_mtp_assistant_dir):
+                p.error("Gemma4 MTP draft directory not found: %s" %
+                        gemma4_mtp_assistant_dir)
+            gemma4_kv_sharing_map = _validate_gemma4_mtp_pair(
+                model_dir, gemma4_mtp_assistant_dir)
+        except ValueError as exc:
+            p.error(str(exc))
+    if args.num_decoder_layer is not None:
+        if args.num_decoder_layer < 1:
+            p.error("--num-decoder-layer must be >= 1")
+        if args.eagle_base or args.mtp or args.dflash_base or args.dflash_draft:
+            p.error("--num-decoder-layer cannot be combined with "
+                    "--eagle-base / --mtp / --dflash-base / --dflash-draft")
 
     _VALID_COMPONENTS = {
-        "thinker", "talker", "code_predictor", "visual", "audio", "code2wav",
-        "action"
+        "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
+        "code2wav", "action"
     }
     requested_components = {
         c.strip()
@@ -1968,8 +2670,8 @@ def main() -> None:
 
     def _get_model_config() -> "ModelConfig":
         if _model_config[0] is None:
-            from ..config import ModelConfig
-            _model_config[0] = ModelConfig.from_pretrained(model_dir)
+            from ..model import load_model_config
+            _model_config[0] = load_model_config(model_dir)
         return _model_config[0]
 
     def _get_code2wav_weights() -> dict:
@@ -2009,22 +2711,32 @@ def main() -> None:
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only and _allow("thinker"), "thinker",
-         lambda out: _export_llm(model_dir,
-                                 out,
-                                 model_type=model_type,
-                                 eagle_base=args.eagle_base,
-                                 mtp_base=args.mtp,
-                                 dflash_base=args.dflash_base,
-                                 dflash_draft_dir=args.dflash_draft_dir,
-                                 fp8_embedding=args.fp8_embedding,
-                                 reduced_vocab_dir=args.reduced_vocab_dir,
-                                 externalize_weights=externalize_weights,
-                                 tp_size=args.tp_size)),
-        (args.mtp, "mtp_draft", lambda out: _export_mtp_draft(
-            model_dir, out, externalize_weights=externalize_weights)),
+         and not _draft_only and _allow("thinker"), "thinker", lambda out:
+         _export_llm(model_dir,
+                     out,
+                     model_type=model_type,
+                     eagle_base=args.eagle_base,
+                     mtp_base=args.mtp and not gemma4_mtp_requested,
+                     dflash_base=args.dflash_base,
+                     dflash_tree_base=args.dflash_tree_base,
+                     dflash_draft_dir=args.dflash_draft_dir,
+                     gemma4_mtp_base=gemma4_mtp_requested,
+                     fp8_embedding=args.fp8_embedding,
+                     reduced_vocab_dir=args.reduced_vocab_dir,
+                     externalize_weights=externalize_weights,
+                     tp_size=args.tp_size,
+                     num_decoder_layers=args.num_decoder_layer)),
+        (args.mtp and not gemma4_mtp_requested
+         and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
+             model_dir, out, externalize_weights=externalize_weights)),
+        (gemma4_mtp_requested and _allow("mtp_draft"),
+         "mtp_draft", lambda out: _export_gemma4_mtp_draft(
+             model_dir, out, gemma4_mtp_assistant_dir, gemma4_kv_sharing_map)),
         (args.dflash_draft, "dflash_draft", lambda out: _export_dflash_draft(
-            model_dir, out, args.dflash_draft_dir)),
+            model_dir,
+            out,
+            args.dflash_draft_dir,
+            draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
          and not _draft_only and _allow("talker"), "talker",
          lambda out: _export_talker(model_dir, out, model_type)),
@@ -2034,14 +2746,14 @@ def main() -> None:
         (_has_visual(model_type) and not args.skip_visual and not _draft_only
          and _allow("visual"), "visual", _export_visual_component),
         (_has_audio(model_type) and not args.skip_audio and not _draft_only
-         and _allow("audio"), "audio",
-         lambda out: _export_audio(model_dir,
-                                   out,
-                                   _get_weights(),
-                                   config,
-                                   model_type,
-                                   dtype,
-                                   model_config=_get_model_config())),
+         and _checkpoint_audio_config(config) is not None and _allow("audio"),
+         "audio", lambda out: _export_audio(model_dir,
+                                            out,
+                                            _get_weights(),
+                                            config,
+                                            model_type,
+                                            dtype,
+                                            model_config=_get_model_config())),
         (_has_code2wav(model_type) and not args.skip_code2wav
          and not _draft_only and _allow("code2wav"), "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
@@ -2064,7 +2776,10 @@ def main() -> None:
         logger.info("  %-15s: %s", component, "yes" if enabled else "no")
     logger.info("FP8 embedding : %s", "yes" if args.fp8_embedding else "no")
     logger.info("MTP capable   : %s", "yes" if has_mtp_draft else "no")
-    logger.info("MTP export    : %s", "yes" if args.mtp else "no")
+    logger.info("MTP export    : %s",
+                "yes" if args.mtp or gemma4_mtp_requested else "no")
+    logger.info("Gemma4 MTP    : %s",
+                gemma4_mtp_assistant_dir if gemma4_mtp_assistant_dir else "no")
     logger.info("DFlash base   : %s", "yes" if args.dflash_base else "no")
     logger.info("DFlash draft  : %s", "yes" if args.dflash_draft else "no")
     logger.info("Reduced vocab : %s",
@@ -2073,6 +2788,9 @@ def main() -> None:
         "External weights: %s",
         ", ".join(externalize_weights) if externalize_weights else "no")
     logger.info("TP size       : %d", args.tp_size)
+    if args.num_decoder_layer is not None:
+        logger.info("Decoder layers: first %d only (accuracy debug)",
+                    args.num_decoder_layer)
     logger.info("=" * 60)
 
     # ``--fp8-embedding`` only applies to the LLM thinker.  Models without a
@@ -2082,6 +2800,12 @@ def main() -> None:
         logger.warning(
             "--fp8-embedding is not supported for Talker / CodePredictor; "
             "using FP16 embeddings.")
+
+    if (_has_audio(model_type) and not args.skip_audio
+            and _checkpoint_audio_config(config) is None):
+        logger.warning(
+            "Model type '%s' supports audio, but this checkpoint has no "
+            "audio_config — skipping audio encoder export.", model_type)
 
     for enabled, component, fn in stages:
         if enabled:

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #ifdef CUTE_DSL_GDN_ENABLED
 
 #include <cmath>
+#include <cstdio>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -1141,6 +1142,309 @@ static void runGDNDecodeMTPTestConfig(int32_t seq_len, bool with_cache)
     CUDA_CHECK(cudaFree(d_interm));
 }
 
+static void gdnDecodeTreeReference(float const* q, float const* k, float const* v, float const* a, float const* b,
+    float const* A_log, float const* dt_bias, float const* h0, int32_t const* treeParentIds, int32_t const* treeDepths,
+    float* o_ref, float* intermediate_states_ref, int32_t n, int32_t seq_len, int32_t h, int32_t hv, int32_t k_dim,
+    int32_t v_dim)
+{
+    float const scale = 1.f / std::sqrt(static_cast<float>(k_dim));
+    int32_t const kv = k_dim * v_dim;
+
+    for (int32_t i_n = 0; i_n < n; ++i_n)
+    {
+        for (int32_t i_hv = 0; i_hv < hv; ++i_hv)
+        {
+            int32_t const i_h = h > 0 ? i_hv / (hv / h) : 0;
+            for (int32_t nodeIdx = 0; nodeIdx < seq_len; ++nodeIdx)
+            {
+                int32_t const treeOffset = i_n * seq_len + nodeIdx;
+                int32_t const parentIdx = treeParentIds[treeOffset];
+                int32_t const depth = treeDepths[treeOffset];
+                bool const isRoot = nodeIdx == 0 && parentIdx < 0 && depth == 0;
+                bool const isValidChild = nodeIdx > 0 && parentIdx >= 0 && parentIdx < nodeIdx && depth > 0;
+                int32_t const h0Base = (i_n * hv + i_hv) * kv;
+                int32_t const intermBase = ((i_n * seq_len + nodeIdx) * hv + i_hv) * kv;
+                std::vector<float> H(k_dim * v_dim);
+
+                if (isRoot)
+                {
+                    for (int32_t i = 0; i < kv; ++i)
+                        H[i] = h0[h0Base + i];
+                }
+                else if (isValidChild)
+                {
+                    int32_t const parentBase = ((i_n * seq_len + parentIdx) * hv + i_hv) * kv;
+                    for (int32_t i = 0; i < kv; ++i)
+                        H[i] = intermediate_states_ref[parentBase + i];
+                }
+                else
+                {
+                    for (int32_t i = 0; i < kv; ++i)
+                        intermediate_states_ref[intermBase + i] = h0[h0Base + i];
+                    continue;
+                }
+
+                int32_t const q_off = ((i_n * seq_len + nodeIdx) * h + i_h) * k_dim;
+                int32_t const v_off = ((i_n * seq_len + nodeIdx) * hv + i_hv) * v_dim;
+                int32_t const ab_off = (i_n * seq_len + nodeIdx) * hv + i_hv;
+                int32_t const o_base = ((i_n * seq_len + nodeIdx) * hv + i_hv) * v_dim;
+
+                float nq = 1e-6f, nk = 1e-6f;
+                for (int32_t i = 0; i < k_dim; ++i)
+                {
+                    float qv = q[q_off + i], kvVal = k[q_off + i];
+                    nq += qv * qv;
+                    nk += kvVal * kvVal;
+                }
+                nq = std::sqrt(nq);
+                nk = std::sqrt(nk);
+
+                std::vector<float> q_eff(k_dim), k_eff(k_dim);
+                for (int32_t i = 0; i < k_dim; ++i)
+                {
+                    q_eff[i] = q[q_off + i] / nq * scale;
+                    k_eff[i] = k[q_off + i] / nk;
+                }
+
+                float const sp = softplus(a[ab_off] + dt_bias[i_hv], 1.f, 20.f);
+                float const g = std::exp(-std::exp(A_log[i_hv]) * sp);
+                float const beta = 1.f / (1.f + std::exp(-b[ab_off]));
+
+                for (int32_t i = 0; i < k_dim * v_dim; ++i)
+                    H[i] *= g;
+
+                std::vector<float> corr(v_dim);
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                {
+                    float dot = 0.f;
+                    for (int32_t ik = 0; ik < k_dim; ++ik)
+                        dot += H[ik * v_dim + iv] * k_eff[ik];
+                    corr[iv] = (v[v_off + iv] - dot) * beta;
+                }
+                for (int32_t ik = 0; ik < k_dim; ++ik)
+                    for (int32_t iv = 0; iv < v_dim; ++iv)
+                        H[ik * v_dim + iv] += k_eff[ik] * corr[iv];
+
+                for (int32_t iv = 0; iv < v_dim; ++iv)
+                {
+                    float dot = 0.f;
+                    for (int32_t ik = 0; ik < k_dim; ++ik)
+                        dot += H[ik * v_dim + iv] * q_eff[ik];
+                    o_ref[o_base + iv] = dot;
+                }
+
+                for (int32_t i = 0; i < kv; ++i)
+                    intermediate_states_ref[intermBase + i] = H[i];
+            }
+        }
+    }
+}
+
+static void runGDNDecodeTreeTestConfig(int32_t n)
+{
+    int32_t const seq_len = 6;
+    int32_t const h = 4;
+    int32_t const hv = 8;
+    int32_t const k = 128;
+    int32_t const v = 128;
+
+    size_t const qkvLen = static_cast<size_t>(n) * seq_len * h * k;
+    size_t const vLen = static_cast<size_t>(n) * seq_len * hv * v;
+    size_t const abLen = static_cast<size_t>(n) * seq_len * hv;
+    size_t const h0Len = static_cast<size_t>(n) * hv * k * v;
+    size_t const oLen = static_cast<size_t>(n) * seq_len * hv * v;
+    size_t const treeLen = static_cast<size_t>(n) * seq_len;
+    size_t const intermLen = static_cast<size_t>(n) * seq_len * hv * k * v;
+
+    size_t const qkvBytes = qkvLen * sizeof(half);
+    size_t const vBytes = vLen * sizeof(half);
+    size_t const abBytes = abLen * sizeof(half);
+    size_t const ALogBytes = static_cast<size_t>(hv) * sizeof(float);
+    size_t const dtBytes = static_cast<size_t>(hv) * sizeof(half);
+    size_t const h0Bytes = h0Len * sizeof(float);
+    size_t const oBytes = oLen * sizeof(half);
+    size_t const treeBytes = treeLen * sizeof(int32_t);
+    size_t const intermBytes = intermLen * sizeof(float);
+
+    std::vector<float> h_q(qkvLen), h_k(qkvLen), h_v(vLen), h_a(abLen), h_b(abLen);
+    std::vector<float> h_A_log(hv), h_dt_bias(hv), h_h0(h0Len);
+    uint32_t seed = 0xDD7701u;
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_q[i] = lcgStep(seed) * 0.2f;
+    for (size_t i = 0; i < qkvLen; ++i)
+        h_k[i] = lcgStep(seed) * 0.2f;
+    for (size_t i = 0; i < vLen; ++i)
+        h_v[i] = lcgStep(seed) * 0.2f;
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a[i] = lcgStep(seed) * 0.4f;
+        h_b[i] = lcgStep(seed) * 0.4f;
+    }
+    for (int32_t i = 0; i < hv; ++i)
+    {
+        h_A_log[i] = -2.f + 0.2f * (i % 5);
+        h_dt_bias[i] = 0.01f * (i + 1);
+    }
+    for (size_t i = 0; i < h0Len; ++i)
+        h_h0[i] = lcgStep(seed) * 0.02f;
+
+    std::vector<int32_t> const baseParent{-1, 0, 0, 1, 2, -1};
+    std::vector<int32_t> const baseDepth{0, 1, 1, 2, 2, 0};
+    std::vector<int32_t> h_parent(treeLen);
+    std::vector<int32_t> h_depth(treeLen);
+    for (int32_t batchIdx = 0; batchIdx < n; ++batchIdx)
+    {
+        for (int32_t nodeIdx = 0; nodeIdx < seq_len; ++nodeIdx)
+        {
+            h_parent[static_cast<size_t>(batchIdx) * seq_len + nodeIdx] = baseParent[nodeIdx];
+            h_depth[static_cast<size_t>(batchIdx) * seq_len + nodeIdx] = baseDepth[nodeIdx];
+        }
+    }
+
+    std::vector<half> h_q_h(qkvLen), h_k_h(qkvLen), h_v_h(vLen);
+    std::vector<half> h_a_h(abLen), h_b_h(abLen), h_dt_h(hv);
+    for (size_t i = 0; i < qkvLen; ++i)
+    {
+        h_q_h[i] = floatToHalf(h_q[i]);
+        h_k_h[i] = floatToHalf(h_k[i]);
+    }
+    for (size_t i = 0; i < vLen; ++i)
+        h_v_h[i] = floatToHalf(h_v[i]);
+    for (size_t i = 0; i < abLen; ++i)
+    {
+        h_a_h[i] = floatToHalf(h_a[i]);
+        h_b_h[i] = floatToHalf(h_b[i]);
+    }
+    for (int32_t i = 0; i < hv; ++i)
+        h_dt_h[i] = floatToHalf(h_dt_bias[i]);
+
+    void* d_q = nullptr;
+    void* d_k = nullptr;
+    void* d_v = nullptr;
+    void* d_a = nullptr;
+    void* d_b = nullptr;
+    void* d_A_log = nullptr;
+    void* d_dt = nullptr;
+    void* d_h0 = nullptr;
+    void* d_o = nullptr;
+    void* d_interm = nullptr;
+    void* d_parent = nullptr;
+    void* d_depth = nullptr;
+    void* d_qk_scales = nullptr;
+    void* d_gate_values = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, qkvBytes));
+    CUDA_CHECK(cudaMalloc(&d_k, qkvBytes));
+    CUDA_CHECK(cudaMalloc(&d_v, vBytes));
+    CUDA_CHECK(cudaMalloc(&d_a, abBytes));
+    CUDA_CHECK(cudaMalloc(&d_b, abBytes));
+    CUDA_CHECK(cudaMalloc(&d_A_log, ALogBytes));
+    CUDA_CHECK(cudaMalloc(&d_dt, dtBytes));
+    CUDA_CHECK(cudaMalloc(&d_h0, h0Bytes));
+    CUDA_CHECK(cudaMalloc(&d_o, oBytes));
+    CUDA_CHECK(cudaMalloc(&d_interm, intermBytes));
+    CUDA_CHECK(cudaMalloc(&d_parent, treeBytes));
+    CUDA_CHECK(cudaMalloc(&d_depth, treeBytes));
+    CUDA_CHECK(cudaMalloc(&d_qk_scales, static_cast<size_t>(n) * seq_len * h * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_gate_values, static_cast<size_t>(n) * seq_len * hv * 2 * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_q, h_q_h.data(), qkvBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_k, h_k_h.data(), qkvBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_v, h_v_h.data(), vBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a_h.data(), abBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, h_b_h.data(), abBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A_log, h_A_log.data(), ALogBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_dt, h_dt_h.data(), dtBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_h0, h_h0.data(), h0Bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_parent, h_parent.data(), treeBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_depth, h_depth.data(), treeBytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_o, 0, oBytes));
+    CUDA_CHECK(cudaMemset(d_interm, 0, intermBytes));
+
+    GDNParams params{};
+    params.q = d_q;
+    params.k = d_k;
+    params.v = d_v;
+    params.a = d_a;
+    params.b = d_b;
+    params.A_log = d_A_log;
+    params.dt_bias = d_dt;
+    params.h0_source = d_h0;
+    params.o = d_o;
+    params.intermediate_states = d_interm;
+    params.tree_parent_ids = d_parent;
+    params.tree_depths = d_depth;
+    params.use_ddtree = true;
+    params.ddtree_qk_scales = d_qk_scales;
+    params.ddtree_gate_values = d_gate_values;
+    params.n = n;
+    params.seq_len = seq_len;
+    params.h = h;
+    params.hv = hv;
+    params.k_dim = k;
+    params.v_dim = v;
+    params.smVersion = getSMVersion();
+
+    bool loaded = CuteDslGDNRunner::loadKernelModules();
+    ASSERT_TRUE(loaded) << "Failed to load GDN kernel modules";
+
+    CuteDslGDNRunner runner;
+    int32_t const ret = runner.run(params, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    EXPECT_EQ(ret, 0) << "GDN DDTree decode run failed";
+
+    std::vector<half> h_o_half(oLen);
+    std::vector<float> h_h0_out(h0Len);
+    std::vector<float> h_interm_out(intermLen, 0.f);
+    CUDA_CHECK(cudaMemcpy(h_o_half.data(), d_o, oBytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_h0_out.data(), d_h0, h0Bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_interm_out.data(), d_interm, intermBytes, cudaMemcpyDeviceToHost));
+
+    std::vector<float> h_o(oLen);
+    for (size_t i = 0; i < oLen; ++i)
+        h_o[i] = halfToFloat(h_o_half[i]);
+
+    std::vector<float> o_ref(oLen, 0.f);
+    std::vector<float> interm_ref(intermLen, 0.f);
+    gdnDecodeTreeReference(h_q.data(), h_k.data(), h_v.data(), h_a.data(), h_b.data(), h_A_log.data(), h_dt_bias.data(),
+        h_h0.data(), h_parent.data(), h_depth.data(), o_ref.data(), interm_ref.data(), n, seq_len, h, hv, k, v);
+
+    float const atol = 0.2f;
+    float const rtol = 0.02f;
+    for (size_t i = 0; i < oLen; ++i)
+    {
+        EXPECT_TRUE(isclose(h_o[i], o_ref[i], rtol, atol))
+            << "DDTree output mismatch at " << i << ": got=" << h_o[i] << " ref=" << o_ref[i];
+    }
+    for (size_t i = 0; i < intermLen; ++i)
+    {
+        EXPECT_TRUE(isclose(h_interm_out[i], interm_ref[i], rtol, atol))
+            << "DDTree intermediate state mismatch at " << i << ": got=" << h_interm_out[i] << " ref=" << interm_ref[i];
+    }
+    for (size_t i = 0; i < h0Len; ++i)
+    {
+        EXPECT_TRUE(isclose(h_h0_out[i], h_h0[i], 0.f, 0.f))
+            << "DDTree h0_source should stay read-only at " << i << ": got=" << h_h0_out[i] << " ref=" << h_h0[i];
+    }
+
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_A_log));
+    CUDA_CHECK(cudaFree(d_dt));
+    CUDA_CHECK(cudaFree(d_h0));
+    CUDA_CHECK(cudaFree(d_o));
+    CUDA_CHECK(cudaFree(d_interm));
+    CUDA_CHECK(cudaFree(d_parent));
+    CUDA_CHECK(cudaFree(d_depth));
+    if (d_qk_scales != nullptr)
+        CUDA_CHECK(cudaFree(d_qk_scales));
+    if (d_gate_values != nullptr)
+        CUDA_CHECK(cudaFree(d_gate_values));
+}
+
 } // namespace
 
 TEST(GDNCuteDsl, Decode)
@@ -1570,6 +1874,12 @@ TEST(GDNCuteDsl, CanImplement)
 TEST(GDNCuteDsl, MTPDecodeWithIntermediateStates)
 {
     runGDNDecodeMTPTestConfig(/*seq_len=*/4, /*with_cache=*/true);
+}
+
+TEST(GDNCuteDsl, DDTreeDecodeWithIntermediateStates)
+{
+    runGDNDecodeTreeTestConfig(/*n=*/1);
+    runGDNDecodeTreeTestConfig(/*n=*/2);
 }
 
 #endif // CUTE_DSL_GDN_ENABLED

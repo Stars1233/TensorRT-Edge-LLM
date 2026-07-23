@@ -96,15 +96,22 @@ public:
     // Routing by absolute layer index
     // ------------------------------------------------------------------
 
+    //! @brief Total number of decoder layers (attention + Mamba).
+    //! @return Number of layers (== size of the configured layer-type list).
+    int32_t numLayers() const noexcept
+    {
+        return static_cast<int32_t>(mConfig.layerTypes.size());
+    }
+
+    //! @brief Type (attention or Mamba/recurrent) of a given absolute layer index.
+    //! @param absLayerIdx Absolute decoder-layer index in [0, numLayers()).
+    //! @return The layer's type.
+    LayerType getLayerType(int32_t absLayerIdx) const;
+
     //! Get the combined KV cache for a given absolute layer index (must be an attention layer).
     //! @param absLayerIdx Absolute decoder-layer index.
     //! @return Reference to the per-layer tensor [maxBatch, 2, numKVHeads, maxSeqLen, headDim].
     rt::Tensor& getCombinedKVCache(int32_t absLayerIdx);
-
-    //! Get the separate K and V caches for a given absolute layer index (must be an attention layer).
-    //! @param absLayerIdx Absolute decoder-layer index.
-    //! @return Pair of non-owned view tensors (K, V).
-    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCache(int32_t absLayerIdx);
 
     //! Get the recurrent state for a given absolute layer index (must be a Mamba layer).
     //! @param absLayerIdx Absolute decoder-layer index.

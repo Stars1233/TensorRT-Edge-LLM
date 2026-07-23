@@ -20,8 +20,10 @@ import os
 import shlex
 from typing import Dict, List, Optional, Tuple
 
-from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
-                      TestConfig, _find_directory, strip_model_quant_suffixes)
+from conftest import EnvironmentConfig
+
+from ..config import (PRE_QUANTIZED_MODELS, ModelType, TestConfig,
+                      strip_model_quant_suffixes)
 from .checkpoint_export_helpers import get_tensorrt_edgellm_root
 
 # Available LoRA weights mapping
@@ -94,6 +96,14 @@ def _llm_quant_shell(
             "Cannot find tensorrt-edge-llm root. "
             "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
         )
+    # The CLI selects calibration datasets by registered name. CI runs
+    # offline, so point the built-in datasets at their cached copies via the
+    # per-dataset EDGELLM_QUANT_DATASET_<NAME> override (the CLI stays
+    # name-only). LibriSpeech is streamed from the Hub as before.
+    env: List[str] = [
+        "EDGELLM_QUANT_DATASET_CNN_DAILYMAIL="
+        f"{config.get_cnn_dailymail_dataset_dir()}",
+    ]
     args: List[str] = [
         "python3",
         "-m",
@@ -101,6 +111,7 @@ def _llm_quant_shell(
         "llm",
         f"--model_dir={input_model_dir}",
         f"--output_dir={output_model_dir}",
+        "--text_dataset=cnn_dailymail",
     ]
     if needs_weight_quant:
         args.append(f"--quantization={config.llm_precision}")
@@ -110,10 +121,15 @@ def _llm_quant_shell(
         args.append("--kv_cache_quantization=fp8")
     if needs_visual_quant:
         args.append("--visual_quantization=fp8")
+        args.append("--image_dataset=mmmu")
+        env.append(
+            f"EDGELLM_QUANT_DATASET_MMMU={config.get_mmmu_dataset_dir()}")
     if needs_audio_quant:
         args.append("--audio_quantization=fp8")
+        args.append("--audio_dataset=librispeech")
+    env_prefix = " ".join(shlex.quote(x) for x in env)
     inner = " ".join(shlex.quote(x) for x in args)
-    return f"cd {shlex.quote(edgellm_root)} && {inner}"
+    return f"cd {shlex.quote(edgellm_root)} && {env_prefix} {inner}"
 
 
 def _generate_quantization_commands(
@@ -170,8 +186,16 @@ def _draft_quant_shell(config: TestConfig) -> str:
             "Set LLM_SDK_DIR to the SDK root, or run from a full tensorrt-edge-llm tree."
         )
     base_model_dir = config.get_base_torch_model_dir()
-    draft_model_dir = config.get_draft_torch_model_dir()
+    if config.is_dflash:
+        draft_model_dir = config.get_dflash_draft_model_dir()
+    else:
+        draft_model_dir = config.get_draft_torch_model_dir()
     quantized_draft_dir = config.get_quantized_draft_model_dir()
+    # Name-only dataset selection; cached cnn_dailymail via the offline override.
+    env: List[str] = [
+        "EDGELLM_QUANT_DATASET_CNN_DAILYMAIL="
+        f"{config.get_cnn_dailymail_dataset_dir()}",
+    ]
     args: List[str] = [
         "python3",
         "-m",
@@ -181,30 +205,31 @@ def _draft_quant_shell(config: TestConfig) -> str:
         f"--draft_model_dir={draft_model_dir}",
         f"--output_dir={quantized_draft_dir}",
         f"--quantization={config.draft_llm_precision}",
-        f"--dataset={config.get_cnn_dailymail_dataset_dir()}",
+        "--text_dataset=cnn_dailymail",
     ]
     if (config.draft_lm_head_precision
             and config.draft_lm_head_precision != "fp16"):
         args.append(f"--lm_head_quantization={config.draft_lm_head_precision}")
+    env_prefix = " ".join(shlex.quote(x) for x in env)
     inner = " ".join(shlex.quote(x) for x in args)
-    return f"cd {shlex.quote(edgellm_root)} && {inner}"
+    return f"cd {shlex.quote(edgellm_root)} && {env_prefix} {inner}"
 
 
 def _generate_draft_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
-    """Generate draft model quantization commands for EAGLE.
+    """Generate draft model quantization commands for EAGLE / DFlash.
 
     Uses ``tensorrt-edgellm-quantize``. Output is a unified ModelOpt
     ``export_hf_checkpoint`` tree consumable by ``tensorrt_edgellm.scripts.export``.
     """
     commands = []
-    if not config.is_eagle:
-        return commands
     if config.is_mtp:
+        return commands
+    if not (config.is_eagle or config.is_dflash):
         return commands
 
     if config.draft_llm_precision is None:
-        raise ValueError("draft_llm_precision not set for EAGLE mode")
+        raise ValueError("draft_llm_precision not set for draft mode")
 
     # Only quantize if draft model is not fp16
     if (config.draft_llm_precision != "fp16"
@@ -329,15 +354,13 @@ def generate_post_tensorrt_edgellm_commands(
                 f"No LoRA weights available for {config.model_name} (also tried "
                 f"base {strip_model_quant_suffixes(config.model_name)}). "
                 f"Please add it to AVAILABLE_LORA_WEIGHTS")
-        edgellm_data_dir = os.environ.get("EDGELLM_DATA_DIR",
-                                          "/scratch.edge_llm_cache")
-        lora_weights_dir = _find_directory(edgellm_data_dir, lora_model_name,
-                                           DEFAULT_SEARCH_DEPTH)
+        lora_weights_dir = config.find_lora_adapter_weights_dir(
+            lora_model_name)
         if not lora_weights_dir:
             raise ValueError(
                 f"LoRA weights directory '{lora_model_name}' not found under "
-                f"'{edgellm_data_dir}' within search depth "
-                f"{DEFAULT_SEARCH_DEPTH}.")
+                f"edgellm_data_dir={config.edgellm_data_dir}, "
+                f"llm_models_dir={config.llm_models_dir}.")
         process_cmd = [
             "python3",
             "-m",
@@ -776,4 +799,59 @@ def generate_kernel_bench_commands(
         cmd.append("--debug")
 
     commands.append((cmd, 600))
+    return commands
+
+
+def generate_vlmevalkit_commands(
+        config: TestConfig,
+        env_config: EnvironmentConfig) -> List[Tuple[List[str], int]]:
+    """Generate VLMEvalKit post-processing commands for MMMU evaluation."""
+    if not env_config.vlmevalkit_dir:
+        raise ValueError("VLMEVALKIT_DIR is required for VLMEvalKit commands. "
+                         "Set the VLMEVALKIT_DIR environment variable.")
+
+    llm_sdk_dir = env_config.llm_sdk_dir
+    vlmevalkit_work_dir = (env_config.vlmevalkit_work_dir or os.path.join(
+        env_config.test_log_dir, "vlmevalkit_workdir"))
+    prepare_script = os.path.join(llm_sdk_dir, "examples", "accuracy",
+                                  "scripts", "prepare_mmmu_vlmevalkit.py")
+    vlmevalkit_run_py = os.path.join(env_config.vlmevalkit_dir, "run.py")
+
+    # VLMEvalKit --reuse looks for xlsx in
+    # {work_dir}/{model_name}/<previous_eval_id>/.
+    reuse_seed_dir = os.path.join(vlmevalkit_work_dir, config.model_name,
+                                  "T00000000_G00000000")
+    output_xlsx = os.path.join(reuse_seed_dir,
+                               f"{config.model_name}_MMMU_DEV_VAL.xlsx")
+
+    commands = [(["bash", "-c",
+                  f"mkdir -p {shlex.quote(reuse_seed_dir)}"], 30)]
+
+    commands.append(([
+        "python3",
+        prepare_script,
+        f"--tsv_file={config.get_vlmevalkit_tsv_file()}",
+        f"--json_file={config.get_output_json_file()}",
+        f"--output_file={output_xlsx}",
+    ], 300))
+
+    # The default exact-matching judge avoids depending on an external service.
+    # CI can opt into an OpenAI-compatible judge by setting VLMEVALKIT_JUDGE_MODEL.
+    judge_model = os.environ.get("VLMEVALKIT_JUDGE_MODEL", "exact_matching")
+    commands.append(([
+        "python3",
+        vlmevalkit_run_py,
+        "--data",
+        "MMMU_DEV_VAL",
+        "--model",
+        config.model_name,
+        "--work-dir",
+        vlmevalkit_work_dir,
+        "--mode",
+        "eval",
+        "--reuse",
+        "--judge",
+        judge_model,
+    ], 600))
+
     return commands

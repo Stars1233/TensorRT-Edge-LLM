@@ -17,10 +17,22 @@
 
 #include "runtime/state/decodingInferenceContext.h"
 
+#include "runtime/debug/layerDebugger.h"
+
 namespace trt_edgellm
 {
 namespace rt
 {
+
+// Out-of-line so the unique_ptr<LayerDebugger> member can hold an incomplete type
+// in the header; LayerDebugger is complete here. Move ops are defined too: a
+// user-declared destructor suppresses the implicit move, but the context is
+// returned by value (e.g. tests' makeContext), so it must stay movable. It
+// remains non-copyable through the unique_ptr member.
+DecodingInferenceContext::DecodingInferenceContext() = default;
+DecodingInferenceContext::DecodingInferenceContext(DecodingInferenceContext&&) noexcept = default;
+DecodingInferenceContext& DecodingInferenceContext::operator=(DecodingInferenceContext&&) noexcept = default;
+DecodingInferenceContext::~DecodingInferenceContext() = default;
 
 void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLength,
     rt::OptionalInputTensor const& visual, rt::OptionalInputTensors const& deepstack, std::string const& loraName,
@@ -36,6 +48,11 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     slotStreams.resize(batchSize);
     stopStringsPerSlot.clear();
     stopStringsPerSlot.resize(batchSize);
+    logitBiasPerSlot.clear();
+    logitBiasPerSlot.resize(batchSize);
+    hasLogitBias = false;
+    logitBiasGpuDirty = false;
+    shouldStopAfterAcceptedToken = {};
 
     batchIndexMapping.resize(batchSize);
     for (int32_t i = 0; i < batchSize; ++i)
@@ -44,6 +61,10 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     }
 
     completedBatches.clear();
+
+    // Initialize per-batch logprobs accumulator (populated only when numLogprobs > 0)
+    stepLogprobs.clear();
+    stepLogprobs.resize(batchSize);
 
     visualEmbeddings = visual;
     deepstackFeatures = deepstack;

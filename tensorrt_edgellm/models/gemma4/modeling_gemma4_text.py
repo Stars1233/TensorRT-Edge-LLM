@@ -17,25 +17,40 @@
 from __future__ import annotations
 
 import itertools
+import re
 from typing import Callable, List, Tuple
 
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
-from ...config import ModelConfig
+from ...checkpoint import checkpoint_utils
+from ...config import QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, CausalLM, DecoderLayer,
                                         OnnxSpec, RMSNorm)
 from ..linear import TPMode, make_linear
-from ..ops import attention_plugin
+from ..ops import (attention_plugin, nvfp4_moe_plugin,
+                   nvfp4_moe_plugin_geforce, use_geforce_nvfp4_moe)
 
 __all__ = [
     "Gemma4Attention",
     "Gemma4ForCausalLM",
     "Gemma4DecoderLayer",
+    "Gemma4NvFP4MoEBlock",
+    "Gemma4NvFP4MoEExperts",
     "Gemma4Transformer",
     "Gemma4ValueRMSNorm",
+    "GEMMA4_NVFP4_KEY_REMAP",
 ]
+
+# Plugin constants for ``Nvfp4MoePlugin`` (same as Qwen3 MoE).
+_NVFP4_ROUTING_MODE_SOFTMAX_TOPK_POST_SCALE = 2
+_NVFP4_ACTIVATION_GEGLU = 5
+_NVFP4_MOE_BACKEND_AUTO = 0
+_NVFP4_MOE_IO_DTYPE_FP16 = 1
+_NVFP4_MOE_MAX_ROUTED_ROWS_AUTO = 0
+_NVFP4_MOE_N_GROUP_FLAT = 1
+_NVFP4_MOE_TOPK_GROUP_FLAT = 1
 
 # These are dummy tensor extents used only to seed torch.export/ONNX export.
 # Runtime limits are controlled by dynamic_shapes and the builder profiles.
@@ -97,66 +112,33 @@ def _mlp_intermediate_size_for_layer(config: ModelConfig,
     return intermediate_size
 
 
-def _rotary_dim_from_rope_config(config: ModelConfig,
-                                 rope_config: dict | None,
-                                 head_dim: int | None = None) -> int:
-    """Return the RoPE table width for one Gemma4 runtime RoPE config."""
-    layer_head_dim = int(head_dim or config.head_dim)
-    if isinstance(rope_config, dict):
-        rope_scaling = rope_config.get("rope_scaling")
-        partial_rotary_factor = float(
-            rope_config.get("partial_rotary_factor",
-                            config.partial_rotary_factor))
-    else:
-        rope_scaling = config.rope_scaling
-        partial_rotary_factor = config.partial_rotary_factor
+def _compute_kv_donor_indices(config: ModelConfig) -> dict[int, int]:
+    """Return shared-layer -> donor-layer KV indices for Gemma4."""
+    num_shared = int(getattr(config, "num_kv_shared_layers", 0) or 0)
+    if num_shared <= 0:
+        return {}
 
-    if isinstance(rope_scaling, dict):
-        rope_type = str(
-            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
-        if rope_type in {"default", "proportional"}:
-            return layer_head_dim
-    return int(layer_head_dim * partial_rotary_factor)
-
-
-def _select_rope_for_layer(
-    layer: nn.Module,
-    rope_rotary_cos_sin: torch.Tensor | None,
-    rope_rotary_cos_sin_sliding: torch.Tensor | None,
-    rope_rotary_cos_sin_full: torch.Tensor | None,
-) -> torch.Tensor:
-    """Select the Gemma4 RoPE table matching ``layer`` attention type."""
-    if (rope_rotary_cos_sin_sliding is None
-            and rope_rotary_cos_sin_full is None):
-        if rope_rotary_cos_sin is None:
-            raise ValueError(
-                "rope_rotary_cos_sin is required for single-RoPE Gemma4 export."
-            )
-        return rope_rotary_cos_sin
-
-    attention_type = getattr(layer.self_attn, "attention_type",
-                             "full_attention")
-    if attention_type == "sliding_attention":
-        if rope_rotary_cos_sin_sliding is None:
-            raise ValueError(
-                "rope_rotary_cos_sin_sliding is required for Gemma4 sliding attention layers."
-            )
-        return rope_rotary_cos_sin_sliding
-
-    if rope_rotary_cos_sin_full is None:
+    num_layers = int(config.num_hidden_layers)
+    if num_shared > num_layers:
         raise ValueError(
-            "rope_rotary_cos_sin_full is required for Gemma4 full attention layers."
-        )
-    return rope_rotary_cos_sin_full
+            "Gemma4 num_kv_shared_layers cannot exceed num_hidden_layers: "
+            f"{num_shared} > {num_layers}.")
 
+    first_shared = num_layers - num_shared
+    donors_by_type: dict[str, int] = {}
+    for layer_idx in range(first_shared):
+        donors_by_type[_attention_type_for_layer(config,
+                                                 layer_idx)] = layer_idx
 
-def _attention_type_for_layer(config: ModelConfig, layer_idx: int) -> str:
-    """Return Gemma4's per-layer attention type."""
-    if layer_idx < len(config.attention_layer_types):
-        return config.attention_layer_types[layer_idx]
-    if config.sliding_window_size >= 0:
-        return "sliding_attention"
-    return "full_attention"
+    donor_map: dict[int, int] = {}
+    for layer_idx in range(first_shared, num_layers):
+        attention_type = _attention_type_for_layer(config, layer_idx)
+        if attention_type not in donors_by_type:
+            raise ValueError(
+                "Gemma4 shared KV layer has no compatible donor before the "
+                f"shared range: layer={layer_idx}, type={attention_type}.")
+        donor_map[layer_idx] = donors_by_type[attention_type]
+    return donor_map
 
 
 def _rotary_dim_from_rope_config(config: ModelConfig,
@@ -165,21 +147,13 @@ def _rotary_dim_from_rope_config(config: ModelConfig,
     """Return the RoPE table width for one Gemma4 runtime RoPE config."""
     effective_head_dim = head_dim if head_dim is not None else int(
         config.head_dim)
-    if isinstance(rope_config, dict):
-        rope_scaling = rope_config.get("rope_scaling")
-        partial_rotary_factor = float(
-            rope_config.get("partial_rotary_factor",
-                            config.partial_rotary_factor))
-    else:
-        rope_scaling = config.rope_scaling
-        partial_rotary_factor = config.partial_rotary_factor
-
-    if isinstance(rope_scaling, dict):
-        rope_type = str(
-            rope_scaling.get("rope_type", rope_scaling.get("type", "default")))
-        if rope_type == "proportional":
-            return effective_head_dim
-    return int(effective_head_dim * partial_rotary_factor)
+    if rope_config is None:
+        rope_config = {
+            "rope_scaling": config.rope_scaling,
+            "partial_rotary_factor": config.partial_rotary_factor,
+        }
+    return checkpoint_utils.rotary_dim_for_runtime(
+        rope_config, effective_head_dim, config.partial_rotary_factor)
 
 
 def _select_rope_for_layer(
@@ -218,6 +192,7 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
                               num_ple_inputs: int,
                               use_dual_rope: bool = False,
                               eagle_base: bool = False,
+                              vision_block_attention: bool = False,
                               emit_hidden_states: bool = False) -> nn.Module:
     """Build a Gemma4 export wrapper with explicit PLE/RoPE tensor inputs."""
     has_hidden_output = eagle_base or emit_hidden_states
@@ -233,6 +208,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
     else:
         param_names += ["rope_rotary_cos_sin"]
     param_names += ["context_lengths", "kvcache_start_index", "last_token_ids"]
+    if vision_block_attention:
+        param_names += ["vision_block_ids"]
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
 
@@ -245,6 +222,8 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
     eagle_kwargs = (", attention_mask=attention_mask"
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
+    vision_kwargs = (", vision_block_ids=vision_block_ids"
+                     if vision_block_attention else "")
     if use_dual_rope:
         rope_arg = "None"
         rope_kwargs = (
@@ -259,14 +238,14 @@ def _make_gemma4_flat_wrapper(model: nn.Module,
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
             f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{eagle_kwargs}{ple_kwarg}{rope_kwargs})\n"
+            f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
         body = (f"    logits, present_key_values = self._model(\n"
                 f"        inputs_embeds, {past_kv_tuple}, {rope_arg}, "
                 f"context_lengths, kvcache_start_index, last_token_ids"
-                f"{eagle_kwargs}{ple_kwarg}{rope_kwargs})\n"
+                f"{eagle_kwargs}{vision_kwargs}{ple_kwarg}{rope_kwargs})\n"
                 f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -315,14 +294,42 @@ def _compute_kv_donor_indices(config: ModelConfig) -> dict:
 
     result: dict = {}
     for i in range(first_shared, n):
-        if i < len(layer_types):
-            lt = layer_types[i]
-            if lt not in donors:
-                raise ValueError(
-                    f"KV-shared layer {i} has type '{lt}' with no "
-                    f"non-shared donor layer of the same type.")
-            result[i] = donors[lt]
+        if i >= len(layer_types):
+            raise ValueError(
+                f"Layer index {i} exceeds attention_layer_types length "
+                f"({len(layer_types)}). Check num_hidden_layers vs "
+                f"attention_layer_types in config.")
+        lt = layer_types[i]
+        if lt not in donors:
+            raise ValueError(f"KV-shared layer {i} has type '{lt}' with no "
+                             f"non-shared donor layer of the same type.")
+        result[i] = donors[lt]
     return result
+
+
+class Gemma4RMSNorm(RMSNorm):
+    """RMSNorm with f32 weight storage for Gemma4.
+
+    Gemma4 31B has norm weights up to 1248 which overflow fp16 when multiplied
+    with normalized values. Weight is stored as f32 and multiplication is done
+    in f32 before casting back to input dtype. This also ensures both operands
+    have matching type in the ONNX graph (required by TRT --stronglyTyped).
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        nn.Module.__init__(self)
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size,
+                                              dtype=torch.float32))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance +
+                                                    self.variance_epsilon)
+        hidden_states = hidden_states * self.weight
+        return hidden_states.to(input_dtype)
 
 
 class Gemma4ValueRMSNorm(nn.Module):
@@ -382,7 +389,13 @@ class Gemma4Attention(Attention):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.k_proj")
         if self.attention_k_eq_v:
-            self.v_proj = None
+            # K=V: forward uses key_states as value_states, but we still
+            # instantiate v_proj so checkpoint loading can assign its weight.
+            self.v_proj = make_linear(config,
+                                      qkv_in_features,
+                                      self.num_kv_heads * self.head_dim,
+                                      bias=config.attention_bias,
+                                      module_name=f"{module_prefix}.v_proj")
         else:
             self.v_proj = make_linear(config,
                                       qkv_in_features,
@@ -391,6 +404,7 @@ class Gemma4Attention(Attention):
                                       module_name=f"{module_prefix}.v_proj")
 
         if self.enable_fp8_kv_cache:
+            self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             if self.v_proj is not None:
                 self.v_proj.register_buffer("v_scale", torch.ones(1))
@@ -400,8 +414,8 @@ class Gemma4Attention(Attention):
                                   hidden_size,
                                   module_name=f"{module_prefix}.o_proj")
         if config.has_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None
@@ -421,9 +435,7 @@ class Gemma4Attention(Attention):
             if hasattr(self, "k_norm") and self.k_norm is not None:
                 del self.k_norm
 
-        self.qk_scale = (float(config.attention_scaling)
-                         if config.attention_scaling > 0.0 else self.head_dim**
-                         -0.5)
+        self.attention_scale = config.attention_scaling
         if not self.is_kv_shared:
             self.v_norm = (Gemma4ValueRMSNorm(self.head_dim,
                                               config.rms_norm_eps)
@@ -434,10 +446,6 @@ class Gemma4Attention(Attention):
                                     if self.attention_type
                                     == "sliding_attention" else -1)
 
-    def _attention_plugin_query_scale(self) -> float:
-        default_plugin_qk_scale = self.head_dim**-0.5
-        return self.qk_scale / default_plugin_qk_scale
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -447,6 +455,7 @@ class Gemma4Attention(Attention):
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -488,11 +497,12 @@ class Gemma4Attention(Attention):
                                              batch_size, seq_len,
                                              self.num_kv_heads * self.head_dim)
 
-        query_scale = self._attention_plugin_query_scale()
-        if query_scale != 1.0:
-            query_states = query_states * query_states.new_tensor(query_scale)
-
         enable_tree = attention_mask is not None and attention_pos_id is not None
+        enable_vision_block = vision_block_ids is not None
+        if enable_tree and enable_vision_block:
+            raise ValueError(
+                "Gemma4 vision block attention and tree attention are mutually exclusive."
+            )
         kwargs: dict = {
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -500,10 +510,16 @@ class Gemma4Attention(Attention):
             "sliding_window_size": self.sliding_window_size,
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
+            "enable_vision_block_attention": enable_vision_block,
         }
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
+        elif enable_vision_block:
+            # AttentionPlugin input slot 7 is shared with the tree mask.  The
+            # static plugin attribute selects its [B,S] block-ID semantics.
+            kwargs["attention_mask"] = vision_block_ids
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
 
@@ -553,12 +569,194 @@ class Gemma4MLP(MLP):
         self.act_fn = _resolve_hidden_activation(config.hidden_activation)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Upcast gate*up product to fp32 to prevent fp16 overflow in large models.
-        gate = self.act_fn(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        intermediate = (gate.to(torch.float32) * up.to(torch.float32)).to(
-            hidden_states.dtype)
-        return self.down_proj(intermediate)
+        # Compute gate*up in f32 to prevent fp16 overflow.
+        # Clamp intermediate to +/-2048 before casting to fp16 for down_proj.
+        # Without this clamp, the fp16 down_proj MatMul can produce Inf
+        # (dot product of 21504 elements at +/-65504 overflows fp16 output range),
+        # which then causes NaN in the subsequent RMSNorm (Inf*0=NaN).
+        gate = self.act_fn(self.gate_proj(hidden_states).to(torch.float32))
+        up = self.up_proj(hidden_states).to(torch.float32)
+        intermediate = (gate * up).clamp(-2048.0, 2048.0)
+        return self.down_proj(intermediate.to(hidden_states.dtype))
+
+
+class Gemma4Router(nn.Module):
+    """Gemma4 MoE router weights for checkpoint loading.
+
+    Holds norm, scale, proj, and per_expert_scale parameters that get repacked
+    by Gemma4NvFP4MoEBlock._prepare_moe_weights(). The TRT plugin handles
+    softmax + topk internally.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.scalar_root_size = self.hidden_size**-0.5
+        self.eps = config.rms_norm_eps
+
+        # Weightless RMSNorm (no learnable scale parameter)
+        self.norm = Gemma4ValueRMSNorm(self.hidden_size, eps=self.eps)
+        self.proj = make_linear(config,
+                                self.hidden_size,
+                                self.num_experts,
+                                bias=False,
+                                module_name=f"layers.{layer_idx}.router.proj")
+        self.scale = nn.Parameter(torch.ones(self.hidden_size))
+        self.per_expert_scale = nn.Parameter(torch.ones(self.num_experts))
+
+
+class Gemma4NvFP4MoEExperts(nn.Module):
+    """Per-expert NVFP4 linear modules for Gemma4 MoE checkpoint loading.
+
+    Mirrors :class:`Qwen3MoEExperts`: each expert has gate_proj, up_proj,
+    down_proj created via ``make_linear()`` which returns ``NVFP4Linear``
+    when ``config.quant.quant_type == QUANT_NVFP4``.
+    """
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        hidden = config.hidden_size
+        inter = config.moe_intermediate_size
+        experts = []
+        for _ in range(config.num_experts):
+            expert = nn.Module()
+            expert.gate_proj = make_linear(config, hidden, inter)
+            expert.up_proj = make_linear(config, hidden, inter)
+            expert.down_proj = make_linear(config, inter, hidden)
+            experts.append(expert)
+        self._experts = nn.ModuleList(experts)
+
+    def __getitem__(self, idx: int) -> nn.Module:
+        return self._experts[idx]
+
+    def __len__(self) -> int:
+        return len(self._experts)
+
+    def __iter__(self):
+        return iter(self._experts)
+
+
+class Gemma4NvFP4MoEBlock(nn.Module):
+    """NVFP4 MoE block for Gemma4 26B-A4B using ``Nvfp4MoePlugin``.
+
+    Wraps the router + NVFP4 per-expert weights for checkpoint loading,
+    then repacks into plugin-compatible layout via ``_prepare_moe_weights()``.
+
+    Forward path: Router RMSNorm + scale + proj produces raw logits; the
+    plugin handles softmax + topk + expert GEMMs internally.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.hidden_size = config.hidden_size
+        self.group_size = config.quant.group_size
+        self.activation_type = _NVFP4_ACTIVATION_GEGLU
+        self.backend = _NVFP4_MOE_BACKEND_AUTO
+        self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
+        self.max_routed_rows = _NVFP4_MOE_MAX_ROUTED_ROWS_AUTO
+
+        self.router = Gemma4Router(config, layer_idx)
+        self.experts = Gemma4NvFP4MoEExperts(config)
+
+    def _prepare_moe_weights(self) -> None:
+        """Repack NVFP4 experts for Nvfp4MoePlugin.
+
+        Called by :func:`~checkpoint.repacking._stack_moe_experts`.
+        """
+        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
+
+        fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
+        fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
+            repack_nvfp4_qwen3_moe_experts(self.experts,
+                                           self.hidden_size,
+                                           self.moe_intermediate_size,
+                                           self.group_size,
+                                           fc1_layout=fc1_layout))
+
+        device = self.router.proj.weight.device
+        self.register_buffer("fc1_qweights",
+                             fc1_qweights.to(device).contiguous())
+        self.register_buffer("fc1_blocks_scale",
+                             fc1_blocks_scale.to(device).contiguous())
+        self.register_buffer("fc2_qweights",
+                             fc2_qweights.to(device).contiguous())
+        self.register_buffer("fc2_blocks_scale",
+                             fc2_blocks_scale.to(device).contiguous())
+
+        # w4a16: weights are NVFP4, activations stay FP16.
+        # repack_nvfp4_qwen3_moe_experts decodes weights to dense (folding
+        # weight_scale_2 in) then re-quantizes → alpha must be 1.0.
+        # No activation quantization → input scales are also 1.0.
+        self.register_buffer(
+            "fc1_alpha",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "fc2_alpha",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "input_global_scale",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+        self.register_buffer(
+            "down_input_scale",
+            torch.ones(self.num_experts, dtype=torch.float32, device=device))
+
+        # per_expert_scale → raw scale applied post-renorm by plugin
+        # (routing_mode=2 triggers multiplicative post-topk application).
+        self.register_buffer(
+            "e_score_correction_bias",
+            self.router.per_expert_scale.data.float().to(device))
+
+        # Discard per-expert modules after repacking.
+        self.experts = nn.ModuleList()
+
+    def forward(self, expert_input: torch.Tensor,
+                residual: torch.Tensor) -> torch.Tensor:
+        """Route via plugin: router_logits → Nvfp4MoePlugin.
+
+        Args:
+            expert_input: [num_tokens, H] — pre-normed expert input (2D).
+            residual: [B, S, H] — pre-MLP residual used for routing.
+        """
+        hidden_flat = residual.reshape(-1, self.hidden_size)
+        # Router: RMSNorm + scale + proj → raw logits (softmax done by plugin)
+        normed = self.router.norm(hidden_flat)
+        scaled = normed * (self.router.scale *
+                           self.router.scalar_root_size).to(normed.dtype)
+        router_logits = self.router.proj(scaled).float()
+
+        moe_op = (nvfp4_moe_plugin_geforce
+                  if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
+        return moe_op(
+            router_logits,
+            expert_input.unsqueeze(0),  # Plugin expects 3D [B, T, H]
+            self.fc1_qweights,
+            self.fc1_blocks_scale,
+            self.fc1_alpha,
+            self.fc2_qweights,
+            self.fc2_blocks_scale,
+            self.fc2_alpha,
+            self.input_global_scale,
+            self.down_input_scale,
+            self.e_score_correction_bias,
+            self.num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.moe_intermediate_size,
+            self.activation_type,
+            _NVFP4_MOE_N_GROUP_FLAT,
+            _NVFP4_MOE_TOPK_GROUP_FLAT,
+            1,
+            1.0,
+            _NVFP4_ROUTING_MODE_SOFTMAX_TOPK_POST_SCALE,
+            self.backend,
+            self.io_dtype,
+            self.max_routed_rows,
+        )
 
 
 class Gemma4DecoderLayer(DecoderLayer):
@@ -577,10 +775,33 @@ class Gemma4DecoderLayer(DecoderLayer):
         #   post_attention_layernorm   -> post-attention, before residual add (inherited)
         #   pre_feedforward_layernorm  -> pre-MLP
         #   post_feedforward_layernorm -> post-MLP, before residual add
-        self.pre_feedforward_layernorm = RMSNorm(config.hidden_size,
-                                                 config.rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
-                                                  config.rms_norm_eps)
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size,
+                                                       config.rms_norm_eps)
+        self.post_feedforward_layernorm = Gemma4RMSNorm(
+            config.hidden_size, config.rms_norm_eps)
+
+        # layer_scalar is applied unconditionally in HF Gemma4 - it scales the
+        # residual stream per-layer (early layers have very small values ~0.06-0.09).
+        self.register_buffer("layer_scalar", torch.ones(1))
+
+        # MoE block: parallel routed experts alongside dense MLP (Gemma4 26B).
+        # Only NVFP4 quantization is supported for MoE.
+        self.enable_moe_block = config.enable_moe_block
+        if self.enable_moe_block:
+            if config.quant.quant_type != QUANT_NVFP4:
+                raise ValueError(
+                    "Gemma4 MoE requires NVFP4 quantization "
+                    f"(got quant_type={config.quant.quant_type!r})")
+            self.moe_block = Gemma4NvFP4MoEBlock(config, layer_idx)
+            self.post_feedforward_layernorm_1 = RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.post_feedforward_layernorm_2 = RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.pre_feedforward_layernorm_2 = RMSNorm(config.hidden_size,
+                                                       config.rms_norm_eps)
+
+        # HF applies layer_scalar unconditionally (it's 1.0 for non-PLE models).
+        self.register_buffer("layer_scalar", torch.ones(1))
 
         if self.hidden_size_per_layer_input > 0:
             self.per_layer_input_gate = make_linear(
@@ -599,9 +820,8 @@ class Gemma4DecoderLayer(DecoderLayer):
                 module_name=f"layers.{layer_idx}.per_layer_projection",
                 tp_mode=TPMode.REPLICATED,
             )
-            self.post_per_layer_input_norm = RMSNorm(config.hidden_size,
-                                                     config.rms_norm_eps)
-            self.register_buffer("layer_scalar", torch.ones(1))
+            self.post_per_layer_input_norm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
 
     def _apply_per_layer_input(
             self, hidden_states: torch.Tensor,
@@ -645,6 +865,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
         per_layer_input: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
@@ -657,6 +878,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             kvcache_start_index,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            vision_block_ids=vision_block_ids,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -664,13 +886,30 @@ class Gemma4DecoderLayer(DecoderLayer):
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+
+        if self.enable_moe_block:
+            # MoE branch: norm MLP output, route residual through experts,
+            # combine both normalized outputs.
+            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+
+            # NVFP4 path: plugin handles routing + expert compute.
+            # pre_feedforward_layernorm_2 normalizes expert input.
+            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
+            expert_input = self.pre_feedforward_layernorm_2(hidden_states_flat)
+            hidden_states_2 = self.moe_block(expert_input, residual)
+            hidden_states_2 = hidden_states_2.reshape(residual.shape)
+            hidden_states_2 = self.post_feedforward_layernorm_2(
+                hidden_states_2)
+
+            hidden_states = hidden_states_1 + hidden_states_2
+
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         hidden_states = self._apply_per_layer_input(hidden_states,
                                                     per_layer_input)
-        if self.hidden_size_per_layer_input > 0:
-            hidden_states = hidden_states * self.layer_scalar
+        hidden_states = hidden_states * self.layer_scalar.to(
+            dtype=hidden_states.dtype)
 
         return hidden_states, present_key_value
 
@@ -694,7 +933,7 @@ class Gemma4Transformer(nn.Module):
             Gemma4DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = Gemma4RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         if self.ple_enabled:
             if self.vocab_size_per_layer_input <= 0:
@@ -715,7 +954,7 @@ class Gemma4Transformer(nn.Module):
                 module_name="per_layer_model_projection",
                 tp_mode=TPMode.REPLICATED,
             )
-            self.per_layer_projection_norm = RMSNorm(
+            self.per_layer_projection_norm = Gemma4RMSNorm(
                 self.hidden_size_per_layer_input,
                 config.rms_norm_eps,
             )
@@ -795,6 +1034,7 @@ class Gemma4Transformer(nn.Module):
         kvcache_start_index: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
@@ -826,6 +1066,7 @@ class Gemma4Transformer(nn.Module):
                 kvcache_start_index,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
+                vision_block_ids=vision_block_ids,
                 per_layer_input=per_layer_input,
             )
             present_key_values_list.append(next_key_value)
@@ -842,6 +1083,11 @@ class Gemma4Transformer(nn.Module):
 
 class Gemma4ForCausalLM(CausalLM):
     """Gemma4 CausalLM wrapper for the checkpoint exporter."""
+
+    # RMSNorm weights are f32 initializers that feed element-wise Mul with
+    # f32 normalized hidden states.  Without this flag, _fix_initializer_dtypes
+    # downgrades them to f16, creating a type mismatch with --stronglyTyped.
+    match_fp32_elementwise_initializers = True
 
     def __init__(self, config: ModelConfig) -> None:
         nn.Module.__init__(self)
@@ -860,7 +1106,11 @@ class Gemma4ForCausalLM(CausalLM):
 
     def onnx_export_spec(self) -> OnnxSpec:
         """Return Gemma4-specific ONNX export parameters."""
-        if not self.ple_enabled and not self.config.use_dual_rope:
+        vision_block_attention = bool(
+            self.config.use_vision_bidirectional_attention)
+        if (not self.ple_enabled and not self.config.use_dual_rope
+                and not vision_block_attention
+                and not self.config.gemma4_mtp_base):
             return super().onnx_export_spec()
 
         config = self.config
@@ -868,9 +1118,14 @@ class Gemma4ForCausalLM(CausalLM):
             raise NotImplementedError(
                 "Gemma4 dual RoPE export is not supported for EAGLE base models."
             )
+        if vision_block_attention and config.eagle_base:
+            raise NotImplementedError(
+                "Gemma4 vision block attention is not supported with EAGLE base models."
+            )
 
         Na = config.num_hidden_layers
         eagle_base = config.eagle_base
+        tree_attention_base = eagle_base or config.gemma4_mtp_base
         num_ple_inputs = Na if self.ple_enabled else 0
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
@@ -966,6 +1221,13 @@ class Gemma4ForCausalLM(CausalLM):
         input_names = input_names + [
             "context_lengths", "kvcache_start_index", "last_token_ids"
         ]
+        if vision_block_attention:
+            vision_block_ids = torch.full((batch_size, seq_len),
+                                          -1,
+                                          dtype=torch.int32,
+                                          device=device)
+            args = args + (vision_block_ids, )
+            input_names = input_names + ["vision_block_ids"]
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states and not eagle_base:
@@ -979,8 +1241,8 @@ class Gemma4ForCausalLM(CausalLM):
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
 
-        num_selected = torch.export.Dim("num_selected", min=1,
-                                        max=256) if eagle_base else None
+        num_selected = torch.export.Dim(
+            "num_selected", min=1, max=256) if tree_attention_base else None
         all_shapes: list = [{0: batch, 1: seq}]
         for _ in range(num_ple_inputs):
             all_shapes.append({0: batch, 1: seq})
@@ -991,11 +1253,13 @@ class Gemma4ForCausalLM(CausalLM):
             all_shapes.append({0: rope_batch, 1: pos})
         all_shapes.append({0: batch})
         all_shapes.append({0: kv_batch})
-        if eagle_base:
+        if tree_attention_base:
             all_shapes.append({0: batch, 1: num_selected})
         else:
             all_shapes.append({0: batch})
-        if eagle_base:
+        if vision_block_attention:
+            all_shapes.append({0: batch, 1: seq})
+        if tree_attention_base:
             attention_pos_id = torch.zeros(batch_size,
                                            seq_len,
                                            dtype=torch.int32,
@@ -1020,8 +1284,10 @@ class Gemma4ForCausalLM(CausalLM):
             Na,
             num_ple_inputs=num_ple_inputs,
             use_dual_rope=config.use_dual_rope,
-            eagle_base=eagle_base,
-            emit_hidden_states=self.emit_hidden_states)
+            eagle_base=tree_attention_base,
+            vision_block_attention=vision_block_attention,
+            emit_hidden_states=(self.emit_hidden_states
+                                or config.gemma4_mtp_base))
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1040,11 +1306,13 @@ class Gemma4ForCausalLM(CausalLM):
         last_token_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         attention_pos_id: torch.Tensor | None = None,
+        vision_block_ids: torch.Tensor | None = None,
         ple_token_embeds: Tuple[torch.Tensor, ...] = (),
         rope_rotary_cos_sin_sliding: torch.Tensor | None = None,
         rope_rotary_cos_sin_full: torch.Tensor | None = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
+        gemma4_mtp_base = self.config.gemma4_mtp_base
         hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
             past_key_values,
@@ -1053,6 +1321,7 @@ class Gemma4ForCausalLM(CausalLM):
             kvcache_start_index,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            vision_block_ids=vision_block_ids,
             output_hidden_states=eagle_base,
             ple_token_embeds=ple_token_embeds,
             rope_rotary_cos_sin_sliding=rope_rotary_cos_sin_sliding,
@@ -1084,4 +1353,39 @@ class Gemma4ForCausalLM(CausalLM):
             return logits, self.model.last_pre_norm_hidden_states, \
                 present_key_values
 
+        if gemma4_mtp_base:
+            return logits, hidden_states, present_key_values
+
         return logits, present_key_values
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint key remap for NVFP4 Gemma4 MoE
+# ---------------------------------------------------------------------------
+# Checkpoint: layers.{i}.router.* → model tree: layers.{i}.moe_block.router.*
+_ROUTER_RE = re.compile(r"(layers\.\d+\.)router\.")
+# Checkpoint: layers.{i}.experts.{j}.* → model tree: layers.{i}.moe_block.experts._experts.{j}.*
+_EXPERTS_RE = re.compile(r"(layers\.\d+\.)experts\.(\d+)\.")
+
+
+def GEMMA4_NVFP4_KEY_REMAP(key: str) -> "str | None":
+    """Remap Gemma4 NVFP4 checkpoint keys to the internal module tree.
+
+    Checkpoint layout (nvidia/Gemma-4-26B-A4B-NVFP4):
+        model.layers.{i}.router.proj.weight
+        model.layers.{i}.router.scale
+        model.layers.{i}.router.per_expert_scale
+        model.layers.{i}.experts.{j}.gate_proj.weight
+        model.layers.{i}.experts.{j}.gate_proj.weight_scale
+        ...
+
+    Model tree (with Gemma4NvFP4MoEBlock):
+        model.layers.{i}.moe_block.router.proj.weight
+        model.layers.{i}.moe_block.router.scale
+        model.layers.{i}.moe_block.router.per_expert_scale
+        model.layers.{i}.moe_block.experts._experts.{j}.gate_proj.weight
+        ...
+    """
+    key = _ROUTER_RE.sub(r"\1moe_block.router.", key)
+    key = _EXPERTS_RE.sub(r"\1moe_block.experts._experts.\2.", key)
+    return key

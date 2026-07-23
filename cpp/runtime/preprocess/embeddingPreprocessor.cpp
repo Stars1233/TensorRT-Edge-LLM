@@ -49,7 +49,9 @@ void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor vi
         auto const inputShape = tokenIds.getShape();
         size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
         Tensor inputIdsCPU(inputShape, DeviceType::kCPU, tokenIds.getDataType());
-        CUDA_CHECK(cudaMemcpy(inputIdsCPU.rawPointer(), tokenIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(
+            inputIdsCPU.rawPointer(), tokenIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::optional<int32_t> audioTokenOpt
             = (mConfig.audioTokenId >= 0) ? std::optional{mConfig.audioTokenId} : std::nullopt;

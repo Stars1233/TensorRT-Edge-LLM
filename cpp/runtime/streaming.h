@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "runtime/llmRuntimeUtils.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -85,6 +86,9 @@ struct StreamChunk
     std::string text;                                //!< Delta text; always well-formed UTF-8.
     bool finished{false};                            //!< True for the final chunk on this channel.
     FinishReason reason{FinishReason::kNotFinished}; //!< Terminal reason (only meaningful when `finished==true`).
+    //! Per-token top-K logprobs: logprobs[i] = [LogprobEntry, ...] for tokenIds[i].
+    //! Empty when numLogprobs == 0.
+    std::vector<std::vector<LogprobEntry>> logprobs;
 };
 
 class StreamChannel; // For the friend-function signatures below.
@@ -107,8 +111,9 @@ void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const
 //! Stage 2 of the per-iter pipeline (after updateFinishStates): push chunks
 //! to channels using the pre-computed `pendingEmitText` and finalized
 //! `terminalReason`. Non-streaming slots are skipped here — their output is
-//! assembled at handleRequest finalization.
-void emitChunks(DecodingInferenceContext& context);
+//! assembled at handleRequest finalization. `tokenizer` is used to resolve the
+//! raw token piece for per-token logprobs (LogprobEntry::piece).
+void emitChunks(DecodingInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
 
 /*! @brief Result of applyStopStringMatch. */
 struct StopMatchOutcome
@@ -208,7 +213,7 @@ private:
     friend bool validateStreamingSubmission(LLMGenerationRequest const&);
     friend void applyCancellationToFinishStates(DecodingInferenceContext&);
     friend void decodePerSlot(DecodingInferenceContext&, tokenizer::Tokenizer const&);
-    friend void emitChunks(DecodingInferenceContext&);
+    friend void emitChunks(DecodingInferenceContext&, tokenizer::Tokenizer const&);
 
     // ── Producer API (runtime-only) ──────────────────────────────────────────
     void push(StreamChunk chunk);
@@ -271,6 +276,9 @@ struct SlotStreamState
 
     //! sentTokenCount at last push (for streamInterval gating).
     size_t lastEmittedTokenCount{0};
+
+    //! Number of logprob steps already pushed (0-based, independent of prompt length).
+    size_t logprobsEmittedCount{0};
 
     //! Trailing incomplete UTF-8 bytes carried across iterations.
     std::string pendingBytes;

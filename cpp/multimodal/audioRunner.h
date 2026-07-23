@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "multimodal/audioUtils.h"
 #include "multimodalRunner.h"
 #include "runtime/audioUtils.h"
 #include "runtime/melSpectrogram.h"
@@ -38,12 +39,10 @@ struct AudioConfig
     int32_t nWindowInfer{100};     //!< Inference window size
 
     // Audio special tokens (from tokenizer_config.json)
-    int32_t audioTokenId{151675};    //!< <|audio_pad|> token ID
-    int32_t audioBosTokenId{151669}; //!< <|audio_start|> token ID
-    int32_t audioEosTokenId{151670}; //!< <|audio_end|> token ID
-    float mropeTheta{0.0F};          //!< Multi-dimensional RoPE theta (0 = no MRope)
-    int32_t mropeSectionH{20};       //!< MRoPE section: frequency pairs for height (default Qwen3-Omni)
-    int32_t mropeSectionW{20};       //!< MRoPE section: frequency pairs for width (default Qwen3-Omni)
+    int32_t audioTokenId{151675}; //!< <|audio_pad|> token ID
+    float mropeTheta{0.0F};       //!< Multi-dimensional RoPE theta (0 = no MRope)
+    int32_t mropeSectionH{20};    //!< MRoPE section: frequency pairs for height (default Qwen3-Omni)
+    int32_t mropeSectionW{20};    //!< MRoPE section: frequency pairs for width (default Qwen3-Omni)
 };
 
 //! \brief Runner for Qwen3-Omni audio encoder
@@ -111,6 +110,32 @@ private:
     bool preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
         std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
 
+    //! \brief Initialize persistent online-GPU-fbank state: load the CuTe DSL
+    //!        GEMM module, pre-allocate every device buffer the fbank path
+    //!        uses (weights, workspace, PCM staging, mel output) at the engine
+    //!        kMAX profile bound, then fill the weight/table tensors.
+    //!        Best-effort: returns false (and leaves the runner on
+    //!        the CPU MelExtractor path) when the GEMM has no variant for the
+    //!        current SM, or mel geometry is not the 128×201 Whisper Slaney
+    //!        bank. The mel filter is reused from ``mFeMel`` (single source of
+    //!        truth — no external mel_filter.bin), so ``mFeMel`` must already
+    //!        be bound (call after validateAndFillConfig).
+    //! \param[in] stream CUDA stream for the H2D uploads
+    //! \return True if online fbank is ready, false to fall back to CPU mel
+    bool initFbankResources(cudaStream_t stream);
+
+    //! \brief Run the online GPU fbank for one clip, if it is applicable.
+    //! \details Gates on online-fbank readiness, the engine mel width, and the
+    //!          sample rate, then uploads PCM, frames it, and runs fbankWhisper.
+    //!          Any gate miss or kernel failure returns false so the caller
+    //!          falls back to the CPU MelExtractor; the [1, nMel, T] FP16
+    //!          contract is identical on both paths.
+    //! \param[in] pcm Host FP32 mono PCM for this clip
+    //! \param[out] melSpec [1, nMel, T] FP16 GPU mel, written only on success
+    //! \param[in] stream CUDA stream
+    //! \return True if melSpec was produced on the GPU, false to use the CPU path
+    bool tryOnlineGpuFbank(rt::audio::AudioPCM const& pcm, rt::Tensor& melSpec, cudaStream_t stream);
+
     //! \brief Tokenize text and insert audio tokens
     //! \param[in] request LLM generation request
     //! \param[out] batchInputIds Batched input IDs after tokenization and audio token insertion
@@ -137,7 +162,23 @@ private:
     rt::Tensor mPaddedMaskAfterCNN{}; //!< [num_chunks, max_len_after_cnn] Mask for valid tokens
     rt::Tensor mPaddedMaskIndices{};  //!< [num_valid_elements, 2] Nonzero indices from mask
     rt::Tensor mAudioAttentionMask{}; //!< [num_attention_elems, num_attention_elems] Block-diagonal attention mask
+    rt::Tensor mCuSeqlens{};          //!< [num_windows + 1] Cumulative sequence lengths (optional TRT input)
+    rt::Tensor mCuSeqlensHost{};      //!< Host staging for mCuSeqlens
+    rt::Tensor mKvLengths{};          //!< [num_windows + 1] Separate copy of cu_seqlens (TRT-native attention)
     rt::Tensor mAudioEmbedding{};     //!< [num_audio_tokens, hidden_dim] Audio encoder output
+    bool mHasCuSeqlens{false};        //!< True when engine exposes cu_seqlens input
+    bool mHasKvLengths{false};        //!< True when engine exposes kv_lengths input
+
+    // Online GPU fbank state (persistent across clips). When mFbankReady is
+    // false (unsupported SM / non-128 melBins / GEMM module unavailable) the
+    // runner transparently falls back to the CPU MelExtractor (mFeMel) — the
+    // [1,128,T] FP16 mel contract is identical on both paths. Every device
+    // buffer below is allocated once by initFbankResources at the engine kMAX
+    // profile bound.
+    bool mFbankReady{false};                          //!< true once initFbankResources succeeds
+    rt::audioUtils::FbankResources mFbankResources{}; //!< Weights/tables, params, pre-allocated workspace
+    rt::Tensor mPcmF32Device{};                       //!< [maxPcmSamples] Float — PCM staging, reshaped to [N] per clip
+    rt::Tensor mMelSpecDevice{}; //!< [1, nMel, maxFrames] Half — fbank output backing store, viewed at [1, nMel, T_out]
 };
 
 } // namespace rt

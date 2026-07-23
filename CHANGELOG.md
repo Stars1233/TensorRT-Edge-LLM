@@ -1,7 +1,19 @@
 # Release Notes
 
+## 0.9.1
+- Added Gemma 4 12B, 26B-A4B, and 31B full support with MTP
+- Expanded DFlash with DDTree for Qwen3 and Qwen3.5 hybrid models, plus 128K/64K/32K draft vocabulary reduction
+- Added paged KV-cache prefill and paged XQA decode support
+- Added Qwen video preprocessing and online GPU filter-bank preprocessing for Whisper-based Qwen3 audio models and Parakeet-based Nemotron-Omni
+- Added logprobs across vanilla and speculative decoders and OpenAI-compatible `logit_bias` requests
+- Added INT4-FP16 CuTe DSL GEMM/GEMV kernels, FP16 MoE support for 128/256 experts, and head-dimension 256 FMHA
+- Added named, per-modality calibration datasets
+- Added Qwen3-Omni/Qwen3-TTS CodePredictor FP8 quantization
+- Fixed speculative-decoding sampling and engine routing, Gemma 4 export issues, FP8 long-context accuracy, and runtime synchronization/stability bugs
+
 ## 0.9.0
 - Added Gemma 4 E2B/E4B text inference support
+- Added Gemma4 Unified 12B image and audio multimodal inference support
 - Added DFlash support
 - Added Qwen3-Omni-30B-A3B NVFP4 support
 - Fixed decode performance regression in 0.8.0

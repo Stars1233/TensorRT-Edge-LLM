@@ -34,8 +34,8 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
 # CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
-pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x
-# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.5.2'
+pip install 'nvidia-cutlass-dsl[cu13]==4.6.0'  # CUDA 13.x
+# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.0'
 ```
 
 If your environment hits a `ModuleNotFoundError` while importing CUTLASS DSL,
@@ -230,7 +230,7 @@ replacing the old cuBLAS-based path.
 
 | Dependency | Version |
 |---|---|
-| `nvidia-cutlass-dsl` | `4.5.2` (CUDA 13: `[cu13]` extra; CUDA 12: base package) |
+| `nvidia-cutlass-dsl` | `4.6.0` (CUDA 13: `[cu13]` extra; CUDA 12: base package) |
 | `cuda-python` | compatible with local CUDA |
 | `cupy-cuda12x` | `12.3.0` for CUDA 12.x |
 | `cupy-cuda13x` | `13.6.0` for CUDA 13.x |

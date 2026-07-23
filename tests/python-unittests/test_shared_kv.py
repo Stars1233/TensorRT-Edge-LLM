@@ -31,6 +31,7 @@ Requirements:
 import ctypes
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pytest
@@ -107,7 +108,7 @@ def _apply_rope_numpy(x: np.ndarray, cos: np.ndarray, sin: np.ndarray,
 
 
 def _numpy_attention(q: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray,
-                     kv_seq_len: int) -> np.ndarray:
+                     kv_seq_len: int, attention_scale: float) -> np.ndarray:
     """Compute scaled dot-product attention against KV cache.
 
     Args:
@@ -115,6 +116,7 @@ def _numpy_attention(q: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray,
         k_cache: [B, H_kv, capacity, D]
         v_cache: [B, H_kv, capacity, D]
         kv_seq_len: number of valid entries in cache
+        attention_scale: absolute multiplier applied to QK scores
     Returns:
         output: [B, S_q, H_q, D]
     """
@@ -132,9 +134,8 @@ def _numpy_attention(q: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray,
     # q: [B, S_q, H_q, D] -> [B, H_q, S_q, D]
     q_t = q.transpose(0, 2, 1, 3)
 
-    scale = 1.0 / np.sqrt(D)
-    scores = np.matmul(q_t, k.transpose(0, 1, 3,
-                                        2)) * scale  # [B, H_q, S_q, kv_len]
+    scores = np.matmul(q_t, k.transpose(
+        0, 1, 3, 2)) * attention_scale  # [B, H_q, S_q, kv_len]
 
     # Causal mask
     for sq in range(S_q):
@@ -150,7 +151,9 @@ def _numpy_attention(q: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray,
     return out
 
 
-def _build_attention_engine(logger, params: SharedKVTestParams):
+def _build_attention_engine(logger,
+                            params: SharedKVTestParams,
+                            attention_scale: Optional[float] = None):
     """Build a TRT engine with the AttentionPlugin.
 
     Shared-KV mode is detected at runtime by passing K/V with seq_len=0.
@@ -202,6 +205,11 @@ def _build_attention_engine(logger, params: SharedKVTestParams):
         trt.PluginField("sliding_window_size", np.array([-1], dtype=np.int32),
                         trt.PluginFieldType.INT32),
     ]
+    if attention_scale is not None:
+        plugin_fields.append(
+            trt.PluginField("attention_scale",
+                            np.array([attention_scale], dtype=np.float32),
+                            trt.PluginFieldType.FLOAT32))
 
     plugin_field_collection = trt.PluginFieldCollection(plugin_fields)
     plugin = plugin_creator.create_plugin("attention", plugin_field_collection,
@@ -282,12 +290,9 @@ class TestSharedKVAttention:
         self.logger = trt.Logger(trt.Logger.WARNING)
         self.device = torch.device("cuda:0")
 
-        try:
-            plugin_path = _find_plugin_library()
-            ctypes.CDLL(plugin_path)
-            trt.init_libnvinfer_plugins(self.logger, "")
-        except Exception as e:
-            pytest.skip(f"Plugin library not available: {e}")
+        plugin_path = _find_plugin_library()
+        ctypes.CDLL(plugin_path)
+        trt.init_libnvinfer_plugins(self.logger, "")
 
     def _to_gpu(self, arr: np.ndarray) -> torch.Tensor:
         """Move numpy array to GPU as a contiguous torch tensor."""
@@ -296,7 +301,8 @@ class TestSharedKVAttention:
     def _run_donor_then_shared(self,
                                donor_seq_len: int,
                                shared_seq_len: int,
-                               is_decode: bool = False):
+                               is_decode: bool = False,
+                               attention_scale: Optional[float] = None):
         """Run donor layer (populates KV cache), then shared layer (reads it).
 
         Returns:
@@ -304,6 +310,8 @@ class TestSharedKVAttention:
              numpy_reference_output)
         """
         p = self.params
+        expected_scale = (attention_scale if attention_scale is not None else
+                          p.head_size**-0.5)
         B = p.batch_size
         D = p.head_size
         H_q = p.num_q_heads
@@ -323,7 +331,8 @@ class TestSharedKVAttention:
         d_rope = self._to_gpu(rope_cos_sin_np)
 
         # --- Step 1: Donor layer fills KV cache (K/V have normal seq_len) ---
-        donor_engine, donor_ctx = _build_attention_engine(self.logger, p)
+        donor_engine, donor_ctx = _build_attention_engine(
+            self.logger, p, attention_scale)
 
         donor_q_np = self.rng.standard_normal(
             (B, donor_seq_len, H_q * D)).astype(np.float16)
@@ -383,7 +392,8 @@ class TestSharedKVAttention:
         kv_cache_after_donor = d_kv_cache.cpu().numpy().copy()
 
         # --- Step 2: Shared layer reads donor's cache (K/V have seq_len=0) ---
-        shared_engine, shared_ctx = _build_attention_engine(self.logger, p)
+        shared_engine, shared_ctx = _build_attention_engine(
+            self.logger, p, attention_scale)
 
         shared_q_np = self.rng.standard_normal(
             (B, shared_seq_len, H_q * D)).astype(np.float16)
@@ -457,7 +467,8 @@ class TestSharedKVAttention:
 
         k_cache = kv_cache_after_donor[:, 0, :, :, :].astype(np.float32)
         v_cache = kv_cache_after_donor[:, 1, :, :, :].astype(np.float32)
-        np_ref = _numpy_attention(q_roped, k_cache, v_cache, total_ctx)
+        np_ref = _numpy_attention(q_roped, k_cache, v_cache, total_ctx,
+                                  expected_scale)
 
         return (shared_attn_out_np, kv_cache_before_shared,
                 kv_cache_after_shared, np_ref)
@@ -481,10 +492,12 @@ class TestSharedKVAttention:
             "Shared-KV plugin modified the KV cache (expected read-only)")
         print("PASS: KV cache unchanged after shared-KV layer")
 
-    def test_shared_kv_attention_correctness(self):
+    @pytest.mark.parametrize("attention_scale", [None, 1.0, 0.37],
+                             ids=["legacy-default", "identity", "custom"])
+    def test_shared_kv_attention_correctness(self, attention_scale):
         """Shared-KV layer output matches numpy reference (prefill)."""
         shared_out, _, _, np_ref = self._run_donor_then_shared(
-            donor_seq_len=4, shared_seq_len=4)
+            donor_seq_len=4, shared_seq_len=4, attention_scale=attention_scale)
 
         atol, rtol = 2e-2, 2e-2
         max_abs = np.abs(shared_out - np_ref).max()
@@ -505,10 +518,15 @@ class TestSharedKVAttention:
             err_msg="Shared-KV decode modified the KV cache")
         print("PASS: KV cache unchanged after shared-KV decode")
 
-    def test_shared_kv_decode_correctness(self):
+    @pytest.mark.parametrize("attention_scale", [None, 1.0, 0.37],
+                             ids=["legacy-default", "identity", "custom"])
+    def test_shared_kv_decode_correctness(self, attention_scale):
         """Shared-KV decode output matches numpy reference."""
         shared_out, _, _, np_ref = self._run_donor_then_shared(
-            donor_seq_len=4, shared_seq_len=1, is_decode=True)
+            donor_seq_len=4,
+            shared_seq_len=1,
+            is_decode=True,
+            attention_scale=attention_scale)
 
         atol, rtol = 2e-2, 2e-2
         max_abs = np.abs(shared_out - np_ref).max()

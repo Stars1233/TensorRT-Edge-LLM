@@ -26,6 +26,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 using namespace nvinfer1;
@@ -65,11 +66,12 @@ struct XQAKernelLoadHashKey
     XQADataType kv_data_type;
     int32_t sm;
     bool specDecode;
+    bool pagedKVCache;
 
     bool operator==(XQAKernelLoadHashKey const& other) const noexcept
     {
         return data_type == other.data_type && kv_data_type == other.kv_data_type && sm == other.sm
-            && specDecode == other.specDecode;
+            && specDecode == other.specDecode && pagedKVCache == other.pagedKVCache;
     }
 };
 
@@ -84,6 +86,8 @@ struct XQAKernelLoadHasher
         key ^= s.sm;
         key <<= 4;
         key ^= s.specDecode;
+        key <<= 4;
+        key ^= s.pagedKVCache;
         return key;
     }
 };
@@ -96,12 +100,13 @@ struct XQAKernelRuntimeHashKey
     int32_t num_q_heads_per_kv;
     int32_t beam_size;
     bool sliding_window;
+    int32_t tokens_per_page;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const noexcept
     {
         return q_data_type == other.q_data_type && kv_data_type == other.kv_data_type && head_size == other.head_size
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
-            && sliding_window == other.sliding_window;
+            && sliding_window == other.sliding_window && tokens_per_page == other.tokens_per_page;
     }
 };
 
@@ -110,7 +115,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQALaunchParams const& xq
     constexpr int32_t kBEAM_SIZE{1};
     int32_t numQHeadPerKV = xqaParams.numQheads / xqaParams.numKVheads;
     return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
-        numQHeadPerKV, kBEAM_SIZE, xqaParams.slidingWinSize > 0};
+        numQHeadPerKV, kBEAM_SIZE, xqaParams.slidingWinSize > 0, static_cast<int32_t>(xqaParams.kvCache.tokensPerPage)};
 }
 
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams const& xqaParams) noexcept
@@ -118,7 +123,7 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParamsSpecDecode(XQALaunchParams
     constexpr int32_t kBEAM_SIZE{1};
     constexpr int32_t kQHEAD_PER_KV = 0; // Tree attention kernel supports any ratio of Q/KV heads.
     return {trtToXqaDataType(xqaParams.dataType), trtToXqaDataType(xqaParams.kvDataType), xqaParams.headSize,
-        kQHEAD_PER_KV, kBEAM_SIZE, xqaParams.slidingWinSize > 0};
+        kQHEAD_PER_KV, kBEAM_SIZE, xqaParams.slidingWinSize > 0, static_cast<int32_t>(xqaParams.kvCache.tokensPerPage)};
 }
 
 struct XQAKernelRuntimeHasher
@@ -136,6 +141,8 @@ struct XQAKernelRuntimeHasher
         key ^= s.beam_size;
         key <<= 4;
         key ^= s.sliding_window;
+        key <<= 8;
+        key ^= s.tokens_per_page;
         return key;
     }
 };
@@ -159,6 +166,57 @@ struct XQADeviceCapability
     bool mSupportsClusterLaunch{false};
     bool mSupportsDistributedSharedMemory{false};
 };
+
+struct KernelContiguousKVCache
+{
+    void* data{nullptr};
+    int32_t const* sequenceLengths{nullptr};
+    uint32_t capacity{0};
+};
+
+struct KernelPagedKVCache
+{
+    void* data{nullptr};
+    int32_t const* pageList{nullptr};
+    int32_t const* sequenceLengths{nullptr};
+    uint32_t maxNbPagesPerSeq{0};
+};
+
+using KernelKVCacheArg = std::variant<KernelContiguousKVCache, KernelPagedKVCache>;
+
+bool usePagedKVCache(XQALaunchParams::KVCache const& kvCache) noexcept
+{
+    return kvCache.tokensPerPage != 0;
+}
+
+bool isPowerOfTwo(uint32_t value) noexcept
+{
+    return value > 0U && (value & (value - 1U)) == 0U;
+}
+
+uint32_t getMaxNbPagesPerSeq(XQALaunchParams::KVCache const& kvCache)
+{
+    check::check(kvCache.tokensPerPage > 0, "Paged KV cache requires non-zero tokensPerPage.");
+    check::check(isPowerOfTwo(kvCache.tokensPerPage), "Paged KV cache tokensPerPage must be a power of 2.");
+    check::check(
+        kvCache.capacity % kvCache.tokensPerPage == 0U, "Paged KV cache capacity must be divisible by tokensPerPage.");
+    return kvCache.capacity / kvCache.tokensPerPage;
+}
+
+KernelKVCacheArg makeKernelKVCacheArg(XQALaunchParams::KVCache const& kvCache, bool usePaged)
+{
+    if (!usePaged)
+    {
+        return KernelContiguousKVCache{kvCache.data, kvCache.sequence_lengths, kvCache.capacity};
+    }
+
+    return KernelPagedKVCache{kvCache.data, kvCache.pageList, kvCache.sequence_lengths, getMaxNbPagesPerSeq(kvCache)};
+}
+
+void* getKernelKVCacheArg(KernelKVCacheArg& kvCacheArg)
+{
+    return std::visit([](auto& kernelKVCache) -> void* { return &kernelKVCache; }, kvCacheArg);
+}
 
 XQADeviceCapability getDeviceCapability()
 {
@@ -255,7 +313,8 @@ void launch2CtaHeadDim512ClusterKernel(XQAKernelFuncInfo const& kernelInfo, dim3
 }
 #endif // SUPPORTS_CLUSTER_LAUNCH
 
-bool hasHeadDim512KernelsForSM(int32_t smVersion, XQADataType kvDataType) noexcept
+bool hasHeadDim512KernelsForSM(
+    int32_t smVersion, XQADataType kvDataType, int32_t headRatio, bool usePagedKVCache) noexcept
 {
     bool hasDecodeKernel{false};
     bool hasSpecDecodeKernel{false};
@@ -263,15 +322,17 @@ bool hasHeadDim512KernelsForSM(int32_t smVersion, XQADataType kvDataType) noexce
     {
         if (kernelMeta.mSM != static_cast<unsigned int>(smVersion)
             || kernelMeta.mDataType != XQADataType::DATA_TYPE_FP16 || kernelMeta.mKVDataType != kvDataType
-            || kernelMeta.mHeadDim != kHEAD_DIM_512 || !isKernelSupportedByBuild(kernelMeta))
+            || kernelMeta.mHeadDim != kHEAD_DIM_512 || kernelMeta.mPagedKVCache != usePagedKVCache
+            || !isKernelSupportedByBuild(kernelMeta))
         {
             continue;
         }
         if (kernelMeta.mMultiQueryTokens)
         {
+            // Spec-decode tree attention kernels support any Q/KV head ratio.
             hasSpecDecodeKernel = true;
         }
-        else
+        else if (kernelMeta.mNumQHeadsOverKV == static_cast<unsigned int>(headRatio))
         {
             hasDecodeKernel = true;
         }
@@ -284,11 +345,13 @@ class XQAKernelList
     using TKernelMetaInfo = xqa::kernels::XQAKernelMetaInfo;
 
 public:
-    XQAKernelList(XQADataType dataType, XQADataType kvDataType, uint32_t sm, bool specDecode) noexcept
+    XQAKernelList(
+        XQADataType dataType, XQADataType kvDataType, uint32_t sm, bool specDecode, bool pagedKVCache) noexcept
         : mKernelMeta(nullptr)
         , mKernelMetaCount(0)
         , mSMVersion(sm)
         , mSpecDecode(specDecode)
+        , mPagedKVCache(pagedKVCache)
         , mDataType(dataType)
         , mKVDataType(kvDataType)
     {
@@ -313,7 +376,7 @@ public:
                 continue;
             }
             // Filter out kernel that irrelevant to this project.
-            if (kernelMeta.mPagedKVCache == true || kernelMeta.mBeamWidth != 1)
+            if (kernelMeta.mPagedKVCache != mPagedKVCache || kernelMeta.mBeamWidth != 1)
             {
                 continue;
             }
@@ -370,7 +433,8 @@ public:
             }
             XQAKernelRuntimeHashKey hashKey{kernelMeta.mDataType, kernelMeta.mKVDataType,
                 static_cast<int32_t>(kernelMeta.mHeadDim), static_cast<int32_t>(kernelMeta.mNumQHeadsOverKV),
-                static_cast<int32_t>(kernelMeta.mBeamWidth), kernelMeta.mSlidingWindow};
+                static_cast<int32_t>(kernelMeta.mBeamWidth), kernelMeta.mSlidingWindow,
+                static_cast<int32_t>(kernelMeta.mTokensPerPage)};
             mFunctions[hashKey].push_back(funcInfo);
         }
         mLoaded = true;
@@ -403,6 +467,7 @@ protected:
     int32_t mKernelMetaCount;
     uint32_t mSMVersion;
     bool mSpecDecode;
+    bool mPagedKVCache;
     XQADataType mDataType;
     XQADataType mKVDataType;
     bool mLoaded{false};
@@ -416,18 +481,19 @@ class XQAKernelLoader
 
 public:
     //! @throws std::runtime_error if a CUDA driver error occurs
-    XQAKernelList* getXQAKernelList(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
+    XQAKernelList* getXQAKernelList(
+        XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode, bool pagedKVCache)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
 
-        XQAKernelLoadHashKey hash_key{dataType, kvDataType, sm, specDecode};
+        XQAKernelLoadHashKey hash_key{dataType, kvDataType, sm, specDecode, pagedKVCache};
 
         auto findIter = mKernels.find(hash_key);
         if (findIter == mKernels.end())
         {
             std::unique_ptr<XQAKernelList> newKernel
-                = std::make_unique<XQAKernelList>(dataType, kvDataType, sm, specDecode);
+                = std::make_unique<XQAKernelList>(dataType, kvDataType, sm, specDecode, pagedKVCache);
             newKernel->loadXQAKernels();
             mKernels.insert(std::make_pair(hash_key, std::move(newKernel)));
             findIter = mKernels.find(hash_key);
@@ -448,9 +514,10 @@ private:
 };
 
 //! @throws std::runtime_error if a CUDA driver error occurs
-inline XQAKernelList* getXQAKernels(XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode)
+inline XQAKernelList* getXQAKernels(
+    XQADataType dataType, XQADataType kvDataType, int32_t sm, bool specDecode, bool pagedKVCache)
 {
-    return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode);
+    return XQAKernelLoader::Get().getXQAKernelList(dataType, kvDataType, sm, specDecode, pagedKVCache);
 }
 
 } // namespace
@@ -482,11 +549,12 @@ XQALaunchParams DecoderXQARunner::initXQAParams() noexcept
 }
 
 bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32_t headSize, int32_t smVersion,
-    DataType dataType, DataType kvDataType) noexcept
+    DataType dataType, DataType kvDataType, bool usePagedKVCache) noexcept
 {
     bool const checkHeadNumbers = numQHeads % numKVHeads == 0;
     bool const checkType = dataType == DataType::kHALF;
-    bool const checkKVType = kvDataType == DataType::kHALF || kvDataType == DataType::kFP8;
+    // FP8 XQA cubins exist only for FP8-capable devices (sm89+).
+    bool const checkKVType = kvDataType == DataType::kHALF || (kvDataType == DataType::kFP8 && smVersion >= 89);
     std::vector<int32_t> allowedSMVersions{80, 86, 87, 89, 100, 101, 120, 121};
     bool const checkSMVersion
         = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
@@ -497,27 +565,32 @@ bool DecoderXQARunner::canImplement(int32_t numQHeads, int32_t numKVHeads, int32
     // (3) Head ratio 2, 4, 6, 8 for head_dim 256
     //     (4/6/8 for Qwen3.5-MoE / Qwen3.5-Omni Thinker+Talker;
     //      2 for Qwen3.5-Omni Talker decode attention — 16 Q heads / 8 KV heads).
-    // (4) Head ratio 4, 8 for head_dim 512 where matching cubins are present.
-    //     (4 for Gemma4 E4B: 8 Q heads / 2 KV heads;
-    //      8 for Gemma4 E2B: 8 Q heads / 1 KV head).
+    // (4) Head ratio 2, 4, 8, 16 for head_dim 512 where matching cubins are present.
+    //     (2 for Gemma4 E4B assistant: 4 Q heads / 2 KV heads;
+    //      4 for Gemma4 E4B: 8 Q heads / 2 KV heads;
+    //      8 for Gemma4 E2B: 8 Q heads / 1 KV head;
+    //      16 for Gemma4 Unified 12B global attention: 16 Q heads / 1 KV head,
+    //      generated for SM100/SM120-family only).
     int32_t const headRatio = numQHeads / numKVHeads;
     XQADataType const xqaKVDataType
         = kvDataType == DataType::kFP8 ? XQADataType::DATA_TYPE_E4M3 : XQADataType::DATA_TYPE_FP16;
-    bool const checkHeadDim512SM = hasHeadDim512KernelsForSM(smVersion, xqaKVDataType);
+    bool const checkHeadDim512SM
+        = headSize == 512 && hasHeadDim512KernelsForSM(smVersion, xqaKVDataType, headRatio, usePagedKVCache);
     bool const checkQHeadPerKV
         = ((headSize == 32 || headSize == 64 || headSize == 128) && headRatio >= 1 && headRatio <= 8)
         || (headSize == 128 && headRatio == 16)
         || (headSize == 256 && (headRatio == 2 || headRatio == 4 || headRatio == 6 || headRatio == 8))
-        || (headSize == 512 && checkHeadDim512SM && (headRatio == 4 || headRatio == 8));
+        || (headSize == 512 && checkHeadDim512SM
+            && (headRatio == 2 || headRatio == 4 || headRatio == 8 || headRatio == 16));
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }
 
 bool DecoderXQARunner::loadDecodeXQAKernels(
-    int32_t smVersion, DataType dataType, DataType kvDataType, bool useSpecDecodeKernels)
+    int32_t smVersion, DataType dataType, DataType kvDataType, bool useSpecDecodeKernels, bool usePagedKVCache)
 {
-    XQAKernelList* xqaKernelList
-        = getXQAKernels(trtToXqaDataType(dataType), trtToXqaDataType(kvDataType), smVersion, useSpecDecodeKernels);
+    XQAKernelList* xqaKernelList = getXQAKernels(
+        trtToXqaDataType(dataType), trtToXqaDataType(kvDataType), smVersion, useSpecDecodeKernels, usePagedKVCache);
     return xqaKernelList != nullptr && xqaKernelList->hasKernels();
 }
 
@@ -525,21 +598,26 @@ void DecoderXQARunner::dispatchXQAKernel(XQALaunchParams& params, cudaStream_t c
 {
     // Check all device pointers are valid.
     check::check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
-            && params.kvCache.sequence_lengths != nullptr,
+            && params.kvCache.sequence_lengths != nullptr
+            && (!usePagedKVCache(params.kvCache) || params.kvCache.pageList != nullptr),
         "Invalid device pointer passed to kernel dispatch function");
 
     constexpr bool useSpecDecode = false;
+    bool const usePagedKV = usePagedKVCache(params.kvCache);
     auto hashKey = getRuntimeHashKeyFromXQAParams(params);
-    XQAKernelList* xqaKernelList
-        = getXQAKernels(trtToXqaDataType(mDataType), trtToXqaDataType(mKVDataType), mSmVersion, useSpecDecode);
+    XQAKernelList* xqaKernelList = getXQAKernels(
+        trtToXqaDataType(mDataType), trtToXqaDataType(mKVDataType), mSmVersion, useSpecDecode, usePagedKV);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the GQA");
 
+    KernelKVCacheArg kernelKVCacheArg = makeKernelKVCacheArg(params.kvCache, usePagedKV);
+    void* const kvCacheArg = getKernelKVCacheArg(kernelKVCacheArg);
+
     void* kernelParamsNoSliding[]
-        = {&params.numKVheads, &params.qScale, &params.output, &params.qInputPtr, &params.attentionSinks,
-            &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
-    void* kernelParamsSliding[] = {&params.numKVheads, &params.slidingWinSize, &params.qScale, &params.output,
-        &params.qInputPtr, &params.attentionSinks, &params.kvCache, &params.batchSize, &params.kScale, &params.vScale,
+        = {&params.numKVheads, &params.attentionScale, &params.output, &params.qInputPtr, &params.attentionSinks,
+            kvCacheArg, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+    void* kernelParamsSliding[] = {&params.numKVheads, &params.slidingWinSize, &params.attentionScale, &params.output,
+        &params.qInputPtr, &params.attentionSinks, kvCacheArg, &params.batchSize, &params.kScale, &params.vScale,
         &params.semaphores, &params.scratch};
     void** kernelParams = kernelInfo.mSlidingWindow ? kernelParamsSliding : kernelParamsNoSliding;
 
@@ -568,23 +646,28 @@ void DecoderXQARunner::dispatchSpecDecodeXQAKernel(XQALaunchParams& params, cuda
 {
     // Check all device pointers are valid.
     check::check(params.output != nullptr && params.qInputPtr != nullptr && params.kvCache.data != nullptr
-            && params.kvCache.sequence_lengths != nullptr && params.treeAttnMask != nullptr,
+            && params.kvCache.sequence_lengths != nullptr && params.treeAttnMask != nullptr
+            && (!usePagedKVCache(params.kvCache) || params.kvCache.pageList != nullptr),
         "Invalid device pointer passed to kernel dispatch function");
 
     constexpr bool useSpecDecode = true;
+    bool const usePagedKV = usePagedKVCache(params.kvCache);
     auto hashKey = getRuntimeHashKeyFromXQAParamsSpecDecode(params);
-    XQAKernelList* xqaKernelList
-        = getXQAKernels(trtToXqaDataType(mDataType), trtToXqaDataType(mKVDataType), mSmVersion, useSpecDecode);
+    XQAKernelList* xqaKernelList = getXQAKernels(
+        trtToXqaDataType(mDataType), trtToXqaDataType(mKVDataType), mSmVersion, useSpecDecode, usePagedKV);
     XQAKernelFuncInfo kernelInfo = xqaKernelList->findKernelFunction(hashKey);
     check::check(kernelInfo.mSharedMemBytes != 0, "No available kernel available for the Spec-DecodeGQA");
 
+    KernelKVCacheArg kernelKVCacheArg = makeKernelKVCacheArg(params.kvCache, usePagedKV);
+    void* const kvCacheArg = getKernelKVCacheArg(kernelKVCacheArg);
+
     void* kernelParamsNoSliding[] = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen,
-        &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
-        &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+        &params.attentionScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
+        kvCacheArg, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
     void* kernelParamsSliding[]
         = {&params.qSeqLen, &params.numKVheads, &params.headGroupSize, &params.qCuSeqLen, &params.slidingWinSize,
-            &params.qScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
-            &params.kvCache, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
+            &params.attentionScale, &params.output, &params.qInputPtr, &params.treeAttnMask, &params.attentionSinks,
+            kvCacheArg, &params.batchSize, &params.kScale, &params.vScale, &params.semaphores, &params.scratch};
     void** kernelParams = kernelInfo.mSlidingWindow ? kernelParamsSliding : kernelParamsNoSliding;
     int32_t const ctaTileY = static_cast<int32_t>(kernelInfo.mMTileSize);
     check::check(ctaTileY > 0, format::fmtstr("Invalid spec-decode ctaTileY %d in XQA kernel metadata.", ctaTileY));

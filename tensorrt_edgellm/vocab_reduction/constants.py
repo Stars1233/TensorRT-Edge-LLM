@@ -16,3 +16,7 @@
 
 VOCAB_MAP_NAME = "vocab_map.safetensors"
 VOCAB_INFO_NAME = "reduced_vocab.json"
+
+# Draft-model reduced-vocab artifacts (separate names to avoid collision with base model)
+DRAFT_VOCAB_MAP_NAME = "draft_vocab_map.safetensors"
+DRAFT_VOCAB_INFO_NAME = "draft_reduced_vocab.json"

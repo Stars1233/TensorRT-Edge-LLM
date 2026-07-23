@@ -1879,15 +1879,38 @@ class MoEDecodeKernel:
                                     if cutlass.const_expr(self.is_gated):
                                         g = alpha_value * gate_slice[elem_idx]
                                         u = alpha_value * up_slice[elem_idx]
-                                        sigmoid_g = cute.arch.rcp_approx(
-                                            cutlass.Float32(1.0)
-                                            + cute.math.exp(
-                                                -g, fastmath=self.fast_math
-                                            ),
-                                        )
-                                        tRS_rD_slice[elem_idx] = (
-                                            g * sigmoid_g * u
-                                        )
+                                        if cutlass.const_expr(self.activation == "geglu"):
+                                            tRS_rD_slice[elem_idx] = (
+                                                cutlass.Float32(0.5)
+                                                * g
+                                                * (
+                                                    cutlass.Float32(1.0)
+                                                    + cute.math.tanh(
+                                                        cutlass.Float32(0.7978845608)
+                                                        * (
+                                                            g
+                                                            + cutlass.Float32(
+                                                                0.044715
+                                                            )
+                                                            * g
+                                                            * g
+                                                            * g
+                                                        ),
+                                                        fastmath=self.fast_math,
+                                                    )
+                                                )
+                                                * u
+                                            )
+                                        else:
+                                            sigmoid_g = cute.arch.rcp_approx(
+                                                cutlass.Float32(1.0)
+                                                + cute.math.exp(
+                                                    -g, fastmath=self.fast_math
+                                                ),
+                                            )
+                                            tRS_rD_slice[elem_idx] = (
+                                                g * sigmoid_g * u
+                                            )
                                     elif self.activation == "identity":
                                         tRS_rD_slice[elem_idx] = (
                                             alpha_value * gate_slice[elem_idx]

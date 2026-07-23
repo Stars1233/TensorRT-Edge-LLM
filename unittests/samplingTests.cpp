@@ -293,6 +293,65 @@ TEST_F(SamplingTest, ShouldUseNonGreedySampling)
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 0.95f));
 }
 
+TEST_F(SamplingTest, ApplyLogitBiasAffectsGreedySamplingPerBatch)
+{
+    constexpr int32_t kBATCH_SIZE = 2;
+    constexpr int32_t kVOCAB_SIZE = 6;
+    rt::Tensor logitsTensor({kBATCH_SIZE, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logitsTensor, {5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
+
+    rt::Tensor biasTokenIds({2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor biasValues({2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor biasOffsets({kBATCH_SIZE + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(biasTokenIds, {3, 0});
+    copyHostToDevice<float>(biasValues, {4.5f, 10.0f});
+    copyHostToDevice<int32_t>(biasOffsets, {0, 1, 2});
+
+    applyLogitBias(logitsTensor, biasTokenIds, biasValues, biasOffsets, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    rt::Tensor selectedIndicesTensor({kBATCH_SIZE, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    size_t workspaceSize = getSelectAllTopKWorkspaceSize(kBATCH_SIZE, kVOCAB_SIZE, 1);
+    rt::Tensor workspaceTensor({static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+
+    selectAllTopK(logitsTensor, std::nullopt, selectedIndicesTensor, 1, workspaceTensor, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const gpuResults = copyDeviceToHost<int32_t>(selectedIndicesTensor);
+    ASSERT_EQ(gpuResults.size(), 2U);
+    EXPECT_EQ(gpuResults[0], 3);
+    EXPECT_EQ(gpuResults[1], 0);
+}
+
+TEST_F(SamplingTest, ApplyLogitBiasCanBanGreedyTopToken)
+{
+    constexpr int32_t kBATCH_SIZE = 1;
+    constexpr int32_t kVOCAB_SIZE = 4;
+    rt::Tensor logitsTensor({kBATCH_SIZE, kVOCAB_SIZE}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logitsTensor, {10.0f, 9.0f, 8.0f, 7.0f});
+
+    rt::Tensor biasTokenIds({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor biasValues({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor biasOffsets({kBATCH_SIZE + 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(biasTokenIds, {0});
+    copyHostToDevice<float>(biasValues, {-100.0f});
+    copyHostToDevice<int32_t>(biasOffsets, {0, 1});
+
+    applyLogitBias(logitsTensor, biasTokenIds, biasValues, biasOffsets, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    rt::Tensor selectedIndicesTensor({kBATCH_SIZE, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    size_t workspaceSize = getSelectAllTopKWorkspaceSize(kBATCH_SIZE, kVOCAB_SIZE, 1);
+    rt::Tensor workspaceTensor({static_cast<int64_t>(workspaceSize)}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+
+    selectAllTopK(logitsTensor, std::nullopt, selectedIndicesTensor, 1, workspaceTensor, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const gpuResults = copyDeviceToHost<int32_t>(selectedIndicesTensor);
+    ASSERT_EQ(gpuResults.size(), 1U);
+    EXPECT_EQ(gpuResults[0], 1);
+}
+
 // Unified sampling tests (accuracy only)
 class SamplingTestSuites : public SamplingTest
 {

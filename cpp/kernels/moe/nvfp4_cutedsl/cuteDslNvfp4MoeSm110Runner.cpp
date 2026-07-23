@@ -38,6 +38,7 @@ namespace trt_edgellm
 
 nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC1Relu2N128 = {};
 nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC1SwiGLUN128 = {};
+nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC1GeGLUN128 = {};
 nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC2N128Fp16 = {};
 bool CuteDslNvfp4MoeSm110Runner::sLoaded = false;
 std::mutex CuteDslNvfp4MoeSm110Runner::sLoadMutex;
@@ -46,6 +47,7 @@ namespace
 {
 constexpr int32_t kACT_SWIGLU{2};
 constexpr int32_t kACT_RELU2{4};
+constexpr int32_t kACT_GEGLU{5};
 constexpr int32_t kIODT_FP16{1};
 constexpr size_t kDeviceAlignment{256};
 
@@ -96,7 +98,7 @@ Sm110WorkspaceLayout buildWorkspaceLayout(int32_t numTokens, int32_t routedRows,
     int64_t const routedRowsForCap = std::max<int64_t>(1, routedRows);
     L.permutedM = static_cast<int32_t>(maxPermutedRows(routedRowsForCap, numExperts));
     L.numTileEntries = std::max(1, L.permutedM / CuteDslNvfp4MoeSm110Runner::kRowTileAlign);
-    L.fc1InputN = activationType == kACT_SWIGLU ? 2 * moeInterSize : moeInterSize;
+    L.fc1InputN = (activationType == kACT_SWIGLU || activationType == kACT_GEGLU) ? 2 * moeInterSize : moeInterSize;
     L.paddedSfColsH = static_cast<int32_t>(padUp64(hiddenSize / CuteDslNvfp4MoeSm110Runner::kNvfp4SfVecSize, 4));
     L.paddedSfColsI = static_cast<int32_t>(padUp64(moeInterSize / CuteDslNvfp4MoeSm110Runner::kNvfp4SfVecSize, 4));
 
@@ -145,7 +147,7 @@ bool CuteDslNvfp4MoeSm110Runner::canImplement(int32_t hiddenSize, int32_t moeInt
     {
         return false;
     }
-    if (activationType != kACT_SWIGLU && activationType != kACT_RELU2)
+    if (activationType != kACT_SWIGLU && activationType != kACT_RELU2 && activationType != kACT_GEGLU)
     {
         return false;
     }
@@ -159,7 +161,8 @@ bool CuteDslNvfp4MoeSm110Runner::canImplement(int32_t hiddenSize, int32_t moeInt
     {
         return false;
     }
-    int32_t const fc1InputN = activationType == kACT_SWIGLU ? 2 * moeInterSize : moeInterSize;
+    int32_t const fc1InputN
+        = (activationType == kACT_SWIGLU || activationType == kACT_GEGLU) ? 2 * moeInterSize : moeInterSize;
     if (moeInterSize <= 0 || moeInterSize % 64 != 0 || fc1InputN % kLevelTileN != 0)
     {
         return false;
@@ -187,6 +190,7 @@ bool CuteDslNvfp4MoeSm110Runner::loadKernelModules()
     {
         nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_Load(&sFC1Relu2N128);
         nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Load(&sFC1SwiGLUN128);
+        nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_Load(&sFC1GeGLUN128);
         nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Load(&sFC2N128Fp16);
         sLoaded = true;
         LOG_DEBUG("CuTe DSL SM100/101/110 NVFP4 MoE modules loaded (FC1 relu2/swiglu n128 + FC2 n128 fp16)");
@@ -208,6 +212,7 @@ void CuteDslNvfp4MoeSm110Runner::unloadKernelModules()
     }
     nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_Unload(&sFC1Relu2N128);
     nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Unload(&sFC1SwiGLUN128);
+    nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_Unload(&sFC1GeGLUN128);
     nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Unload(&sFC2N128Fp16);
     sLoaded = false;
 }
@@ -296,7 +301,6 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
     int64_t const m = L.permutedM;
     int64_t const n1 = L.fc1InputN;
     int64_t const h = params.hiddenSize;
-    // Runtime expert count (L); the AOT cubins are polymorphic in this dim.
     int64_t const e = params.numExperts;
 
     if (params.activationType == kACT_RELU2)
@@ -311,6 +315,15 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
     else if (params.activationType == kACT_SWIGLU)
     {
         ret = cute_dsl_nvfp4_moe_sm110_fc1_swiglu_n128_wrapper(&sFC1SwiGLUN128, inputFP4,
+            const_cast<void*>(params.fc1QWeights), inputSF, const_cast<void*>(params.fc1BlocksScale), fc1FP4, fc1SF,
+            const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
+            const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
+            const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
+            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+    }
+    else if (params.activationType == kACT_GEGLU)
+    {
+        ret = cute_dsl_nvfp4_moe_sm110_fc1_geglu_n128_wrapper(&sFC1GeGLUN128, inputFP4,
             const_cast<void*>(params.fc1QWeights), inputSF, const_cast<void*>(params.fc1BlocksScale), fc1FP4, fc1SF,
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),

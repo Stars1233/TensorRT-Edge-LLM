@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -110,7 +111,7 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
@@ -131,6 +132,27 @@ bool hasInputBinding(nvinfer1::INetworkDefinition const& network, char const* in
     return false;
 }
 
+std::optional<int64_t> getStaticInputDim(
+    nvinfer1::INetworkDefinition const& network, char const* inputName, int32_t axis)
+{
+    std::string_view const target{inputName};
+    for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
+    {
+        auto const* input = network.getInput(idx);
+        if (std::string_view{input->getName()} != target)
+        {
+            continue;
+        }
+        nvinfer1::Dims const dims = input->getDimensions();
+        if (axis >= dims.nbDims || dims.d[axis] <= 0)
+        {
+            return std::nullopt;
+        }
+        return dims.d[axis];
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 LLMBuilder::LLMBuilder(
@@ -143,7 +165,10 @@ LLMBuilder::LLMBuilder(
 
 bool LLMBuilder::build()
 {
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
+    std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
+        + std::to_string(NV_TENSORRT_PATCH);
+    LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
+#if NV_TENSORRT_MAJOR >= 11 || NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
     std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
     if (!lunowudFlags.empty())
     {
@@ -251,8 +276,8 @@ bool LLMBuilder::build()
     mNumDeepstackFeatures = 0;
     for (int32_t idx = 0; idx < network->getNbInputs(); idx++)
     {
-        std::string const inputName = network->getInput(idx)->getName();
-        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos)
+        std::string_view const inputName = network->getInput(idx)->getName();
+        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string_view::npos)
         {
             mNumDeepstackFeatures++;
         }
@@ -312,7 +337,8 @@ bool LLMBuilder::parseConfig()
     std::string const role = engineRole(mModelConfig);
     if (!isValidSpecDecodeType(specType))
     {
-        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash.", specType.c_str());
+        LOG_ERROR(
+            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, gemma4_mtp.", specType.c_str());
         return false;
     }
     if (!isValidEngineRole(role))
@@ -344,7 +370,8 @@ bool LLMBuilder::parseConfig()
     {
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
-    else if (isSpecDecodeDraft(mModelConfig, "dflash") && mModelConfig.contains("base_model_hidden_size"))
+    else if ((isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+        && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
     }
@@ -456,12 +483,6 @@ bool LLMBuilder::parseConfig()
             globalHeadSize);
     }
 
-    // Read trt_native_ops flag from config if present
-    if (mModelConfig.contains("trt_native_ops"))
-    {
-        mBuilderConfig.useTrtNativeOps = mModelConfig["trt_native_ops"].get<bool>();
-    }
-
     return true;
 }
 
@@ -488,6 +509,21 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         return true;
     }
 
+    if (isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+    {
+        result &= setupGemma4MTPDraftProfiles(*contextProfile, *generationProfile, network);
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup Gemma4 MTP draft optimization profiles");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
+        LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+        config.addOptimizationProfile(contextProfile);
+        config.addOptimizationProfile(generationProfile);
+        return true;
+    }
+
     // Setup common profiles
     result &= setupCommonProfiles(*contextProfile, *generationProfile);
     result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
@@ -502,11 +538,12 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
     }
 
-    // Setup intermediate state profiles for MTP base models
+    // Setup hybrid state profiles for MTP/DFlash base models.
     if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
+        result &= setupLinearAttentionSpecVerifyProfiles(*contextProfile, *generationProfile, network);
     }
 
     // Setup Gemma4 PLE profiles when ple_token_embeds_* inputs are present.
@@ -618,6 +655,16 @@ bool LLMBuilder::setupVanillaProfiles(
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, 1, mHiddenSize}));
 
+    if (mModelConfig.value("use_vision_bidirectional_attention", false))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+        // Decode ignores block IDs, but the static engine binding remains present.
+        result &= setOptimizationProfile(&generationProfile, binding_names::kVisionBlockIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    }
+
     // Last token IDs
     result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
@@ -630,29 +677,6 @@ bool LLMBuilder::setupVanillaProfiles(
 bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
-    // TRT-native-ops + speculative decoding is a partially-wired path: the Python export
-    // emits a 4D bool `attention_mask` [batch, 1, seq_len, seq_len + past_len]
-    // (see `llm_model_trtnative.py` with `is_eagle_base=True`), and only the
-    // `prepareEagleBaseTreeDecodingInputsTrtNative` kernel exists
-    // (`cpp/kernels/speculative/eagleUtilKernels.{h,cu}`). However the
-    // builder's speculative profile setup below and the runtime dispatch in
-    // spec-decode runtime paths
-    // hardcode the plugin-path 3D packed-INT32 mask layout. Attempting to
-    // build this combination produces a cryptic TRT error:
-    //
-    //   "Dynamic-shaped input tensor attention_mask has 4 dimensions but
-    //    profile 0 has 3 dimensions"
-    //
-    // Fail fast with an actionable message until the full TRT-native + spec-decode
-    // path (builder profile + registry + runtime dispatch) is completed.
-    if (mBuilderConfig.useTrtNativeOps && (mBuilderConfig.specBase || mBuilderConfig.specDraft))
-    {
-        LOG_ERROR(
-            "TRT-native-ops + speculative decoding is not yet supported. "
-            "Re-export the engine ONNX with trt_native_ops=False (plugin attention path).");
-        return false;
-    }
-
     bool result = true;
 
     int const maxTokens = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
@@ -793,18 +817,77 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     return result;
 }
 
+bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+    int64_t const baseHiddenSize = mTargetModelOutputHiddenDim;
+
+    auto setupRopeProfile = [&](nvinfer1::IOptimizationProfile& profile, char const* bindingName, int64_t rotaryDim) {
+        return setOptimizationProfile(&profile, bindingName,
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity, rotaryDim}));
+    };
+
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile) {
+        bool ok = true;
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, baseHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}));
+        ok &= setOptimizationProfile(&profile, binding_names::kBaseModelHiddenStates,
+            createDims({1, 1, baseHiddenSize}), createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, 1, baseHiddenSize}));
+        ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+
+        if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinSliding, 2))
+        {
+            ok &= setupRopeProfile(profile, binding_names::kRopeCosSinSliding, *rotaryDim);
+        }
+        if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinFull, 2))
+        {
+            ok &= setupRopeProfile(profile, binding_names::kRopeCosSinFull, *rotaryDim);
+        }
+        if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSin, 2))
+        {
+            ok &= setupRopeProfile(profile, binding_names::kRopeCosSin, *rotaryDim);
+        }
+
+        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t const layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            nvinfer1::Dims const minKVCacheShape = createDims({1, 2, layerNumKVHeads, 1, layerHeadSize});
+            nvinfer1::Dims const optKVCacheShape = createDims(
+                {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+            nvinfer1::Dims const maxKVCacheShape = optKVCacheShape;
+            ok &= setOptimizationProfile(&profile, binding_names::formatKVCacheName(i, true).c_str(), minKVCacheShape,
+                optKVCacheShape, maxKVCacheShape);
+        }
+
+        return ok;
+    };
+
+    result &= setupOneProfile(contextProfile);
+    result &= setupOneProfile(generationProfile);
+    return result;
+}
+
 bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile,
     nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
     bool foundPleInput = false;
-    std::string const prefix = binding_names::kPleTokenEmbedsTemplate;
+    std::string_view const prefix = binding_names::kPleTokenEmbedsTemplate;
 
     for (int32_t idx = 0; idx < network.getNbInputs(); ++idx)
     {
         auto const* input = network.getInput(idx);
-        std::string const inputName = input->getName();
-        if (inputName.rfind(prefix, 0) != 0 || inputName.size() <= prefix.size() || inputName[prefix.size()] != '_')
+        char const* const inputName = input->getName();
+        std::string_view const inputNameView = inputName;
+        if (inputNameView.rfind(prefix, 0) != 0 || inputNameView.size() <= prefix.size()
+            || inputNameView[prefix.size()] != '_')
         {
             continue;
         }
@@ -813,14 +896,13 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         auto const inputDims = input->getDimensions();
         if (inputDims.nbDims != 3 || inputDims.d[2] <= 0)
         {
-            LOG_ERROR("PLE input %s must be rank-3 [batch, seq_len, hidden] with static hidden dimension.",
-                inputName.c_str());
+            LOG_ERROR("PLE input %s must be rank-3 [batch, seq_len, hidden] with static hidden dimension.", inputName);
             result = false;
             continue;
         }
 
         int64_t const pleHiddenSize = inputDims.d[2];
-        result &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+        result &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1, pleHiddenSize}),
             createDims(
                 {mBuilderConfig.maxBatchSize, std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2), pleHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, pleHiddenSize}));
@@ -829,13 +911,13 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         {
             int64_t const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
-            result &= setOptimizationProfile(&generationProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+            result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTokens / 2), pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, pleHiddenSize}));
         }
         else
         {
-            result &= setOptimizationProfile(&generationProfile, inputName.c_str(), createDims({1, 1, pleHiddenSize}),
+            result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, 1, pleHiddenSize}));
         }
@@ -861,10 +943,10 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
     std::vector<std::string> deepstackInputs;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
-        std::string const inputName = network.getInput(idx)->getName();
-        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string::npos)
+        std::string_view const inputName = network.getInput(idx)->getName();
+        if (inputName.find(binding_names::kDeepstackEmbedsTemplate) != std::string_view::npos)
         {
-            deepstackInputs.push_back(inputName);
+            deepstackInputs.emplace_back(inputName);
         }
     }
 
@@ -920,7 +1002,7 @@ bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& conte
     bool hasLmHeadWeight = false;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
-        std::string const inputName = network.getInput(idx)->getName();
+        std::string_view const inputName = network.getInput(idx)->getName();
         if (inputName == binding_names::kLmHeadWeight)
         {
             hasLmHeadWeight = true;
@@ -973,9 +1055,10 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
     for (int i = 0; i < network.getNbInputs(); ++i)
     {
         auto* input = network.getInput(i);
-        std::string const inputName = input->getName();
+        char const* const inputName = input->getName();
+        std::string_view const inputNameView = inputName;
 
-        if (inputName.find(binding_names::kLoraAPrefix) != std::string::npos)
+        if (inputNameView.find(binding_names::kLoraAPrefix) != std::string_view::npos)
         {
             if (!findLoraWeights)
             {
@@ -986,17 +1069,15 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
             if (dims.nbDims == 2)
             {
                 int64_t gemm_k = dims.d[0];
-                result
-                    &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({gemm_k, 0}), // min shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                              // opt shape
-                        createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                 // max shape
-                result &= setOptimizationProfile(&generationProfile, inputName.c_str(),
-                    createDims({gemm_k, 0}),                              // min shape
-                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}), // opt shape
-                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));    // max shape
+                result &= setOptimizationProfile(&contextProfile, inputName, createDims({gemm_k, 0}),    // min shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                                // opt shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                   // max shape
+                result &= setOptimizationProfile(&generationProfile, inputName, createDims({gemm_k, 0}), // min shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank / 2}),                                // opt shape
+                    createDims({gemm_k, mBuilderConfig.maxLoraRank}));                                   // max shape
             }
         }
-        else if (inputName.find(binding_names::kLoraBPrefix) != std::string::npos)
+        else if (inputNameView.find(binding_names::kLoraBPrefix) != std::string_view::npos)
         {
             if (!findLoraWeights)
             {
@@ -1007,14 +1088,12 @@ bool LLMBuilder::setupLoraProfiles(nvinfer1::IOptimizationProfile& contextProfil
             if (dims.nbDims == 2)
             {
                 int64_t gemm_n = dims.d[1];
-                result
-                    &= setOptimizationProfile(&contextProfile, inputName.c_str(), createDims({0, gemm_n}), // min shape
-                        createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                              // opt shape
-                        createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                 // max shape
-                result &= setOptimizationProfile(&generationProfile, inputName.c_str(),
-                    createDims({0, gemm_n}),                              // min shape
-                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}), // opt shape
-                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));    // max shape
+                result &= setOptimizationProfile(&contextProfile, inputName, createDims({0, gemm_n}),    // min shape
+                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                                // opt shape
+                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                   // max shape
+                result &= setOptimizationProfile(&generationProfile, inputName, createDims({0, gemm_n}), // min shape
+                    createDims({mBuilderConfig.maxLoraRank / 2, gemm_n}),                                // opt shape
+                    createDims({mBuilderConfig.maxLoraRank, gemm_n}));                                   // max shape
             }
         }
     }
@@ -1039,51 +1118,21 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
-    if (mBuilderConfig.useTrtNativeOps)
+    // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+    for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
-        {
-            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
-            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-            // TRT attention: separate K and V caches without the "2" dimension
-            // Shape: [batch, num_kv_heads, seq_len, head_dim]
-            nvinfer1::Dims minKVCacheShape
-                = createDims({1, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-            nvinfer1::Dims optKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-            nvinfer1::Dims maxKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-            // K cache bindings
-            result &= setOptimizationProfile(&contextProfile, binding_names::formatKCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, binding_names::formatKCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+        int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+        nvinfer1::Dims minKVCacheShape = createDims({1, 2, layerNumKVHeads, 0, layerHeadSize});
+        nvinfer1::Dims optKVCacheShape = createDims(
+            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims maxKVCacheShape = createDims(
+            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
 
-            // V cache bindings
-            result &= setOptimizationProfile(&contextProfile, binding_names::formatVCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, binding_names::formatVCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-        }
-    }
-    else
-    {
-        // Plugin path: combined KV cache with "2" dimension
-        // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
-        {
-            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
-            nvinfer1::Dims minKVCacheShape = createDims({1, 2, mNumKVHeads, 0, layerHeadSize});
-            nvinfer1::Dims optKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-            nvinfer1::Dims maxKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, 2, mNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-
-            result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-            result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-                minKVCacheShape, optKVCacheShape, maxKVCacheShape);
-        }
+        result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
+            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+        result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
+            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
     }
 
     return result;
@@ -1208,7 +1257,51 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
         result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
     }
 
-    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP)", mNumLinearAttnLayers);
+    LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash)", mNumLinearAttnLayers);
+    return result;
+}
+
+bool LLMBuilder::setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    if (mNumLinearAttnLayers == 0)
+    {
+        return true;
+    }
+
+    if (!hasInputBinding(network, binding_names::kSpecVerifyPhaseMarker))
+    {
+        LOG_ERROR("Hybrid MTP/DFlash base engine is missing input '%s'. Re-export the ONNX model.",
+            binding_names::kSpecVerifyPhaseMarker);
+        return false;
+    }
+
+    bool result = true;
+    result &= setOptimizationProfile(
+        &contextProfile, binding_names::kSpecVerifyPhaseMarker, createDims({0}), createDims({0}), createDims({0}));
+    result &= setOptimizationProfile(
+        &generationProfile, binding_names::kSpecVerifyPhaseMarker, createDims({0}), createDims({1}), createDims({1}));
+
+    auto setOptionalTreeProfile = [&](char const* inputName) {
+        if (!hasInputBinding(network, inputName))
+        {
+            return true;
+        }
+
+        int64_t const maxTreeTokens = std::max<int64_t>(1, mBuilderConfig.maxVerifyTreeSize);
+        bool ok = true;
+        ok &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
+        ok &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTreeTokens / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
+        return ok;
+    };
+
+    result &= setOptionalTreeProfile(binding_names::kTreeParentIds);
+    result &= setOptionalTreeProfile(binding_names::kTreeDepths);
+
+    LOG_DEBUG("Set up hybrid linear-attention spec-verify profiles for %d recurrent layers", mNumLinearAttnLayers);
     return result;
 }
 
@@ -1277,17 +1370,56 @@ bool LLMBuilder::copyConfig()
         Json kvLayerConfigs = Json::array();
         Json normalizedLayerTypes = Json::array();
 
-        for (int i = 0; i < mNbKVCacheInputs; ++i)
+        // Preserve the per-position ordering from the input `layer_types` when it is
+        // present and complete: attention and mamba layers can interleave (e.g. Qwen3.5
+        // GDN hybrids place attention every Nth layer), and emitting "all attention then
+        // all mamba" would misplace every layer in the runtime routing table. Attention
+        // entries consume the per-layer head sizes in order; mamba entries carry no KV.
+        bool const haveInputLayerTypes = mModelConfig.contains("layer_types") && mModelConfig["layer_types"].is_array()
+            && mModelConfig["layer_types"].size() == static_cast<size_t>(mNbKVCacheInputs + mNumLinearAttnLayers);
+        if (haveInputLayerTypes)
         {
-            normalizedLayerTypes.push_back("attention");
-            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-            kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+            int attnIdx = 0;
+            for (auto const& layerType : mModelConfig["layer_types"])
+            {
+                // Input layer_types are normalized to "attention" / "mamba" by the export.
+                if (layerType.is_string() && layerType.get<std::string>() == "mamba")
+                {
+                    normalizedLayerTypes.push_back("mamba");
+                    kvLayerConfigs.push_back(nullptr);
+                }
+                else
+                {
+                    // The total-size guard above does not constrain the attention/mamba split,
+                    // so a layer_types inconsistent with the ONNX (more attention entries than
+                    // KV cache inputs) would index past mPerLayerHeadSize. Fail clearly instead.
+                    check::check(attnIdx < static_cast<int>(mPerLayerHeadSize.size()),
+                        "copyConfig: layer_types has more attention layers than the " + std::to_string(mNbKVCacheInputs)
+                            + " KV cache input(s); config.json layer_types is inconsistent with the engine.");
+                    normalizedLayerTypes.push_back("attention");
+                    int64_t const layerNumKVHeads
+                        = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[attnIdx] : mNumKVHeads;
+                    kvLayerConfigs.push_back(
+                        Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[attnIdx]}});
+                    ++attnIdx;
+                }
+            }
         }
-        // Hybrid models also have recurrent (mamba) layers that need routing entries.
-        for (int i = 0; i < mNumLinearAttnLayers; ++i)
+        else
         {
-            normalizedLayerTypes.push_back("mamba");
-            kvLayerConfigs.push_back(nullptr);
+            // Legacy fallback (no per-position info): attention layers first, then mamba.
+            // Correct for pure-attention and all-attention heterogeneous models (e.g. Gemma4).
+            for (int i = 0; i < mNbKVCacheInputs; ++i)
+            {
+                normalizedLayerTypes.push_back("attention");
+                int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+                kvLayerConfigs.push_back(Json{{"num_kv_heads", layerNumKVHeads}, {"head_dim", mPerLayerHeadSize[i]}});
+            }
+            for (int i = 0; i < mNumLinearAttnLayers; ++i)
+            {
+                normalizedLayerTypes.push_back("mamba");
+                kvLayerConfigs.push_back(nullptr);
+            }
         }
         configWithBuilder["layer_types"] = normalizedLayerTypes;
         configWithBuilder["kv_layer_configs"] = kvLayerConfigs;
@@ -1370,22 +1502,32 @@ bool LLMBuilder::copyEagleFiles()
 
 bool LLMBuilder::copyVocabMappingFiles()
 {
-    // Copy vocab_map.safetensors if reduced vocabulary is used
+    // Copy the vocab map sidecar if reduced vocabulary is used. Base engines
+    // consume vocab_map.safetensors; DFlash draft engines consume
+    // draft_vocab_map.safetensors. Pick the right filename based on the build
+    // role so the runtime finds the sidecar in mEngineDir.
     if (mModelConfig.contains(binding_names::kReducedVocabSizeKey)
         && mModelConfig[binding_names::kReducedVocabSizeKey].get<int32_t>() > 0)
     {
-        std::string const vocabMapPath = (mOnnxDir / binding_names::kVocabMapFileName).string();
-        std::string const targetVocabMapPath = (mEngineDir / binding_names::kVocabMapFileName).string();
+        char const* const vocabMapFileName
+            = mBuilderConfig.specDraft ? binding_names::kDraftVocabMapFileName : binding_names::kVocabMapFileName;
+        std::string const vocabMapPath = (mOnnxDir / vocabMapFileName).string();
+        std::string const targetVocabMapPath = (mEngineDir / vocabMapFileName).string();
 
-        if (file_io::copyFile(vocabMapPath, targetVocabMapPath))
+        if (!file_io::copyFile(vocabMapPath, targetVocabMapPath))
         {
-            LOG_INFO("Copied %s to %s", binding_names::kVocabMapFileName, targetVocabMapPath.c_str());
+            // The enclosing guard already proved reduced_vocab_size > 0, so the
+            // sidecar is required. Runtime will refuse to load (DFlashDecoder
+            // hard-errors when reducedVocabSize > 0 and the file is missing;
+            // base-model runtime falls back to no remap but produces wrong IDs).
+            // Fail the build instead of letting a broken engine ship.
+            LOG_ERROR(
+                "%s not found in %s but reduced_vocab_size > 0; the sidecar is "
+                "required for the runtime to remap reduced->full vocabulary IDs.",
+                vocabMapFileName, mOnnxDir.string().c_str());
+            return false;
         }
-        else
-        {
-            LOG_WARNING("%s not found in %s. This is expected if reduced vocabulary is not used.",
-                binding_names::kVocabMapFileName, mOnnxDir.string().c_str());
-        }
+        LOG_INFO("Copied %s to %s", vocabMapFileName, targetVocabMapPath.c_str());
     }
 
     return true;

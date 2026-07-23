@@ -17,11 +17,35 @@
 
 #pragma once
 
+#include "common/checkMacros.h"
 #include "fmhaParams_v2.h"
 
 #include <NvInferRuntime.h>
+#include <cmath>
+#include <cstdint>
+#include <optional>
 namespace trt_edgellm
 {
+
+//! Validate an absolute QK^T multiplier.
+inline void validateAttentionScale(float attentionScale)
+{
+    ELLM_CHECK(std::isfinite(attentionScale) && attentionScale > 0.0F,
+        "Attention scale must be finite and greater than zero.");
+}
+
+//! Resolve an optional absolute QK^T multiplier, preserving the legacy default.
+inline float resolveAttentionScale(std::optional<float> attentionScale, int32_t headSize)
+{
+    if (!attentionScale.has_value())
+    {
+        ELLM_CHECK(headSize > 0, "Attention head size must be greater than zero when attention scale is absent.");
+        attentionScale = 1.0F / std::sqrt(static_cast<float>(headSize));
+    }
+
+    validateAttentionScale(*attentionScale);
+    return *attentionScale;
+}
 
 /*!
  * @brief Runner for context-phase fused multi-head attention (FMHA)
@@ -65,9 +89,10 @@ public:
      * Configures FMHA parameters. Device pointers must be set by caller.
      *
      * @param params FMHA parameter structure
-     * @throws std::runtime_error if input layout or alpha type is unsupported
+     * @param attentionScale Absolute multiplier applied to QK^T before softmax
+     * @throws std::runtime_error if the scale, input layout, or alpha type is unsupported
      */
-    void setupParams(FusedMultiheadAttentionParamsV2& params);
+    void setupParams(FusedMultiheadAttentionParamsV2& params, float attentionScale);
 
     /*!
      * @brief Dispatch FMHA kernel execution
@@ -76,6 +101,18 @@ public:
      * @throws std::runtime_error if device pointers are invalid, or a CUDA error happens
      */
     void dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream);
+
+    /*!
+     * @brief Check whether the exact kernel this instance would dispatch exists in the cubin table
+     *
+     * Performs the same kernel lookup as dispatchFMHAKernel() (including the
+     * sequence-length driven tiled/non-tiled selection) without launching.
+     * Used for per-instance routing decisions, e.g. the vision-block prefill
+     * seam probing for CUSTOM_MASK kernels.
+     *
+     * @return True if the kernel is available
+     */
+    bool isKernelAvailable() const noexcept;
 
     // Static methods to check kernel availability and load cubins into device.
     /*!

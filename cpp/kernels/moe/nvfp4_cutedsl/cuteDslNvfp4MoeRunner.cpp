@@ -29,17 +29,19 @@
 namespace trt_edgellm
 {
 
-// AOT module handles -- 2 backends x 5 activations x n128 = 10.
+// AOT module handles -- 2 backends x 6 activations x n128 = 12.
 nvfp4_fused_moe_decode_identity_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeIdentity_n128 = {};
 nvfp4_fused_moe_decode_silu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeSiLU_n128 = {};
 nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeSwiGLU_n128 = {};
 nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeGeLU_n128 = {};
 nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeReLU2_n128 = {};
+nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeGeGLU_n128 = {};
 nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillIdentity_n128 = {};
 nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillSiLU_n128 = {};
 nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillSwiGLU_n128 = {};
 nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillGeLU_n128 = {};
 nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillReLU2_n128 = {};
+nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillGeGLU_n128 = {};
 bool CuteDslNvfp4MoeRunner::sLoaded = false;
 std::mutex CuteDslNvfp4MoeRunner::sLoadMutex;
 
@@ -51,8 +53,8 @@ bool CuteDslNvfp4MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSiz
     {
         return false;
     }
-    // FP16 io_dtype is the only supported dtype. All five CuteDslMoeActivation values
-    // (identity / silu / swiglu / gelu / relu2) are wired -- each backed by its own AOT module.
+    // FP16 io_dtype is the only supported dtype. All six CuteDslMoeActivation values
+    // (identity / silu / swiglu / gelu / relu2 / geglu) are wired -- each backed by its own AOT module.
     if (ioDtype != CuteDslMoeIoDtype::kFP16)
     {
         return false;
@@ -63,7 +65,8 @@ bool CuteDslNvfp4MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSiz
     case CuteDslMoeActivation::kSiLU:
     case CuteDslMoeActivation::kSwiGLU:
     case CuteDslMoeActivation::kGeLU:
-    case CuteDslMoeActivation::kReLU2: break;
+    case CuteDslMoeActivation::kReLU2:
+    case CuteDslMoeActivation::kGeGLU: break;
     default: return false;
     }
     // Both backends are supported; kAuto picks between them based on routed-row count.
@@ -120,12 +123,14 @@ bool CuteDslNvfp4MoeRunner::loadKernelModules()
         nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_Load(&sDecodeSwiGLU_n128);
         nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_Load(&sDecodeGeLU_n128);
         nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_Load(&sDecodeReLU2_n128);
+        nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_Load(&sDecodeGeGLU_n128);
         // Prefill backend: 5 activations x n128 = 5 modules.
         nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_Load(&sPrefillIdentity_n128);
         nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_Load(&sPrefillSiLU_n128);
         nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_Load(&sPrefillSwiGLU_n128);
         nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_Load(&sPrefillGeLU_n128);
         nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_Load(&sPrefillReLU2_n128);
+        nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_Load(&sPrefillGeGLU_n128);
 
         sLoaded = true;
         LOG_DEBUG(
@@ -152,11 +157,13 @@ void CuteDslNvfp4MoeRunner::unloadKernelModules()
     nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_Unload(&sDecodeSwiGLU_n128);
     nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_Unload(&sDecodeGeLU_n128);
     nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_Unload(&sDecodeReLU2_n128);
+    nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_Unload(&sDecodeGeGLU_n128);
     nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_Unload(&sPrefillIdentity_n128);
     nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_Unload(&sPrefillSiLU_n128);
     nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_Unload(&sPrefillSwiGLU_n128);
     nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_Unload(&sPrefillGeLU_n128);
     nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_Unload(&sPrefillReLU2_n128);
+    nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_Unload(&sPrefillGeGLU_n128);
     sLoaded = false;
 }
 
@@ -504,6 +511,10 @@ int32_t CuteDslNvfp4MoeRunner::decodeCapRoutedRows(CuteDslMoeBackend backend, in
             CALL_DECODE_MOE(nvfp4_fused_moe_decode_relu2_##N_SUFFIX,                                                   \
                 sDecodeReLU2_##N_SUFFIX);                                                                              \
             break;                                                                                                     \
+        case CuteDslMoeActivation::kGeGLU:                                                                             \
+            CALL_DECODE_MOE(nvfp4_fused_moe_decode_geglu_##N_SUFFIX,                                                   \
+                sDecodeGeGLU_##N_SUFFIX);                                                                              \
+            break;                                                                                                     \
         default:                                                                                                       \
             LOG_ERROR("CuteDslNvfp4MoeRunner: unsupported activation for decode backend");                             \
             return -1;                                                                                                 \
@@ -681,6 +692,10 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
         case CuteDslMoeActivation::kReLU2:                                                                             \
             CALL_PREFILL_MOE(nvfp4_fused_moe_prefill_relu2_##N_SUFFIX,                                                 \
                 sPrefillReLU2_##N_SUFFIX);                                                                             \
+            break;                                                                                                     \
+        case CuteDslMoeActivation::kGeGLU:                                                                             \
+            CALL_PREFILL_MOE(nvfp4_fused_moe_prefill_geglu_##N_SUFFIX,                                                 \
+                sPrefillGeGLU_##N_SUFFIX);                                                                             \
             break;                                                                                                     \
         default:                                                                                                       \
             LOG_ERROR("CuteDslNvfp4MoeRunner: unsupported activation for prefill backend");                            \

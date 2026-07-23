@@ -20,6 +20,7 @@
 #include <NvInferRuntime.h>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,9 @@ public:
     //! \param[in] name Plugin instance name
     //! \param[in] numHeads Number of attention heads
     //! \param[in] headSize Head dimension size
-    ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize);
+    //! \param[in] attentionScale Optional absolute QK^T multiplier; defaults to 1/sqrt(headSize)
+    ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize,
+        std::optional<float> attentionScale = std::nullopt);
     ViTAttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     ViTAttentionPlugin() = delete;
@@ -85,8 +88,9 @@ protected:
     std::string mLayerName; //!< Plugin layer name
     std::string mNamespace; //!< Plugin namespace
 
-    int32_t mNumHeads{}; //!< Number of attention heads
-    int32_t mHeadSize{}; //!< Number of elements per head (head dimension)
+    int32_t mNumHeads{};     //!< Number of attention heads
+    int32_t mHeadSize{};     //!< Number of elements per head (head dimension)
+    float mAttentionScale{}; //!< Absolute QK^T multiplier.
 
     //! Datatype of attention. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};

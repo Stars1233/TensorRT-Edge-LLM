@@ -62,6 +62,8 @@ def _attention_plugin_translation(
     sliding_window_size: int,
     enable_tree_attention: int,
     enable_fp8_kv_cache: int,
+    attention_scale: float,
+    enable_vision_block_attention: int,
     attention_mask: onnxscript.INT32,
     attention_pos_id: onnxscript.INT32,
     qkv_scales: Sequence[float],
@@ -89,8 +91,10 @@ def _attention_plugin_translation(
         head_size=head_size,
         enable_tree_attention=enable_tree_attention,
         enable_fp8_kv_cache=enable_fp8_kv_cache,
+        enable_vision_block_attention=enable_vision_block_attention,
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
+        attention_scale=attention_scale,
         _outputs=2,
     )
     return attn_4d, present_kv
@@ -345,6 +349,7 @@ def _causal_conv1d_with_intermediate_translation(
     bias: onnxscript.FLOAT16,
     conv_state: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
     stride: int,
     padding: int,
     dilation: int,
@@ -356,11 +361,46 @@ def _causal_conv1d_with_intermediate_translation(
         bias,
         conv_state,
         context_lengths,
+        spec_verify_phase_marker,
         stride=stride,
         padding=padding,
         dilation=dilation,
         groups=groups,
         use_mtp=1,
+        _outputs=3,
+    )
+    return output, conv_state_out, intermediate_conv_state_out
+
+
+@script()
+def _causal_conv1d_with_intermediate_tree_translation(
+    hidden_states: onnxscript.FLOAT16,
+    weight: onnxscript.FLOAT16,
+    bias: onnxscript.FLOAT16,
+    conv_state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    tree_parent_ids: onnxscript.INT32,
+    tree_depths: onnxscript.INT32,
+    stride: int,
+    padding: int,
+    dilation: int,
+    groups: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT16]:
+    output, conv_state_out, intermediate_conv_state_out = _trt_edgellm.causal_conv1d(
+        hidden_states,
+        weight,
+        bias,
+        conv_state,
+        context_lengths,
+        spec_verify_phase_marker,
+        tree_parent_ids,
+        tree_depths,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+        use_ddtree=1,
         _outputs=3,
     )
     return output, conv_state_out, intermediate_conv_state_out
@@ -376,15 +416,39 @@ def _causal_conv1d_dispatch(
     padding,
     dilation,
     groups,
-    collect_intermediate_states=False,
 ):
-    if collect_intermediate_states:
-        return _causal_conv1d_with_intermediate_translation(
-            hidden_states, weight, bias, conv_state, context_lengths, stride,
-            padding, dilation, groups)
     return _causal_conv1d_translation(hidden_states, weight, bias, conv_state,
                                       context_lengths, stride, padding,
                                       dilation, groups)
+
+
+def _causal_conv1d_intermediate_dispatch(
+    hidden_states,
+    weight,
+    bias,
+    conv_state,
+    context_lengths,
+    stride,
+    padding,
+    dilation,
+    groups,
+    spec_verify_phase_marker,
+    tree_parent_ids=None,
+    tree_depths=None,
+    use_ddtree_state=False,
+):
+    if use_ddtree_state:
+        if tree_parent_ids is None or tree_depths is None:
+            raise ValueError(
+                "causal_conv1d DDTree state path requires tree_parent_ids and tree_depths"
+            )
+        return _causal_conv1d_with_intermediate_tree_translation(
+            hidden_states, weight, bias, conv_state, context_lengths,
+            spec_verify_phase_marker, tree_parent_ids, tree_depths, stride,
+            padding, dilation, groups)
+    return _causal_conv1d_with_intermediate_translation(
+        hidden_states, weight, bias, conv_state, context_lengths,
+        spec_verify_phase_marker, stride, padding, dilation, groups)
 
 
 @script()
@@ -431,6 +495,7 @@ def _gated_delta_net_with_intermediate_translation(
     dt_bias: onnxscript.FLOAT16,
     h0_source: onnxscript.FLOAT,
     context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
     k_dim: int,
     v_dim: int,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
@@ -444,9 +509,48 @@ def _gated_delta_net_with_intermediate_translation(
         dt_bias,
         h0_source,
         context_lengths,
+        spec_verify_phase_marker,
         k_dim=k_dim,
         v_dim=v_dim,
         use_mtp=1,
+        _outputs=3,
+    )
+    return output, h0_out, intermediate_h0_out
+
+
+@script()
+def _gated_delta_net_with_intermediate_tree_translation(
+    q: onnxscript.FLOAT16,
+    k: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    a: onnxscript.FLOAT16,
+    b: onnxscript.FLOAT16,
+    A_log: onnxscript.FLOAT,
+    dt_bias: onnxscript.FLOAT16,
+    h0_source: onnxscript.FLOAT,
+    context_lengths: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    tree_parent_ids: onnxscript.INT32,
+    tree_depths: onnxscript.INT32,
+    k_dim: int,
+    v_dim: int,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT, onnxscript.FLOAT]:
+    output, h0_out, intermediate_h0_out = _trt_edgellm.gated_delta_net(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0_source,
+        context_lengths,
+        spec_verify_phase_marker,
+        tree_parent_ids,
+        tree_depths,
+        k_dim=k_dim,
+        v_dim=v_dim,
+        use_ddtree=1,
         _outputs=3,
     )
     return output, h0_out, intermediate_h0_out
@@ -464,15 +568,41 @@ def _gated_delta_net_dispatch(
     context_lengths,
     k_dim,
     v_dim,
-    collect_intermediate_states=False,
 ):
-    if collect_intermediate_states:
-        return _gated_delta_net_with_intermediate_translation(
-            q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths, k_dim,
-            v_dim)
     return _gated_delta_net_translation(q, k, v, a, b, A_log, dt_bias,
                                         h0_source, context_lengths, k_dim,
                                         v_dim)
+
+
+def _gated_delta_net_intermediate_dispatch(
+    q,
+    k,
+    v,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    h0_source,
+    context_lengths,
+    k_dim,
+    v_dim,
+    spec_verify_phase_marker,
+    tree_parent_ids=None,
+    tree_depths=None,
+    use_ddtree_state=False,
+):
+    if use_ddtree_state:
+        if tree_parent_ids is None or tree_depths is None:
+            raise ValueError(
+                "gated_delta_net DDTree state path requires tree_parent_ids and tree_depths"
+            )
+        return _gated_delta_net_with_intermediate_tree_translation(
+            q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
+            spec_verify_phase_marker, tree_parent_ids, tree_depths, k_dim,
+            v_dim)
+    return _gated_delta_net_with_intermediate_translation(
+        q, k, v, a, b, A_log, dt_bias, h0_source, context_lengths,
+        spec_verify_phase_marker, k_dim, v_dim)
 
 
 @script()
@@ -545,6 +675,7 @@ def _vit_attention_plugin_translation(
     max_seqlen_carrier: onnxscript.INT32,
     num_heads: int,
     head_size: int,
+    attention_scale: float,
 ) -> onnxscript.FLOAT16:
     """ViT ragged self-attention without KV cache."""
     return _trt_edgellm.ViTAttentionPlugin(
@@ -555,6 +686,7 @@ def _vit_attention_plugin_translation(
         max_seqlen_carrier,
         num_heads=num_heads,
         head_size=head_size,
+        attention_scale=attention_scale,
     )
 
 
@@ -564,7 +696,7 @@ def _vit_attention_plugin_translation(
 
 
 @script()
-def _vit_trt_attention_inner(
+def _trt_ragged_attention_inner(
     query_states: onnxscript.FLOAT16,
     key_states: onnxscript.FLOAT16,
     value_states: onnxscript.FLOAT16,
@@ -587,7 +719,7 @@ def _vit_trt_attention_inner(
     )
 
 
-def _vit_trt_attention_translation(
+def _trt_ragged_attention_translation(
     query_states,
     key_states,
     value_states,
@@ -595,18 +727,22 @@ def _vit_trt_attention_translation(
     kv_lengths,
     num_heads,
     head_size,
+    attention_scale,
+    mask=None,
 ):
-    """ViT ragged self-attention via TRT-native IAttention (packed NHD).
+    """Ragged self-attention via TRT-native IAttention (packed NHD).
 
-    Q is expected to be pre-scaled by 1/sqrt(head_size) by the caller.
+    Non-identity attention scaling is folded into Q before TRT attention.
     query_lengths and kv_lengths must be separate graph tensors — TRT
     crashes when the same ONNX tensor is wired to both positions.
     """
-    return _vit_trt_attention_inner(
+    if attention_scale != 1.0:
+        query_states = _op21.Mul(query_states, attention_scale)
+    return _trt_ragged_attention_inner(
         query_states,
         key_states,
         value_states,
-        None,
+        mask,
         query_lengths,
         kv_lengths,
     )
@@ -815,19 +951,18 @@ def _nvfp4_moe_plugin_geforce_translation(
 
 
 # ---------------------------------------------------------------------------
-# FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
+# FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM + AllReduce)
 # ---------------------------------------------------------------------------
 
 
 @script()
-def _fused_gemm_allreduce_translation(
+def _fused_nvfp4_gemm_allreduce_translation(
     hidden_states: onnxscript.FLOAT16,
     global_scale: onnxscript.FLOAT,
     weight_f4: onnxscript.INT8,
     weight_f8_scale: onnxscript.FLOAT8E4M3FN,
     weight_f32_scale: onnxscript.FLOAT,
     tp_size: int,
-    fuse_residual_rmsnorm: int,
 ) -> onnxscript.FLOAT16:
     """Emit the full row-parallel NVFP4 GEMM + AllReduce ONNX subgraph."""
     x_f4, sx_f8 = _trt.TRT_FP4DynamicQuantize(
@@ -839,14 +974,13 @@ def _fused_gemm_allreduce_translation(
         _outputs=2,
     )
     combined_scale = _trt.DequantizeLinear(sx_f8, global_scale)
-    return _trt_edgellm.FusedGemmAllReducePlugin(
+    return _trt_edgellm.FusedNvfp4GemmAllReducePlugin(
         x_f4,
         combined_scale,
         weight_f4,
         weight_f8_scale,
         weight_f32_scale,
         tp_size=tp_size,
-        fuse_residual_rmsnorm=fuse_residual_rmsnorm,
     )
 
 
@@ -874,6 +1008,41 @@ def _dflash_target_kv_cache_update_translation(
         delta_lengths,
     )
     return present_kv
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 Audio Attention Plugin
+# ---------------------------------------------------------------------------
+
+
+@script()
+def _gemma4_audio_attention_plugin_translation(
+    q_raw: onnxscript.FLOAT16,
+    k_raw: onnxscript.FLOAT16,
+    v: onnxscript.FLOAT16,
+    gamma: onnxscript.FLOAT,
+    rel_key: onnxscript.FLOAT16,
+    valid: onnxscript.BOOL,
+    seq_len_carrier: onnxscript.INT32,
+    chunk_size: int,
+    left_horizon: int,
+    context_size: int,
+    logit_cap: float,
+) -> onnxscript.FLOAT16:
+    """Gemma4 audio chunked local attention plugin."""
+    return _trt_edgellm.Gemma4AudioAttentionPlugin(
+        q_raw,
+        k_raw,
+        v,
+        gamma,
+        rel_key,
+        valid,
+        seq_len_carrier,
+        chunk_size=chunk_size,
+        left_horizon=left_horizon,
+        context_size=context_size,
+        logit_cap=logit_cap,
+    )
 
 
 def build_custom_translation_table() -> dict:
@@ -914,14 +1083,18 @@ def build_custom_translation_table() -> dict:
         _int8_sq_weight_dq_translation,
         torch.ops.trt_edgellm.causal_conv1d.default:
         _causal_conv1d_dispatch,
+        torch.ops.trt_edgellm.causal_conv1d_with_intermediate.default:
+        _causal_conv1d_intermediate_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
         _gated_delta_net_dispatch,
+        torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:
+        _gated_delta_net_intermediate_dispatch,
         torch.ops.trt.vit_attention_plugin.default:
         _vit_attention_plugin_translation,
-        torch.ops.trt.vit_trt_attention.default:
-        _vit_trt_attention_translation,
+        torch.ops.trt.trt_ragged_attention.default:
+        _trt_ragged_attention_translation,
         torch.ops.trt.gather_nd.default:
         _gather_nd_translation,
         torch.ops.trt_edgellm.int4_moe_plugin.default:
@@ -932,13 +1105,15 @@ def build_custom_translation_table() -> dict:
         _nvfp4_moe_plugin_geforce_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
-        # TRT native attention ops (used by EdgeLLMAttentionTRTNative / Alpamayo)
+        # TRT native attention ops (used by Alpamayo)
         torch.ops.trt.rope_onnx.default:
         _rope_onnx_translation,
         torch.ops.trt.kv_cache_update_onnx.default:
         _kv_cache_update_onnx_translation,
         torch.ops.trt.attention_onnx.default:
         _attention_onnx_translation,
-        torch.ops.trt_edgellm.fused_gemm_allreduce.default:
-        _fused_gemm_allreduce_translation,
+        torch.ops.trt_edgellm.fused_nvfp4_gemm_allreduce.default:
+        _fused_nvfp4_gemm_allreduce_translation,
+        torch.ops.trt_edgellm.gemma4_audio_attention_plugin.default:
+        _gemma4_audio_attention_plugin_translation,
     }

@@ -227,15 +227,18 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
 def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
     """Strip trailing empty optional inputs from AttentionPlugin ONNX nodes.
 
-    When ``enable_tree_attention=False``, ``torch.export`` still emits two
-    empty-string inputs (``attention_mask``, ``attention_pos_id``) in the
-    ONNX node.  The TRT AttentionPlugin C++ requires exactly
-    ``kNUM_REQUIRED_INPUTS=7`` inputs for non-tree-attention mode and raises
-    ``(input) != nullptr`` when it encounters the extra null entries via
+    ``torch.export`` emits the two optional inputs (``attention_mask``,
+    ``attention_pos_id``) on every node, as empty strings when unused.  The
+    TRT AttentionPlugin C++ requires exactly ``kNUM_REQUIRED_INPUTS=7``
+    inputs for vanilla mode and raises ``(input) != nullptr`` when it
+    encounters the extra null entries via
     ``INetworkDefinition::addPluginV2``.
 
-    This pass removes trailing empty inputs from every ``AttentionPlugin``
-    node whose ``enable_tree_attention`` attribute equals 0.
+    This pass trims each ``AttentionPlugin`` node to its expected input
+    count: 7 for vanilla nodes, 8 for vision-block-attention nodes (the
+    real ``attention_mask`` input carrying block IDs is kept, the empty
+    ``attention_pos_id`` placeholder is dropped), and 9 for tree-attention
+    nodes (both optional inputs are real and kept).
     """
     _REQUIRED = 7
     model = onnx.load(onnx_path, load_external_data=False)
@@ -247,14 +250,21 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             (a.i for a in node.attribute if a.name == "enable_tree_attention"),
             0,
         )
-        if tree_attn:
-            continue  # tree-attention nodes use the extra optional inputs
-        extra = [i for i in list(node.input)[_REQUIRED:] if i == ""]
-        if not extra:
+        vision_block_attn = next(
+            (a.i for a in node.attribute
+             if a.name == "enable_vision_block_attention"),
+            0,
+        )
+        optional_count = 2 if tree_attn else (1 if vision_block_attn else 0)
+        keep = _REQUIRED + optional_count
+        trailing = list(node.input)[keep:]
+        if not trailing or any(i != "" for i in trailing):
             continue
-        # Trim to exactly _REQUIRED inputs (drop trailing empty strings)
-        del node.input[_REQUIRED:]
-        changed += len(extra)
+        # Keep the real vision-block-ID input while dropping its unused
+        # attention_pos_id placeholder.  Vanilla nodes retain only required
+        # inputs; tree nodes retain both optional inputs.
+        del node.input[keep:]
+        changed += len(trailing)
 
     if not changed:
         return
@@ -436,19 +446,20 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
     compile-time constants during export.
 
     Stored attribute: ``module._qkv_scales_float = [q, k, v]``
-      - q_scale : 1.0 (not stored in any current checkpoint)
+      - q_scale : ``q_proj.q_scale`` buffer value if present, else 1.0
       - k_scale : ``k_proj.k_scale`` buffer value if present, else 1.0
       - v_scale : ``v_proj.v_scale`` buffer value if present, else 1.0
     """
     for module in model.modules():
         if not getattr(module, "enable_fp8_kv_cache", False):
             continue
+        q_buf = getattr(getattr(module, "q_proj", None), "q_scale", None)
         k_buf = getattr(getattr(module, "k_proj", None), "k_scale", None)
         v_buf = getattr(getattr(module, "v_proj", None), "v_scale", None)
         if v_buf is None and getattr(module, "attention_k_eq_v", False):
             v_buf = k_buf
         module._qkv_scales_float = [
-            1.0,
+            float(q_buf.item()) if q_buf is not None else 1.0,
             float(k_buf.item()) if k_buf is not None else 1.0,
             float(v_buf.item()) if v_buf is not None else 1.0,
         ]
@@ -479,8 +490,7 @@ def _fix_initializer_dtypes(
 
        Initializers whose name contains any substring in
        ``preserve_fp32_patterns`` are kept FP32.  This is how a model opts
-       out of the downgrade for weights that must stay FP32 (e.g.
-       CodePredictor's ``down_proj``, see ``_DownProjFP32``). Some
+       out of the downgrade for weights that must stay FP32.  Some
        ``torch.export`` initializers are anonymous, so selected models can
        additionally request MatMul initializer dtype matching when the other
        input is known to be FP32.

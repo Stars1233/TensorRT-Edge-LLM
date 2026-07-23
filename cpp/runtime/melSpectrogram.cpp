@@ -349,6 +349,18 @@ MelExtractor::~MelExtractor() = default;
 MelExtractor::MelExtractor(MelExtractor&&) noexcept = default;
 MelExtractor& MelExtractor::operator=(MelExtractor&&) noexcept = default;
 
+std::vector<float> const& MelExtractor::melFilterBank() const noexcept
+{
+    static std::vector<float> const kEmpty;
+    return mImpl ? mImpl->melFilterStorage : kEmpty;
+}
+
+std::vector<float> const& MelExtractor::window() const noexcept
+{
+    static std::vector<float> const kEmpty;
+    return mImpl ? mImpl->windowFn : kEmpty;
+}
+
 bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
 {
     if (pcm.sampleRate != mConfig.sampleRate)
@@ -399,7 +411,17 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
     // pad_mode="reflect")). Materialised once into a local scratch.
     std::vector<float> centerBuf;
     int32_t srcLen = numSamples;
-    if (mConfig.framePadding == FramePadding::kCenterReflect || mConfig.framePadding == FramePadding::kCenterZero)
+    if (mConfig.framePadding == FramePadding::kSemicausalZero)
+    {
+        // HF Gemma4: prepend winLength/2 zeros so the first frame is centred
+        // at t=0; no right padding.
+        int32_t const pad = winLen / 2;
+        centerBuf.assign(static_cast<size_t>(numSamples) + pad, 0.0f);
+        std::copy_n(srcPtr, numSamples, centerBuf.begin() + pad);
+        srcPtr = centerBuf.data();
+        srcLen = numSamples + pad;
+    }
+    else if (mConfig.framePadding == FramePadding::kCenterReflect || mConfig.framePadding == FramePadding::kCenterZero)
     {
         int32_t const pad = nFFT / 2;
         centerBuf.assign(static_cast<size_t>(numSamples) + 2 * pad, 0.0f);
@@ -430,7 +452,13 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
     //  - Left-aligned (unfold + rfft(n=nFFT)): each frame covers only
     //    ``winLen`` source samples (the tail of the FFT buffer is zero), so
     //    ``nFrames = (srcLen - winLen) / hop + 1``.
-    int32_t const frameSpanSamples = mConfig.windowCentredInFft ? nFFT : winLen;
+    int32_t frameSpanSamples = mConfig.windowCentredInFft ? nFFT : winLen;
+    if (mConfig.framePadding == FramePadding::kSemicausalZero)
+    {
+        // HF Gemma4 unfolds frames of winLength+1 samples (the extra sample
+        // only feeds the preemphasis filter and is dropped before the window).
+        frameSpanSamples = winLen + 1;
+    }
     int32_t nFrames = (srcLen >= frameSpanSamples) ? ((srcLen - frameSpanSamples) / hop + 1) : 1;
     // HF Whisper / Parakeet apply ``stft[..., :-1]`` before mel / log / post-norm.
     // Drop the trailing frame so post-normalize statistics (max-clamp, per-feature
@@ -511,7 +539,8 @@ bool MelExtractor::extract(AudioPCM const& pcm, Tensor& out)
         {
             float const re = fftOut[k * 2 + 0];
             float const im = fftOut[k * 2 + 1];
-            power[k] = re * re + im * im;
+            float const p2 = re * re + im * im;
+            power[k] = mConfig.magnitudeSpectrum ? std::sqrt(p2) : p2;
         }
 
         for (int32_t m = 0; m < nMel; ++m)
@@ -610,6 +639,37 @@ MelExtractor makeWhisperExtractor()
     cfg.postNormalize = PostNormalize::kWhisperClamp;
     cfg.timePadding = TimePadding::kNone;
     cfg.dropLastStftFrame = true; // HF Whisper drops stft[..., :-1] before mel.
+    return MelExtractor(std::move(cfg));
+}
+
+MelExtractor makeGemma4AudioExtractor()
+{
+    // Matches HF Gemma4FeatureExtractor (USM-style front end): 20 ms periodic
+    // Hann window, 10 ms hop, rfft(n=512) over the left-aligned frame,
+    // magnitude spectrum, HTK mel without filter norm, ln(mel + 1e-3), no
+    // post-normalization, semicausal time padding.
+    MelExtractorConfig cfg;
+    cfg.name = "gemma4-usm";
+    cfg.sampleRate = 16000;
+    cfg.nFFT = 512;
+    cfg.hopLength = 160;
+    cfg.winLength = 320;
+    cfg.nMel = 128;
+    cfg.minFrequencyHz = 0.0f;
+    cfg.maxFrequencyHz = 8000.0f;
+    cfg.windowType = WindowType::kHannPeriodic;
+    cfg.windowCentredInFft = false;
+    cfg.magnitudeSpectrum = true;
+    cfg.melScale = MelScale::kHtk;
+    cfg.melNorm = MelNorm::kNone;
+    cfg.logType = LogType::kLn;
+    cfg.logFloorMode = LogFloorMode::kAdd;
+    cfg.logFloor = 1e-3f;
+    cfg.framePadding = FramePadding::kSemicausalZero;
+    cfg.layout = MelLayout::kMelTime;
+    cfg.postNormalize = PostNormalize::kNone;
+    cfg.timePadding = TimePadding::kNone;
+    cfg.dropLastStftFrame = false;
     return MelExtractor(std::move(cfg));
 }
 

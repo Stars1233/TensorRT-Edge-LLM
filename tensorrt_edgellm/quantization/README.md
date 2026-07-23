@@ -51,9 +51,10 @@ heavy and brittle.
    inference forward with KV-cache and GatherND belongs in the export
    layer.
 
-3. **Calibration** uses text data for LLM-only quantization and a multimodal
-   image-question dataset when `--visual_quantization fp8` is requested.
-   Audio calibration is not implemented.
+3. **Calibration** uses explicit datasets by modality: text data for LLM,
+   LM-head, KV-cache, CodePredictor, MTP, EAGLE3, and DFlash quantization;
+   image-question data when `--visual_quantization fp8` is requested; and
+   audio-transcript data for Qwen3-ASR/audio quantization.
 
 4. **Output** is always a unified HuggingFace checkpoint produced by
    `modelopt.torch.export.export_hf_checkpoint`.  This is the format
@@ -61,13 +62,13 @@ heavy and brittle.
 
 ### Supported quantization methods
 
-| Backbone        | LM-head         | KV-cache | Visual tower |
-|-----------------|-----------------|----------|--------------|
-| `fp8`           | `fp8`           | `fp8`    | `fp8`        |
-| `int4_awq`      | `int4_awq`      | —        | —            |
-| `nvfp4`         | `nvfp4`         | —        | —            |
-| `mxfp8`         | `mxfp8`         | —        | —            |
-| `int8_sq`       | —               | —        | —            |
+| Backbone        | LM-head         | KV-cache | Visual tower | Audio tower | CodePredictor |
+|-----------------|-----------------|----------|--------------|-------------|---------------|
+| `fp8`           | `fp8`           | `fp8`    | `fp8`        | `fp8`       | `fp8`         |
+| `int4_awq`      | `int4_awq`      | —        | —            | —           | —             |
+| `nvfp4`         | `nvfp4`         | —        | —            | —           | —             |
+| `mxfp8`         | `mxfp8`         | —        | —            | —           | —             |
+| `int8_sq`       | —               | —        | —            | —           | —             |
 
 Any backbone method can be combined with any lm_head method.  Examples:
 
@@ -87,6 +88,9 @@ tensorrt-edgellm-quantize llm \
     --quantization nvfp4 \
     --lm_head_quantization nvfp4
 ```
+
+Calibration uses the default `cnn_dailymail` text dataset; pick another with
+`--text_dataset <name>`.
 
 ### Speculative draft quantization
 
@@ -125,10 +129,19 @@ the exporter can keep its full-FP32 accumulation path.
 | `--lm_head_quantization` | None | LM-head method |
 | `--kv_cache_quantization` | None | KV-cache method (fp8) |
 | `--visual_quantization` | None | Visual tower method (fp8) |
+| `--audio_quantization` | None | Audio tower method (fp8) |
+| `--cp_quantization` | None | Qwen3-Omni / Qwen3-TTS CodePredictor method (fp8) |
 | `--dtype` | fp16 | Loading dtype |
 | `--device` | cuda | CUDA device |
-| `--dataset` | cnn_dailymail | Calibration dataset (`cnn_dailymail`, a HuggingFace dataset, or a local JSON/JSONL file with `text` or `article`) |
+| `--text_dataset` | cnn_dailymail | Registered text dataset name (`cnn_dailymail`, `wikitext`) |
+| `--image_dataset` | mmmu | Registered image dataset name (used with `--visual_quantization`) |
+| `--audio_dataset` | librispeech | Registered audio dataset name (Qwen3-ASR / audio tower) |
 | `--num_samples` | 512 | Number of calibration samples |
+
+Calibration datasets are selected **by name**. An unknown name fails out with
+the list of registered datasets and a pointer to the customization guide. To
+add your own dataset, or run a built-in offline, see
+[Calibration Dataset Customization](../../docs/source/developer_guide/customization/calibration-datasets.md).
 
 ### Python API
 
@@ -140,6 +153,7 @@ quantize_and_export(
     output_dir="/path/to/output",
     quantization="nvfp4",
     lm_head_quantization="nvfp4",
+    text_dataset="cnn_dailymail",   # registered name, instance, or None
 )
 ```
 

@@ -156,10 +156,10 @@ void reference(std::vector<float> const& q, std::vector<float> const& k, std::ve
                     {
                         int j = n * C - L + m;
                         int dist = i - j;
-                        bool local = dist >= 0 && dist < L;
-                        bool jWithinSeq = j >= 0 && j < S;
-                        bool vj = jWithinSeq && valid[static_cast<size_t>(b) * S + j];
-                        if (local && jWithinSeq && vj)
+                        bool inWindow = dist >= 0 && dist < L;
+                        bool jin = j >= 0 && j < S;
+                        bool vj = jin && valid[static_cast<size_t>(b) * S + j];
+                        if (inWindow && jin && vj)
                         {
                             float sc = 0.f;
                             for (int r = 0; r < D; ++r)

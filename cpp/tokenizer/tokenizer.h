@@ -68,6 +68,7 @@ struct ChatTemplateConfig
     std::string generationPromptThinking; //!< Generation prompt with thinking enabled (optional, model-specific)
     std::string defaultSystemPrompt;      //!< Default system prompt
     bool trimContent{false};              //!< Whether to trim whitespace from message content (matches Jinja | trim)
+    std::string promptPrefix;             //!< Emitted once at the very start of a rendered conversation (e.g. BOS text)
 };
 
 /*!

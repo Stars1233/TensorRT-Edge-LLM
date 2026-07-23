@@ -68,6 +68,8 @@ struct PipelineIO
     Tensor hostContextLengths; //!< CPU (pinned, [maxBatch] INT32)
     Tensor
         hostSelectTokenIndices; //!< CPU (pinned, [maxBatch, 1] INT64) — pairs with selectTokenIndices for H2D staging
+    //! Gemma4 Unified block IDs, [batch, seq_len] INT32; empty for other models.
+    Tensor visionBlockIds;
 
     // Multimodal (resize deepstackEmbeds BEFORE buildTensorMap, never after)
     std::vector<Tensor> deepstackEmbeds;
@@ -98,6 +100,16 @@ struct PipelineIO
     //! Written by proposal/verify input preparation kernels; consumed by the base and draft
     //! engines via the `kAttentionPosId` binding.
     Tensor specDecodePositionIds;
+    //! Shape-only marker for hybrid MTP/DFlash base engines. The runtime binds
+    //! this tensor at shape [0] for normal prefill/decode and [1] for spec
+    //! verify; plugins branch on the shape, not the payload.
+    Tensor specVerifyPhaseMarker;
+    //! DDTree parent node ids, [batch, proposalSize] INT32. Runtime-owned
+    //! metadata for tree attention and hybrid state plugin bindings.
+    Tensor specTreeParentIds;
+    //! DDTree depth per node, [batch, proposalSize] INT32. Runtime-owned
+    //! metadata for tree attention and hybrid state plugin bindings.
+    Tensor specTreeDepths;
 
     //! Build PipelineIO for the vanilla single-engine LLM runtime
     //! (basic I/O tensors, deepstack embeds, MRope cos/sin cache).
@@ -116,7 +128,7 @@ void allocateDeepstackEmbeds(PipelineIO& io, int32_t numFeatures, int32_t maxBat
     nvinfer1::DataType dtype);
 
 void allocateSpecDecodeHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
-    int32_t draftHiddenDim, nvinfer1::DataType dtype);
+    int32_t draftHiddenDim, nvinfer1::DataType dtype, bool allocateDraftHiddenStates);
 
 void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity, int32_t rotaryDim);
 
@@ -139,14 +151,23 @@ void buildTensorMap(
 //! mask, proposal position IDs).
 //!
 //! Preconditions: `io` must have been constructed via `PipelineIO::createForSpecDecode`
-//! (baseHiddenStates / draftHiddenStatesIn/Out / packedAttentionMask /
-//! specDecodePositionIds populated).
+//! for an EAGLE/MTP-style draft path where draftHiddenStatesIn/Out are
+//! populated alongside baseHiddenStates, packedAttentionMask, and
+//! specDecodePositionIds. DFlash uses its own draft TensorMap.
 //!
 //! @param map Output map for the draft engine's bindings.
 //! @param io  Pipeline I/O (must be the SpecDecode-flavoured one).
 //! @param res Shared resources.
 //! @param cfg Draft engine configuration.
 void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg);
+
+//! Populate a TensorMap for a Gemma4 MTP assistant draft engine.
+//!
+//! Unlike EAGLE/MTP draft engines, Gemma4 assistant engines do not own a draft
+//! KV cache. Their `past_key_values_*` bindings are zero-copy aliases to the
+//! base target KV cache selected by `draftCfg.gemma4MTPKVSharingMap`.
+void buildTensorMapForGemma4MTPDraft(
+    TensorMap& map, PipelineIO& io, SharedResources& res, DeploymentConfig const& bundle);
 
 } // namespace rt
 } // namespace trt_edgellm

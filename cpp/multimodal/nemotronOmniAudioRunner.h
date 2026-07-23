@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "multimodal/audioUtils.h"
 #include "multimodalRunner.h"
 #include "runtime/audioUtils.h"
 #include "runtime/melSpectrogram.h"
@@ -117,11 +118,54 @@ private:
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
         std::vector<int64_t> const& audioTokenLengths, tokenizer::Tokenizer const* tokenizer);
 
+    //! \brief Build the online GPU fbank resources (mel filter / window / FFT
+    //!        twiddle + scalar params) from the bound CPU MelExtractor's config,
+    //!        validated parakeet-spec. Best-effort: returns false (→ CPU fallback)
+    //!        when the extractor isn't parakeet-spec, the CuTe DSL GEMM is
+    //!        unavailable for this device/build, or a resource upload fails.
+    bool initFbankResources(cudaStream_t stream);
+
+    //! \brief Whether the online GPU fbank can run for this clip: resources ready,
+    //!        engine mel width agrees, and the sample rate matches what the kernels
+    //!        assume. Checked in pass 1 of encodeAllClips before committing a clip
+    //!        to the GPU path.
+    bool gpuFbankViable(rt::audio::AudioPCM const& pcm) const;
+
+    //! \brief Pass 2 GPU fbank for one clip: upload PCM and run fbankParakeet into a
+    //!        fresh ``[1, numFrames, mel_bins]`` FP16 ``melSpec``. Returns false on
+    //!        upload / kernel failure so the caller can fall back to the CPU
+    //!        extractor (which yields the same frame count, keeping pass-1 sizing valid).
+    bool runGpuFbankClip(
+        rt::audio::AudioPCM const& pcm, int64_t const numFrames, rt::Tensor& melSpec, cudaStream_t stream);
+
+    //! \brief Per-clip mel plan: built in pass 1 of encodeAllClips (frame count +
+    //!        chosen path), consumed in pass 2 by produceClipMel.
+    struct ClipPlan
+    {
+        rt::audio::AudioPCM const* pcm{nullptr}; //!< non-null → run GPU fbank in pass 2
+        rt::Tensor hostMel{};                    //!< valid → CPU mel already extracted (upload in pass 2)
+        int64_t numFrames{0};                    //!< T (shapes the GPU melSpec view)
+    };
+
+    //! \brief Pass 2: produce one clip's ``[1, T, mel_bins]`` FP16 GPU mel from its
+    //!        plan — GPU fbank when planned (falling back to a CPU re-extract on
+    //!        runtime failure), otherwise upload the pass-1 CPU mel. The fallback
+    //!        yields the same floor(N/hop) frame count, keeping pass-1 sizing valid.
+    bool produceClipMel(ClipPlan& plan, rt::Tensor& melSpec, cudaStream_t stream);
+
     NemotronOmniAudioConfig mConfig{}; //!< Nemotron-Omni Parakeet audio configuration
     rt::audio::MelExtractor mFeMel;    //!< FE for PCM→mel; family bound by validateAndFillConfig
     rt::Tensor mInputFeatures{};       //!< [1, paddedSeqLen, mel_bins] encoder input (rebound per clip)
     rt::Tensor mAudioEmbedding{};      //!< [totalEncodedRows, hidden_dim] flat output for all clips in batch
     int64_t mMaxSeqLen{0};             //!< Max raw mel-spectrogram time steps from engine profile
+
+    // Online GPU fbank state (persistent across clips).
+    // When mFbankReady is false the runner uses the CPU MelExtractor (mFeMel).
+    bool mFbankReady{false}; //!< true once initFbankResources succeeds
+    rt::audioUtils::FbankResourcesParakeet
+        mFbankResourcesParakeet{}; //!< weights / tables / scalars + pre-allocated workspace
+    rt::Tensor mPcmF32Device{};    //!< [maxPcmSamples] Float — mono FP32 PCM staging, reshaped to [N] per clip
+    rt::Tensor mMelSpecDevice{}; //!< [1, maxFrames, nMel] Half — fbank output backing store, viewed at [1, T_out, nMel]
 };
 
 } // namespace rt

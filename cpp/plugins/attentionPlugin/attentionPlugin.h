@@ -20,6 +20,7 @@
 #include <NvInferRuntime.h>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,11 +49,14 @@ public:
     //! \param[in] headSize Head dimension size
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
     //! \param[in] enableFp8KVCache Whether to enable FP8 KV cache
+    //! \param[in] enableVisionBlockAttention Enable Gemma4 vision block attention
     //! \param[in] slidingWindowSize Sliding window size (-1 = no sliding window)
     //! \param[in] qkvScales Optional [q, k, v] FP8 dequant scales (required when enableFp8KVCache)
+    //! \param[in] attentionScale Optional absolute QK^T multiplier; defaults to 1/sqrt(headSize)
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t slidingWindowSize = -1,
-        std::vector<float> const& qkvScales = {});
+        int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t enableVisionBlockAttention,
+        int32_t slidingWindowSize = -1, std::vector<float> const& qkvScales = {},
+        std::optional<float> attentionScale = std::nullopt);
     AttentionPlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fc);
 
     AttentionPlugin() = delete;
@@ -102,15 +106,29 @@ private:
         std::byte*& workspacePtr, int32_t batchSize, int32_t numKVHeads, int32_t kvCacheCapacity, int32_t headSize,
         int32_t seqLen, cudaStream_t stream);
 
-    //! Launch the CuTe DSL FFPA d512 causal attention kernel.
-    static void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t batchSize,
-        int32_t seqlenQ, int32_t seqlenK, int32_t numQHeads, int32_t numKVHeads, int32_t headDim, cudaStream_t stream);
+    //! enqueue() body. enqueue() wraps it in a try/catch so a thrown error
+    //! fails the call instead of terminating the process (enqueue is noexcept).
+    int32_t enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
+        void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream);
 
-    //! Zero the attention output buffer before FFPA prefill.
-    //! FFPA is a dense causal kernel with no cu_seqlens support, so it processes padding positions as real data.
-    //! Zeroing the output ensures padding positions don't carry NaN/garbage into downstream layers.
-    static void zeroPrefillOutputForPaddingForFFPA(rt::Tensor& attentionOutput, int32_t batchSize, int32_t seqLen,
-        int32_t numQHeads, int32_t headSize, cudaStream_t stream);
+    //! Launch the CuTe DSL FFPA d512 causal attention kernel with per-batch varlen masking.
+    void dispatchFFPAKernel(half const* q, half const* k, half const* v, half* o, int32_t const* cuSeqLenQ,
+        int32_t const* cuSeqLenK, int32_t batchSize, int32_t seqlenQ, int32_t seqlenK, cudaStream_t stream);
+
+    //! Prefill routing under vision-block attention: the FFPA d512
+    //! vision-block overlay kernel serves full-causal headSize=512 layers;
+    //! all other vision layers (the sliding d256 class) go to FMHA
+    //! CUSTOM_MASK (see mCanImplementCustomMaskFMHA).  There is no fallback:
+    //! enforceVisionBlockKernelSupport() makes both hard requirements.
+    bool canUseFFPAOverlayForVisionPrefill() const noexcept;
+
+    //! Hard construction-time validation of the vision-block kernel set:
+    //! FFPA d512 vision-block overlay (full-causal d512 prefill) or FMHA_v2
+    //! CUSTOM_MASK cubins (all other vision prefill), plus XQA decode.
+    //! Throws (via ELLM_CHECK) naming the missing kernel/artifact and the SM
+    //! — vision-block attention has no fallback path, so a clear build/
+    //! load-time error beats a silently wrong deployment.
+    void enforceVisionBlockKernelSupport() const;
 
 protected:
     std::string mLayerName; //!< Plugin layer name
@@ -122,8 +140,11 @@ protected:
     int32_t mNumKVHeads{};
     //! Number of elements per head (head dimension)
     int32_t mHeadSize{};
+    float mAttentionScale{}; //!< Absolute QK^T multiplier.
     //! Whether to enable tree attention for EAGLE speculative decoding
     int32_t mEnableTreeAttention{};
+    //! Whether slot 7 carries [B,S] Gemma4 image block IDs.
+    int32_t mEnableVisionBlockAttention{};
 
     //! Datatype of QKV and KV cache. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
@@ -147,11 +168,19 @@ protected:
 #endif
 
     //! Whether FMHA context kernels are available for this configuration.
-    //! When false (e.g. headSize=512), the prefill path uses XQA instead.
+    //! When false, prefill runs FFPA (headSize=512); other head sizes have no
+    //! prefill support.
     bool mCanImplementFMHA{true};
 
-    //! Whether FFPA d512 kernel is available for headSize=512 prefill+decode.
+    //! Whether the FFPA d512 kernel is available for headSize=512 prefill.
     bool mCanImplementFFPA{false};
+
+    //! Whether FMHA_v2 CUSTOM_MASK context kernels are available for this
+    //! head size (vision-block prefill production path for the sliding d256
+    //! layers).  Discovered from the cubin metadata table at construction;
+    //! the exact per-sequence-length kernel is re-probed at enqueue via
+    //! ContextFMHARunner::isKernelAvailable().
+    bool mCanImplementCustomMaskFMHA{false};
 
     //! Whether XQA decode kernels are available.
     bool mCanImplementXQA{false};

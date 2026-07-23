@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,7 @@ gdn_prefill_Kernel_Module_t CuteDslGDNRunner::sPrefillModule = {};
 gdn_prefill_blackwell_Kernel_Module_t CuteDslGDNRunner::sBlackwellPrefillModule = {};
 #endif
 gdn_decode_mtp_cache_Kernel_Module_t CuteDslGDNRunner::sMTPDecodeCacheModule = {};
+gdn_decode_tree_split_v_precomputed_Kernel_Module_t CuteDslGDNRunner::sDecodeTreeSplitVPrecomputedModule = {};
 bool CuteDslGDNRunner::sLoaded = false;
 
 static std::mutex sGDNMutex;
@@ -61,6 +62,15 @@ static std::mutex sGDNMutex;
         (tensor).dynamic_shapes[2] = (dim2);                                                                           \
         (tensor).dynamic_strides[0] = static_cast<int64_t>(dim1) * (dim2);                                             \
         (tensor).dynamic_strides[1] = static_cast<int64_t>(dim2);                                                      \
+    } while (0)
+
+#define SET_2D_TENSOR(tensor, data_ptr, dim0, dim1)                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        (tensor).data = (data_ptr);                                                                                    \
+        (tensor).dynamic_shapes[0] = (dim0);                                                                           \
+        (tensor).dynamic_shapes[1] = (dim1);                                                                           \
+        (tensor).dynamic_strides[0] = static_cast<int64_t>(dim1);                                                      \
     } while (0)
 
 #define SET_1D_TENSOR(tensor, data_ptr, dim0)                                                                          \
@@ -90,8 +100,9 @@ bool CuteDslGDNRunner::loadKernelModules()
         gdn_prefill_blackwell_Kernel_Module_Load(&sBlackwellPrefillModule);
 #endif
         gdn_decode_mtp_cache_Kernel_Module_Load(&sMTPDecodeCacheModule);
+        gdn_decode_tree_split_v_precomputed_Kernel_Module_Load(&sDecodeTreeSplitVPrecomputedModule);
         LOG_DEBUG(
-            "CuTe DSL GDN kernel modules loaded (decode + prefill + MTP"
+            "CuTe DSL GDN kernel modules loaded (decode + prefill + MTP + DDTree"
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
             " + blackwell"
 #endif
@@ -117,22 +128,143 @@ void CuteDslGDNRunner::unloadKernelModules()
         gdn_prefill_blackwell_Kernel_Module_Unload(&sBlackwellPrefillModule);
 #endif
         gdn_decode_mtp_cache_Kernel_Module_Unload(&sMTPDecodeCacheModule);
+        gdn_decode_tree_split_v_precomputed_Kernel_Module_Unload(&sDecodeTreeSplitVPrecomputedModule);
         sLoaded = false;
     }
 }
 
 int CuteDslGDNRunner::run(GDNParams const& params, cudaStream_t stream)
 {
+    if (params.use_ddtree)
+    {
+        // DDTree verifies many tree nodes from one committed recurrent state.
+        // The tree kernels keep h0_source read-only and emit per-node checkpoints for accept/commit.
+        return runDecodeTree(params, stream);
+    }
     // MTP decode takes priority: handles any seq_len for speculative-decoding verification.
     if (params.use_mtp)
+    {
         return runDecodeMTP(params, stream);
+    }
     if (params.seq_len == 1)
+    {
         return runDecode(params, stream);
+    }
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
     if (params.smVersion >= 100)
+    {
         return runPrefillBlackwell(params, stream);
+    }
 #endif
     return runPrefill(params, stream);
+}
+
+int CuteDslGDNRunner::runDecodeTree(GDNParams const& params, cudaStream_t stream)
+{
+    if (!sLoaded)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode kernel module not loaded.");
+        return -1;
+    }
+
+    if (params.seq_len < 1)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode requires seq_len >= 1, got %d", params.seq_len);
+        return -1;
+    }
+    constexpr int32_t kDDTreeGDNMaxSeqLen = 128;
+    if (params.seq_len > kDDTreeGDNMaxSeqLen)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode supports seq_len <= %d, got %d", kDDTreeGDNMaxSeqLen, params.seq_len);
+        return -1;
+    }
+    if (params.k_dim != 128 || params.v_dim != 128)
+    {
+        LOG_ERROR(
+            "CuTe DSL GDN DDTree decode requires k_dim=v_dim=128, got k_dim=%d v_dim=%d", params.k_dim, params.v_dim);
+        return -1;
+    }
+    if (params.h <= 0 || params.hv <= 0 || params.hv < params.h || (params.hv % params.h) != 0)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode requires hv >= h and hv %% h == 0, got h=%d hv=%d", params.h, params.hv);
+        return -1;
+    }
+    if (params.tree_parent_ids == nullptr || params.tree_depths == nullptr)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode requires non-null tree_parent_ids and tree_depths.");
+        return -1;
+    }
+    if (params.intermediate_states == nullptr)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode requires intermediate_states output for rollback state checkpoints.");
+        return -1;
+    }
+
+    if (params.ddtree_qk_scales == nullptr || params.ddtree_gate_values == nullptr)
+    {
+        LOG_ERROR("CuTe DSL GDN DDTree decode requires precomputed split-v workspace buffers.");
+        return -1;
+    }
+
+    return runDecodeTreeSplitVPrecomputed(params, stream);
+}
+
+int CuteDslGDNRunner::runDecodeTreeSplitVPrecomputed(GDNParams const& params, cudaStream_t stream)
+{
+    int32_t const n = params.n;
+    int32_t const seqLen = params.seq_len;
+    int32_t const h = params.h;
+    int32_t const hv = params.hv;
+    int32_t const k = params.k_dim;
+    int32_t const v = params.v_dim;
+
+    launchGdnDDTreePrecompute(params.q, params.k, params.a, params.b, params.A_log, params.dt_bias,
+        params.ddtree_qk_scales, params.ddtree_gate_values, n, seqLen, h, hv, k, stream);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_h0_source_t h0Tensor{};
+    h0Tensor.data = params.h0_source;
+    h0Tensor.dynamic_shapes[0] = n;
+    h0Tensor.dynamic_shapes[1] = hv;
+    h0Tensor.dynamic_strides[0] = static_cast<int64_t>(hv) * k * v;
+
+    gdn_decode_tree_split_v_precomputed_Tensor_q_t qTensor{};
+    SET_4D_TENSOR(qTensor, params.q, n, seqLen, h, k);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_k_t kTensor{};
+    SET_4D_TENSOR(kTensor, params.k, n, seqLen, h, k);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_v_t vTensor{};
+    SET_4D_TENSOR(vTensor, params.v, n, seqLen, hv, v);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_o_t oTensor{};
+    SET_4D_TENSOR(oTensor, params.o, n, seqLen, hv, v);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_intermediate_states_t intermTensor{};
+    intermTensor.data = params.intermediate_states;
+    intermTensor.dynamic_shapes[0] = n;
+    intermTensor.dynamic_shapes[1] = seqLen;
+    intermTensor.dynamic_shapes[2] = hv;
+    intermTensor.dynamic_strides[0] = static_cast<int64_t>(seqLen) * hv * k * v;
+    intermTensor.dynamic_strides[1] = static_cast<int64_t>(hv) * k * v;
+    intermTensor.dynamic_strides[2] = static_cast<int64_t>(k) * v;
+    intermTensor.dynamic_strides[3] = static_cast<int64_t>(v);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_tree_parent_ids_t parentTensor{};
+    SET_2D_TENSOR(parentTensor, params.tree_parent_ids, n, seqLen);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_tree_depths_t depthTensor{};
+    SET_2D_TENSOR(depthTensor, params.tree_depths, n, seqLen);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_qk_scales_t qkScalesTensor{};
+    SET_4D_TENSOR(qkScalesTensor, params.ddtree_qk_scales, n, seqLen, h, 2);
+
+    gdn_decode_tree_split_v_precomputed_Tensor_gate_values_t gateValuesTensor{};
+    SET_4D_TENSOR(gateValuesTensor, params.ddtree_gate_values, n, seqLen, hv, 2);
+
+    cute_dsl_gdn_decode_tree_split_v_precomputed_wrapper(&sDecodeTreeSplitVPrecomputedModule, &h0Tensor, &qTensor,
+        &kTensor, &vTensor, &oTensor, &intermTensor, &parentTensor, &depthTensor, &qkScalesTensor, &gateValuesTensor,
+        seqLen, stream);
+    return 0;
 }
 
 int CuteDslGDNRunner::runDecode(GDNParams const& params, cudaStream_t stream)

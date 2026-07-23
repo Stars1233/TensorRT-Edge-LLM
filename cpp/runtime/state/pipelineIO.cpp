@@ -31,7 +31,6 @@ namespace trt_edgellm
 {
 namespace rt
 {
-
 void allocateBasicIO(
     PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype)
 {
@@ -62,10 +61,14 @@ void allocateDeepstackEmbeds(
 }
 
 void allocateSpecDecodeHiddenStates(PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t baseHiddenDim,
-    int32_t draftHiddenDim, nvinfer1::DataType dtype)
+    int32_t draftHiddenDim, nvinfer1::DataType dtype, bool allocateDraftHiddenStates)
 {
     io.baseHiddenStates
         = Tensor({maxBatch, maxSeq, baseHiddenDim}, DeviceType::kGPU, dtype, "PipelineIO::baseHiddenStates");
+    if (!allocateDraftHiddenStates)
+    {
+        return;
+    }
     io.draftHiddenStatesIn
         = Tensor({maxBatch, maxSeq, draftHiddenDim}, DeviceType::kGPU, dtype, "PipelineIO::draftHiddenStatesIn");
     io.draftHiddenStatesOut
@@ -129,6 +132,10 @@ void buildTensorMap(
     map.set(binding_names::kLogits, io.outputLogits);
     map.set(binding_names::kContextLengths, io.contextLengths);
     map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        map.set(binding_names::kVisionBlockIds, io.visionBlockIds);
+    }
 
     bindRopeTensors(map, io, res, cfg);
 
@@ -137,23 +144,6 @@ void buildTensorMap(
     auto& cacheMgr = *res.cacheManagers[kvCacheIndex];
     auto& kvMgr = cacheMgr.getKVCacheManager();
     auto& mambaMgr = cacheMgr.getMambaCacheManager();
-
-    // The split K/V view cache only needs to exist in TRT-native mode.
-    // `KVCacheManager::getSeparateKVCache` returns views by value, so we store
-    // them in stable-address storage (res.kCacheViews / res.vCacheViews).
-    if (cfg.useTrtNativeOps)
-    {
-        if (static_cast<int32_t>(res.kCacheViews.size()) <= kvCacheIndex)
-        {
-            res.kCacheViews.resize(kvCacheIndex + 1);
-            res.vCacheViews.resize(kvCacheIndex + 1);
-        }
-        int32_t const numAttn = static_cast<int32_t>(cfg.kvLayerConfigs.size());
-        res.kCacheViews[kvCacheIndex].clear();
-        res.vCacheViews[kvCacheIndex].clear();
-        res.kCacheViews[kvCacheIndex].reserve(numAttn);
-        res.vCacheViews[kvCacheIndex].reserve(numAttn);
-    }
 
     int32_t localAttnIdx = 0;
     int32_t localMambaIdx = 0;
@@ -167,30 +157,11 @@ void buildTensorMap(
                 ? cfg.kvSharingDonors[localAttnIdx]
                 : -1;
 
-            if (!cfg.useTrtNativeOps)
-            {
-                // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
-                auto& combinedKV
-                    = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
-                map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
-                map.set(
-                    binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
-            }
-            else
-            {
-                // TRT-native (split K/V): views returned by value, stored in the view cache.
-                auto& kViews = res.kCacheViews[kvCacheIndex];
-                auto& vViews = res.vCacheViews[kvCacheIndex];
-                int32_t const sourceIdx = (donorIdx >= 0) ? donorIdx : localAttnIdx;
-                auto [kT, vT] = kvMgr.getSeparateKVCache(sourceIdx);
-                kViews.push_back(std::move(kT));
-                vViews.push_back(std::move(vT));
-
-                map.set(binding_names::formatKCacheName(localAttnIdx, /*isPast=*/true), kViews.back());
-                map.set(binding_names::formatKCacheName(localAttnIdx, /*isPast=*/false), kViews.back()); // alias
-                map.set(binding_names::formatVCacheName(localAttnIdx, /*isPast=*/true), vViews.back());
-                map.set(binding_names::formatVCacheName(localAttnIdx, /*isPast=*/false), vViews.back()); // alias
-            }
+            // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
+            auto& combinedKV
+                = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
+            map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
+            map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
             ++localAttnIdx;
         }
         else if (cfg.layerTypes[absIdx] == rt::HybridCacheManager::LayerType::kMamba)
@@ -201,7 +172,7 @@ void buildTensorMap(
             map.set(binding_names::formatRecurrentStateName(localMambaIdx, /*isPast=*/false), rec);
             map.set(binding_names::formatConvStateName(localMambaIdx, /*isPast=*/true), conv);
             map.set(binding_names::formatConvStateName(localMambaIdx, /*isPast=*/false), conv);
-            // MTP base only: bind the per-layer intermediate state outputs.
+            // Spec-decode hybrid base: bind the per-layer intermediate state outputs.
             // `hasIntermediateRecurrentStates()` is true iff the MambaCacheManager
             // was built with `maxIntermediateSeqLen > 0` (set by createForSpecDecode
             // for hybrid MTP bases). EAGLE3 base lacks recurrent layers entirely,
@@ -263,6 +234,18 @@ void buildTensorMap(
         map.set(binding_names::kAttentionMask, io.packedAttentionMask);
         map.set(binding_names::kAttentionPosId, io.specDecodePositionIds);
     }
+    if (!io.specVerifyPhaseMarker.isEmpty())
+    {
+        map.set(binding_names::kSpecVerifyPhaseMarker, io.specVerifyPhaseMarker);
+    }
+    if (!io.specTreeParentIds.isEmpty())
+    {
+        map.set(binding_names::kTreeParentIds, io.specTreeParentIds);
+    }
+    if (!io.specTreeDepths.isEmpty())
+    {
+        map.set(binding_names::kTreeDepths, io.specTreeDepths);
+    }
 
     // LoRA bindings are NOT set here because adapter tensor names may differ
     // from engine binding names (e.g. fused QKV).  LoRAManager::refreshTensorMap()
@@ -291,12 +274,45 @@ void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedReso
     map.set(binding_names::kAttentionPosId, io.specDecodePositionIds);
 }
 
+void buildTensorMapForGemma4MTPDraft(
+    TensorMap& map, PipelineIO& io, SharedResources& res, DeploymentConfig const& bundle)
+{
+    check::check(bundle.draft.has_value(), "buildTensorMapForGemma4MTPDraft requires bundle.draft");
+    check::check(bundle.specConfig.has_value(), "buildTensorMapForGemma4MTPDraft requires bundle.specConfig");
+    check::check(bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP,
+        "buildTensorMapForGemma4MTPDraft requires spec_decode_type=gemma4_mtp");
+    check::check(!res.cacheManagers.empty(), "buildTensorMapForGemma4MTPDraft requires base cache manager");
+
+    LLMEngineConfig const& draftCfg = *bundle.draft;
+
+    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
+    map.set(binding_names::kLogits, io.outputLogits);
+    map.set(binding_names::kBaseModelHiddenStates, io.draftHiddenStatesIn);
+    map.set(binding_names::kOutputHiddenStates, io.draftHiddenStatesOut);
+
+    bindRopeTensors(map, io, res, draftCfg);
+
+    auto& baseCacheManager = *res.cacheManagers[0];
+    map.set(binding_names::kContextLengths, baseCacheManager.getKVCacheLengths());
+    for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
+    {
+        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCache(entry.targetAbsoluteLayerIdx);
+        map.set(binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), targetKV);
+    }
+}
+
 PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t stream)
 {
     PipelineIO io;
 
     allocateBasicIO(io, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize, cfg.outputVocabSize,
         nvinfer1::DataType::kHALF);
+
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        io.visionBlockIds = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
+    }
 
     if (cfg.numDeepstackFeatures > 0)
     {
@@ -336,25 +352,31 @@ PipelineIO PipelineIO::createForSpecDecode(
     int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
     int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
     int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
+    int32_t const draftRuntimeHiddenSize
+        = bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP ? baseOutputHiddenDim : draftHiddenSize;
     int32_t const draftVocabSize = bundle.draft->vocabSize;
 
     // Use max of base and draft dimensions for shared tensors
     int32_t const maxInputLength = std::max(bundle.base.maxSupportedInputLength, bundle.draft->maxSupportedInputLength);
-    int32_t const effectiveMaxDraftProposalSize = std::max(maxDraftProposalSize, bundle.specConfig->verifySize);
+    int32_t const effectiveMaxDraftProposalSize
+        = std::max({maxDraftProposalSize, bundle.specConfig->verifySize, bundle.specConfig->dflashBlockSize});
     int32_t const maxLogitsSize = maxRuntimeBatchSize * effectiveMaxDraftProposalSize;
     int32_t const maxVocabSize = std::max(bundle.base.outputVocabSize, draftVocabSize);
+    int32_t const maxTensorSeqLen = std::max(maxInputLength, effectiveMaxDraftProposalSize);
 
     allocateBasicIO(
-        io, maxRuntimeBatchSize, maxInputLength, bundle.base.hiddenSize, maxVocabSize, nvinfer1::DataType::kHALF);
+        io, maxRuntimeBatchSize, maxTensorSeqLen, bundle.base.hiddenSize, maxVocabSize, nvinfer1::DataType::kHALF);
 
     // Override outputLogits to support proposal-sized outputs: [maxLogitsSize, maxVocabSize].
     // dtype is kFLOAT (matching allocateBasicIO); only the shape changes for SpecDecode.
     io.outputLogits = rt::Tensor(
         {maxLogitsSize, maxVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
 
-    // Allocate hidden states for SpecDecode.
-    allocateSpecDecodeHiddenStates(
-        io, maxRuntimeBatchSize, maxInputLength, baseOutputHiddenDim, draftHiddenSize, nvinfer1::DataType::kHALF);
+    // Allocate hidden states for SpecDecode. DFlash binds the draft target-hidden
+    // input directly to baseHiddenStates, so it does not need the generic
+    // EAGLE/MTP draft hidden-state ping-pong buffers.
+    allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxTensorSeqLen, baseOutputHiddenDim,
+        draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, bundle.specDecodeMode() != SpecDecodeMode::kDFlash);
 
     if (bundle.base.numDeepstackFeatures > 0)
     {
@@ -391,6 +413,25 @@ PipelineIO PipelineIO::createForSpecDecode(
         nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
     CUDA_CHECK(
         cudaMemsetAsync(io.selectTokenIndices.rawPointer(), 0, io.selectTokenIndices.getMemoryCapacity(), stream));
+
+    io.specVerifyPhaseMarker
+        = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::specVerifyPhaseMarker");
+    CUDA_CHECK(cudaMemsetAsync(
+        io.specVerifyPhaseMarker.rawPointer(), 0, io.specVerifyPhaseMarker.getMemoryCapacity(), stream));
+
+    bool const useDFlashTree
+        = bundle.specDecodeMode() == SpecDecodeMode::kDFlash && bundle.specConfig->draftingTopK > 1;
+    if (useDFlashTree)
+    {
+        io.specTreeParentIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "PipelineIO::specTreeParentIds");
+        CUDA_CHECK(
+            cudaMemsetAsync(io.specTreeParentIds.rawPointer(), 0, io.specTreeParentIds.getMemoryCapacity(), stream));
+
+        io.specTreeDepths = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT32, "PipelineIO::specTreeDepths");
+        CUDA_CHECK(cudaMemsetAsync(io.specTreeDepths.rawPointer(), 0, io.specTreeDepths.getMemoryCapacity(), stream));
+    }
 
     return io;
 }

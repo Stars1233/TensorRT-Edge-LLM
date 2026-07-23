@@ -1,5 +1,5 @@
 diff --git a/cpp/kernels/fmha_v2/Makefile b/cpp/kernels/fmha_v2/Makefile
-index bec3b70e7..91bcc9301 100644
+index bec3b70..91bcc93 100644
 --- a/cpp/kernels/fmha_v2/Makefile
 +++ b/cpp/kernels/fmha_v2/Makefile
 @@ -101,16 +101,20 @@ GENCODE_SM87 = -gencode=arch=compute_87,code=\"sm_87\"
@@ -87,10 +87,24 @@ index bec3b70e7..91bcc9301 100644
  ###################################################################################################
  
 diff --git a/cpp/kernels/fmha_v2/setup.py b/cpp/kernels/fmha_v2/setup.py
-index cc3931caa..c730e68c6 100644
+index cc3931c..c77e64f 100644
 --- a/cpp/kernels/fmha_v2/setup.py
 +++ b/cpp/kernels/fmha_v2/setup.py
-@@ -1947,7 +1947,7 @@ def get_hopper_instruction_traits(instruction_traits, kernel_spec):
+@@ -1872,7 +1872,12 @@ def encode_name(kernel_spec):
+                            attrib='__placeholder__')
+ 
+     # Produce file, launch function and kernel names.
+-    fname = name_base.replace('__placeholder__', '')
++    # In the EdgeLLM custom-mask round the custom-mask kernels go into
++    # standalone files/cubins (the kernel names inside are unchanged), so the
++    # pre-existing per-family cubins are not touched.
++    fname_attrib = ('_custom_mask'
++                    if "GENERATE_CUSTOM_MASK_ONLY" in os.environ else '')
++    fname = name_base.replace('__placeholder__', fname_attrib)
+     if seqlen >= 1024 and not kernel_spec.flash_attention:
+         fname += '.no_i2f_f2i'
+     fname += '.cu'
+@@ -1947,7 +1952,7 @@ def get_hopper_instruction_traits(instruction_traits, kernel_spec):
  
  
  def get_effective_sm_and_name(kspec):
@@ -99,7 +113,7 @@ index cc3931caa..c730e68c6 100644
      # Override the mma instruction with an older one.
      if kspec.sm_mma in sm2name:
          assert kspec.sm_mma <= kspec.sm, "Instruction version should be at most target arch"
-@@ -1962,7 +1962,7 @@ def selected_mask_types(kspec):
+@@ -1962,7 +1967,7 @@ def selected_mask_types(kspec):
      padding_mask = '1'
      causal_mask = '1'
      sliding_or_chunked_causal_mask = '1'
@@ -108,7 +122,7 @@ index cc3931caa..c730e68c6 100644
      # only generate certain needed combinations of input_layout and mask types for trt-llm.
      if "GENERATE_CUBIN" in os.environ:
          if kspec.sage_block_sizes:
-@@ -1984,12 +1984,13 @@ def selected_mask_types(kspec):
+@@ -1984,13 +1989,31 @@ def selected_mask_types(kspec):
              # NOTE: 72/80 are added for vision transformer
              if kspec.head_size not in [32, 64, 72, 80, 128]:
                  padding_mask = '0'
@@ -124,9 +138,27 @@ index cc3931caa..c730e68c6 100644
 +                causal_mask = '0'
 +                sliding_or_chunked_causal_mask = '0'
                  custom_mask = '0'
++        # EdgeLLM uses the separate_q_k_v input layout. Vision-transformer
++        # head sizes (72/80) only need the padding mask. The custom mask
++        # (used by vision-block attention) is generated in a separate round
++        # (GENERATE_CUSTOM_MASK_ONLY) that emits standalone *_custom_mask
++        # cubins so the pre-existing cubins stay byte-identical.
++        elif (kspec.input_layout == InputLayout.SEPARATE_Q_K_V
++              and "GENERATE_EDGE_LLM" in os.environ):
++            if "GENERATE_CUSTOM_MASK_ONLY" in os.environ:
++                padding_mask = '0'
++                causal_mask = '0'
++                sliding_or_chunked_causal_mask = '0'
++                # Only d256 (the Gemma4 Unified sliding layers) consumes the
++                # CUSTOM_MASK path; specs without any selected mask are skipped.
++                custom_mask = '1' if kspec.head_size in [256] else '0'
++            elif kspec.head_size in [72, 80]:
++                causal_mask = '0'
++                sliding_or_chunked_causal_mask = '0'
          # paged kv cache is always needed in gpt variants.
          # cross-attention also needs paged kv cache.
-@@ -3520,8 +3521,6 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
+         elif kspec.input_layout == InputLayout.Q_PAGED_KV:
+@@ -3520,8 +3543,6 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
      bool mEnableSkipSoftmax;{launcher_line}
  }};
  
@@ -135,7 +167,7 @@ index cc3931caa..c730e68c6 100644
  
  }} // namespace kernels
  TRTLLM_NAMESPACE_END
-@@ -3530,13 +3529,7 @@ TRTLLM_NAMESPACE_END
+@@ -3530,13 +3551,7 @@ TRTLLM_NAMESPACE_END
          source_content = '''\
  {copyright}
  
@@ -150,7 +182,7 @@ index cc3931caa..c730e68c6 100644
  
  //--- Cubin Arrays
  {cubins}
-@@ -3544,17 +3537,7 @@ TRTLLM_NAMESPACE_END
+@@ -3544,17 +3559,7 @@ TRTLLM_NAMESPACE_END
  //--- Cubin Lengths
  {cubin_lens}
  
@@ -169,7 +201,7 @@ index cc3931caa..c730e68c6 100644
  
  // FIXME: These are duplicated declarations, we should remove them in the future.
  constexpr int32_t kSM_70 = 70;
-@@ -3562,6 +3545,7 @@ constexpr int32_t kSM_72 = 72;
+@@ -3562,6 +3567,7 @@ constexpr int32_t kSM_72 = 72;
  constexpr int32_t kSM_75 = 75;
  constexpr int32_t kSM_80 = 80;
  constexpr int32_t kSM_86 = 86;
@@ -177,7 +209,7 @@ index cc3931caa..c730e68c6 100644
  constexpr int32_t kSM_89 = 89;
  constexpr int32_t kSM_90 = 90;
  constexpr int32_t kSM_100 = 100;
-@@ -3569,6 +3553,7 @@ constexpr int32_t kSM_100f = 10100;
+@@ -3569,6 +3575,7 @@ constexpr int32_t kSM_100f = 10100;
  constexpr int32_t kSM_103 = 103;
  constexpr int32_t kSM_120 = 120;
  constexpr int32_t kSM_121 = 121;
@@ -185,7 +217,7 @@ index cc3931caa..c730e68c6 100644
  
  // FIXME: These are duplicated declarations, we should remove them in the future.
  enum Data_type
-@@ -3621,8 +3606,7 @@ extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {
+@@ -3621,8 +3628,7 @@ extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {
  {metadata_v2}
  }};
  
@@ -195,7 +227,7 @@ index cc3931caa..c730e68c6 100644
  '''.format(**locals(), copyright=copyright)
      else:
          # Non-GENERATE_CUBIN mode: use old behavior
-@@ -4965,6 +4949,60 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
+@@ -4965,6 +4971,64 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
                                            head_size_v)
  
  
@@ -216,6 +248,10 @@ index cc3931caa..c730e68c6 100644
 +    # (tiled, head_size, q_step, kv_step, limit_fragments, ldgsts_kv)
 +    kernel_configs = [
 +        (0, 64, 64, 32, False, True),
++        # NOTE: 72/80 are vision-transformer head sizes (padding mask only,
++        # see selected_mask_types).
++        (0, 72, 64, 32, False, True),
++        (0, 80, 64, 32, False, True),
 +        (0, 128, 64, 32, False, True),
 +        (1, 128, 64, 128, False, True),
 +        (0, 256, 64, 16, True, False),
@@ -256,7 +292,7 @@ index cc3931caa..c730e68c6 100644
  # Note this will be used in TRT-LLM.
  def enumerate_hmma_flash_kernels_base(specs,
                                        sm=80,
-@@ -6405,6 +6443,29 @@ def enumerate_kernels():
+@@ -6405,6 +6469,29 @@ def enumerate_kernels():
  
      specs = []
  
@@ -287,7 +323,7 @@ index cc3931caa..c730e68c6 100644
  
      # Current fp16 384 kernel does 1x8 (smem limit), STEP=48. FP16 does not currently have noloop.
 diff --git a/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h b/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h
-index 34b5ccfd3..89dc1a5bb 100644
+index 34b5ccf..89dc1a5 100644
 --- a/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h
 +++ b/cpp/kernels/fmha_v2/src/fmha/gmem_tile_qkv_packed.h
 @@ -575,6 +575,10 @@ struct Gmem_tile_q_k_v
@@ -302,7 +338,7 @@ index 34b5ccfd3..89dc1a5bb 100644
          // Assemble the final pointer.
          q_k_v_ptr_ += row_offset + idx * VALID_BYTES_PER_ROW + col_in_bytes_;
 diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_attention.h b/cpp/kernels/fmha_v2/src/fused_multihead_attention.h
-index f71bd9486..946fa227d 100644
+index f71bd94..946fa22 100644
 --- a/cpp/kernels/fmha_v2/src/fused_multihead_attention.h
 +++ b/cpp/kernels/fmha_v2/src/fused_multihead_attention.h
 @@ -146,7 +146,7 @@ struct Fused_multihead_attention_params_base
@@ -315,7 +351,7 @@ index f71bd9486..946fa227d 100644
      uint32_t scale_bmm1, scale_softmax, scale_bmm2;
      // The bmm2 scaling factors in the device.
 diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h b/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h
-index 126cf14d6..3c49d5c7d 100644
+index 126cf14..3c49d5c 100644
 --- a/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h
 +++ b/cpp/kernels/fmha_v2/src/fused_multihead_attention_demo_bert_params.h
 @@ -129,7 +129,7 @@ struct Fused_multihead_attention_params_v2
@@ -328,7 +364,7 @@ index 126cf14d6..3c49d5c7d 100644
      int dv = 0;
      // The number of grouped heads in the seqlen dimension.
 diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h b/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h
-index 9b5103164..d09be3410 100644
+index 9b51031..d09be34 100644
 --- a/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h
 +++ b/cpp/kernels/fmha_v2/src/fused_multihead_attention_kernel.h
 @@ -135,7 +135,7 @@ struct Single_cta<2>
@@ -340,3 +376,37 @@ index 9b5103164..d09be3410 100644
          }
          else
          {
+diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop.h b/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop.h
+index 467d614..49b5322 100644
+--- a/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop.h
++++ b/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop.h
+@@ -364,7 +364,11 @@ inline __device__ void device_flash_attention_nl(Params const& params)
+         bool const first_step = (kv_loop == kv_loop_start);
+         // It is possible that all tokens are masked out (sliding-window-attention).
+         bool const apply_sliding_window_mask = (mask_sliding_window && kv_loop <= sliding_window_mask_end);
+-        bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
++        // CUSTOM_MASK: the packed mask encodes validity everywhere (e.g. a sliding window folded
++        // into the mask bits), so apply it on every kv tile, not only in the diagonal band and to
++        // its right.
++        bool const apply_mask = Kernel_traits::CUSTOM_MASK || params.has_alibi
++            || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
+ 
+         // Move mask offset.
+         // Pre-load packed mask if it has.
+diff --git a/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop_tiled.h b/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop_tiled.h
+index 55ba07e..19ad96a 100644
+--- a/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop_tiled.h
++++ b/cpp/kernels/fmha_v2/src/fused_multihead_flash_attention_kernel_noloop_tiled.h
+@@ -302,7 +302,11 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
+         bool const first_step = (kv_loop == kv_loop_start);
+         // It is possible that all tokens are masked out (sliding-window-attention).
+         bool const apply_sliding_window_mask = (mask_sliding_window && kv_loop <= sliding_window_mask_end);
+-        bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
++        // CUSTOM_MASK: the packed mask encodes validity everywhere (e.g. a sliding window folded
++        // into the mask bits), so apply it on every kv tile, not only in the diagonal band and to
++        // its right.
++        bool const apply_mask = Kernel_traits::CUSTOM_MASK || params.has_alibi
++            || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
+ 
+         // Declare the accumulators for the 1st gemm.
+         fmha::Fragment_accumulator<Traits_p> acc_p[Mma_tile_p::MMAS_M][Mma_tile_p::MMAS_N];

@@ -60,11 +60,13 @@ in-tree FP32 BSHD reference.
 | Variant | D | Mask | KV group | Dtype | Tuning |
 |---------|---:|------|---------:|-------|--------|
 | `ffpa_d512_causal` | 512 | causal | runtime | FP16 | `Br=64, Bc=16, threads=128` |
+| `ffpa_d512_causal_visionblock` | 512 | causal + vision-block overlay | runtime | FP16 | `Br=64, Bc=16, threads=128` |
 
 Compile-time axes:
 
 - `head_dim`
 - `is_causal`
+- `vision_block` (Gemma4 vision-block overlay; requires `is_causal`)
 - `Br`, `Bc`, `num_threads`
 - `skip_rescale`
 
@@ -77,6 +79,29 @@ Runtime axes:
   equal to Q-head count = MHA). The kernel derives the group size internally;
   the C++ runner passes `numKVHeads` from `CuteDslFFPAParams` and rejects any
   `numQHeads % numKVHeads != 0`.
+- `mCuSeqLenQ` / `mCuSeqLenK` — `(B+1,)` Int32 cumulative sequence lengths
+  carrying the *logical* per-batch valid lengths.  Per batch
+  `b`, `seqlen_q_b = cu_q[b+1] - cu_q[b]` and `seqlen_k_b = cu_k[b+1] -
+  cu_k[b]`; the causal mask is bottom-right aligned with offset
+  `seqlen_k_b - seqlen_q_b` (0 for right-padded prefill, the KV prefix length
+  for chunked prefill).  Padding K/V positions beyond `seqlen_k_b` are never
+  attended, padding Q rows are residual-masked, and whole-padding Q tiles
+  write exact zeros.  Pass uniform cumulative lengths (`[0, S, 2S, ...]`) to
+  recover the previous dense behaviour.  Varlen behaviour is covered by
+  `unittests/cuteDslFFPARunnerTest.cpp` (ragged poisoned-padding and
+  chunked-prefill cases against the FP32 reference).
+- `mBlockBegin` / `mBlockEnd` (`ffpa_d512_causal_visionblock` only) —
+  `(B, S_q)` Int32 vision-block interval tensors for Gemma4 Unified.  Per
+  query row `q` they carry an extra allowed KV interval
+  `[blockBegin[q], blockEnd[q]]` so contiguous image blocks attend
+  bidirectionally: `allow(q, k) = causal(q, k) OR blockBegin[q] <= k <=
+  blockEnd[q]`.  Text rows hold the `-1/-1` sentinel (empty interval).  The
+  per-CTA KV traversal bound is extended to the Q tile's max `blockEnd`, so
+  the extra cost is bounded by the block length past the diagonal.  The
+  plain `ffpa_d512_causal` variant is compiled from the same script with
+  the tensors set to `None` — its codegen and C ABI are unchanged.  The
+  C++ runner (`CuteDslFFPARunner::run`) selects the overlay variant iff
+  `CuteDslFFPAParams::blockBegin/blockEnd` are non-null.
 
 The AOT export bakes the BSND layout with `D=512` as the innermost contiguous
 dim, so the per-tensor batch and seq strides must match `S * H * D` and

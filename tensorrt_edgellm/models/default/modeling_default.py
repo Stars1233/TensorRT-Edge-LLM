@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -213,6 +213,7 @@ class Attention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
         module_prefix = f"layers.{layer_idx}.self_attn"
@@ -235,10 +236,11 @@ class Attention(nn.Module):
                                   bias=config.attention_bias,
                                   module_name=f"{module_prefix}.v_proj",
                                   tp_mode=TPMode.COL)
-        # FP8 KV-cache scales live on the proj modules (checkpoint keys
-        # ``...k_proj.k_scale`` / ``...v_proj.v_scale``); they are not part of
-        # FP8Linear's per-tensor weight/input scales.
+        # FP8 attention scales live on the projection modules (checkpoint keys
+        # ``...{q,k,v}_proj.{q,k,v}_scale``); they are not part of FP8Linear's
+        # per-tensor weight/input scales.
         if self.enable_fp8_kv_cache:
+            self.q_proj.register_buffer("q_scale", torch.ones(1))
             self.k_proj.register_buffer("k_scale", torch.ones(1))
             self.v_proj.register_buffer("v_scale", torch.ones(1))
 
@@ -292,6 +294,8 @@ class Attention(nn.Module):
             "sliding_window_size": self.sliding_window_size,
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
+            "attention_scale": self.attention_scale,
+            "enable_vision_block_attention": False,
         }
         if enable_tree:
             kwargs["attention_mask"] = attention_mask

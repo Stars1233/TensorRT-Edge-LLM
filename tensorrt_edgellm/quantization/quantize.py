@@ -24,8 +24,9 @@ import os
 import shutil
 import time
 from contextlib import contextmanager
+from itertools import islice
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -35,47 +36,34 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (AutoModel, AutoModelForCausalLM,
-                          AutoModelForImageTextToText, AutoProcessor,
+                          AutoModelForImageTextToText,
+                          AutoModelForTextToWaveform, AutoProcessor,
                           AutoTokenizer)
 
+from .datasets import (AudioDataset, ImageDataset, TextDataset, dataset_name,
+                       resolve_dataset)
 from .quantization_configs import build_quant_config
 from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
-
-
-def _load_dataset(*args, **kwargs):
-    from datasets import load_dataset
-    return load_dataset(*args, **kwargs)
+from .qwen3_cp_loader import has_code_predictor, qwen3_cp_calibration_loop
 
 
 def _text_calib_dataloader(tokenizer,
-                           dataset_name="cnn_dailymail",
+                           text_dataset: TextDataset,
                            batch_size=1,
                            num_samples=512,
                            max_length=512):
-    """Return a DataLoader of tokenised ``input_ids`` for calibration."""
+    """Return a DataLoader of tokenised ``input_ids`` for calibration.
 
-    def _get_texts(ds):
-        if "text" in ds.column_names:
-            col = "text"
-        elif "article" in ds.column_names:
-            col = "article"
-        else:
-            raise ValueError(
-                f"Dataset {dataset_name!r} has no 'text' or 'article' column: "
-                f"{ds.column_names}")
-        return ds[col][:num_samples]
-
-    if "cnn_dailymail" in dataset_name:
-        ds = _load_dataset(dataset_name, name="3.0.0", split="train")
-        texts = ds["article"][:num_samples]
-    elif os.path.isfile(dataset_name):
-        ds = _load_dataset("json", data_files=dataset_name, split="train")
-        texts = _get_texts(ds)
-    else:
-        ds = _load_dataset(dataset_name, split="train")
-        texts = _get_texts(ds)
+    ``text_dataset`` is a text generator function; the first ``num_samples``
+    non-empty strings it yields are tokenized.
+    """
+    texts = list(islice(text_dataset(), num_samples))
+    if not texts:
+        raise ValueError(
+            f"Text calibration dataset {dataset_name(text_dataset)!r} yielded "
+            f"no samples. Check dataset access / fields.")
 
     enc = tokenizer(texts,
                     return_tensors="pt",
@@ -118,61 +106,23 @@ def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
             shutil.copy2(src, os.path.join(output_dir, name))
 
 
-def _iter_image_question_pairs(dataset_name: str):
-    """Yield ``(image, question)`` pairs from a HuggingFace calibration dataset.
-
-    Tolerant of two common schemas:
-      * ScienceQA-style: single ``image`` column.
-      * MMMU-style: numbered ``image_1`` / ``image_2`` / ... columns, no
-        single ``image`` column (one row may carry several images; we take
-        the first non-empty one for calibration).
-
-    Splits are tried in the order ``dev`` → ``validation`` → ``train``.
-    """
-    last_err: Optional[Exception] = None
-    ds = None
-    for split in ("dev", "validation", "train"):
-        try:
-            ds = _load_dataset(dataset_name, split=split, streaming=True)
-            break
-        except Exception as e:  # pylint: disable=broad-except
-            last_err = e
-    if ds is None:
-        raise RuntimeError(f"Could not load {dataset_name!r} via any of "
-                           f"split=dev/validation/train") from last_err
-
-    for example in ds:
-        image = example.get("image")
-        if image is None:
-            for i in range(1, 8):
-                image = example.get(f"image_{i}")
-                if image is not None:
-                    break
-        question = example.get("question") or ""
-        if image is not None and question:
-            yield image, question
-
-
 def _multimodal_calib_dataloader(processor,
-                                 dataset_name: str = "lmms-lab/MMMU",
+                                 image_dataset: ImageDataset,
                                  num_samples: int = 128,
                                  max_length: int = 512,
                                  is_phi4mm: bool = False):
     """Yield ``BatchFeature`` dicts with ``input_ids`` + ``pixel_values``.
 
-    Streams image-question pairs through the model's own ``AutoProcessor``
-    chat template so the visual tower receives real activations.  Used when
-    ``visual_quantization`` is set — text-only calibration would leave visual
-    quantizers with uninitialised scales.
+    Streams ``(image, question)`` pairs from ``image_dataset`` through the
+    model's own ``AutoProcessor`` chat template so the visual tower receives
+    real activations.  Used when ``visual_quantization`` is set — text-only
+    calibration would leave visual quantizers with uninitialised scales.
 
-    Default is ``lmms-lab/MMMU`` (the single-config HF re-pack of MMMU's
-    multi-config original). Pass any other HF name to switch
-    (e.g. ``derek-thomas/ScienceQA``).
     Drops down to 128 samples at batch_size=1 — VLM calibration is
     GPU-memory bound; small batches are safest.
     """
     batches: list[dict[str, Any]] = []
-    for image, question in _iter_image_question_pairs(dataset_name):
+    for image, question in image_dataset():
         messages = [{
             "role":
             "user",
@@ -228,8 +178,9 @@ def _multimodal_calib_dataloader(processor,
 
     if not batches:
         raise RuntimeError(
-            f"No usable multimodal samples from {dataset_name!r}. "
-            "Check dataset access / processor chat template.")
+            f"No usable multimodal samples from "
+            f"{dataset_name(image_dataset)!r}. Check dataset access, fields, "
+            "and the processor chat template.")
     return batches
 
 
@@ -287,9 +238,15 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
         # for *recognition* failures — not for ImportError or other runtime
         # errors, which would otherwise be silently masked by a misleading
         # "Unrecognized configuration class" exception.
+        # Most-specific factory first: TextToWaveform > ImageTextToText >
+        # CausalLM > AutoModel (fallback for custom architectures).
+        factories = [
+            f
+            for f in (AutoModelForTextToWaveform, AutoModelForImageTextToText,
+                      AutoModelForCausalLM, AutoModel) if f is not None
+        ]
         last_err: Optional[Exception] = None
-        for factory in (AutoModelForImageTextToText, AutoModelForCausalLM,
-                        AutoModel):
+        for factory in factories:
             try:
                 model = factory.from_pretrained(
                     model_dir,
@@ -425,6 +382,47 @@ def _calibrate(model, dataloader):
             model(data)
 
 
+def _collect_attention_q_scales_for_export(
+        model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Preserve calibrated FP8 Q-BMM scales in the exported checkpoint.
+
+    ModelOpt retains the calibrated Q-BMM amax on the quantizer, but checkpoint
+    export does not emit it as ``q_proj.q_scale``. Edge-LLM needs that scale to
+    quantize prefill Q to E4M3 without saturation.
+    """
+    q_scales: dict[str, torch.Tensor] = {}
+    for module_name, module in model.named_modules():
+        quantizer = getattr(module, "q_bmm_quantizer", None)
+        if quantizer is None or not getattr(quantizer, "is_enabled", False):
+            continue
+        if getattr(module, "q_proj", None) is None:
+            continue
+
+        amax = getattr(quantizer, "_amax", None)
+        if amax is None:
+            raise RuntimeError(
+                f"Enabled Q-BMM quantizer {module_name}.q_bmm_quantizer "
+                "has no calibrated amax")
+        if amax.numel() != 1:
+            raise RuntimeError(
+                f"Q-BMM quantizer {module_name}.q_bmm_quantizer must use "
+                f"a per-tensor scale, got shape {tuple(amax.shape)}")
+
+        maxbound = float(quantizer.maxbound)
+        if maxbound <= 0.0:
+            raise RuntimeError(
+                f"Invalid Q-BMM maxbound for {module_name}: {maxbound}")
+        scale = amax.detach().float().reshape(1).cpu() / maxbound
+        if not torch.isfinite(scale).all() or scale.item() <= 0.0:
+            raise RuntimeError(
+                f"Invalid calibrated Q-BMM scale for {module_name}: "
+                f"amax={amax.item()}, maxbound={maxbound}")
+        prefix = f"{module_name}." if module_name else ""
+        q_scales[f"{prefix}q_proj.q_scale"] = scale
+
+    return q_scales
+
+
 def _normalize_tied_weights_keys(model) -> None:
     """WAR for transformers >= 5.x ``_tied_weights_keys`` format change.
 
@@ -531,8 +529,12 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     # NVFP4 on hybrid models: resmoothing is safe and required for GDN
     # input projection fusion — do NOT skip.
     is_nvfp4 = quantization.lower() in ("nvfp4", "fp4")
+    # Multimodal wrappers have no top-level ``forward``; resmooth's dummy
+    # ``model(fake_input)`` crashes on them. Resmooth is a no-op without
+    # AWQ pre_quant_scales, so skipping is safe here.
     should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
-                   or model_type in ("phi4mm", "phi4_multimodal"))
+                   or model_type in ("phi4mm", "phi4_multimodal", "qwen3_omni",
+                                     "qwen3_omni_moe", "qwen3_omni_next"))
     if not should_skip:
         yield
         return
@@ -619,11 +621,15 @@ def quantize_and_export(
     quantization: Optional[str] = None,
     lm_head_quantization: Optional[str] = None,
     visual_quantization: Optional[str] = None,
+    cp_quantization: Optional[str] = None,
     kv_cache_quantization: Optional[str] = None,
     audio_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    *,
+    text_dataset: Union[str, TextDataset, None] = None,
+    image_dataset: Union[str, ImageDataset, None] = None,
+    audio_dataset: Union[str, AudioDataset, None] = None,
     num_samples: int = 512,
 ) -> str:
     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
@@ -634,6 +640,13 @@ def quantize_and_export(
     tower with text-only calibration produces uninitialised activation scales
     on the visual path — a multimodal calibration loader is required for
     accurate visual stats (see ``A3``).
+
+    ``text_dataset`` / ``image_dataset`` / ``audio_dataset`` each accept a
+    registered dataset name (str), a dataset generator function, or ``None``
+    for that modality's default. Only the dataset for the modality a run
+    actually calibrates is resolved, so an unknown name for an unused modality
+    never fails the run; an unknown name for the modality in use fails out
+    with a pointer to the customization guide.
     """
     t0 = time.time()
     model, tokenizer, processor = _load_model(model_dir, dtype, device)
@@ -643,6 +656,7 @@ def quantize_and_export(
     mtp_state_dict: dict[str, torch.Tensor] = {}
     if (mtp_layers > 0 and quantization is not None
             and not is_quantized(model)):
+        text_ds = resolve_dataset(text_dataset, "text")
         from .models.mtp_draft import (export_quantized_mtp_state_dict,
                                        quantize_mtp_from_base)
         print(f"Detected {mtp_layers} MTP layer(s); quantizing MTP draft "
@@ -656,7 +670,7 @@ def quantize_and_export(
             kv_cache_quantization=kv_cache_quantization,
             dtype=dtype,
             device=device,
-            dataset=dataset,
+            text_dataset=text_ds,
             num_samples=num_samples,
         )
         mtp_state_dict = export_quantized_mtp_state_dict(
@@ -672,23 +686,77 @@ def quantize_and_export(
     if is_quantized(model):
         print("Model already quantized — skipping.")
     else:
+        # Fail fast when the user asks for CP quantization on a model that
+        # has no CodePredictor — otherwise the cp_quantization argument
+        # silently no-ops (build_quant_config still adds *code_predictor*
+        # wildcards but they match nothing).
+        if cp_quantization is not None and not has_code_predictor(model):
+            raise ValueError(
+                f"--cp_quantization={cp_quantization} requires a model with "
+                "talker.code_predictor (Qwen3-Omni / Qwen3-TTS); the loaded "
+                "checkpoint has none.")
+        # MoE Thinker backbone quantization runs through the dedicated
+        # ``tensorrt-edgellm-quantize thinker`` command (qwen3_omni_thinker.py);
+        # the ``llm`` command can't dummy-walk the MoE wrapper. Joint mode
+        # here would silently produce a Thinker-unquantized checkpoint.
+        if (cp_quantization is not None and quantization is not None
+                and getattr(model, "thinker", None) is not None
+                and "Moe" in type(model).__name__):
+            raise ValueError(
+                "Joint --quantization + --cp_quantization on the Qwen3-Omni-MoE "
+                "wrapper is not supported here. Use `--cp_quantization fp8` "
+                "alone via `tensorrt-edgellm-quantize llm`, and run "
+                "`tensorrt-edgellm-quantize thinker --quantization fp8` "
+                "separately for the MoE Thinker backbone.")
         quant_cfg = build_quant_config(
             quantization,
             lm_head_quantization,
             kv_cache_quantization,
             visual_quantization=visual_quantization,
             audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization,
         )
-        if is_qwen3_asr_model(model_dir):
+        if cp_quantization is not None and has_code_predictor(model):
+            # CP is only reached via the Thinker->Talker->CP generation path,
+            # so a dedicated loop drives that chain (bs=1: Talker uses 3D
+            # RoPE, no batch-mixing). When backbone is co-quantized, prepend
+            # a standard text pass; backbone forward doesn't fire CP
+            # quantizers so CP amax matches standalone mode.
+            text_ds = resolve_dataset(text_dataset, "text")
+            print(f"Text calibration dataset: {dataset_name(text_ds)}")
+            cp_loader = _text_calib_dataloader(tokenizer,
+                                               text_ds,
+                                               batch_size=1,
+                                               num_samples=num_samples)
+            cp_n = min(num_samples, 64)
+            if quantization is not None:
+                bb_loader = _text_calib_dataloader(tokenizer,
+                                                   text_ds,
+                                                   batch_size=16,
+                                                   num_samples=num_samples)
+
+                def _joint_cp_loop(m):
+                    _calibrate(m, bb_loader)
+                    qwen3_cp_calibration_loop(m,
+                                              cp_loader,
+                                              num_cp_samples=cp_n)
+
+                mtq.quantize(model, quant_cfg, forward_loop=_joint_cp_loop)
+            else:
+                mtq.quantize(
+                    model,
+                    quant_cfg,
+                    forward_loop=lambda m: qwen3_cp_calibration_loop(
+                        m, cp_loader, num_cp_samples=cp_n),
+                )
+        elif is_qwen3_asr_model(model_dir):
+            audio_ds = resolve_dataset(audio_dataset, "audio")
+            print(f"Audio calibration dataset: {dataset_name(audio_ds)}")
             # ASR multimodal calibration: stream real (audio, transcript)
             # pairs through the joint audio_tower + text decoder so the
             # text quantizers see audio-embedding-spliced inputs (the
             # distribution they actually see at runtime). Mirror of the
-            # visual_quantization branch below for VLMs. Uses LibriSpeech
-            # by default; --dataset can override but the loader expects an
-            # ``audio`` + ``text`` schema (LibriSpeech / GigaSpeech / ...).
-            asr_dataset = (dataset if dataset != "cnn_dailymail" else
-                           "openslr/librispeech_asr")
+            # visual_quantization branch below for VLMs.
             asr_samples = min(num_samples, 128)
             audio_n_window = int(model.audio_tower.config.get("n_window", 100))
             num_mel_bins = int(
@@ -704,7 +772,7 @@ def quantize_and_export(
                     audio_token_id=audio_token_id,
                     audio_n_window=audio_n_window,
                     num_mel_bins=num_mel_bins,
-                    dataset_name=asr_dataset,
+                    audio_dataset=audio_ds,
                     num_samples=asr_samples,
                 ))
             mtq.quantize(
@@ -713,19 +781,16 @@ def quantize_and_export(
                 forward_loop=lambda m: _calibrate_asr_multimodal(m, batches),
             )
         elif visual_quantization is not None:
+            image_ds = resolve_dataset(image_dataset, "image")
+            print(f"Image calibration dataset: {dataset_name(image_ds)}")
             # Multimodal calibration: feed (image, text) pairs through the
             # whole VLM so visual + LLM quantizers both see real activations.
             processor = AutoProcessor.from_pretrained(model_dir,
                                                       trust_remote_code=True)
             mm_samples = min(num_samples, 128)
-            # Use the user's --dataset when it looks like an image+text dataset;
-            # fall back to lmms-lab/MMMU when --dataset is the text-only default
-            # (cnn_dailymail) since that has no images.
-            mm_dataset = (dataset
-                          if dataset != "cnn_dailymail" else "lmms-lab/MMMU")
             batches = _multimodal_calib_dataloader(
                 processor,
-                dataset_name=mm_dataset,
+                image_dataset=image_ds,
                 num_samples=mm_samples,
                 is_phi4mm=_is_phi4mm_model(model_dir))
             mtq.quantize(
@@ -734,9 +799,11 @@ def quantize_and_export(
                 forward_loop=lambda m: _calibrate_multimodal(m, batches),
             )
         else:
+            text_ds = resolve_dataset(text_dataset, "text")
+            print(f"Text calibration dataset: {dataset_name(text_ds)}")
             batch_size = 16 if quantization in (None, "int4_awq") else 1
             loader = _text_calib_dataloader(tokenizer,
-                                            dataset,
+                                            text_ds,
                                             batch_size=batch_size,
                                             num_samples=num_samples)
             mtq.quantize(model,
@@ -755,12 +822,30 @@ def quantize_and_export(
         if mtp_layer_prefixes:
             model._mtp_layer_prefixes = mtp_layer_prefixes
 
+    attention_q_scales = _collect_attention_q_scales_for_export(model)
+    extra_state_dict = dict(mtp_state_dict)
+    extra_state_dict.update(attention_q_scales)
+
     os.makedirs(output_dir, exist_ok=True)
-    with torch.inference_mode(), _skip_resmooth_for_hybrid(
-            model, quantization or ""):
-        export_hf_checkpoint(model,
-                             export_dir=output_dir,
-                             extra_state_dict=mtp_state_dict)
+    # MoE wrapper has no top-level ``forward`` → ``export_hf_checkpoint``'s
+    # dummy walk crashes. Route CP-only quantization on such wrappers through
+    # ``qwen3_omni._export_submodel(model, "talker", ...)``.
+    cp_only_moe_wrapper = (cp_quantization is not None and quantization is None
+                           and has_code_predictor(model)
+                           and getattr(model, "thinker", None) is not None
+                           and "Moe" in type(model).__name__)
+    if cp_only_moe_wrapper:
+        from .qwen3_omni import _export_submodel
+        _export_submodel(model, "talker", output_dir)
+    else:
+        with torch.inference_mode(), _skip_resmooth_for_hybrid(
+                model, quantization or ""):
+            export_hf_checkpoint(model,
+                                 export_dir=output_dir,
+                                 extra_state_dict=extra_state_dict)
+        if attention_q_scales:
+            print("Exported calibrated Q-BMM scales for "
+                  f"{len(attention_q_scales)} attention layer(s).")
     _remove_stale_safetensors_index(output_dir)
     tokenizer.save_pretrained(output_dir)
     if processor is not None:

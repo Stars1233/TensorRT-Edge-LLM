@@ -9,7 +9,12 @@ tests:
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-1.7B-nvfp4-mxsl2048-eagle-eagle3-nvfp4-mxbs1-mxil1024-llm_basic]
 
   # === DFlash LLM - Qwen3.5-4B with DFlash speculative decoding ===
+  # Linear DFlash: uses --dflash-base export and the default specDraftTopK=1 runtime.
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3.5-4B-fp16-mxsl2048-dflash-b16-mxbs1-mxil1024-mvts16-mdts16]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3.5-4B-fp16-mxsl2048-dflash-b16-mxbs1-mxil1024-mvts16-mdts16-llm_basic]
+  # DFlash DDTree: uses --dflash-tree-base export and requires specDraftTopK > 1.
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3.5-4B-fp16-mxsl2048-dflash-b16-ddtree-mxbs1-mxil1024-mvts16-mdts16]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3.5-4B-fp16-mxsl2048-dflash-b16-ddtree-mxbs1-mxil1024-mvts16-mdts16-edtk8-llm_basic]
+  # Linear DFlash NVFP4 smoke.
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3.5-4B-nvfp4-mxsl2048-dflash-b16-nvfp4-mxbs1-mxil1024-mvts16-mdts16]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen3.5-4B-nvfp4-mxsl2048-dflash-b16-nvfp4-mxbs1-mxil1024-mvts16-mdts16-llm_basic]

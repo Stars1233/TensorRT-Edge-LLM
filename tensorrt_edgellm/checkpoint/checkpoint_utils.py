@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "RUNTIME_TOKENIZER_FILENAMES",
     "normalize_rope_scaling_for_runtime",
+    "rotary_dim_for_runtime",
     "load_checkpoint_config_dicts",
     "load_config_dict",
     "build_runtime_llm_config_dict",
@@ -69,6 +70,21 @@ def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
     if "type" not in normalized and "rope_type" in normalized:
         normalized["type"] = normalized["rope_type"]
     return normalized
+
+
+def rotary_dim_for_runtime(rope_config: Dict[str, Any], head_dim: int,
+                           fallback_partial_rotary_factor: float) -> int:
+    """Return the RoPE binding width expected by the C++ builder/runtime."""
+    rope_scaling = rope_config.get("rope_scaling")
+    if isinstance(rope_scaling, dict):
+        rope_type = str(
+            rope_scaling.get("type") or rope_scaling.get("rope_type") or "")
+        if rope_type in ("default", "proportional"):
+            return int(head_dim)
+    partial_rotary_factor = float(
+        rope_config.get("partial_rotary_factor",
+                        fallback_partial_rotary_factor))
+    return int(float(head_dim) * partial_rotary_factor)
 
 
 def _normalize_explicit_rope_config_for_runtime(
@@ -285,6 +301,8 @@ def _export_tool_version() -> str:
 
 def _determine_spec_decode_type(config) -> str:
     """Return the speculative decoding algorithm for runtime config."""
+    if config.gemma4_mtp_base or config.gemma4_mtp_draft:
+        return "gemma4_mtp"
     if config.is_eagle3_draft or config.eagle_base:
         return "eagle3"
     if config.is_dflash_draft or config.dflash_base:
@@ -296,9 +314,11 @@ def _determine_spec_decode_type(config) -> str:
 
 def _determine_engine_role(config) -> str:
     """Return the engine role within the speculative decoding deployment."""
-    if config.is_eagle3_draft or config.is_dflash_draft or config.is_mtp_draft:
+    if (config.is_eagle3_draft or config.is_dflash_draft or config.is_mtp_draft
+            or config.gemma4_mtp_draft):
         return "draft"
-    if config.eagle_base or config.dflash_base or config.mtp_base:
+    if (config.eagle_base or config.dflash_base or config.mtp_base
+            or config.gemma4_mtp_base):
         return "base"
     return "llm"
 
@@ -318,22 +338,40 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     tp_rank = max(0, getattr(config, "tp_rank", 0))
 
     out: Dict[str, Any] = {
-        "model": config.model_type,
-        "spec_decode_type": _determine_spec_decode_type(config),
-        "engine_role": _determine_engine_role(config),
-        "edgellm_version": _export_tool_version(),
-        "vocab_size": config.vocab_size,
-        "hidden_size": config.hidden_size,
-        "intermediate_size": config.intermediate_size,
-        "num_hidden_layers": config.num_hidden_layers,
-        "num_attention_heads": config.num_attention_heads,
-        "num_key_value_heads": config.num_key_value_heads,
-        "head_dim": config.head_dim,
-        "max_position_embeddings": config.max_position_embeddings,
-        "rope_theta": config.rope_theta,
-        "rope_scaling": rope_scaling,
-        "partial_rotary_factor": config.partial_rotary_factor,
-        "num_deepstack_features": config.num_deepstack_features,
+        "model":
+        config.model_type,
+        "spec_decode_type":
+        _determine_spec_decode_type(config),
+        "engine_role":
+        _determine_engine_role(config),
+        "edgellm_version":
+        _export_tool_version(),
+        "vocab_size":
+        config.vocab_size,
+        "hidden_size":
+        config.hidden_size,
+        "intermediate_size":
+        config.intermediate_size,
+        "num_hidden_layers":
+        config.num_hidden_layers,
+        "num_attention_heads":
+        config.num_attention_heads,
+        "num_key_value_heads":
+        config.num_key_value_heads,
+        "head_dim":
+        config.head_dim,
+        "max_position_embeddings":
+        config.max_position_embeddings,
+        "rope_theta":
+        config.rope_theta,
+        "rope_scaling":
+        rope_scaling,
+        "partial_rotary_factor":
+        config.partial_rotary_factor,
+        "num_deepstack_features":
+        config.num_deepstack_features,
+        "use_vision_bidirectional_attention":
+        config.use_vision_bidirectional_attention,
     }
     if tp_size > 1:
         out["tp_size"] = tp_size
@@ -342,21 +380,29 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
     if config.global_head_dim and config.global_head_dim != config.head_dim:
         out["global_head_dim"] = config.global_head_dim
+        use_global_kv_heads = bool(config.attention_k_eq_v
+                                   and config.num_global_key_value_heads)
+        # C++ sizes KV tensors from kv_layer_configs below. Keep the top-level
+        # field only for Python/config round-trip metadata.
+        if (config.num_global_key_value_heads and use_global_kv_heads
+                and config.num_global_key_value_heads
+                != config.num_key_value_heads):
+            out["num_global_key_value_heads"] = config.num_global_key_value_heads
         out["layer_types"] = config.layer_types
         # Emit kv_layer_configs so C++ runtime sizes per-layer KV cache correctly.
         # The C++ parser expects "attention"/"mamba" strings in layer_types when
         # kv_layer_configs is present, so emit a normalised copy.
         norm_lt: list = []
         kv_cfgs: list = []
+        full_attention_kv_heads = (config.num_global_key_value_heads
+                                   if use_global_kv_heads else
+                                   config.num_key_value_heads)
         for lt in config.layer_types:
             norm_lt.append("attention")  # all layers are attention in Gemma4
             if lt == "full_attention":
                 kv_cfgs.append({
-                    "num_kv_heads":
-                    config.num_global_key_value_heads
-                    or config.num_key_value_heads,
-                    "head_dim":
-                    config.global_head_dim
+                    "num_kv_heads": full_attention_kv_heads,
+                    "head_dim": config.global_head_dim
                 })
             else:
                 kv_cfgs.append({
@@ -373,7 +419,7 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
 
     # KV-sharing donors: shared layers read from donor layer's KV cache.
     num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-    if num_kv_shared > 0:
+    if num_kv_shared > 0 and not config.gemma4_mtp_draft:
         from ..models.gemma4.modeling_gemma4_text import \
             _compute_kv_donor_indices
         donor_map = _compute_kv_donor_indices(config)
@@ -401,6 +447,14 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             config.sliding_rope_config or {})
         out["full_rope_config"] = _normalize_explicit_rope_config_for_runtime(
             config.full_rope_config or {})
+        if config.gemma4_mtp_draft:
+            out["sliding_rotary_dim"] = rotary_dim_for_runtime(
+                out["sliding_rope_config"], config.head_dim, 1.0)
+            out["full_rotary_dim"] = rotary_dim_for_runtime(
+                out["full_rope_config"],
+                config.global_head_dim or config.head_dim,
+                config.partial_rotary_factor,
+            )
 
     if config.is_hybrid and mc is not None:
         out.update({
@@ -440,12 +494,20 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     # Only attention and linear-attention layers carry KV/recurrent state and
     # must appear in the per-layer routing table. MLP layers are skipped.
     if config.is_hybrid and config.layer_types:
-        from ..config import LAYER_ATTN, LAYER_GDN, LAYER_MAMBA
+        from ..config import (_VALID_ATTENTION_LAYER_TYPES, LAYER_ATTN,
+                              LAYER_GDN, LAYER_MAMBA)
 
+        # ``config.layer_types`` normalizes recurrent layers to LAYER_GDN /
+        # LAYER_MAMBA, but attention layers keep their raw HF type (e.g.
+        # Qwen3.5 uses ``"full_attention"``), so match the attention family
+        # explicitly. Matching only LAYER_ATTN silently drops those layers,
+        # collapsing the per-layer routing table and shifting every attention
+        # layer's position (see num_attn_layers, which counts the same set).
+        attention_types = (LAYER_ATTN, ) + _VALID_ATTENTION_LAYER_TYPES
         normalized_layer_types: list = []
         kv_layer_configs: list = []
         for lt in config.layer_types:
-            if lt == LAYER_ATTN:
+            if lt in attention_types:
                 normalized_layer_types.append("attention")
                 kv_layer_configs.append({
                     "num_kv_heads": config.num_key_value_heads,
@@ -473,6 +535,66 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         out.update({
             "draft_vocab_size": config.vocab_size,
             "base_model_hidden_size": config.hidden_size,
+        })
+
+    if config.gemma4_mtp_base:
+        out.update({
+            "base_model_hidden_size":
+            config.hidden_size,
+            "layer_types":
+            list(config.raw_layer_types or config.layer_types),
+            "sliding_window":
+            config.sliding_window_size,
+            "global_head_dim":
+            config.global_head_dim,
+            "num_kv_shared_layers":
+            config.num_kv_shared_layers,
+            "rope_parameters":
+            normalize_rope_scaling_for_runtime(config.rope_parameters),
+            "attention_k_eq_v":
+            config.attention_k_eq_v,
+        })
+
+    if config.gemma4_mtp_draft:
+        out.update({
+            "model":
+            "gemma4_assistant",
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            config.backbone_hidden_size,
+            "assistant_hidden_size":
+            config.assistant_hidden_size or config.hidden_size,
+            "shares_target_kv":
+            config.shares_target_kv,
+            "has_own_kv_cache":
+            config.has_own_kv_cache,
+            "constant_draft_positions":
+            config.constant_draft_positions,
+            "returns_feedback_hidden":
+            config.returns_feedback_hidden,
+            "use_ordered_embeddings":
+            config.use_ordered_embeddings,
+            "num_centroids":
+            config.num_centroids,
+            "centroid_intermediate_top_k":
+            config.centroid_intermediate_top_k,
+            "sparse_logits_enabled":
+            config.sparse_logits_enabled,
+            "layer_types":
+            list(config.raw_layer_types or config.layer_types),
+            "sliding_window":
+            config.sliding_window_size,
+            "global_head_dim":
+            config.global_head_dim,
+            "num_kv_shared_layers":
+            config.num_kv_shared_layers,
+            "rope_parameters":
+            normalize_rope_scaling_for_runtime(config.rope_parameters),
+            "attention_k_eq_v":
+            config.attention_k_eq_v,
+            "kv_sharing_map":
+            list(config.kv_sharing_map),
         })
 
     if config.is_dflash_draft:
@@ -694,9 +816,11 @@ def write_runtime_artifacts(model: "CausalLM",
     # EAGLE3 draft models don't need embedding.safetensors — the C++ runtime
     # uses the base model's shared embedding table (the builder already skips
     # copying for draft models).
-    if model.config.is_eagle3_draft or model.config.is_mtp_draft:
+    if (model.config.is_eagle3_draft or model.config.is_mtp_draft
+            or model.config.is_gemma4_mtp_draft):
         kind = ("EAGLE3 draft"
-                if model.config.is_eagle3_draft else "MTP draft")
+                if model.config.is_eagle3_draft else "Gemma4 MTP draft"
+                if model.config.is_gemma4_mtp_draft else "MTP draft")
         logger.info(
             "%s: skipping embedding.safetensors (uses base model embedding)",
             kind)

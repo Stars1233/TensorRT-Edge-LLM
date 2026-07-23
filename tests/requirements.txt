@@ -15,3 +15,13 @@ pypcre>=0.2.5
 device-smi>=0.5.1
 optimum==2.1.0
 nvidia-modelopt==0.44.0
+# ONNX export toolchain: the few-layer validation runs `export` inside
+# the pipeline-test runner, unlike other pipeline tests which reuse the ONNX
+# pre-exported by the checkpoint_export job. This template installs only
+# tests/requirements.txt (not the top-level requirements.txt nor `pip install
+# -e .`), so these must be pinned here too (kept in sync with requirements.txt).
+onnx==1.19.0
+onnxscript==0.7.0
+onnx-graphsurgeon==0.6.1
+fastapi==0.136.1
+httpx>=0.27.0

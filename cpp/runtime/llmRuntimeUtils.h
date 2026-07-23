@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -77,6 +78,17 @@ struct TokenCallbackInfo
  *  Invoked inside the decode loop after cudaStreamSynchronize. */
 using TokenCallback = std::function<void(TokenCallbackInfo const&)>;
 
+/*! \brief One top-K log-probability entry for a single generated token.
+ *  `piece` is the raw token bytes (Tokenizer::idToPiece), possibly not valid
+ *  UTF-8 on its own (byte-level BPE); filled at assembly time, not on the
+ *  decoder hot path which only writes tokenId/logprob. */
+struct LogprobEntry
+{
+    int32_t tokenId;   //!< Token ID
+    float logprob;     //!< Natural-log probability (<= 0)
+    std::string piece; //!< Raw token bytes; empty until filled at assembly time
+};
+
 /*! \brief LLM Generation Request structure
  */
 struct LLMGenerationRequest
@@ -104,6 +116,9 @@ struct LLMGenerationRequest
         //! Stop strings; generation halts on the earliest match and trims it from output.
         std::vector<std::string> stopStrings;
 
+        //! Sparse per-token logit bias map keyed by full tokenizer token ID.
+        std::unordered_map<int32_t, float> logitBias;
+
         mutable FormattedRequest formatted; //!< Formatted request (populated by tokenizer or user-provided)
     };
     //! \endcond
@@ -127,6 +142,10 @@ struct LLMGenerationRequest
     bool enableThinking{false};
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
     bool disableSpecDecode{false};
+
+    //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).
+    //! Logprobs are computed as log(softmax(logits)) and returned in LLMGenerationResponse::logprobs.
+    int32_t numLogprobs{0};
 
     //! Per-slot streaming channels. Size 0 disables streaming globally.
     //! When non-empty the size must equal `requests.size()` and individual entries may be null
@@ -153,6 +172,9 @@ struct LLMGenerationResponse
 {
     std::vector<std::vector<int32_t>> outputIds; //!< Generated token IDs for each request in the batch
     std::vector<std::string> outputTexts;        //!< Generated text strings for each request in the batch
+    //! Top log-probabilities per generated token: logprobs[batch][step] = [LogprobEntry, ...].
+    //! Sorted by descending probability. Populated only when LLMGenerationRequest::numLogprobs > 0.
+    std::vector<std::vector<std::vector<LogprobEntry>>> logprobs;
     //!< Future trajectory waypoints (e.g. accel, kappa) per batch item; populated when action engine is used
     std::vector<std::vector<FutureTrajectoryPoint>> outputTrajectories;
 
@@ -343,6 +365,14 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
  */
 rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
     std::optional<int32_t> imageTokenId, int32_t vocabSize);
+
+/*! \brief Build Gemma4 block IDs from host token IDs.
+ *
+ * Image placeholders form one block for each contiguous run.  Such positions
+ * receive a non-negative run ID; text, audio, and padding receive -1.  This
+ * matches Transformers' get_block_sequence_ids_for_mask semantics.
+ */
+rt::Tensor generateVisionBlockIds(rt::Tensor const& inputIds, int32_t imageTokenId);
 
 } // namespace rt
 } // namespace trt_edgellm

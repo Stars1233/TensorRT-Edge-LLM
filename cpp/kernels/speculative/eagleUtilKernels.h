@@ -41,19 +41,6 @@ namespace kernel
 void prepareEaglePrefillInputs(rt::Tensor const& sequenceContextLengths,
     rt::Tensor& selectTokenIndices,  cudaStream_t stream);
 
-//! The kernel will prepare causal attention mask and position IDs for TRT native prefill step.
-//! Inputs:
-//!     sequenceContextLengths [GPU, Int32]: The sequence context lengths for each batch, shape [batch].
-//!     stream: The CUDA stream to execute the kernel.
-//! Outputs:
-//!     trtNativeAttentionMask [GPU, Bool]: Causal attention mask [batch, 1, inputSequenceLength, presentLength]
-//!         where presentLength = pastLength + inputSequenceLength
-//!     positionIds [GPU, Int32]: Sequential position IDs [batch, inputSequenceLength] with values starting from pastLength
-//!
-//! @throws std::runtime_error if tensors are not located on the GPU, or datatypes are incorrect
-void prepareEaglePrefillInputsTrtNative(rt::Tensor const& sequenceContextLengths, 
-    rt::Tensor& trtNativeAttentionMask, rt::Tensor& positionIds, cudaStream_t stream);
-
 //! The kernel will prepare required inputs to execute the eagle draft proposal step.
 //! In detail, the kernel will prepare packed draft tree mask, compute token positional indices, and prepare other
 //! MISC inputs to execute the draft proposal step.
@@ -72,42 +59,6 @@ void prepareEaglePrefillInputsTrtNative(rt::Tensor const& sequenceContextLengths
 //! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
 void prepareEagleDraftProposalInputs(rt::Tensor const& draftTreeMask, rt::Tensor const& draftTreeLength,
     rt::Tensor const& sequenceStartIndices, rt::Tensor& packedDraftTreeMask, rt::Tensor& tensorPositionIndices,
-    rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream);
-
-//! The kernel will prepare required inputs for TRT native attention (unpacked boolean masks).
-//! Inputs:
-//!     draftTreeMask [GPU, Int8]: unpacked draft tree mask denote the relationship between the draft tree nodes.
-//!         The input is padded with shape [batch, padded-draft-tree-size, padded-draft-tree-size] to ease implementation.
-//!     draftTreeLength [GPU, Int32]: Real length of the draft tree.
-//!     sequenceStartIndices [GPU, Int32]: The start indices of "top level" tree nodes.
-//!     stream: The CUDA stream to execute the kernel.
-//! Outputs:
-//!     trtNativeAttentionMask [GPU, Bool]: Unpacked boolean mask for TRT native attention
-//!         [batch, 1, padded-draft-tree-size, present_length] where present_length = sequenceStartIndex + paddedDraftTreeSize
-//!     tensorPositionIndices [GPU, Int32]: Positional indices of draft tree nodes among the sequence.
-//!     selectTokenIndices [GPU, Int64]: Denote the position to gather the hidden states and logits output.
-//!     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine.
-//!
-//! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
-void prepareEagleDraftProposalInputsTrtNative(rt::Tensor const& draftTreeMask, rt::Tensor const& draftTreeLength,
-    rt::Tensor const& sequenceStartIndices, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
-    rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream);
-
-//! The kernel will prepare required inputs for TRT native attention accept decode step (causal masks).
-//! Inputs:
-//!     sequenceStartIndices [GPU, Int32]: The start indices of the first accepted token, shape [batch].
-//!     acceptedTokenNums [GPU, Int32]: Number of accepted tokens for each batch, shape [batch].
-//!     stream: The CUDA stream to execute the kernel.
-//! Outputs:
-//!     trtNativeAttentionMask [GPU, Bool]: Unpacked boolean causal mask for TRT native attention
-//!         [batch, 1, max-accepted-token-num, present_length] where present_length = sequenceStartIndex + acceptedTokenNum
-//!     tensorPositionIndices [GPU, Int32]: Positional indices of accepted tokens among the sequence.
-//!     selectTokenIndices [GPU, Int64]: Denote the position (always the last one) to gather the hidden states and logits.
-//!     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine.
-//!
-//! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
-void prepareEagleAcceptDecodeTokenInputsTrtNative(rt::Tensor const& sequenceStartIndices, 
-    rt::Tensor const& acceptedTokenNums, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
     rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream);
 
 //! The kernel will prepare required inputs to execute the eagle accept decode token step.
@@ -146,23 +97,6 @@ void prepareEagleAcceptDecodeTokenInputs(rt::Tensor const& sequenceStartIndices,
 void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, rt::Tensor const& sequenceStartIndices,
     rt::Tensor& packedBaseTreeDecodingMask, rt::Tensor& tensorPositionIndices, rt::Tensor& selectTokenIndices,
     rt::Tensor& sequenceContextLengths, cudaStream_t stream);
-
-//! The kernel will prepare required inputs for TRT native attention eagle base tree decoding (unpacked boolean masks).
-//! Inputs:
-//!     baseTreeDecodingMask [GPU, Int8]: unpacked base tree decoding mask [batch, tree-size, tree-size]
-//!     sequenceStartIndices [GPU, Int32]: The start indices of "top level" tree nodes.
-//!     stream: The CUDA stream to execute the kernel.
-//! Outputs:
-//!     trtNativeAttentionMask [GPU, Bool]: Unpacked boolean mask for TRT native attention
-//!         [batch, 1, tree-size, present_length] where present_length = sequenceStartIndex + treeSize
-//!     tensorPositionIndices [GPU, Int32]: Positional indices of base tree decoding nodes among the sequence.
-//!     selectTokenIndices [GPU, Int64]: Denote the position to gather the hidden states and logits output.
-//!     sequenceContextLengths [GPU, Int32]: The sequence context lengths input fed into TRT engine.
-//!
-//! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
-void prepareEagleBaseTreeDecodingInputsTrtNative(rt::Tensor const& baseTreeDecodingMask, 
-    rt::Tensor const& sequenceStartIndices, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
-    rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream);
 
 //! Per-head-dim-group batched commit of accepted tokens into the KVCache.
 //!

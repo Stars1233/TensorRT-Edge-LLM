@@ -38,10 +38,9 @@ activations produced from the unquantized base model's hidden states.
 
 import json
 import logging
-import math
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -50,7 +49,9 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
+from .attention_scale import resolve_attention_scale
 from .layers import (RMSNorm, RotaryEmbedding, SwiGLUMLP, apply_rotary_pos_emb,
                      repeat_kv, rotate_half)
 
@@ -64,13 +65,20 @@ logger = logging.getLogger(__name__)
 class DFlashCalibAttention(nn.Module):
     """DFlash draft attention for calibration (no KV cache, no plugins)."""
 
-    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim,
-                 rms_norm_eps):
+    def __init__(self,
+                 hidden_size,
+                 num_heads,
+                 num_kv_heads,
+                 head_dim,
+                 rms_norm_eps,
+                 attention_scale=None):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_groups = num_heads // num_kv_heads
+        self.attention_scale = (resolve_attention_scale({}, "", head_dim) if
+                                attention_scale is None else attention_scale)
 
         self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size,
@@ -131,7 +139,7 @@ class DFlashCalibAttention(nn.Module):
 
         # Scaled dot-product attention with causal mask for proposal tokens
         total_len = k_full.shape[2]
-        w = torch.matmul(q, k_full.transpose(2, 3)) / math.sqrt(self.head_dim)
+        w = torch.matmul(q, k_full.transpose(2, 3)) * self.attention_scale
 
         # Proposal tokens can attend to all target tokens + causal self
         if BS > 1:
@@ -155,12 +163,18 @@ class DFlashCalibAttention(nn.Module):
 class DFlashCalibDecoderLayer(nn.Module):
     """DFlash draft decoder layer for calibration."""
 
-    def __init__(self, hidden_size, intermediate_size, num_heads, num_kv_heads,
-                 head_dim, rms_norm_eps):
+    def __init__(self,
+                 hidden_size,
+                 intermediate_size,
+                 num_heads,
+                 num_kv_heads,
+                 head_dim,
+                 rms_norm_eps,
+                 attention_scale=None):
         super().__init__()
         self.self_attn = DFlashCalibAttention(hidden_size, num_heads,
                                               num_kv_heads, head_dim,
-                                              rms_norm_eps)
+                                              rms_norm_eps, attention_scale)
         self.mlp = SwiGLUMLP(hidden_size, intermediate_size)
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -209,6 +223,8 @@ class DFlashCalibDraftModel(nn.Module):
         hs = config.hidden_size
         head_dim = getattr(config, "head_dim",
                            hs // config.num_attention_heads)
+        attention_scale = resolve_attention_scale(
+            config, getattr(config, "model_type", ""), head_dim)
 
         dflash_cfg = getattr(config, "dflash_config", {}) or {}
         self.target_layer_ids = dflash_cfg.get("target_layer_ids",
@@ -224,7 +240,7 @@ class DFlashCalibDraftModel(nn.Module):
             DFlashCalibDecoderLayer(hs, config.intermediate_size,
                                     config.num_attention_heads,
                                     config.num_key_value_heads, head_dim,
-                                    config.rms_norm_eps)
+                                    config.rms_norm_eps, attention_scale)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hs, eps=config.rms_norm_eps)
@@ -377,7 +393,8 @@ def quantize_and_export_dflash_draft(
     kv_cache_quantization: Optional[str] = None,
     dtype: str = "fp16",
     device: str = "cuda",
-    dataset: str = "cnn_dailymail",
+    *,
+    text_dataset: Union[str, TextDataset, None] = None,
     num_samples: int = 512,
 ) -> str:
     """Load base + DFlash draft models, quantize draft, and export."""
@@ -411,9 +428,11 @@ def quantize_and_export_dflash_draft(
                                        kv_cache_quantization)
         _disable_dflash_fc_quantization(quant_cfg)
         from ..quantize import _text_calib_dataloader
+        text_ds = resolve_dataset(text_dataset, "text")
+        print(f"DFlash text calibration: {dataset_name(text_ds)}")
         loader = _text_calib_dataloader(
             tokenizer,
-            dataset,
+            text_ds,
             batch_size=16 if "int4" in quantization else 1,
             num_samples=num_samples)
 

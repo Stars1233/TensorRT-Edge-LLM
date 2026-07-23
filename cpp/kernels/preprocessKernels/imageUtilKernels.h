@@ -36,6 +36,21 @@ namespace kernel
 void normalizeImage(rt::Tensor const& originalImage, rt::Tensor const& mean, rt::Tensor const& std,
     rt::Tensor& normalizedImage, cudaStream_t stream);
 
+//! The kernel will transpose image data to patch format for Gemma4 VIT (channel-last within patch)
+//! Gemma4's vision encoder expects patches with element order [patchH, patchW, C] matching
+//! HuggingFace convert_image_to_patches: reshape(C,pH,ps,pW,ps).permute(1,3,2,4,0).reshape(pH*pW,-1)
+//! Inputs:
+//!     originalImage [GPU, Half]: Current image [1, height, width, channels]
+//!     inputOffset: Offset in elements into inputPatches (prevCuSeqlen * inputDim)
+//!     patchSize: Patch size for the vision transformer
+//!     stream: CUDA stream for execution
+//! Outputs:
+//!     inputPatches [GPU, Half]: Total VIT input tensor [totalSeqLength, inputDim]
+//!         inputDim = patchSize * patchSize * channels
+//! \throws std::runtime_error if image has invalid shape, data type or location
+void transposeToPatchGemma4ViT(rt::Tensor const& originalImage, rt::Tensor& inputPatches, int64_t const inputOffset,
+    int64_t const patchSize, cudaStream_t stream);
+
 //! The kernel will transpose image data to patch format for Qwen2-VL and Qwen2.5-VL VIT
 //! The transpose is corresponding to the following python code:
 //! https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py#L299

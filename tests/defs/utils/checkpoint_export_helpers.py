@@ -295,9 +295,10 @@ def run_checkpoint_export(config: TestConfig,
             label += f" (mxkvc{config.max_kv_cache_capacity})"
 
         extra_env = {}
-        if config.trt_native_vit_attn:
-            extra_env["USE_TRT_NATIVE_VIT_ATTN"] = "1"
-            label += " (TRT-native VIT attn)"
+        if config.trt_native_attn:
+            extra_env["USE_TRT_NATIVE_ATTN"] = "1"
+            label += " (TRT-native attn)"
+        extra_env.update(config.get_export_env_vars())
 
         _run_export_subprocess(model_dir,
                                tmp_dir,
@@ -337,6 +338,7 @@ def run_tensorrt_edgellm_draft_export(config: TestConfig,
             f"Exporting EAGLE draft {config.draft_model_id} via the checkpoint exporter",
             test_logger,
             timeout,
+            extra_env=config.get_export_env_vars() or None,
             failure_prefix="tensorrt_edgellm draft export")
 
         draft_llm_out = os.path.join(tmp_dir, "llm")
@@ -384,6 +386,7 @@ def run_tensorrt_edgellm_mtp_export(config: TestConfig,
             test_logger,
             timeout,
             extra_args=["--mtp"],
+            extra_env=config.get_export_env_vars() or None,
             failure_prefix="MTP export")
 
         llm_output = os.path.join(tmp_dir, "llm")

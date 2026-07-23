@@ -64,8 +64,8 @@ void LoRAManager::loadWeights(std::string const& name, std::filesystem::path con
     WeightMap weights;
     for (auto& t : tensors)
     {
-        std::string const bindingName = t.getName();
-        weights.emplace(bindingName, std::move(t));
+        std::string bindingName = t.getName();
+        weights.emplace(std::move(bindingName), std::move(t));
     }
 
     LOG_INFO("LoRAManager: adapter '%s' loaded with %zu binding(s)", name.c_str(), weights.size());

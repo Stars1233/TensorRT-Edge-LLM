@@ -48,6 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
 from ..linear import make_linear
 
 if TYPE_CHECKING:
@@ -111,12 +112,13 @@ class Phi4MMVisionAttention(nn.Module):
     def __init__(self,
                  hidden_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.hidden_size = hidden_size
         self.q_proj = make_linear(
             model_config,
@@ -153,7 +155,9 @@ class Phi4MMVisionAttention(nn.Module):
                                             self.head_dim).transpose(1, 2)
         # Manual SDPA decomposition — dynamo export emits F.sdpa as a
         # multi-output ONNX Attention op that TRT cannot parse.
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        if self.attention_scale != 1.0:
+            scores = scores * self.attention_scale
         attn_weights = F.softmax(scores, dim=-1,
                                  dtype=torch.float32).to(q.dtype)
         out = torch.matmul(attn_weights, v)
@@ -214,6 +218,7 @@ class Phi4MMVisionEncoderLayer(nn.Module):
                  num_heads: int,
                  intermediate_size: int,
                  layer_norm_eps: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -221,6 +226,7 @@ class Phi4MMVisionEncoderLayer(nn.Module):
         self.self_attn = Phi4MMVisionAttention(
             hidden_size,
             num_heads,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.self_attn" if name_prefix else "")
         self.layer_norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
@@ -255,6 +261,7 @@ class Phi4MMVisionEncoder(nn.Module):
                  num_heads: int,
                  intermediate_size: int,
                  layer_norm_eps: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -264,6 +271,7 @@ class Phi4MMVisionEncoder(nn.Module):
                 num_heads,
                 intermediate_size,
                 layer_norm_eps,
+                attention_scale,
                 model_config,
                 name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
             for i in range(num_layers)
@@ -302,6 +310,7 @@ class Phi4MMVisionModel(nn.Module):
                  patch_size: int,
                  layer_norm_eps: float,
                  feature_layer: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -313,6 +322,7 @@ class Phi4MMVisionModel(nn.Module):
             num_heads,
             intermediate_size,
             layer_norm_eps,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.encoder" if name_prefix else "")
         self.post_layernorm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
@@ -359,6 +369,9 @@ class Phi4MMVisualModel(nn.Module):
         num_channels: int = config.get("num_channels", 3)
         layer_norm_eps: float = config.get("layer_norm_eps", 1e-5)
         feature_layer: int = config["feature_layer"]
+        head_dim = hidden_size // num_heads
+        attention_scale = config_module._get_attention_scaling(
+            config, head_dim, 1.0 / (float(head_dim)**0.5))
 
         # LLM projection hidden size — look for the LLM dim in parent config
         proj_hidden_size: int = config["proj_hidden_size"]
@@ -389,6 +402,7 @@ class Phi4MMVisualModel(nn.Module):
             patch_size=patch_size,
             layer_norm_eps=layer_norm_eps,
             feature_layer=feature_layer,
+            attention_scale=attention_scale,
             model_config=model_config,
             name_prefix=f"{img_embed_prefix}.img_processor",
         )

@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# L1 Pipeline Tests - Jetson Orin (Ampere device, CUDA 12.9, JetPack 6)
+# Focus: EAGLE spec-dec + MTP coverage. Orin Ampere → int4_awq dominant.
+# Reference timing: DB task 296.
+
+tests:
+  - tests/defs/test_common.py::test_build_project
+  - tests/defs/test_common.py::test_unit_tests
+
+  # Qwen3-1.7B int4_awq + eagle3-int4_awq
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3-1.7B-int4_awq-mxsl4096-eagle-eagle3-int4_awq-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-1.7B-int4_awq-mxsl4096-eagle-eagle3-int4_awq-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-1.7B-int4_awq-mxsl4096-eagle-eagle3-int4_awq-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-1.7B-int4_awq-mxsl4096-eagle-eagle3-int4_awq-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3-4B-Instruct-2507 int4_awq + eagle-v2.1-int4_awq
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-int4_awq-mxsl4096-eagle-v2.1-int4_awq-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-int4_awq-mxsl4096-eagle-v2.1-int4_awq-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3-4B-Instruct-2507 int4_awq + eagle-v2.1-int4_awq
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3-4B-Instruct-2507-int4_awq-mxsl4096-eagle-v2.1-int4_awq-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-int4_awq-mxsl4096-eagle-v2.1-int4_awq-mxbs4-mxil4096-mtbench-bs1]
+
+  # Qwen3.5-2B int4_awq + mtp (mxbs4 for higher batch)
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-2B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3.5-4B int4_awq + mtp
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-4B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3-VL-4B int4_awq + eagle3-int4_awq
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-4B-Instruct-int4_awq-mxsl8192-eagle-eagle3-int4_awq-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-int4_awq-mxsl8192-eagle-eagle3-int4_awq-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-int4_awq-mxsl8192-eagle-eagle3-int4_awq-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-int4_awq-mxsl8192-eagle-eagle3-int4_awq-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs4]
+
+  # Qwen3.5-4B (VLM) int4_awq + mtp
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-4B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-4B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-4B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-4B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]
+
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3-4B-Instruct-2507-fp16-mxsl4096-eagle-v2.1-fp16-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-fp16-mxsl4096-eagle-v2.1-fp16-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-fp16-mxsl4096-eagle-v2.1-fp16-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-4B-Instruct-2507-fp16-mxsl4096-eagle-v2.1-fp16-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3-1.7B fp16 + eagle3-fp16
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3-1.7B-fp16-mxsl4096-eagle-eagle3-fp16-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-1.7B-fp16-mxsl4096-eagle-eagle3-fp16-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-1.7B-fp16-mxsl4096-eagle-eagle3-fp16-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3-1.7B-fp16-mxsl4096-eagle-eagle3-fp16-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3.5-2B fp16 + mtp
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-2B-fp16-mxsl4096-mtp-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-fp16-mxsl4096-mtp-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-fp16-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-2B-fp16-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3-VL-4B fp16 + eagle3-fp16
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3-VL-4B-Instruct-fp16-mxsl8192-eagle-eagle3-fp16-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-fp16-mxsl8192-eagle-eagle3-fp16-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-fp16-mxsl8192-eagle-eagle3-fp16-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3-VL-4B-Instruct-fp16-mxsl8192-eagle-eagle3-fp16-mxbs4-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs4]
+
+  # Qwen3.5-4B fp16 + mtp
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-4B-fp16-mxsl4096-mtp-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-fp16-mxsl4096-mtp-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-fp16-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-4B-fp16-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3.5-9B int4_awq + mtp (LLM)
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_engine_build[Qwen3.5-9B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mmlu_5-bs4]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs1]
+  - tests/defs/test_llm_pipeline.py::TestLLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl4096-mtp-mxbs4-mxil4096-mtbench-bs4]
+
+  # Qwen3.5-9B int4_awq + mtp (VLM)
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_engine_build[Qwen3.5-9B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-mmmu-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs1]
+  - tests/defs/test_vlm_pipeline.py::TestVLMPipeline::test_e2e_bench[Qwen3.5-9B-int4_awq-mxsl8192-mtp-mxbs2-mxil7168-mnit128-mxit6400-mxpiit1280-coco-bs2]

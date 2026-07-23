@@ -19,6 +19,7 @@
 
 #include "action/actionModelTypes.h"
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
@@ -145,9 +146,9 @@ private:
     int32_t const* getActualKVLengths(cudaStream_t stream, int32_t activeBatchSize);
 
     //! \brief Deinterleave combined [maxBatchSize, 2, H, S, D] (KV Cache layout from attention plugin) for one layer
-    //! into owned buffers and return refs to them. Used instead of HybridCacheManager::getSeparateKVCache,
-    //! which separates a KV cache of shape [2, maxBatchSize, H, S, D] (KV Cache layout from TRT native attention op)
-    //! because of the different memory layout.
+    //! into owned buffers and return refs to them. The Alpamayo action expert's exported graph consumes separate K/V
+    //! caches of shape [2, maxBatchSize, H, S, D] (the TRT native attention op layout), so this runner repacks the
+    //! plugin-path combined buffer into that layout.
     //! \param stream CUDA stream for execution
     //! \param kvcache KV cache containing the VLM outputs; used to read active batch size and KV cache lengths
     //! \param decoderLayerIdx Index of the decoder layer
@@ -164,6 +165,7 @@ private:
     int32_t mNoiseSeed{5};  //!< Random seed for diffusion noise trajectory initialization
     ActionConfig mConfig{}; //!< Model configuration parsed from config.json
 
+    AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime{nullptr};
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine{nullptr};
     std::unique_ptr<nvinfer1::IExecutionContext> mContext{nullptr};

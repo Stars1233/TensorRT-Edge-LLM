@@ -77,11 +77,17 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
     // chunked prefill, decode, and verification use [batch] start offsets.
     // InferenceDims::startIndexLen carries this per-phase: prefillDims sets it to 0
-    // when (!useTrtNativeOps && kvCacheAllEmpty), else batch; all other recipes
+    // when kvCacheAllEmpty, else batch; all other recipes
     // set it to batch. Shape 0 is engine-valid here — TRT reads 0 bytes from
     // the bound address and the engine branches to the initial-prefill path.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
+
+    if (cfg.useVisionBidirectionalAttention)
+    {
+        reg.addTensor({binding_names::kVisionBlockIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen)}});
+    }
 
     // RoPE cache inputs: single binding for single-RoPE models, explicit
     // sliding/full bindings for mixed-attention dual-RoPE models.
@@ -107,24 +113,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io, std::vector<ShapeDim> const& shape) {
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
-            if (cfg.useTrtNativeOps)
-            {
-                // TRT native: separate K / V, 4D [batch, numKVHeads, kv_len, headDim]
-                std::vector<ShapeDim> const shape{
-                    sym(&InferenceDims::batch), fixed(lc.numKVHeads), sym(&InferenceDims::kvLen), fixed(lc.headDim)};
-                addKVCacheTensor(binding_names::kKCacheTemplate, TensorIO::kInput, shape);
-                addKVCacheTensor(binding_names::kPresentKCacheTemplate, TensorIO::kOutput, shape);
-                addKVCacheTensor(binding_names::kVCacheTemplate, TensorIO::kInput, shape);
-                addKVCacheTensor(binding_names::kPresentVCacheTemplate, TensorIO::kOutput, shape);
-            }
-            else
-            {
-                // Plugin: combined KV, 5D [batch, 2, numKVHeads, kv_len, headDim]
-                std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
-                    sym(&InferenceDims::kvLen), fixed(lc.headDim)};
-                addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
-                addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput, shape);
-            }
+            // Plugin: combined KV, 5D [batch, 2, numKVHeads, kv_len, headDim]
+            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
+                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+            addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
+            addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput, shape);
             ++localAttnIdx;
         }
         else // kMamba
@@ -206,6 +199,13 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
         // attention_pos_id: [batch, attn_seq_len] INT32
         reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
+
+        if ((cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash)
+            && cfg.numLinearAttnLayers > 0)
+        {
+            reg.addTensor({binding_names::kSpecVerifyPhaseMarker, TensorIO::kInput, nvinfer1::DataType::kINT32,
+                {sym(&InferenceDims::specVerifyPhaseLen)}});
+        }
     }
 
     // ---------------------------------------------------------------
@@ -389,6 +389,58 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
             addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput);
             ++localAttnIdx;
         }
+    }
+
+    return reg;
+}
+
+TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle)
+{
+    check::check(bundle.draft.has_value(), "buildRegistryForGemma4MTPDraft: bundle.draft must be set");
+    check::check(bundle.specConfig.has_value(), "buildRegistryForGemma4MTPDraft: bundle.specConfig must be set");
+    check::check(bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP,
+        "buildRegistryForGemma4MTPDraft requires spec_decode_type=gemma4_mtp");
+
+    TensorRegistry reg;
+    LLMEngineConfig const& draftCfg = *bundle.draft;
+    int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
+    int32_t const draftVocabSize = draftCfg.outputVocabSize;
+
+    // inputs_embeds: [B, 1, Hb] target/base embedding table output.
+    reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(baseOutputHiddenDim)}});
+
+    // hidden_states_input: [B, 1, Hb] target hidden seed or assistant feedback hidden.
+    reg.addTensor({binding_names::kBaseModelHiddenStates, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(baseOutputHiddenDim)}});
+
+    // context_lengths: [B] target KV lengths.
+    reg.addTensor(
+        {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+
+    addRopeTensorSpecs(reg, draftCfg);
+
+    // logits: [B, vocab] full-logits correctness path.
+    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+        {sym(&InferenceDims::batch), fixed(draftVocabSize)}});
+
+    // hidden_states: [B, 1, Hb] assistant feedback hidden in target backbone space.
+    reg.addTensor({binding_names::kOutputHiddenStates, TensorIO::kOutput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(baseOutputHiddenDim)}});
+
+    for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
+    {
+        check::check(entry.assistantLayerIdx >= 0 && entry.assistantLayerIdx < draftCfg.numAttentionLayers,
+            "buildRegistryForGemma4MTPDraft: invalid assistant layer index");
+        check::check(entry.targetAttentionLayerIdx >= 0
+                && entry.targetAttentionLayerIdx < static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
+            "buildRegistryForGemma4MTPDraft: invalid target attention layer index");
+
+        auto const& targetKV = bundle.base.kvLayerConfigs[entry.targetAttentionLayerIdx];
+        std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(targetKV.numKVHeads),
+            sym(&InferenceDims::kvLen), fixed(targetKV.headDim)};
+        reg.addTensor({binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), TensorIO::kInput,
+            bundle.base.kvCacheDtype, shape});
     }
 
     return reg;

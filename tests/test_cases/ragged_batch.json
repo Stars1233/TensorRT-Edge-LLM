@@ -1,0 +1,41 @@
+{
+    "batch_size": 4,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 6,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "The capital of France is"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Artificial intelligence has rapidly transformed many industries over the past decade, from healthcare and finance to transportation and entertainment, and researchers around the world continue to explore new model architectures that can reason more reliably and efficiently about the physical world."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "List three primary colors."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain in detail how a transformer neural network processes a sequence of tokens, including the role of self-attention, positional encodings, and the position-wise feed-forward layers."
+                }
+            ]
+        }
+    ]
+}

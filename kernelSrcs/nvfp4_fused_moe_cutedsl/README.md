@@ -4,8 +4,9 @@ End-to-end fused Mixture-of-Experts kernels for Blackwell consumer
 GeForce silicon (SM120 / SM121). Each kernel fuses route/pack + FC1 +
 activation + quantize + FC2 + scatter into a single resident-grid launch,
 eliminating the host-side FC1/FC2 handoff of the SM110 decomposed
-`nvfp4_moe` pipeline. Both backends share the unified
-`Nvfp4MoePlugin` (see [`cpp/plugins/nvfp4MoePlugin/`](../../cpp/plugins/nvfp4MoePlugin/)).
+`nvfp4_moe` pipeline. Both backends are exposed through
+`NvFP4MoEPluginGeforce` (see
+[`cpp/plugins/nvfp4MoePluginGeforce/`](../../cpp/plugins/nvfp4MoePluginGeforce/)).
 
 ## Shape support
 
@@ -29,7 +30,7 @@ work by shape polymorphism but should be accuracy-checked.
 
 ## Variants (build_cutedsl.py group: `nvfp4_fused_moe`)
 
-10 active variants: 5 activations x 2 backends, all using MMA N-tile 128.
+12 active variants: 6 activations x 2 backends, all using MMA N-tile 128.
 
 The C++ runner currently dispatches n128. Add a new N-tile dispatch axis only
 after rebuilding the artifact pack with matching wrapper symbols and validating
@@ -42,11 +43,13 @@ accuracy/perf across the full matrix.
 | `nvfp4_fused_moe_decode_swiglu_n128` | decode | swiglu |
 | `nvfp4_fused_moe_decode_gelu_n128` | decode | gelu |
 | `nvfp4_fused_moe_decode_relu2_n128` | decode | relu2 |
+| `nvfp4_fused_moe_decode_geglu_n128` | decode | geglu |
 | `nvfp4_fused_moe_prefill_identity_n128` | prefill | identity |
 | `nvfp4_fused_moe_prefill_silu_n128` | prefill | silu |
 | `nvfp4_fused_moe_prefill_swiglu_n128` | prefill | swiglu |
 | `nvfp4_fused_moe_prefill_gelu_n128` | prefill | gelu |
 | `nvfp4_fused_moe_prefill_relu2_n128` | prefill | relu2 |
+| `nvfp4_fused_moe_prefill_geglu_n128` | prefill | geglu |
 
 All variants target SM120/SM121 only.
 
@@ -70,7 +73,7 @@ Artifacts land in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/`:
 
 ## CuTeDSL SM121 Support
 
-`nvidia-cutlass-dsl==4.5.2` supports the `sm_121a` architecture used by
+`nvidia-cutlass-dsl==4.6.0` supports the `sm_121a` architecture used by
 DIGITS/GB10. For SM121 fused MoE builds, `build_cutedsl.py` sets
 `CUTE_DSL_ARCH=sm_121a` for this group so the generated image targets SM121
 directly instead of relying on an SM120-compatible cubin.
@@ -119,7 +122,7 @@ integration with the TRT Edge-LLM plugin system.
 
 ## Dependencies
 
-- `nvidia-cutlass-dsl == 4.5.2` (CUDA 13: `[cu13]` extra; CUDA 12: base package)
+- `nvidia-cutlass-dsl == 4.6.0` (CUDA 13: `[cu13]` extra; CUDA 12: base package)
 - `cuda-python` (provides `cuda.bindings.driver`)
 - `cupy-cuda13x` (GPU memory allocation during AOT compilation)
 
@@ -132,14 +135,14 @@ pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
 pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
 
 # CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
-pip install 'nvidia-cutlass-dsl[cu13]==4.5.2'  # CUDA 13.x
-# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.5.2'
+pip install 'nvidia-cutlass-dsl[cu13]==4.6.0'  # CUDA 13.x
+# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.0'
 ```
 
 ## TensorRT plugin
 
 The FP16 variants of this kernel family are wrapped as a TensorRT plugin at
-[`cpp/plugins/nvfp4MoePlugin/`](../../cpp/plugins/nvfp4MoePlugin/).
+[`cpp/plugins/nvfp4MoePluginGeforce/`](../../cpp/plugins/nvfp4MoePluginGeforce/).
 See that plugin's
-[`README.md`](../../cpp/plugins/nvfp4MoePlugin/README.md) for the
+[`README.md`](../../cpp/plugins/nvfp4MoePluginGeforce/README.md) for the
 supported-shapes contract and integration instructions.

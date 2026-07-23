@@ -584,7 +584,7 @@ int main(int argc, char* argv[])
     // Create runtime
     std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     try
     {
@@ -637,6 +637,10 @@ int main(int argc, char* argv[])
     bool hasFailedRequest = false;
     std::string const errorMessage = "TensorRT Edge LLM cannot handle this request. Fails.";
     size_t failedCount = 0;
+    // Index of the request in the input file's flat "requests" array. Batching packs
+    // batchSize consecutive requests into one batched request, so downstream consumers
+    // must receive the flat index, not the batch index.
+    size_t flatRequestIdx = 0;
 
     // Process each request with progress indication
     LOG_INFO("Processing %zu batched requests...", batchedRequests.size());
@@ -683,7 +687,7 @@ int main(int argc, char* argv[])
             // Validate UTF-8 for output text (inputs are always valid)
             // If invalid UTF-8 detected, error message is returned and original text is logged
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
-            responseJson["request_idx"] = requestIdx;
+            responseJson["request_idx"] = flatRequestIdx++;
             responseJson["batch_idx"] = batchIdx;
             // Store messages for reference
             nlohmann::json messagesJson = nlohmann::json::array();

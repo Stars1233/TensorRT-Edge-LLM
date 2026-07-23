@@ -43,6 +43,10 @@ constexpr int kReasonableMaxBatchSize = 16;
 constexpr size_t kMaxMessageContentSizeBytes = 128 * 1024; // 128KB per content item
 constexpr size_t kMaxMessagesPerRequest = 64;
 constexpr size_t kMaxContentItemsPerMessage = 18;
+// Match vLLM's MAX_NUM_LOGIT_BIAS_TOKENS sparse logit-bias guardrail.
+constexpr size_t kMaxLogitBiasTokens = 1024;
+constexpr float kMinLogitBias = -100.0F;
+constexpr float kMaxLogitBias = 100.0F;
 
 } // namespace security
 

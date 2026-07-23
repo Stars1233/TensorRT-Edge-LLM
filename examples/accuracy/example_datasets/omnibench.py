@@ -41,7 +41,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from audio_eval_utils import OMNI_SYSTEM_PROMPT, save_audio_array_to_wav
+from audio_eval_utils import (OMNI_SYSTEM_PROMPT, audio_extension_from_payload,
+                              save_audio_array_to_flac, write_audio_bytes)
 from datasets import Audio, Dataset, load_dataset
 from edgellm_dataset import DatasetConfig, EdgeLLMDataset
 
@@ -51,13 +52,13 @@ class OmniBenchDataset(EdgeLLMDataset):
     OmniBench dataset with audio + image + text multimodal inputs.
     https://huggingface.co/datasets/m-a-p/OmniBench
 
-    Extends EdgeLLMDataset with audio preprocessing support.
+    Extends EdgeLLMDataset with raw audio-file export support.
     """
 
     def __init__(self, dataset: Dataset, config: DatasetConfig, **kwargs):
         super().__init__(dataset=dataset, config=config, **kwargs)
         self.images_dir = os.path.join(self.output_dir, "images")
-        self.audio_dir = os.path.join(self.output_dir, "audio_wavs")
+        self.audio_dir = os.path.join(self.output_dir, "audio")
         os.makedirs(self.images_dir, exist_ok=True)
         os.makedirs(self.audio_dir, exist_ok=True)
 
@@ -109,15 +110,12 @@ class OmniBenchDataset(EdgeLLMDataset):
         return image_paths
 
     def save_audio(self, data: Dict[str, Any]) -> Optional[str]:
-        """Save OmniBench audio to disk for the C++ ``llm_inference`` CLI.
+        """Save OmniBench audio for the C++ ``llm_inference`` CLI.
 
-        HF gives ``bytes`` (raw container) or ``array`` (decoded waveform).
-        For ``bytes`` we drop them verbatim — miniaudio in the C++ runtime
-        handles container decode + resample + downmix. For ``array`` we
-        write a 16-bit WAV at the dataset-reported sample rate.
+        HF gives ``bytes`` (encoded container) or ``array`` (decoded waveform).
+        Encoded audio is copied verbatim; decoded arrays are written as FLAC.
+        The runtime decodes and runs the model-specific audio frontend.
         """
-        from pathlib import Path
-
         audio_data = data.get("audio")
         if audio_data is None:
             return None
@@ -125,28 +123,26 @@ class OmniBenchDataset(EdgeLLMDataset):
         idx = data.get("index", id(data))
         os.makedirs(self.audio_dir, exist_ok=True)
 
-        if isinstance(audio_data, dict) and "bytes" in audio_data:
-            ext = Path(audio_data.get("path", "")).suffix.lower()
-            if ext not in (".wav", ".mp3", ".flac"):
-                ext = ".wav"
+        if isinstance(audio_data, dict) and audio_data.get("bytes"):
+            encoded = audio_data["bytes"]
+            ext = audio_extension_from_payload(audio_data.get("path"), encoded)
             out_path = os.path.join(self.audio_dir, f"audio_{idx}{ext}")
             if not os.path.exists(out_path):
-                with open(out_path, "wb") as f:
-                    f.write(audio_data["bytes"])
+                write_audio_bytes(encoded, out_path)
             return out_path
 
-        wav_path = os.path.join(self.audio_dir, f"audio_{idx}.wav")
-        if os.path.exists(wav_path):
-            return wav_path
+        flac_path = os.path.join(self.audio_dir, f"audio_{idx}.flac")
+        if os.path.exists(flac_path):
+            return flac_path
         if isinstance(audio_data, dict) and "array" in audio_data:
             arr = np.array(audio_data["array"], dtype=np.float32)
-            sr = audio_data["sampling_rate"]
+            sr = audio_data.get("sampling_rate", 16000)
         else:
             arr = np.array(audio_data, dtype=np.float32)
             sr = 16000
         if arr.ndim > 1:
             arr = arr.mean(axis=0)
-        return save_audio_array_to_wav(arr, wav_path, sample_rate=sr)
+        return save_audio_array_to_flac(arr, flac_path, sample_rate=sr)
 
     def extract_answer(self, data: Dict[str, Any]) -> Optional[str]:
         """Extract the correct answer letter (A/B/C/D) from OmniBench data."""
@@ -163,8 +159,7 @@ class OmniBenchDataset(EdgeLLMDataset):
 def convert_omnibench_dataset(
         config: DatasetConfig,
         dataset_name_or_dir: str = "m-a-p/OmniBench",
-        output_dir: Union[str, os.PathLike] = "omnibench_dataset",
-        max_samples: Optional[int] = None):
+        output_dir: Union[str, os.PathLike] = "omnibench_dataset"):
     """
     Convert OmniBench dataset to TensorRT Edge-LLM format.
 
@@ -172,17 +167,12 @@ def convert_omnibench_dataset(
         config: DatasetConfig object with processing parameters
         dataset_name_or_dir: HuggingFace dataset name or local directory path
         output_dir: Output directory for converted dataset
-        max_samples: Limit number of samples
     """
     print(f"Converting OmniBench from {dataset_name_or_dir} to {output_dir}")
 
     dataset = load_dataset(dataset_name_or_dir, split="train")
     dataset = dataset.cast_column("audio", Audio(decode=False))
     print(f"Loaded OmniBench with {len(dataset)} examples")
-
-    if max_samples:
-        dataset = dataset.select(range(min(max_samples, len(dataset))))
-        print(f"Using first {len(dataset)} samples")
 
     edge_llm_dataset = OmniBenchDataset(dataset=dataset,
                                         config=config,

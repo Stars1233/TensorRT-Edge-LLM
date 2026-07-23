@@ -68,10 +68,12 @@ std::vector<PluginField> ViTAttentionPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(ViTAttentionPluginCreator);
 
-ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads, int32_t headSize)
+ViTAttentionPlugin::ViTAttentionPlugin(
+    std::string const& name, int32_t numHeads, int32_t headSize, std::optional<float> attentionScale)
     : mLayerName(name)
     , mNumHeads(numHeads)
     , mHeadSize(headSize)
+    , mAttentionScale(resolveAttentionScale(attentionScale, headSize))
 {
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
@@ -118,9 +120,10 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, int32_t numHeads
 
 ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldCollection const* fc)
     : mLayerName(name)
+    , mNumHeads(parsePluginScalarField<int32_t>("num_heads", fc).value_or(0))
+    , mHeadSize(parsePluginScalarField<int32_t>("head_size", fc).value_or(0))
+    , mAttentionScale(resolveAttentionScale(parsePluginScalarField<float>("attention_scale", fc), mHeadSize))
 {
-    mNumHeads = parsePluginScalarField<int32_t>("num_heads", fc).value_or(0);
-    mHeadSize = parsePluginScalarField<int32_t>("head_size", fc).value_or(0);
     ELLM_CHECK(mNumHeads > 0 && mHeadSize > 0, "ViTAttentionPlugin requires both num_heads and head_size > 0.");
 
     mSMVersion = getSMVersion();
@@ -178,7 +181,7 @@ IPluginV3* ViTAttentionPlugin::clone() noexcept
 {
     try
     {
-        auto* p = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize);
+        auto* p = new ViTAttentionPlugin(mLayerName, mNumHeads, mHeadSize, mAttentionScale);
         p->setPluginNamespace(mNamespace.c_str());
         return p;
     }
@@ -387,7 +390,7 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
         CuteDslFMHARunner runner(mNumHeads, mNumHeads, mHeadSize);
         runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(), vInputTensor.dataPointer<half>(),
             attentionOutputTensor.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen,
-            runtimeMaxSeqLen, runtimeBatchSize, stream);
+            runtimeMaxSeqLen, runtimeBatchSize, stream, mAttentionScale);
     }
     else
 #endif
@@ -396,7 +399,7 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
             mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::PADDING, false);
 
         FusedMultiheadAttentionParamsV2 params{};
-        fmhaRunner.setupParams(params);
+        fmhaRunner.setupParams(params, mAttentionScale);
         params.q_ptr = qInputTensor.dataPointer<half>();
         params.k_ptr = kInputTensor.dataPointer<half>();
         params.v_ptr = vInputTensor.dataPointer<half>();
@@ -427,6 +430,7 @@ PluginFieldCollection const* ViTAttentionPlugin::getFieldsToSerialize() noexcept
     mDataToSerialize.clear();
     mDataToSerialize.emplace_back("num_heads", &mNumHeads, PluginFieldType::kINT32, 1);
     mDataToSerialize.emplace_back("head_size", &mHeadSize, PluginFieldType::kINT32, 1);
+    mDataToSerialize.emplace_back("attention_scale", &mAttentionScale, PluginFieldType::kFLOAT32, 1);
     mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
     mFCToSerialize.fields = mDataToSerialize.data();
     return &mFCToSerialize;
@@ -444,6 +448,7 @@ ViTAttentionPluginCreator::ViTAttentionPluginCreator()
     mPluginAttributes.clear();
     mPluginAttributes.emplace_back(PluginField("num_heads", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("head_size", nullptr, PluginFieldType::kINT32, 1));
+    mPluginAttributes.emplace_back(PluginField("attention_scale", nullptr, PluginFieldType::kFLOAT32, 0));
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
 }

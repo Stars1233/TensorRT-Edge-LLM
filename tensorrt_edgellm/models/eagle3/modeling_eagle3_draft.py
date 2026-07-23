@@ -85,6 +85,7 @@ class Eagle3Attention(nn.Module):
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.attention_scale = config.attention_scaling
         self.sliding_window_size = -1
 
         self.q_proj = make_linear(config,
@@ -152,6 +153,8 @@ class Eagle3Attention(nn.Module):
             sliding_window_size=self.sliding_window_size,
             enable_tree_attention=True,
             enable_fp8_kv_cache=False,
+            attention_scale=self.attention_scale,
+            enable_vision_block_attention=False,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],

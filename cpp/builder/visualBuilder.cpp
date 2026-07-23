@@ -206,9 +206,43 @@ bool VisualBuilder::parseConfig()
         break;
     }
 
+    case multimodal::ModelType::GEMMA4_UNIFIED_VISION:
+    {
+        // The exporter records the checkpoint's fixed per-image soft-token
+        // budget in builder_config. The total request budget remains a
+        // builder/CLI choice so a profile can support multiple images.
+        if (mModelConfig.contains("builder_config"))
+        {
+            auto const& exportedBuilderConfig = mModelConfig["builder_config"];
+            int64_t const exportedMaxPerImage
+                = exportedBuilderConfig.value("max_image_tokens_per_image", mBuilderConfig.maxImageTokensPerImage);
+            if (exportedMaxPerImage < 1 || mBuilderConfig.minImageTokens < 1
+                || mBuilderConfig.maxImageTokens < mBuilderConfig.minImageTokens)
+            {
+                LOG_ERROR(
+                    "Invalid Gemma4 Unified visual token bounds: requested min=%ld, requested max=%ld, "
+                    "exported max_per_image=%ld",
+                    mBuilderConfig.minImageTokens, mBuilderConfig.maxImageTokens, exportedMaxPerImage);
+                return false;
+            }
+            mBuilderConfig.maxImageTokensPerImage
+                = std::min({mBuilderConfig.maxImageTokensPerImage, exportedMaxPerImage, mBuilderConfig.maxImageTokens});
+            LOG_INFO(
+                "Gemma4 Unified visual profile: min=%ld, configurable total max=%ld, "
+                "sidecar-capped max_per_image=%ld",
+                mBuilderConfig.minImageTokens, mBuilderConfig.maxImageTokens, mBuilderConfig.maxImageTokensPerImage);
+        }
+        break;
+    }
+
     case multimodal::ModelType::UNKNOWN: LOG_ERROR("Unsupported model type: %s", modelTypeStr.c_str()); return false;
 
     default: break;
+    }
+
+    if (mModelConfig.value("use_trt_native_vit_attn", false))
+    {
+        logTrtNativeAttentionPath("ViTAttention");
     }
 
     return true;
@@ -236,6 +270,10 @@ bool VisualBuilder::setupVisualOptimizationProfile(
         break;
 
     case multimodal::ModelType::GEMMA4_VISION: result = setupGemma4ViTProfile(*visualProfile, network); break;
+
+    case multimodal::ModelType::GEMMA4_UNIFIED_VISION:
+        result = setupGemma4UnifiedVisionProfile(*visualProfile, network);
+        break;
 
     default: LOG_ERROR("Unsupported model type for visual encoder: %d", static_cast<int>(mModelType)); return false;
     }
@@ -333,6 +371,23 @@ bool VisualBuilder::setupQwenViTProfile(
         // Use maxImageTokens as a safe upper bound for cumulative window sequence lengths.
         result &= setOptimizationProfile(&profile, binding_names::kCuWindowSeqlens, createDims({2}),
             createDims({mBuilderConfig.maxImageTokens}), createDims({mBuilderConfig.maxImageTokens}));
+        if (mBuilderConfig.useTrtNativeVitAttn)
+        {
+            bool hasKvLengthsWindow = false;
+            for (int32_t i = 0; i < network.getNbInputs(); ++i)
+            {
+                if (strcmp(network.getInput(i)->getName(), binding_names::kKvLengthsWindow) == 0)
+                {
+                    hasKvLengthsWindow = true;
+                    break;
+                }
+            }
+            if (hasKvLengthsWindow)
+            {
+                result &= setOptimizationProfile(&profile, binding_names::kKvLengthsWindow, createDims({2}),
+                    createDims({mBuilderConfig.maxImageTokens}), createDims({mBuilderConfig.maxImageTokens}));
+            }
+        }
         result &= setOptimizationProfile(&profile, binding_names::kWindowIndex, createDims({minHW / 4}),
             createDims({optHW / 4}), createDims({maxHW / 4}));
         result &= setOptimizationProfile(&profile, binding_names::kReverseWindowIndex, createDims({minHW / 4}),
@@ -492,6 +547,62 @@ bool VisualBuilder::setupGemma4ViTProfile(
     if (!result)
     {
         LOG_ERROR("Failed to setup Gemma4 ViT optimization profile");
+    }
+    return result;
+}
+
+bool VisualBuilder::setupGemma4UnifiedVisionProfile(
+    nvinfer1::IOptimizationProfile& profile, nvinfer1::INetworkDefinition const& network)
+{
+    int64_t inputDim = 0;
+    int64_t positionDim = 0;
+    for (int32_t i = 0; i < network.getNbInputs(); ++i)
+    {
+        auto const* input = network.getInput(i);
+        if (strcmp(input->getName(), binding_names::kVisualInput) == 0)
+        {
+            auto const dims = input->getDimensions();
+            if (dims.nbDims == 2)
+            {
+                inputDim = dims.d[1];
+            }
+        }
+        else if (strcmp(input->getName(), binding_names::kPixelPositionIds) == 0)
+        {
+            auto const dims = input->getDimensions();
+            if (dims.nbDims == 2)
+            {
+                positionDim = dims.d[1];
+            }
+        }
+    }
+
+    constexpr int64_t kUnifiedPatchDim = 48 * 48 * 3;
+    if (inputDim != kUnifiedPatchDim || positionDim != 2)
+    {
+        LOG_ERROR(
+            "Gemma4 Unified visual ONNX inputs must be input [N,%ld] and pixel_position_ids [N,2]; "
+            "got trailing dimensions %ld and %ld",
+            kUnifiedPatchDim, inputDim, positionDim);
+        return false;
+    }
+    if (mBuilderConfig.minImageTokens < 1 || mBuilderConfig.maxImageTokens < mBuilderConfig.minImageTokens)
+    {
+        LOG_ERROR("Gemma4 Unified visual profile requires 1 <= minImageTokens <= maxImageTokens");
+        return false;
+    }
+
+    int64_t const minPatches = mBuilderConfig.minImageTokens;
+    int64_t const maxPatches = mBuilderConfig.maxImageTokens;
+    int64_t const optPatches = minPatches + (maxPatches - minPatches) / 2;
+    bool result = true;
+    result &= setOptimizationProfile(&profile, binding_names::kVisualInput, createDims({minPatches, inputDim}),
+        createDims({optPatches, inputDim}), createDims({maxPatches, inputDim}));
+    result &= setOptimizationProfile(&profile, binding_names::kPixelPositionIds, createDims({minPatches, 2}),
+        createDims({optPatches, 2}), createDims({maxPatches, 2}));
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Gemma4 Unified vision optimization profile");
     }
     return result;
 }

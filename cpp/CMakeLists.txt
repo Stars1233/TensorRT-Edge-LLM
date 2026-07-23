@@ -22,6 +22,14 @@ set(CMAKE_CUDA_FLAGS_RELEASE
 
 set(CMAKE_CUDA_FLAGS_DEBUG "-g")
 
+# Hide internal C++ symbols; only EDGELLM_PLUGIN_EXPORT entry points stay
+# visible. Prevents duplicate-symbol collisions when our libraries are loaded
+# together.
+function(edgellm_set_hidden_visibility target)
+  set_target_properties(${target} PROPERTIES CXX_VISIBILITY_PRESET hidden
+                                             VISIBILITY_INLINES_HIDDEN ON)
+endfunction()
+
 # ------------------------------------------------------------------------------
 # FMHA Cubin Conditional Compilation Exclude SM architectures that are not in
 # CMAKE_CUDA_ARCHITECTURES to reduce binary size. Only cubins for the target
@@ -101,6 +109,7 @@ edgellm_xqa_configure_target(edgellmKernels)
 target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+edgellm_set_hidden_visibility(edgellmKernels)
 
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
 
@@ -124,6 +133,7 @@ target_link_libraries(edgellmCore PRIVATE dl)
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
 # Enable separable compilation for MoE Marlin kernel templates
 set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+edgellm_set_hidden_visibility(edgellmCore)
 
 # Generate builder C++ static library
 file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
@@ -131,6 +141,7 @@ add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
 target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                   ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
+edgellm_set_hidden_visibility(edgellmBuilder)
 
 # Generate the TensorRT plugin shared libraries
 file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
@@ -147,6 +158,9 @@ target_link_libraries(
   NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels
                                  ${CUDA_DRIVER_LIB} ${CUDART_LIB})
 add_cross_build_link_options(NvInfer_edgellm_plugin)
+edgellm_set_hidden_visibility(NvInfer_edgellm_plugin)
+# Also drop symbols pulled in from static archives (edgellmKernels, CuTe DSL).
+target_link_options(NvInfer_edgellm_plugin PRIVATE "-Wl,--exclude-libs,ALL")
 
 # cmake-format: off
 # CuTe DSL unified kernels: link local prebuilt static library. Artifacts are
@@ -154,6 +168,8 @@ add_cross_build_link_options(NvInfer_edgellm_plugin)
 # ENABLE_CUTE_DSL to enable one of:
 #   fmha             -- FMHA Blackwell attention
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
+#   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
+#                       Blackwell DC, and Blackwell GeForce
 #   nvfp4_moe        -- SM110 (Thor) split FC1/FC2 NVFP4 MoE; consumed by the
 #                       SM110-only ``Nvfp4MoePlugin``
 #   nvfp4_fused_moe  -- SM12x (consumer Blackwell / Spark GB10) fused NVFP4

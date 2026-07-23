@@ -45,5 +45,21 @@ void mtpScatterRecurrentStates(MtpLayerInfo const* deviceLayerInfos, int32_t num
 void mtpScatterConvStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
     int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptLengths, cudaStream_t stream);
 
+/// Batched scatter of accepted recurrent states (FP32) for DDTree verification.
+/// For each (layer, batch), finds the last stateNodeId >= 0 within
+/// acceptedStateNodeIds[b, 0:min(acceptLengths[b], maxAcceptLen)] and copies:
+/// dst[b, :] = src[b, nodeId, :].
+/// Skip if no non-negative state node id is present.
+/// stateElements must be divisible by 8 (DVec<float> vec_size).
+void mtpScatterAcceptedTreeRecurrentStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers,
+    int32_t activeBatchSize, int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptedStateNodeIds,
+    int32_t maxAcceptLen, int32_t const* acceptLengths, cudaStream_t stream);
+
+/// Batched scatter of accepted conv states (FP16) for DDTree verification. Same
+/// accepted-state-node semantics as the recurrent variant.
+void mtpScatterAcceptedTreeConvStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
+    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptedStateNodeIds, int32_t maxAcceptLen,
+    int32_t const* acceptLengths, cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

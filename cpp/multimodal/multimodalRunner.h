@@ -168,7 +168,8 @@ public:
     }
 
 protected:
-    multimodal::ModelType mModelType;                     //!< Model type identifier
+    multimodal::ModelType mModelType; //!< Model type identifier
+    AuxStreamSet mAuxStreams{};
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;         //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine; //!< Visual encoder engine (null for audio-only runners)
     std::unique_ptr<nvinfer1::IExecutionContext> mVisualContext; //!< Visual execution context

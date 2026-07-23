@@ -593,9 +593,13 @@ __global__ void topKStage2Sampling(int32_t const* __restrict__ topKTmpIdBuf, flo
     }
 }
 
-template <int BLOCK_SIZE>
-__global__ void softmaxKernel(
-    float const* logits, float* probs, int32_t batchSize, int32_t vocabSize, float temperature)
+// Unified softmax / log-softmax kernel.
+// LOG_OUTPUT=false: output[i] = exp(x[i]*invT - max) / sum_exp  (probabilities for sampling)
+// LOG_OUTPUT=true:  output[i] = x[i]*invT - max - log(sum_exp)  (log-probabilities, T=1 for logprobs)
+// Use customed reductionOp to WAR CUDA12/13 compatibility issue
+template <int BLOCK_SIZE, bool LOG_OUTPUT>
+__global__ void softmaxKernelImpl(
+    float const* logits, float* output, int32_t batchSize, int32_t vocabSize, float temperature)
 {
     auto const batchId = static_cast<int32_t>(blockIdx.x);
     auto const tid = static_cast<int32_t>(threadIdx.x);
@@ -608,49 +612,98 @@ __global__ void softmaxKernel(
 
     typedef cub::BlockReduce<float, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
-    __shared__ float maxLogit;
-    __shared__ float sumExp;
+    __shared__ float sharedMax;
+    __shared__ float sharedAgg; // sum_exp (softmax) or log(sum_exp) (log-softmax)
 
-    // Find max logit for numerical stability
+    // Pass 1: find max for numerical stability
     float threadMax = -FLT_MAX;
     for (int32_t i = tid; i < vocabSize; i += BLOCK_SIZE)
-    {
-        auto logit = logits[offset + i] * invTemp;
-        threadMax = fmaxf(threadMax, logit);
-    }
-
-    // Use customed reductionOp to WAR CUDA12/13 compatibility issue
+        threadMax = fmaxf(threadMax, logits[offset + i] * invTemp);
     float blockMax = BlockReduce(tempStorage).Reduce(threadMax, maxOpFunctor());
     if (tid == 0)
     {
-        maxLogit = blockMax;
-        sumExp = 0.0f;
+        sharedMax = blockMax;
+        sharedAgg = 0.0f;
     }
     __syncthreads();
 
-    // Compute exp(logit - maxLogit) and sum
+    // Pass 2: compute exp(x*invT - max), store intermediates for softmax, accumulate sum
     float threadSum = 0.0f;
     for (int32_t i = tid; i < vocabSize; i += BLOCK_SIZE)
     {
-        auto logit = logits[offset + i] * invTemp;
-        auto expLogit = expf(logit - maxLogit);
-        probs[offset + i] = expLogit;
-        threadSum += expLogit;
+        float expVal = expf(logits[offset + i] * invTemp - sharedMax);
+        if constexpr (!LOG_OUTPUT)
+            output[offset + i] = expVal; // store for in-place normalization in pass 3
+        threadSum += expVal;
     }
-
     float blockSum = BlockReduce(tempStorage).Reduce(threadSum, sumOpFunctor());
     if (tid == 0)
-    {
-        sumExp = blockSum;
-    }
+        sharedAgg = LOG_OUTPUT ? logf(blockSum) : blockSum;
     __syncthreads();
 
-    // Normalize to get probabilities
+    // Pass 3: write final output
     for (int32_t i = tid; i < vocabSize; i += BLOCK_SIZE)
     {
-        auto prob = probs[offset + i] / sumExp;
-        probs[offset + i] = prob;
+        if constexpr (LOG_OUTPUT)
+            output[offset + i] = logits[offset + i] * invTemp - sharedMax - sharedAgg;
+        else
+            output[offset + i] /= sharedAgg;
     }
+}
+
+__global__ void applyLogitBiasKernel(
+    float* logits, int32_t const* tokenIds, float const* biasValues, int32_t const* offsets, int32_t vocabSize)
+{
+    int32_t const batchId = static_cast<int32_t>(blockIdx.x);
+    int32_t const begin = offsets[batchId];
+    int32_t const end = offsets[batchId + 1];
+    float* rowLogits = logits + static_cast<int64_t>(batchId) * vocabSize;
+
+    for (int32_t entryIdx = begin + static_cast<int32_t>(threadIdx.x); entryIdx < end;
+        entryIdx += static_cast<int32_t>(blockDim.x))
+    {
+        int32_t const tokenId = tokenIds[entryIdx];
+        if (tokenId >= 0 && tokenId < vocabSize)
+        {
+            rowLogits[tokenId] += biasValues[entryIdx];
+        }
+    }
+}
+
+void applyLogitBias(rt::Tensor& logits, rt::Tensor const& tokenIds, rt::Tensor const& biasValues,
+    rt::Tensor const& offsets, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU && tokenIds.getDeviceType() == rt::DeviceType::kGPU
+            && biasValues.getDeviceType() == rt::DeviceType::kGPU && offsets.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(logits.getDataType() == nvinfer1::DataType::kFLOAT
+            && tokenIds.getDataType() == nvinfer1::DataType::kINT32
+            && biasValues.getDataType() == nvinfer1::DataType::kFLOAT
+            && offsets.getDataType() == nvinfer1::DataType::kINT32,
+        "Invalid tensor data types");
+
+    auto const logitsShape = logits.getShape();
+    auto const tokenIdsShape = tokenIds.getShape();
+    auto const biasValuesShape = biasValues.getShape();
+    auto const offsetsShape = offsets.getShape();
+
+    check::check(logitsShape.getNumDims() == 2 && tokenIdsShape.getNumDims() == 1 && biasValuesShape.getNumDims() == 1
+            && offsetsShape.getNumDims() == 1,
+        "Invalid tensor dimensions");
+    check::check(tokenIdsShape[0] == biasValuesShape[0], "Logit bias token/value shape mismatch");
+    check::check(offsetsShape[0] == logitsShape[0] + 1, "Logit bias offsets shape mismatch");
+
+    int32_t const batchSize = static_cast<int32_t>(logitsShape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(logitsShape[1]);
+    int64_t const numBiasedTokens = tokenIdsShape[0];
+    if (batchSize == 0 || vocabSize == 0 || numBiasedTokens == 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBLOCK_SIZE = 256;
+    applyLogitBiasKernel<<<batchSize, kBLOCK_SIZE, 0, stream>>>(logits.dataPointer<float>(),
+        tokenIds.dataPointer<int32_t>(), biasValues.dataPointer<float>(), offsets.dataPointer<int32_t>(), vocabSize);
 }
 
 // Initialize ID values and offsets for top-p sampling
@@ -850,7 +903,7 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
         // Stage 0: Convert logits to probabilities using softmax
         int const SOFTMAX_BLOCK_SIZE = 256;
 
-        softmaxKernel<SOFTMAX_BLOCK_SIZE><<<params.batchSize, SOFTMAX_BLOCK_SIZE, 0, stream>>>(
+        softmaxKernelImpl<SOFTMAX_BLOCK_SIZE, false><<<params.batchSize, SOFTMAX_BLOCK_SIZE, 0, stream>>>(
             logits.dataPointer<float>(), ws.toppProbs, params.batchSize, params.vocabSize, params.temperature);
 
         // Stage 1: Initialize
@@ -971,6 +1024,102 @@ __global__ void mapReducedVocabToFullVocabKernel(
         int32_t reducedId = vocabIds[idx];
         vocabIds[idx] = vocabMappingTable[reducedId];
     }
+}
+
+namespace
+{
+//! 256-byte alignment keeps the top-K temp storage that follows the log-softmax
+//! buffer inside the logprobs workspace CUB-friendly.
+constexpr size_t kLogprobsBufferAlignment = 256;
+
+size_t alignedLogSoftmaxBufferBytes(int32_t batchSize, int32_t vocabSize) noexcept
+{
+    size_t const bytes = static_cast<size_t>(batchSize) * vocabSize * sizeof(float);
+    return (bytes + kLogprobsBufferAlignment - 1) / kLogprobsBufferAlignment * kLogprobsBufferAlignment;
+}
+
+//! Tensor-level launcher for the numerically-stable log-softmax kernel.
+void logSoftmax(rt::Tensor const& logits, rt::Tensor& out, cudaStream_t stream)
+{
+    auto const shape = logits.getShape();
+    int32_t const batchSize = static_cast<int32_t>(shape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(shape[1]);
+    constexpr int32_t LOG_SOFTMAX_BLOCK = 256;
+    softmaxKernelImpl<LOG_SOFTMAX_BLOCK, true><<<batchSize, LOG_SOFTMAX_BLOCK, 0, stream>>>(
+        logits.dataPointer<float>(), out.dataPointer<float>(), batchSize, vocabSize, 1.0f);
+}
+} // namespace
+
+size_t getExtractTopKLogprobsWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK) noexcept
+{
+    // Log-softmax buffer up front (256B-aligned), selectAllTopK temp storage after it.
+    return alignedLogSoftmaxBufferBytes(batchSize, vocabSize)
+        + getSelectAllTopKWorkspaceSize(batchSize, vocabSize, topK);
+}
+
+void extractTopKLogprobs(rt::Tensor const& logits, rt::Tensor& logprobsValues, rt::Tensor& logprobsIndices,
+    int32_t topK, rt::Tensor& workspace, cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU
+            && logprobsValues.getDeviceType() == rt::DeviceType::kGPU
+            && logprobsIndices.getDeviceType() == rt::DeviceType::kGPU
+            && workspace.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+
+    auto const inputShape = logits.getShape();
+    int32_t const batchSize = static_cast<int32_t>(inputShape[0]);
+    int32_t const vocabSize = static_cast<int32_t>(inputShape[1]);
+
+    // Carve the workspace: log-softmax buffer up front, top-K temp storage after it.
+    size_t const bufferBytes = alignedLogSoftmaxBufferBytes(batchSize, vocabSize);
+    check::check(static_cast<size_t>(workspace.getMemoryCapacity())
+            >= getExtractTopKLogprobsWorkspaceSize(batchSize, vocabSize, topK),
+        "Logprobs workspace too small; size it with getExtractTopKLogprobsWorkspaceSize()");
+    int8_t* const wsBase = workspace.dataPointer<int8_t>();
+    rt::Tensor logSoftmaxOut(wsBase, {batchSize, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor topKWorkspace(wsBase + bufferBytes,
+        {static_cast<int64_t>(workspace.getMemoryCapacity() - static_cast<int64_t>(bufferBytes))}, rt::DeviceType::kGPU,
+        nvinfer1::DataType::kINT8);
+
+    // Compute numerically-stable log-softmax, then select top-K (values are already log-probs).
+    logSoftmax(logits, logSoftmaxOut, stream);
+    selectAllTopK(logSoftmaxOut, rt::OptionalOutputTensor{std::ref(logprobsValues)}, logprobsIndices, topK,
+        topKWorkspace, stream);
+}
+
+namespace
+{
+// One block per output row; each thread copies a stride of vocab elements.
+__global__ void gatherSpecVerifyAcceptedLogitRowsKernel(float const* __restrict__ logits,
+    int32_t const* __restrict__ acceptedIndices, float* __restrict__ gathered, int32_t verifyTreeSize,
+    int32_t maxAcceptDepth, int32_t vocabSize)
+{
+    int32_t const outRow = blockIdx.x; // 0 .. batchSize*maxAcceptDepth-1
+    int32_t const batch = outRow / maxAcceptDepth;
+    int32_t const treePos = acceptedIndices[outRow];
+    int32_t const safeTreePos = min(max(treePos, 0), verifyTreeSize - 1);
+    int32_t const inRow = batch * verifyTreeSize + safeTreePos;
+
+    float const* src = logits + static_cast<ptrdiff_t>(inRow) * vocabSize;
+    float* dst = gathered + static_cast<ptrdiff_t>(outRow) * vocabSize;
+    for (int32_t v = threadIdx.x; v < vocabSize; v += blockDim.x)
+        dst[v] = src[v];
+}
+} // namespace
+
+void gatherSpecVerifyAcceptedLogitRows(rt::Tensor const& logits, rt::Tensor const& acceptedIndices,
+    rt::Tensor& gathered, int32_t batchSize, int32_t verifyTreeSize, int32_t maxAcceptDepth, int32_t vocabSize,
+    cudaStream_t stream)
+{
+    check::check(logits.getDeviceType() == rt::DeviceType::kGPU
+            && acceptedIndices.getDeviceType() == rt::DeviceType::kGPU
+            && gathered.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    int32_t const totalRows = batchSize * maxAcceptDepth;
+    constexpr int32_t kBlock = 256;
+    gatherSpecVerifyAcceptedLogitRowsKernel<<<totalRows, kBlock, 0, stream>>>(logits.dataPointer<float>(),
+        acceptedIndices.dataPointer<int32_t>(), gathered.dataPointer<float>(), verifyTreeSize, maxAcceptDepth,
+        vocabSize);
 }
 
 void mapReducedVocabToFullVocab(rt::Tensor& vocabIds, rt::Tensor const& vocabMappingTable, cudaStream_t stream)

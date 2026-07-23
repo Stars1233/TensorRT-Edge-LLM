@@ -93,12 +93,6 @@ public:
     //! @return A reference to the tensor with shape [maxBatchSize, 2, numKVHeads_i, maxSequenceLength, headDim_i].
     rt::Tensor& getCombinedKVCache(int32_t attnLayerIdx) noexcept;
 
-    //! Get the separate K and V caches for the given attention layer.
-    //! Returns a pair of non-owned view tensors, the first is the K cache and the second is the V cache.
-    //! @param attnLayerIdx The index of the attention layer.
-    //! @return A pair of tensors with shapes [maxBatchSize, numKVHeads_i, maxSequenceLength, headDim_i].
-    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCache(int32_t attnLayerIdx) noexcept;
-
     //! Get the layer configuration for the given attention layer.
     //! @param attnLayerIdx The index of the attention layer.
     //! @return The KVLayerConfig for this layer.

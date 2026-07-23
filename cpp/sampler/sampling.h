@@ -85,6 +85,14 @@ struct SamplingParams
  */
 struct SamplingWorkspace;
 
+/*! \brief Maximum number of top log-probabilities that can be requested per generated token.
+ *
+ *  The cap applies to the per-token K of each individual request; it is not a cumulative
+ *  budget across requests or batches. A batch computes at the maximum K requested by its
+ *  requests. Input parsing rejects values above this; the runtime clamps as a backstop for
+ *  direct API callers. */
+inline constexpr int32_t kMaxLogprobsK = 50;
+
 /*!
  * @brief Decide whether sampling parameters require non-greedy decoding
  *
@@ -116,6 +124,24 @@ bool shouldUseNonGreedySampling(float temperature, int64_t topK, float topP) noe
  */
 void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIndices, SamplingParams const& params,
     rt::Tensor& workspace, cudaStream_t stream, uint64_t philoxSeed = 42, uint64_t philoxOffset = 0);
+
+/*!
+ * \brief Apply sparse per-batch logit biases in place before sampling.
+ *
+ * Biases are represented in CSR-style flattened buffers. For each batch row
+ * `b`, entries in `[offsets[b], offsets[b + 1])` are added to
+ * `logits[b, tokenIds[i]]`. Invalid token IDs are ignored defensively; callers
+ * should still validate token IDs before invoking this helper.
+ *
+ * \param[in,out] logits Logits tensor [GPU, Float] with shape [batch-size, vocab-size]
+ * \param[in] tokenIds Flattened biased token IDs [GPU, Int32] with shape [num-biased-tokens]
+ * \param[in] biasValues Flattened bias values [GPU, Float] with shape [num-biased-tokens]
+ * \param[in] offsets Per-batch CSR offsets [GPU, Int32] with shape [batch-size + 1]
+ * \param[in] stream CUDA stream to execute the kernel
+ * \throws std::runtime_error If tensor validation or CUDA launch fails
+ */
+void applyLogitBias(rt::Tensor& logits, rt::Tensor const& tokenIds, rt::Tensor const& biasValues,
+    rt::Tensor const& offsets, cudaStream_t stream);
 
 /*!
  * \brief Select all top-K elements from input tensor.
@@ -164,6 +190,62 @@ size_t getTopKtopPSamplingWorkspaceSize(int32_t batchSize, int32_t vocabSize, Sa
  * \return Required workspace size in bytes
  */
 size_t getSelectAllTopKWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK) noexcept;
+
+/*!
+ * \brief Get workspace size required for extractTopKLogprobs.
+ *
+ * The workspace holds the intermediate log-softmax buffer ([batch-size, vocab-size] floats,
+ * 256-byte aligned) followed by the selectAllTopK temporary storage. It is NOT a plain
+ * selectAllTopK workspace; always size logprobs workspaces with this function.
+ *
+ * \param[in] batchSize Batch size
+ * \param[in] vocabSize Vocabulary size
+ * \param[in] topK Number of top log-probabilities to extract
+ * \return Required workspace size in bytes
+ */
+size_t getExtractTopKLogprobsWorkspaceSize(int32_t batchSize, int32_t vocabSize, int32_t topK) noexcept;
+
+/*!
+ * \brief Extract top-K log-probabilities from raw logits.
+ *
+ * Computes numerically-stable log-softmax over the full vocabulary for each batch element,
+ * then selects the top-K (token_id, log_prob) pairs sorted by descending probability.
+ * No temperature scaling is applied — logprobs match OpenAI convention: log(softmax(logits)).
+ *
+ * \param[in]  logits          Input logits [GPU, Float] with shape [batch-size, vocab-size]
+ * \param[out] logprobsValues  Top-K log-prob values [GPU, Float] with shape [batch-size, top-K]
+ * \param[out] logprobsIndices Top-K token indices [GPU, Int32] with shape [batch-size, top-K]
+ * \param[in]  topK            Number of top elements to select (must be <= kMaxLogprobsK)
+ * \param[in,out] workspace    Workspace buffer [GPU, Int8]; holds the log-softmax buffer and the
+ *                             top-K selection temp storage. Size it with
+ *                             getExtractTopKLogprobsWorkspaceSize().
+ * \param[in]  stream          CUDA stream
+ * \throws std::runtime_error If CUDA operations fail
+ */
+void extractTopKLogprobs(rt::Tensor const& logits, rt::Tensor& logprobsValues, rt::Tensor& logprobsIndices,
+    int32_t topK, rt::Tensor& workspace, cudaStream_t stream);
+
+/*!
+ * \brief Spec-decode verify: gather accepted logit rows from the full verify-tree logits tensor.
+ *
+ * For each (batch, depth) pair, copies the logit row at tree position
+ * acceptedIndices[batch * maxAcceptDepth + depth] into the output gathered tensor at row
+ * batch * maxAcceptDepth + depth.  Enables running log-softmax only on the accepted rows
+ * (typically 4–7) rather than the full verify tree (60 rows). Used only by speculative-decode
+ * verification (EAGLE / MTP) when collecting per-token logprobs.
+ *
+ * \param[in]  logits          GPU float32 [batchSize * verifyTreeSize, vocabSize]
+ * \param[in]  acceptedIndices GPU int32   [batchSize * maxAcceptDepth] — tree-position indices
+ * \param[out] gathered        GPU float32 [batchSize * maxAcceptDepth, vocabSize]
+ * \param[in]  batchSize       Active batch size
+ * \param[in]  verifyTreeSize  Rows per batch item in logits
+ * \param[in]  maxAcceptDepth  draftingStep + 1
+ * \param[in]  vocabSize       Vocabulary size
+ * \param[in]  stream          CUDA stream
+ */
+void gatherSpecVerifyAcceptedLogitRows(rt::Tensor const& logits, rt::Tensor const& acceptedIndices,
+    rt::Tensor& gathered, int32_t batchSize, int32_t verifyTreeSize, int32_t maxAcceptDepth, int32_t vocabSize,
+    cudaStream_t stream);
 
 /*!
  * \brief Map reduced vocabulary IDs to full vocabulary IDs using a lookup table (in-place).

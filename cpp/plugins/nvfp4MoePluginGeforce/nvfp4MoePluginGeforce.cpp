@@ -22,6 +22,7 @@
 #include "common/logger.h"
 #include "common/stringUtils.h"
 #include "common/tensor.h"
+#include "kernels/moe/moePerExpertScaleKernels.h"
 #include "kernels/moe/moeSigmoidGroupTopkKernels.h"
 #include "kernels/moe/moeTopkSoftmaxKernels.h"
 #include "plugins/utils/pluginUtils.h"
@@ -81,6 +82,7 @@ constexpr int32_t kACT_SILU{1};
 constexpr int32_t kACT_SWIGLU{2};
 constexpr int32_t kACT_GELU{3};
 constexpr int32_t kACT_RELU2{4};
+constexpr int32_t kACT_GEGLU{5};
 
 constexpr int32_t kBACKEND_AUTO{0};
 constexpr int32_t kBACKEND_DECODE{1};
@@ -91,6 +93,7 @@ constexpr int32_t kIODT_FP16{1};
 
 constexpr int32_t kROUTING_MODE_SOFTMAX_TOPK{0};
 constexpr int32_t kROUTING_MODE_SIGMOID_GROUP_TOPK{1};
+constexpr int32_t kROUTING_MODE_SOFTMAX_TOPK_POST_SCALE{2};
 
 //! NVFP4 scale-factor group size (kK dim grouping) — block scales have K/sf_vec_size entries.
 constexpr int32_t kNvfp4SfVecSize{16};
@@ -109,8 +112,7 @@ inline int32_t ceilDivInt(int32_t a, int32_t b)
 
 inline bool isGatedActivation(int32_t activationType)
 {
-    // geglu would be gated too, support it in the future.
-    return activationType == kACT_SWIGLU;
+    return activationType == kACT_SWIGLU || activationType == kACT_GEGLU;
 }
 
 //! Number of output rows in FC1 given the gated/non-gated activation.
@@ -129,6 +131,7 @@ CuteDslMoeActivation toRunnerActivation(int32_t activationType)
     case kACT_SWIGLU: return CuteDslMoeActivation::kSwiGLU;
     case kACT_GELU: return CuteDslMoeActivation::kGeLU;
     case kACT_RELU2: return CuteDslMoeActivation::kReLU2;
+    case kACT_GEGLU: return CuteDslMoeActivation::kGeGLU;
     default: return CuteDslMoeActivation::kSwiGLU;
     }
 }
@@ -266,20 +269,23 @@ NvFP4MoEPluginGeforce::NvFP4MoEPluginGeforce(std::string const& name, PluginFiel
     case kACT_SILU:
     case kACT_SWIGLU:
     case kACT_GELU:
-    case kACT_RELU2: break;
+    case kACT_RELU2:
+    case kACT_GEGLU: break;
     default:
         throw std::invalid_argument(
             "NvFP4MoEPluginGeforce: activation_type must be 0 (identity), 1 (silu), "
-            "2 (swiglu), 3 (gelu), or 4 (relu2)");
+            "2 (swiglu), 3 (gelu), 4 (relu2), or 5 (geglu)");
     }
     if (mBackend != kBACKEND_AUTO && mBackend != kBACKEND_DECODE && mBackend != kBACKEND_PREFILL)
     {
         throw std::invalid_argument("NvFP4MoEPluginGeforce: backend must be 0 (auto), 1 (decode), or 2 (prefill)");
     }
-    if (mRoutingMode != kROUTING_MODE_SOFTMAX_TOPK && mRoutingMode != kROUTING_MODE_SIGMOID_GROUP_TOPK)
+    if (mRoutingMode != kROUTING_MODE_SOFTMAX_TOPK && mRoutingMode != kROUTING_MODE_SIGMOID_GROUP_TOPK
+        && mRoutingMode != kROUTING_MODE_SOFTMAX_TOPK_POST_SCALE)
     {
         throw std::invalid_argument(
-            "NvFP4MoEPluginGeforce: routing_mode must be 0 (softmax top-k) or 1 (sigmoid group top-k)");
+            "NvFP4MoEPluginGeforce: routing_mode must be 0 (softmax top-k), 1 (sigmoid group top-k), "
+            "or 2 (softmax top-k post-scale)");
     }
     if (mRoutingMode == kROUTING_MODE_SIGMOID_GROUP_TOPK)
     {
@@ -832,19 +838,34 @@ int32_t NvFP4MoEPluginGeforce::enqueue(PluginTensorDesc const* inputDesc, Plugin
             rt::Coords{inputDesc[kIN_ROUTER_LOGITS].dims}, rt::DeviceType::kGPU, DataType::kFLOAT);
         rt::Tensor topkWeightsT(topkWeightsPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
         rt::Tensor topkIdsT(topkIdsPtr, {numTokens, mTopK}, rt::DeviceType::kGPU, DataType::kINT32);
-        rt::Tensor correctionBiasT(const_cast<void*>(inputs[kIN_E_SCORE_CORRECTION_BIAS]), {mNumExperts},
-            rt::DeviceType::kGPU, DataType::kFLOAT);
-        rt::OptionalInputTensor correctionBiasOpt = correctionBiasT;
         if (mRoutingMode == kROUTING_MODE_SIGMOID_GROUP_TOPK)
         {
+            rt::Tensor correctionBiasT(const_cast<void*>(inputs[kIN_E_SCORE_CORRECTION_BIAS]), {mNumExperts},
+                rt::DeviceType::kGPU, DataType::kFLOAT);
+            rt::OptionalInputTensor correctionBiasOpt = correctionBiasT;
             trt_edgellm::kernel::moeSigmoidGroupTopk(routerLogitsT, topkWeightsT, topkIdsT, mTopK, mNGroup, mTopkGroup,
                 mNormTopkProb != 0, mRoutedScalingFactor, stream, correctionBiasOpt);
         }
-        else
+        else if (mRoutingMode == kROUTING_MODE_SOFTMAX_TOPK)
         {
+            // Pre-softmax additive bias (DeepSeek, Qwen3).
+            rt::Tensor correctionBiasT(const_cast<void*>(inputs[kIN_E_SCORE_CORRECTION_BIAS]), {mNumExperts},
+                rt::DeviceType::kGPU, DataType::kFLOAT);
+            rt::OptionalInputTensor biasForSoftmax = correctionBiasT;
             trt_edgellm::kernel::moeTopkSoftmax(routerLogitsT, topkWeightsT, topkIdsT, mTopK,
                 softmaxWs > 0 ? softmaxScratch : nullptr, softmaxWs, stream, /*renormalize=*/true, 0.0F,
-                correctionBiasOpt);
+                biasForSoftmax);
+        }
+        else
+        {
+            // kSOFTMAX_TOPK_POST_SCALE: softmax (no bias) + post-renorm multiplicative scale (Gemma4).
+            rt::OptionalInputTensor biasForSoftmax;
+            trt_edgellm::kernel::moeTopkSoftmax(routerLogitsT, topkWeightsT, topkIdsT, mTopK,
+                softmaxWs > 0 ? softmaxScratch : nullptr, softmaxWs, stream, /*renormalize=*/true, 0.0F,
+                biasForSoftmax);
+
+            float const* scalePtr = static_cast<float const*>(inputs[kIN_E_SCORE_CORRECTION_BIAS]);
+            trt_edgellm::kernel::applyPerExpertScale(topkWeightsPtr, topkIdsPtr, scalePtr, numTokens, mTopK, stream);
         }
         CUDA_CHECK(cudaGetLastError());
 

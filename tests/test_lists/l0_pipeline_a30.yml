@@ -16,5 +16,6 @@ tests:
   - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
   - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_streaming[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
   - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate_with_logit_bias[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
   - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
   - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_streaming[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]

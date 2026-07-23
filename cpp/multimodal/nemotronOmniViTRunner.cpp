@@ -183,12 +183,12 @@ bool NemotronOmniViTRunner::allocateBuffer(cudaStream_t stream)
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "NemotronOmniViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor({maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "NemotronOmniViTRunner::mNormalizedImageDevice");
-    // Set max image size to 1xmaxImagePixelsxchannels, will reshape to actual image size in resizeImage
-    rt::Tensor resizeBuffer({1, maxImagePixels / channels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "NemotronOmniViTRunner::resizeBuffer");
+    // Scratch buffer for resizeImage output (4D placeholder shape; resizeImage reshapes per call).
+    rt::Tensor resizeBuffer({1, 1, maxImagePixels / channels, channels}, rt::DeviceType::kCPU,
+        nvinfer1::DataType::kUINT8, "NemotronOmniViTRunner::resizeBuffer");
     mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    // Thumbnail image has fixed size: blockImageSizeH x blockImageSizeW x channels
-    rt::Tensor thumbnailBuffer({mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
+    // Thumbnail image has fixed size: 1 x blockImageSizeH x blockImageSizeW x channels (4D, frames=1).
+    rt::Tensor thumbnailBuffer({1, mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
         nvinfer1::DataType::kUINT8, "NemotronOmniViTRunner::thumbnailBuffer");
     mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
 

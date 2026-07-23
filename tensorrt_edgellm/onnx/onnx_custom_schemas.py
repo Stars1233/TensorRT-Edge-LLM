@@ -157,6 +157,14 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="enable_vision_block_attention",
+            type=OpSchema.AttrType.INT,
+            description=(
+                "Use attention_mask as Gemma4 vision block IDs during "
+                "prefill (0(false), 1(true)). Optional."),
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="sliding_window_size",
             type=OpSchema.AttrType.INT,
             description=
@@ -169,6 +177,12 @@ _attention_plugin_schema = OpSchema(
             description=
             "QKV dequant scales for FP8 KV cache: [q_scale, k_scale, v_scale]. "
             "Defaults to [1.0, 1.0, 1.0] when the checkpoint has no explicit scales.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="attention_scale",
+            type=OpSchema.AttrType.FLOAT,
+            description="Absolute multiplier applied to QK^T before softmax.",
             required=False,
         ),
     ],
@@ -233,6 +247,12 @@ _vit_attention_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Size of each attention head",
             required=True,
+        ),
+        OpSchema.Attribute(
+            name="attention_scale",
+            type=OpSchema.AttrType.FLOAT,
+            description="Absolute multiplier applied to QK^T before softmax.",
+            required=False,
         ),
     ],
 )
@@ -577,6 +597,12 @@ _causal_conv1d_schema = OpSchema(
         OpSchema.FormalParameter(name="context_lengths",
                                  description="Context lengths per batch",
                                  type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="spec_decode_metadata",
+            description=
+            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
+            type_str="T_CL",
+            param_option=OpSchema.FormalParameterOption.Variadic),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -615,7 +641,14 @@ _causal_conv1d_schema = OpSchema(
         OpSchema.Attribute(
             name="use_mtp",
             type=OpSchema.AttrType.INT,
-            description="Whether to emit per-token intermediate states",
+            description=
+            "Enable linear spec-verify intermediate state output; retained as use_mtp for compatibility with existing MTP ONNX/plugin schema",
+            required=False),
+        OpSchema.Attribute(
+            name="use_ddtree",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether tree_parent_ids/tree_depths drive tree-state execution; also enables intermediate state output",
             required=False),
     ],
 )
@@ -834,22 +867,22 @@ _attention_trt_native_schema = OpSchema(
         OpSchema.Attribute(
             name="scale",
             type=OpSchema.AttrType.FLOAT,
-            description="Attention scale factor (1.0 when Q is pre-scaled)",
+            description="Absolute multiplier applied to QK^T before softmax.",
             required=False,
         ),
     ],
 )
 
-_vit_trt_attention_schema = OpSchema(
+_trt_ragged_attention_schema = OpSchema(
     name="TRT_Attention",
     domain="trt",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc="TRT-native ViT attention (packed NHD, no causal mask, no KV cache).",
+    doc=
+    "TRT-native ragged attention (packed NHD, no causal mask, no KV cache).",
     inputs=[
         OpSchema.FormalParameter(
             name="query",
-            description=
-            "Query tensor [total_S, H, D] (pre-scaled by 1/sqrt(D))",
+            description="Query tensor [total_S, H, D]",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -864,22 +897,16 @@ _vit_trt_attention_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="mask",
-            description="Unused — positional placeholder",
+            description="Optional attention mask",
             type_str="T",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
-        OpSchema.FormalParameter(
-            name="query_lengths",
-            description="Cumulative query lengths [B+1]",
-            type_str="tensor(int32)",
-            param_option=OpSchema.FormalParameterOption.Optional,
-        ),
-        OpSchema.FormalParameter(
-            name="kv_lengths",
-            description="Cumulative KV lengths [B+1]",
-            type_str="tensor(int32)",
-            param_option=OpSchema.FormalParameterOption.Optional,
-        ),
+        OpSchema.FormalParameter(name="query_lengths",
+                                 description="Cumulative query lengths [B+1]",
+                                 type_str="tensor(int32)"),
+        OpSchema.FormalParameter(name="kv_lengths",
+                                 description="Cumulative KV lengths [B+1]",
+                                 type_str="tensor(int32)"),
     ],
     outputs=[
         OpSchema.FormalParameter(
@@ -958,6 +985,12 @@ _gated_delta_net_schema = OpSchema(
             name="context_lengths",
             description="Valid token count per batch row [n]",
             type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="spec_decode_metadata",
+            description=
+            "Optional speculative metadata: spec_verify_phase_marker, tree_parent_ids, tree_depths",
+            type_str="T_CL",
+            param_option=OpSchema.FormalParameterOption.Variadic),
     ],
     outputs=[
         OpSchema.FormalParameter(name="o",
@@ -990,7 +1023,14 @@ _gated_delta_net_schema = OpSchema(
         OpSchema.Attribute(
             name="use_mtp",
             type=OpSchema.AttrType.INT,
-            description="Whether to emit per-token intermediate states",
+            description=
+            "Enable linear spec-verify intermediate state output; retained as use_mtp for compatibility with existing MTP ONNX/plugin schema",
+            required=False),
+        OpSchema.Attribute(
+            name="use_ddtree",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether tree_parent_ids/tree_depths drive tree-state execution; also enables intermediate state output",
             required=False),
     ],
 )
@@ -1222,11 +1262,11 @@ _nvfp4_moe_plugin_geforce_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::FusedGemmAllReducePlugin (row-parallel NVFP4 GEMM)
+# trt_edgellm::FusedNvfp4GemmAllReducePlugin (row-parallel NVFP4 GEMM)
 # ---------------------------------------------------------------------------
 
-_fused_gemm_allreduce_plugin_schema = OpSchema(
-    name="FusedGemmAllReducePlugin",
+_fused_nvfp4_gemm_allreduce_plugin_schema = OpSchema(
+    name="FusedNvfp4GemmAllReducePlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
     doc=("NVFP4 row-parallel GEMM fused with AllReduce.  Replaces the "
@@ -1276,18 +1316,6 @@ _fused_gemm_allreduce_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Tensor parallel world size",
             required=True,
-        ),
-        OpSchema.Attribute(
-            name="fuse_residual_rmsnorm",
-            type=OpSchema.AttrType.INT,
-            description="0/1: fuse the post-AllReduce residual+RMSNorm",
-            required=False,
-        ),
-        OpSchema.Attribute(
-            name="rmsnorm_epsilon",
-            type=OpSchema.AttrType.FLOAT,
-            description="RMSNorm epsilon when fuse_residual_rmsnorm=1",
-            required=False,
         ),
     ],
 )
@@ -1351,6 +1379,97 @@ _dflash_target_kv_cache_update_schema = OpSchema(
     ],
 )
 
+# ---------------------------------------------------------------------------
+# Gemma4 Audio Attention Plugin
+# ---------------------------------------------------------------------------
+
+_gemma4_audio_attention_plugin_schema = OpSchema(
+    name="Gemma4AudioAttentionPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    ("Fused Gemma 4 audio chunked local attention (post-QKV, pre-output-proj). "
+     "Per-dim Q scaling, fixed K scaling, content + rel-pos scores, "
+     "tanh soft-cap, local mask, softmax, value mix."),
+    inputs=[
+        OpSchema.FormalParameter(
+            name="q_raw",
+            description="Raw query projections [B, S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="k_raw",
+            description="Raw key projections [B, S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="v",
+            description="Value projections [B, S, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="gamma",
+            description="Per-dim learned query scale [D] (float32)",
+            type_str="tensor(float)",
+        ),
+        OpSchema.FormalParameter(
+            name="rel_key",
+            description="Projected relative-position embeddings [P, H, D]",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="valid",
+            description="Audio validity mask [B, S] (bool)",
+            type_str="tensor(bool)",
+        ),
+        OpSchema.FormalParameter(
+            name="seq_len_carrier",
+            description="Shape carrier [1] (int32)",
+            type_str="tensor(int32)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="attn_output",
+            description="Attention output [B, S, H, D]",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"],
+            "Q/K/V/relKey/output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="chunk_size",
+            type=OpSchema.AttrType.INT,
+            description="Query block size (default 12)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="left_horizon",
+            type=OpSchema.AttrType.INT,
+            description="Effective left context (default 12)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="context_size",
+            type=OpSchema.AttrType.INT,
+            description="Gathered K/V context size (default 24)",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="logit_cap",
+            type=OpSchema.AttrType.FLOAT,
+            description="Tanh soft-cap on logits (default 50.0)",
+            required=True,
+        ),
+    ],
+)
+
 _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _attention_plugin_schema,
     _vit_attention_plugin_schema,
@@ -1364,13 +1483,14 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _rotary_embedding_schema,
     _tensor_scatter_schema,
     _attention_trt_native_schema,
-    _vit_trt_attention_schema,
+    _trt_ragged_attention_schema,
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
-    _fused_gemm_allreduce_plugin_schema,
+    _fused_nvfp4_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
+    _gemma4_audio_attention_plugin_schema,
 )
 
 _registered_tensorrt_edgellm_schemas: bool = False

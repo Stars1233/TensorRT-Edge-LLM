@@ -26,11 +26,13 @@
 #include "common/version.h"
 #include "runtime/exec/engineExecutor.h"
 
+#include <algorithm>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace trt_edgellm
 {
@@ -122,8 +124,12 @@ SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
     {
         return SpecDecodeMode::kDFlash;
     }
+    if (specDecodeType == "gemma4_mtp")
+    {
+        return SpecDecodeMode::kGemma4MTP;
+    }
     throw std::runtime_error("parseEngineConfig: invalid spec_decode_type '" + specDecodeType
-        + "'. Allowed values: none, mtp, eagle3, dflash.");
+        + "'. Allowed values: none, mtp, eagle3, dflash, gemma4_mtp.");
 }
 
 std::string parseEngineRole(Json const& configJson)
@@ -192,22 +198,54 @@ void parseDFlashFields(
     }
 }
 
+void parseGemma4MTPFields(Json const& configJson, LLMEngineConfig& cfg)
+{
+    cfg.modelType = configJson.value("model", configJson.value("model_type", std::string{}));
+    cfg.baseModelHiddenSize = configJson.value("base_model_hidden_size", cfg.baseModelHiddenSize);
+
+    if (cfg.specDecodeType != SpecDecodeMode::kGemma4MTP)
+    {
+        return;
+    }
+
+    cfg.sharesTargetKV = configJson.value("shares_target_kv", false);
+    cfg.hasOwnKVCache = configJson.value("has_own_kv_cache", true);
+    cfg.constantDraftPositions = configJson.value("constant_draft_positions", false);
+    cfg.returnsFeedbackHidden = configJson.value("returns_feedback_hidden", false);
+    cfg.assistantHiddenSize = configJson.value("assistant_hidden_size", 0);
+
+    if (!configJson.contains("kv_sharing_map"))
+    {
+        return;
+    }
+
+    ELLM_CHECK(
+        configJson["kv_sharing_map"].is_array(), "parseEngineConfig: gemma4_mtp kv_sharing_map must be an array.");
+    for (auto const& entryJson : configJson["kv_sharing_map"])
+    {
+        ELLM_CHECK(entryJson.is_object(),
+            "parseEngineConfig: gemma4_mtp kv_sharing_map entries must be objects written by export.");
+        ELLM_CHECK(entryJson.contains("assistant_layer") && entryJson["assistant_layer"].is_number_integer(),
+            "parseEngineConfig: gemma4_mtp kv_sharing_map entry must contain integer assistant_layer.");
+        ELLM_CHECK(
+            entryJson.contains("target_attention_layer") && entryJson["target_attention_layer"].is_number_integer(),
+            "parseEngineConfig: gemma4_mtp kv_sharing_map entry must contain integer target_attention_layer.");
+
+        Gemma4MTPKVSharingEntry entry;
+        entry.assistantLayerIdx = entryJson["assistant_layer"].get<int32_t>();
+        entry.targetAttentionLayerIdx = entryJson["target_attention_layer"].get<int32_t>();
+        cfg.gemma4MTPKVSharingMap.push_back(std::move(entry));
+    }
+}
+
 bool isDFlashDraftConfig(LLMEngineConfig const& config)
 {
     return config.specDecodeType == SpecDecodeMode::kDFlash && !config.isSpecDecodeBase;
 }
 
-bool engineHasTensor(EngineExecutor const& executor, std::string const& tensorName)
+bool isGemma4MTPDraftConfig(LLMEngineConfig const& config)
 {
-    int32_t const numIOTensors = executor.getNumIOTensors();
-    for (int32_t i = 0; i < numIOTensors; ++i)
-    {
-        if (tensorName == executor.getIOTensorName(i))
-        {
-            return true;
-        }
-    }
-    return false;
+    return config.specDecodeType == SpecDecodeMode::kGemma4MTP && !config.isSpecDecodeBase;
 }
 
 //! Helper: parse explicit sliding/full RoPE config blocks when present.
@@ -229,8 +267,18 @@ void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
         // Do not promote original_max_position_embeddings here: it is LongRope-only,
         // and dual RoPE cache binding does not support LongRope.
         ropeConfig = collectRopeConfig(ropeJson);
-        rotaryDim = static_cast<int32_t>(getRotaryDim(ropeJson, headDim));
+        if (configJson.contains(rotaryDimName))
+        {
+            rotaryDim = configJson.at(rotaryDimName).get<int32_t>();
+        }
+        else
+        {
+            rotaryDim = static_cast<int32_t>(getRotaryDim(ropeJson, headDim));
+        }
         requirePositive(rotaryDim, rotaryDimName);
+        ELLM_CHECK(rotaryDim <= headDim,
+            std::string("parseEngineConfig: invalid ") + rotaryDimName + ": " + std::to_string(rotaryDim)
+                + " exceeds head_dim " + std::to_string(headDim));
         ELLM_CHECK(ropeConfig.type != RopeType::kMRope,
             std::string("parseEngineConfig: dual RoPE does not support context-dependent MRoPE bindings: ") + key);
     };
@@ -242,13 +290,27 @@ void parseDualRopeFields(Json const& configJson, LLMEngineConfig& cfg)
     parseRopeBlock("full_rope_config", "full_rotary_dim", cfg.fullRopeConfig, cfg.fullRotaryDim, fullHeadDim);
 }
 
+bool engineHasTensorWithPrefix(EngineExecutor const& executor, std::string const& prefix)
+{
+    int32_t const numIOTensors = executor.getNumIOTensors();
+    for (int32_t i = 0; i < numIOTensors; ++i)
+    {
+        std::string const name = executor.getIOTensorName(i);
+        if (name.rfind(prefix, 0) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 //! Fields shared by base and draft engines. Parses top-level model dims and
 //! dtypes (kv_cache_dtype lives at top level — it is a property of the
 //! exported weights written by the Python export step, not a builder knob;
 //! the C++ builder never emits it inside builder_config). Also parses the
 //! common builder_config batch/input/kv limits and RoPE configuration.
 //! Engine-type-specific fields (reduced vocab, hybrid state, SpecDecode
-//! capacities, LoRA, trt_native_ops) are filled in by the calling parser
+//! capacities, LoRA) are filled in by the calling parser
 //! around this helper.
 void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
 {
@@ -338,6 +400,36 @@ void populateLayerTypes(Json const& configJson, LLMEngineConfig& cfg)
     }
     else
     {
+        if (configJson.contains("layer_types"))
+        {
+            auto const& layerTypesJson = configJson["layer_types"];
+            if (layerTypesJson.is_array() && !layerTypesJson.empty())
+            {
+                bool const allGemma4AttentionTypes
+                    = std::all_of(layerTypesJson.begin(), layerTypesJson.end(), [](Json const& layerTypeJson) {
+                          if (!layerTypeJson.is_string())
+                          {
+                              return false;
+                          }
+                          std::string const layerType = layerTypeJson.get<std::string>();
+                          return layerType == "sliding_attention" || layerType == "full_attention";
+                      });
+                if (allGemma4AttentionTypes)
+                {
+                    int32_t const globalHeadDim = configJson.value("global_head_dim", cfg.headDim);
+                    requirePositive(globalHeadDim, "global_head_dim");
+                    for (auto const& layerTypeJson : layerTypesJson)
+                    {
+                        std::string const layerType = layerTypeJson.get<std::string>();
+                        cfg.layerTypes.push_back(HybridCacheManager::LayerType::kAttention);
+                        int32_t const layerHeadDim = (layerType == "full_attention") ? globalHeadDim : cfg.headDim;
+                        cfg.kvLayerConfigs.push_back({cfg.numKVHeads, layerHeadDim});
+                    }
+                    return;
+                }
+            }
+        }
+
         // Fallback: attention-first then mamba, matching main's
         // llmEngineRunner.cpp scalar-broadcast ordering.
         if (cfg.numLinearAttnLayers > 0)
@@ -396,7 +488,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     if (cfg.isSpecDecodeBase)
     {
         ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, or dflash.");
+            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, or gemma4_mtp.");
     }
     else
     {
@@ -407,6 +499,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
     parseCoreFields(configJson, cfg);
+    parseGemma4MTPFields(configJson, cfg);
 
     // --- Base-specific: vocab, rotary dim, deepstack / multimodal, hybrid ---
     cfg.vocabSize = getRequired<int32_t>(configJson, "vocab_size");
@@ -421,6 +514,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.pleHiddenSize = configJson.value("ple_hidden_size", 0);
     cfg.audioTokenId = configJson.value("audio_token_id", -1);
     cfg.imageTokenId = configJson.value("image_token_id", -1);
+    cfg.useVisionBidirectionalAttention = configJson.value("use_vision_bidirectional_attention", false);
+    ELLM_CHECK(!cfg.useVisionBidirectionalAttention || cfg.imageTokenId >= 0,
+        "use_vision_bidirectional_attention requires image_token_id in the LLM config.");
 
     cfg.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
@@ -443,12 +539,6 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     {
         parseRequiredStateDtype(configJson, "recurrent_state_dtype", cfg.recurrentStateDtype);
         parseRequiredStateDtype(configJson, "conv_state_dtype", cfg.convStateDtype);
-    }
-
-    // TRT native ops flag.
-    if (bc.contains("trt_native_ops"))
-    {
-        cfg.useTrtNativeOps = bc["trt_native_ops"].get<bool>();
     }
 
     // Base-specific positivity checks (beyond parseCoreFields's core set).
@@ -488,6 +578,13 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     {
         cfg.maxVerifyTreeSize = getRequired<int32_t>(bc, "max_verify_tree_size");
         requirePositive(cfg.maxVerifyTreeSize, "max_verify_tree_size");
+        if (cfg.specDecodeType == SpecDecodeMode::kGemma4MTP)
+        {
+            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text",
+                "parseEngineConfig: gemma4_mtp base config must set model to gemma4 or gemma4_text.");
+            ELLM_CHECK(cfg.baseModelHiddenSize == 0 || cfg.baseModelHiddenSize == cfg.hiddenSize,
+                "parseEngineConfig: gemma4_mtp base_model_hidden_size must match hidden_size.");
+        }
     }
 
     // Populate per-layer type routing from canonical fields or scalar fallback.
@@ -555,11 +652,13 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole == "draft", "parseDraftEngineConfig: draft config must set engine_role=draft.");
     ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, or dflash.");
+        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, or "
+        "gemma4_mtp.");
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
     // batch/input/kv limits, RoPE, common positivity checks).
     parseCoreFields(configJson, cfg);
+    parseGemma4MTPFields(configJson, cfg);
 
     // --- Draft-specific ---
     cfg.numAttentionLayers = cfg.numDecoderLayers;
@@ -569,7 +668,8 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     // tail as identity.
     cfg.rotaryDim = static_cast<int32_t>(getRotaryDim(configJson, cfg.headDim));
     cfg.vocabSize = configJson.value("draft_vocab_size", configJson.value("vocab_size", 0));
-    cfg.outputVocabSize = cfg.vocabSize;
+    cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
+    cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
 
     // Draft engines do not own speculative base verification bindings.
@@ -594,6 +694,23 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.baseModelHiddenSize = getRequired<int32_t>(configJson, "base_model_hidden_size");
     requirePositive(cfg.baseModelHiddenSize, "base_model_hidden_size");
 
+    if (cfg.specDecodeType == SpecDecodeMode::kGemma4MTP)
+    {
+        ELLM_CHECK(cfg.modelType == "gemma4_assistant",
+            "parseDraftEngineConfig: gemma4_mtp draft config must set model to gemma4_assistant.");
+        ELLM_CHECK(cfg.sharesTargetKV, "parseDraftEngineConfig: gemma4_mtp assistant must set shares_target_kv=true.");
+        ELLM_CHECK(!cfg.hasOwnKVCache, "parseDraftEngineConfig: gemma4_mtp assistant must set has_own_kv_cache=false.");
+        ELLM_CHECK(cfg.constantDraftPositions,
+            "parseDraftEngineConfig: gemma4_mtp assistant must set constant_draft_positions=true.");
+        ELLM_CHECK(cfg.returnsFeedbackHidden,
+            "parseDraftEngineConfig: gemma4_mtp assistant must set returns_feedback_hidden=true.");
+        if (cfg.assistantHiddenSize > 0)
+        {
+            ELLM_CHECK(cfg.assistantHiddenSize == cfg.hiddenSize,
+                "parseDraftEngineConfig: assistant_hidden_size must match hidden_size for gemma4_mtp draft.");
+        }
+    }
+
     LOG_INFO(
         "parseDraftEngineConfig: hiddenSize=%d vocabSize=%d layers=%d kvHeads=%d headDim=%d "
         "maxBatch=%d maxInputLen=%d maxKVCap=%d maxDraftTreeSize=%d baseModelHiddenSize=%d",
@@ -617,9 +734,8 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
        << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
-       << " pleHiddenSize=" << cfg.pleHiddenSize << " useTrtNativeOps=" << cfg.useTrtNativeOps
-       << " isSpecDecodeBase=" << cfg.isSpecDecodeBase << " specDecodeType=" << static_cast<int>(cfg.specDecodeType)
-       << " loraRank=" << cfg.maxSupportedLoraRank;
+       << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
+       << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
     {
         ss << " useDualRope=true" << " slidingRotaryDim=" << cfg.slidingRotaryDim
@@ -658,6 +774,12 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
         }
         ss << "]";
     }
+    if (cfg.specDecodeType == SpecDecodeMode::kGemma4MTP)
+    {
+        ss << " modelType=" << cfg.modelType << " sharesTargetKV=" << cfg.sharesTargetKV
+           << " hasOwnKVCache=" << cfg.hasOwnKVCache << " assistantHiddenSize=" << cfg.assistantHiddenSize
+           << " kvSharingMap=" << cfg.gemma4MTPKVSharingMap.size();
+    }
     ss << " }";
     return ss.str();
 }
@@ -683,8 +805,8 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     // and read uninitialized buffer bits, producing garbage outputs.
     //
     // startIndexLen=0 is the plugin-path sentinel for "initial prefill of an
-    // empty KV cache"; chunked prefill and TRT-native-ops engines use [batch].
-    int64_t const startIndexLen = (!useTrtNativeOps && kvCacheAllEmpty) ? 0 : batch;
+    // empty KV cache"; chunked prefill uses [batch].
+    int64_t const startIndexLen = kvCacheAllEmpty ? 0 : batch;
     return InferenceDims{
         /*.batch=*/batch,
         /*.seqLen=*/seqLen,
@@ -694,6 +816,7 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.startIndexLen=*/startIndexLen,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -708,6 +831,7 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -725,6 +849,7 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifySize, 32)),
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/1,
     };
 }
 
@@ -744,6 +869,7 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(proposalSize, 32)),
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -762,6 +888,7 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(acceptLen, 32)),
         /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 
@@ -787,7 +914,7 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         };
         for (auto const* name : kRequiredBindings)
         {
-            ELLM_CHECK(engineHasTensor(executor, std::string(name)),
+            ELLM_CHECK(executor.hasIOTensor(name),
                 std::string("DFlash cached draft engine (") + engineLabel + ") is missing required binding '" + name
                     + "'. This engine may be from the old explicit DFlash path. Re-export and rebuild.");
         }
@@ -797,10 +924,10 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         {
             std::string const kvPastName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
             std::string const kvPresentName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/false);
-            ELLM_CHECK(engineHasTensor(executor, kvPastName),
+            ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
                 std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '" + kvPastName
                     + "'. Old explicit DFlash engines are not compatible. Re-export and rebuild.");
-            ELLM_CHECK(engineHasTensor(executor, kvPresentName),
+            ELLM_CHECK(executor.hasIOTensor(kvPresentName.c_str()),
                 std::string("DFlash cached draft engine (") + engineLabel + ") missing KV cache binding '"
                     + kvPresentName + "'.");
 
@@ -814,17 +941,91 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
         return;
     }
 
+    if (isGemma4MTPDraftConfig(config))
+    {
+        LOG_INFO("Gemma4 MTP draft engine (%s): validating shared-target-KV bindings.", engineLabel);
+
+        static char const* const kRequiredBindings[] = {
+            binding_names::kInputsEmbeds,
+            binding_names::kBaseModelHiddenStates,
+            binding_names::kLogits,
+            binding_names::kOutputHiddenStates,
+            binding_names::kContextLengths,
+        };
+        for (auto const* name : kRequiredBindings)
+        {
+            ELLM_CHECK(executor.hasIOTensor(name),
+                std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required binding '" + name
+                    + "'. Re-export and rebuild the assistant engine.");
+        }
+        if (config.useDualRope)
+        {
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kRopeCosSinSliding),
+                std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required dual-RoPE binding '"
+                    + binding_names::kRopeCosSinSliding + "'. Re-export and rebuild the assistant engine.");
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kRopeCosSinFull),
+                std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required dual-RoPE binding '"
+                    + binding_names::kRopeCosSinFull + "'. Re-export and rebuild the assistant engine.");
+        }
+        else
+        {
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kRopeCosSin),
+                std::string("Gemma4 MTP draft engine (") + engineLabel + ") is missing required binding '"
+                    + binding_names::kRopeCosSin + "'. Re-export and rebuild the assistant engine.");
+        }
+
+        ELLM_CHECK(!executor.hasIOTensor(binding_names::kDraftModelHiddenStates),
+            std::string("Gemma4 MTP draft engine (") + engineLabel + ") must not expose binding '"
+                + binding_names::kDraftModelHiddenStates + "'.");
+        ELLM_CHECK(!executor.hasIOTensor(binding_names::kKVCacheStartIndex),
+            std::string("Gemma4 MTP draft engine (") + engineLabel
+                + ") must not expose draft-owned kvcache_start_index.");
+        ELLM_CHECK(!engineHasTensorWithPrefix(executor, binding_names::kPresentKeyValuesTemplate),
+            std::string("Gemma4 MTP draft engine (") + engineLabel + ") must not expose present_key_values_* outputs.");
+
+        for (int32_t assistantLayerIdx = 0; assistantLayerIdx < config.numAttentionLayers; ++assistantLayerIdx)
+        {
+            std::string const kvPastName = binding_names::formatKVCacheName(assistantLayerIdx, /*isPast=*/true);
+            ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
+                std::string("Gemma4 MTP draft engine (") + engineLabel + ") missing shared target KV input '"
+                    + kvPastName + "'.");
+            auto const engineDtype = executor.getBindingDataType(kvPastName.c_str());
+            ELLM_CHECK(engineDtype == config.kvCacheDtype,
+                std::string("Gemma4 MTP shared KV dtype mismatch (") + engineLabel + "): config says "
+                    + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                    + " for binding '" + kvPastName + "'.");
+            ELLM_CHECK(assistantLayerIdx < static_cast<int32_t>(config.kvLayerConfigs.size()),
+                std::string("Gemma4 MTP draft engine (") + engineLabel
+                    + ") config is missing per-layer KV metadata for assistant layer "
+                    + std::to_string(assistantLayerIdx) + ".");
+
+            auto const& kvConfig = config.kvLayerConfigs[assistantLayerIdx];
+            int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+            for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+            {
+                for (auto const selector : {nvinfer1::OptProfileSelector::kMIN, nvinfer1::OptProfileSelector::kOPT,
+                         nvinfer1::OptProfileSelector::kMAX})
+                {
+                    auto const shape = executor.getProfileShape(kvPastName.c_str(), profileIdx, selector);
+                    ELLM_CHECK(shape.nbDims == 5,
+                        std::string("Gemma4 MTP shared KV binding '") + kvPastName + "' must be rank-5.");
+                    ELLM_CHECK(shape.d[1] == 2 && shape.d[2] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
+                        std::string("Gemma4 MTP shared KV profile shape mismatch for binding '") + kvPastName
+                            + "': expected static dims [*,2," + std::to_string(kvConfig.numKVHeads) + ",*,"
+                            + std::to_string(kvConfig.headDim) + "].");
+                }
+            }
+        }
+
+        return;
+    }
+
     // KV cache binding: validated on layer 0; all layers share the same dtype.
-    // TRT-native-ops engines split KV into separate `k_cache_%d` / `v_cache_%d`
-    // bindings; plugin-path engines use a combined `past_key_values_%d`. Query
-    // whichever the engine actually exposes — asking for the wrong name returns
-    // a spurious FLOAT32 (TRT's default for an unknown binding).
+    // Plugin-path engines use a combined `past_key_values_%d` binding.
     if (config.numAttentionLayers > 0)
     {
-        std::string const kvBindingName = config.useTrtNativeOps
-            ? binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true)
-            : binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
-        ELLM_CHECK(engineHasTensor(executor, kvBindingName),
+        std::string const kvBindingName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+        ELLM_CHECK(executor.hasIOTensor(kvBindingName.c_str()),
             std::string("Missing KV cache binding (") + engineLabel + "): expected '" + kvBindingName + "'.");
         auto const engineDtype = executor.getBindingDataType(kvBindingName.c_str());
         ELLM_CHECK(engineDtype == config.kvCacheDtype,
@@ -837,7 +1038,7 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
     if (config.numLinearAttnLayers > 0)
     {
         std::string const recBindingName = binding_names::formatRecurrentStateName(/*layerIdx=*/0, /*isPast=*/true);
-        ELLM_CHECK(engineHasTensor(executor, recBindingName),
+        ELLM_CHECK(executor.hasIOTensor(recBindingName.c_str()),
             std::string("Missing recurrent-state binding (") + engineLabel + "): expected '" + recBindingName + "'.");
         auto const recEngineDtype = executor.getBindingDataType(recBindingName.c_str());
         ELLM_CHECK(recEngineDtype == config.recurrentStateDtype,
@@ -847,13 +1048,26 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                 + "'. Re-export the engine with matching recurrent_state_dtype.");
 
         std::string const convBindingName = binding_names::formatConvStateName(/*layerIdx=*/0, /*isPast=*/true);
-        ELLM_CHECK(engineHasTensor(executor, convBindingName),
+        ELLM_CHECK(executor.hasIOTensor(convBindingName.c_str()),
             std::string("Missing conv-state binding (") + engineLabel + "): expected '" + convBindingName + "'.");
         auto const convEngineDtype = executor.getBindingDataType(convBindingName.c_str());
         ELLM_CHECK(convEngineDtype == config.convStateDtype,
             std::string("Conv state dtype mismatch (") + engineLabel + "): config says "
                 + getDataTypeString(config.convStateDtype) + ", engine reports " + getDataTypeString(convEngineDtype)
                 + " for binding '" + convBindingName + "'. Re-export the engine with matching conv_state_dtype.");
+
+        if (config.isSpecDecodeBase && config.numLinearAttnLayers > 0
+            && (config.specDecodeType == SpecDecodeMode::kMTP || config.specDecodeType == SpecDecodeMode::kDFlash))
+        {
+            ELLM_CHECK(executor.hasIOTensor(binding_names::kSpecVerifyPhaseMarker),
+                std::string("Missing spec-verify phase marker binding (") + engineLabel + "): expected '"
+                    + binding_names::kSpecVerifyPhaseMarker + "'. Re-export the hybrid MTP/DFlash base engine.");
+            auto const markerEngineDtype = executor.getBindingDataType(binding_names::kSpecVerifyPhaseMarker);
+            ELLM_CHECK(markerEngineDtype == nvinfer1::DataType::kINT32,
+                std::string("Spec-verify phase marker dtype mismatch (") + engineLabel + "): engine reports "
+                    + getDataTypeString(markerEngineDtype) + " for binding '" + binding_names::kSpecVerifyPhaseMarker
+                    + "'. Re-export the hybrid MTP/DFlash base engine.");
+        }
     }
 }
 
@@ -873,6 +1087,7 @@ InferenceDims LLMEngineConfig::resetDims() const
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/1,
         /*.startIndexLen=*/1,
+        /*.specVerifyPhaseLen=*/0,
     };
 }
 

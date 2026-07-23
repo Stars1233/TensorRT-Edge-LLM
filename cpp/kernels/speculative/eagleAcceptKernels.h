@@ -86,5 +86,26 @@ void eagleAccept(rt::Tensor const& logits, rt::Tensor const& tokenIds, rt::Tenso
     rt::Tensor& acceptedTokenIds, rt::Tensor& acceptedLogitsIndices, rt::Tensor& acceptLength,
     rt::OptionalInputTensor const& vocabMappingTable, void* workspace, size_t workspaceSize, cudaStream_t stream);
 
+/**
+ * @brief Sequential linear-chain accept for speculative decoding.
+ *
+ * For each batch element, computes base top-1 tokens for all verification positions,
+ * then accepts the linear chain until the first draft/base mismatch. Position 0 is
+ * always accepted as the base prediction after the root token.
+ *
+ * @param logits Base model logits [batchSize, verifyLen, vocabSize] (FP32, GPU)
+ * @param draftTokenIds Draft/verify token IDs [batchSize, verifyLen] (INT32, GPU)
+ * @param acceptedTokenIds Output accepted token IDs [batchSize, verifyLen] (INT32, GPU)
+ * @param acceptLength Output accept length per batch [batchSize] (INT32, GPU)
+ * @param argmaxScratch Temporary top-1 token IDs [batchSize * verifyLen] (INT32, GPU)
+ * @param batchSize Number of batch elements
+ * @param verifyLen Number of tokens to verify per batch
+ * @param vocabSize Vocabulary size
+ * @param stream CUDA stream
+ */
+void sequentialAccept(rt::Tensor const& logits, rt::Tensor const& draftTokenIds, rt::Tensor& acceptedTokenIds,
+    rt::Tensor& acceptLength, rt::Tensor& argmaxScratch, int32_t batchSize, int32_t verifyLen, int32_t vocabSize,
+    cudaStream_t stream);
+
 } // namespace kernel
 } // namespace trt_edgellm

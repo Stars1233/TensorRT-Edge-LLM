@@ -304,12 +304,40 @@ inline constexpr char const* kDraftModelHiddenStates = "hidden_states_from_draft
  */
 inline constexpr char const* kAttentionMask = "attention_mask";
 
+/*! Gemma4 Unified prefill block IDs: [batch_size, sequence_length] INT32. */
+inline constexpr char const* kVisionBlockIds = "vision_block_ids";
+
 /*!
  * @brief Attention position IDs for Eagle models
  *
  * Shape: [batch_size, tree_size] (INT32)
  */
 inline constexpr char const* kAttentionPosId = "attention_pos_id";
+
+/*!
+ * @brief Shape-only marker for speculative verification in hybrid MTP/DFlash base engines
+ *
+ * Shape: [0] for normal prefill/decode/reset, [1] for MTP/DFlash verification (INT32).
+ * The INT32 payload is ignored. Hybrid GDN/conv plugins only need to distinguish
+ * speculative verify seq_len > 1 from ordinary prefill seq_len > 1.
+ */
+inline constexpr char const* kSpecVerifyPhaseMarker = "spec_verify_phase_marker";
+
+/*!
+ * @brief DDTree parent node ids for hybrid DFlash base verification
+ *
+ * Shape: [batch_size, verify_tree_size] (INT32). Each entry points to the
+ * flattened parent node whose hybrid state is used to evaluate the current node.
+ */
+inline constexpr char const* kTreeParentIds = "tree_parent_ids";
+
+/*!
+ * @brief DDTree node depths for hybrid DFlash base verification
+ *
+ * Shape: [batch_size, verify_tree_size] (INT32). Depth is used for positional
+ * metadata and for tree-state kernels that need node order information.
+ */
+inline constexpr char const* kTreeDepths = "tree_depths";
 
 /*! @} */
 
@@ -361,6 +389,16 @@ inline constexpr char const* kCuSeqlens = "cu_seqlens";
  * Shape: [num_images + 1] (INT32)
  */
 inline constexpr char const* kKvLengths = "kv_lengths";
+
+/*!
+ * @brief Window KV sequence lengths for Qwen2.5-VL TRT-native attention.
+ *
+ * Same data as cu_window_seqlens but must be a separate tensor for
+ * TRT_Attention query_lengths/kv_lengths inputs in window-attention blocks.
+ *
+ * Shape: [num_windows + 1] (INT32)
+ */
+inline constexpr char const* kKvLengthsWindow = "kv_lengths_window";
 
 /*!
  * @brief Shape-only input used to convey runtime max sequence-length for FMHA launch
@@ -446,11 +484,30 @@ inline constexpr char const* kReducedVocabSizeKey = "reduced_vocab_size";
  */
 inline constexpr char const* kVocabMapFileName = "vocab_map.safetensors";
 
+/*!
+ * @brief Draft model vocabulary mapping file name
+ *
+ * SafeTensors file containing mapping from reduced draft vocabulary to full vocabulary.
+ *
+ * @note Currently consumed only by DFlashDecoder (gated on the draft engine config's
+ *       reduced_vocab_size > 0) and produced only by the DFlash draft export path. If a
+ *       future decoder adopts draft vocab reduction, it must (a) gate the load on the same
+ *       config field and (b) be added as a consumer of this constant.
+ */
+inline constexpr char const* kDraftVocabMapFileName = "draft_vocab_map.safetensors";
+
 /*! @} */
 
 /*! @name Audio Encoder Bindings (Qwen3-Omni)
  * @{
  */
+
+/*!
+ * @brief Raw framed PCM input used by encoder-free audio embedders
+ *
+ * Shape: [1, num_frames, frame_size] (FLOAT16)
+ */
+inline constexpr char const* kAudioInputFeatures = "input_features";
 
 /*!
  * @brief Audio padded features tensor - chunked and padded Mel-spectrogram

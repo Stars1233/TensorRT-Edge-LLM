@@ -115,32 +115,6 @@ rt::Tensor& KVCacheManager::getCombinedKVCache(int32_t attnLayerIdx) noexcept
     return mLayerCaches[attnLayerIdx];
 }
 
-std::pair<rt::Tensor, rt::Tensor> KVCacheManager::getSeparateKVCache(int32_t attnLayerIdx) noexcept
-{
-    rt::Tensor& combined = mLayerCaches[attnLayerIdx];
-    KVLayerConfig const& lc = mConfig.layerConfigs[attnLayerIdx];
-    size_t const elemSize = rt::utils::getTypeSize(mConfig.kvCacheType);
-
-    void* kvCachePtr = combined.rawPointer();
-
-    // K cache starts at the beginning of the combined buffer.
-    rt::Tensor kCache
-        = rt::Tensor(kvCachePtr, {mConfig.maxBatchSize, lc.numKVHeads, mConfig.maxSequenceLength, lc.headDim},
-            DeviceType::kGPU, mConfig.kvCacheType);
-
-    // V cache starts after the K cache portion.
-    // Offset = maxBatchSize * numKVHeads * maxSequenceLength * headDim * elemSize
-    int64_t const vCacheOffset = static_cast<int64_t>(mConfig.maxBatchSize) * lc.numKVHeads * mConfig.maxSequenceLength
-        * lc.headDim * static_cast<int64_t>(elemSize);
-    void* vCachePtr = static_cast<void*>(static_cast<char*>(kvCachePtr) + vCacheOffset);
-
-    rt::Tensor vCache
-        = rt::Tensor(vCachePtr, {mConfig.maxBatchSize, lc.numKVHeads, mConfig.maxSequenceLength, lc.headDim},
-            DeviceType::kGPU, mConfig.kvCacheType);
-
-    return {std::move(kCache), std::move(vCache)};
-}
-
 KVLayerConfig const& KVCacheManager::getLayerConfig(int32_t attnLayerIdx) const noexcept
 {
     return mConfig.layerConfigs[attnLayerIdx];

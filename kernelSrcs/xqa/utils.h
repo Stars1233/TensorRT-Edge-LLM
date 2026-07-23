@@ -70,6 +70,43 @@ HOST_DEVICE_FUNC constexpr inline uint32_t exactDiv(uint32_t a, uint32_t b)
     return a / b;
 }
 
+HOST_DEVICE_FUNC constexpr inline bool isPowerOf2(uint32_t x)
+{
+    return x != 0U && (x & (x - 1U)) == 0U;
+}
+
+HOST_DEVICE_FUNC constexpr inline uint32_t exactLog2(uint32_t x)
+{
+    assert(isPowerOf2(x));
+    uint32_t log2 = 0U;
+    while (x > 1U)
+    {
+        x >>= 1U;
+        ++log2;
+    }
+    return log2;
+}
+
+HOST_DEVICE_FUNC constexpr inline uint32_t maskForLog2(uint32_t log2)
+{
+    return (1U << log2) - 1U;
+}
+
+HOST_DEVICE_FUNC constexpr inline uint32_t divByPow2(uint32_t x, uint32_t log2)
+{
+    return x >> log2;
+}
+
+HOST_DEVICE_FUNC constexpr inline uint32_t modByPow2(uint32_t x, uint32_t log2)
+{
+    return x & maskForLog2(log2);
+}
+
+HOST_DEVICE_FUNC constexpr inline uint32_t divUpByPow2(uint32_t x, uint32_t log2)
+{
+    return (x + maskForLog2(log2)) >> log2;
+}
+
 template <typename T>
 HOST_DEVICE_FUNC constexpr inline T divUp(T a, T b)
 {

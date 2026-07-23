@@ -39,11 +39,34 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     {
     case SpecDecodeMode::kMTP:
     case SpecDecodeMode::kDFlash: return true;
+    case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kEAGLE:
     case SpecDecodeMode::kNONE: return false;
     }
     return false;
 }
+
+namespace
+{
+bool isDFlashDDTreeShape(DeploymentConfig const& bundle)
+{
+    return bundle.specConfig.has_value() && bundle.base.specDecodeType == SpecDecodeMode::kDFlash
+        && bundle.specConfig->draftingTopK > 1;
+}
+
+int32_t baseVerifyIntermediateSeqLen(DeploymentConfig const& bundle)
+{
+    if (!needsBaseVerifyIntermediateStates(bundle))
+    {
+        return 0;
+    }
+    if (bundle.base.specDecodeType != SpecDecodeMode::kDFlash)
+    {
+        return bundle.specConfig->maxVerifySize;
+    }
+    return isDFlashDDTreeShape(bundle) ? bundle.specConfig->verifySize : bundle.specConfig->dflashBlockSize;
+}
+} // namespace
 
 void allocateZeroBuffer(SharedResources& res, int64_t bytes)
 {
@@ -157,12 +180,11 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
 
     int32_t const maxDraftProposalSize = bundle.specConfig->maxDraftProposalSize;
 
-    // Base hybrid cache manager (index 0). Hybrid MTP/DFlash base verification
+    // Base hybrid cache manager (index 0). Hybrid spec-decode base verification
     // writes per-token recurrent/conv snapshots; after accept, the decoder
     // scatters only the accepted prefix into the persistent state pools.
     {
-        int32_t const baseMaxIntermediateSeqLen
-            = needsBaseVerifyIntermediateStates(bundle) ? bundle.specConfig->maxVerifySize : 0;
+        int32_t const baseMaxIntermediateSeqLen = baseVerifyIntermediateSeqLen(bundle);
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
@@ -191,7 +213,14 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
     }
 
-    // Draft hybrid cache manager (index 1). Same pattern: pure-attention.
+    // Draft hybrid cache manager (index 1). Gemma4 MTP assistant reads the
+    // base/target KV cache directly and must not allocate a draft-owned cache.
+    if (bundle.specDecodeMode() == SpecDecodeMode::kGemma4MTP)
+    {
+        check::check(bundle.draft->sharesTargetKV && !bundle.draft->hasOwnKVCache,
+            "Gemma4 MTP assistant must share target KV and must not own a draft KV cache.");
+    }
+    else
     {
         rt::KVCacheManager::Config kvCfg{
             /*.numAttentionLayers=*/static_cast<int32_t>(bundle.draft->kvLayerConfigs.size()),

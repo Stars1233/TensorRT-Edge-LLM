@@ -51,6 +51,7 @@ constexpr int32_t kNumExperts = 128;
 constexpr int32_t kTopK = 8;
 constexpr int32_t kActSwiGLU = 2;
 constexpr int32_t kActReLU2 = 4;
+constexpr int32_t kActGeGLU = 5;
 constexpr int32_t kIoDtypeFp16 = 1;
 constexpr int32_t kBackendAuto = 0;
 
@@ -239,6 +240,14 @@ inline float silu(float x)
     return x / (1.0f + std::exp(-x));
 }
 
+inline float gelu(float x)
+{
+    // GELU (tanh approximation): 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    float const inner = kSqrt2OverPi * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + std::tanh(inner));
+}
+
 // SwiGLU with 64-wide up/gate interleave used by the SM110 FC1 layout:
 // reshape projection to [n1/128, 128], then up = chunk[:64], gate = chunk[64:].
 std::vector<float> applySwigluInterleaved(float const* projection, int32_t n1)
@@ -262,9 +271,31 @@ std::vector<float> applySwigluInterleaved(float const* projection, int32_t n1)
     return out;
 }
 
+// GeGLU with 64-wide up/gate interleave (same layout as SwiGLU, GELU activation on gate).
+std::vector<float> applyGegluInterleaved(float const* projection, int32_t n1)
+{
+    if (n1 % 128 != 0)
+    {
+        throw std::runtime_error("GeGLU projection must be 128-interleaved");
+    }
+    int32_t const numChunks = n1 / 128;
+    std::vector<float> out(static_cast<size_t>(numChunks) * 64, 0.0f);
+    for (int32_t chunk = 0; chunk < numChunks; ++chunk)
+    {
+        float const* up = projection + static_cast<size_t>(chunk) * 128;
+        float const* gate = up + 64;
+        float* o = out.data() + static_cast<size_t>(chunk) * 64;
+        for (int32_t i = 0; i < 64; ++i)
+        {
+            o[i] = up[i] * gelu(gate[i]);
+        }
+    }
+    return out;
+}
+
 inline int32_t fc1InputN(int32_t intermediateSize, int32_t activationType)
 {
-    return activationType == kActSwiGLU ? 2 * intermediateSize : intermediateSize;
+    return (activationType == kActSwiGLU || activationType == kActGeGLU) ? 2 * intermediateSize : intermediateSize;
 }
 
 // ---------------------------------------------------------------------------
@@ -420,11 +451,15 @@ std::vector<float> computeReference(CaseData const& c)
                 projection[row] = acc * inputScale;
             }
 
-            // Activation: SwiGLU interleaved (64 up | 64 gate per 128).
+            // Activation: SwiGLU/GeGLU interleaved (64 up | 64 gate per 128), or ReLU2.
             std::vector<float> activated;
             if (c.config.activationType == kActSwiGLU)
             {
                 activated = applySwigluInterleaved(projection.data(), n1);
+            }
+            else if (c.config.activationType == kActGeGLU)
+            {
+                activated = applyGegluInterleaved(projection.data(), n1);
             }
             else
             {
@@ -641,6 +676,11 @@ std::vector<MoeCase> defaultCases()
             /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*numExperts=*/128, /*seed=*/0xFEEDFACEu},
         {/*name=*/"prefill_h1024_i768_t8_relu2_e128", /*numTokens=*/8, /*hiddenSize=*/1024,
             /*intermediateSize=*/768, /*activationType=*/kActReLU2, /*numExperts=*/128, /*seed=*/0xBADCAFEu},
+        // GeGLU path: same gated structure as SwiGLU (fc1InputN = 2*I) but with GELU activation on gate.
+        {/*name=*/"decode_h1024_i768_t1_geglu_e128", /*numTokens=*/1, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActGeGLU, /*numExperts=*/128, /*seed=*/0x6E610001u},
+        {/*name=*/"prefill_h1024_i768_t8_geglu_e128", /*numTokens=*/8, /*hiddenSize=*/1024,
+            /*intermediateSize=*/768, /*activationType=*/kActGeGLU, /*numExperts=*/128, /*seed=*/0x6E610008u},
         // E=256 coverage: the FC1/FC2 cubins are runtime-polymorphic in L, so the
         // same kernels must handle 256 experts. Decode exercises the fused
         // fp4BuildLayoutAndQuantizeRoutedLinearSFDecode path (kMaxDecodeExperts=256);
@@ -670,6 +710,9 @@ TEST(CuteDslNvfp4MoeSm110Test, canImplementSupportedSms)
                 << "sm=" << sm << " e=" << e;
             EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
                 /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActReLU2, kIoDtypeFp16, kBackendAuto))
+                << "sm=" << sm << " e=" << e;
+            EXPECT_TRUE(CuteDslNvfp4MoeSm110Runner::canImplement(
+                /*hiddenSize=*/1024, /*moeInterSize=*/768, e, kTopK, sm, kActGeGLU, kIoDtypeFp16, kBackendAuto))
                 << "sm=" << sm << " e=" << e;
         }
         // Expert counts outside the supported set are rejected (the cubin is

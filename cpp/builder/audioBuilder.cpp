@@ -36,6 +36,7 @@ Json AudioBuilderConfig::toJson() const noexcept
     // Audio encoder config
     json["min_time_steps"] = minTimeSteps;
     json["max_time_steps"] = maxTimeSteps;
+    json["use_trt_native_audio_attn"] = useTrtNativeAudioAttn;
     // Code2Wav config
     json["min_code_len"] = minCodeLen;
     json["opt_code_len"] = optCodeLen;
@@ -54,6 +55,10 @@ AudioBuilderConfig AudioBuilderConfig::fromJson(Json const& json)
     if (json.contains("max_time_steps"))
     {
         config.maxTimeSteps = json["max_time_steps"];
+    }
+    if (json.contains("use_trt_native_audio_attn"))
+    {
+        config.useTrtNativeAudioAttn = json["use_trt_native_audio_attn"];
     }
     // Code2Wav config
     if (json.contains("min_code_len"))
@@ -75,7 +80,8 @@ std::string AudioBuilderConfig::toString() const
 {
     std::ostringstream oss;
     oss << "AudioBuilderConfig:"
-        << " AudioEncoder[min=" << minTimeSteps << ",max=" << maxTimeSteps << "]"
+        << " AudioEncoder[min=" << minTimeSteps << ",max=" << maxTimeSteps
+        << ",use_trt_native_audio_attn=" << useTrtNativeAudioAttn << "]"
         << "\n  Code2Wav[min=" << minCodeLen << ",opt=" << optCodeLen << ",max=" << maxCodeLen << "]";
     return oss.str();
 }
@@ -283,14 +289,54 @@ bool AudioBuilder::parseConfig()
     case AudioBuildType::CODE2WAV: return parseCode2WavConfig();
     case AudioBuildType::AUDIO_ENCODER:
     {
-        if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
+        bool parseOk = false;
+        if (mModelType == multimodal::ModelType::GEMMA4_UNIFIED_AUDIO)
         {
-            return parseNemotronOmniAudioConfig();
+            parseOk = parseGemma4UnifiedAudioConfig();
         }
-        return parseAudioEncoderConfig();
+        else if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
+        {
+            parseOk = parseNemotronOmniAudioConfig();
+        }
+        else
+        {
+            parseOk = parseAudioEncoderConfig();
+        }
+        if (parseOk && mModelConfig.value("use_trt_native_audio_attn", false))
+        {
+            logTrtNativeAttentionPath("AudioAttention");
+        }
+        return parseOk;
     }
     default: LOG_ERROR("Unknown build type"); return false;
     }
+}
+
+bool AudioBuilder::parseGemma4UnifiedAudioConfig()
+{
+    if (!mModelConfig.contains("audio_config"))
+    {
+        LOG_ERROR("audio_config not found in config.json for Gemma4 Unified audio");
+        return false;
+    }
+    auto const& audioConfig = mModelConfig["audio_config"];
+    mAudioFeatureDim = audioConfig.value("audio_samples_per_token", audioConfig.value("audio_embed_dim", int32_t{0}));
+    if (mAudioFeatureDim != 640)
+    {
+        LOG_ERROR(
+            "Gemma4 Unified audio requires audio_samples_per_token/audio_embed_dim=640, got %d", mAudioFeatureDim);
+        return false;
+    }
+    if (mBuilderConfig.maxTimeSteps < 1)
+    {
+        LOG_ERROR("Gemma4 Unified maxTimeSteps must be at least one raw PCM frame");
+        return false;
+    }
+    LOG_INFO(
+        "Gemma4 Unified AudioEncoder config: frame_size=%d samples; maxTimeSteps=%ld means raw 640-sample "
+        "PCM frames (minimum profile length is always 1)",
+        mAudioFeatureDim, mBuilderConfig.maxTimeSteps);
+    return true;
 }
 
 bool AudioBuilder::parseAudioEncoderConfig()
@@ -312,14 +358,18 @@ bool AudioBuilder::parseAudioEncoderConfig()
         return false;
     }
 
-    // n_window: same name in HF config
-    if (!audioConfig.contains("n_window"))
+    // n_window: required for Qwen3-Omni audio encoder (chunked feature format).
+    // Gemma4 and Nemotron-Omni use [1, seq_len, mel_bins] input and don't need n_window.
+    if (audioConfig.contains("n_window"))
     {
-        LOG_ERROR("audio_config.n_window not found in config.json");
+        // Feature tensor uses n_window * 2 (implementation detail of Qwen3-Omni audio encoder)
+        mNWindowDim = audioConfig["n_window"].get<int32_t>() * 2;
+    }
+    else if (mModelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
+    {
+        LOG_ERROR("audio_config.n_window not found in config.json (required for Qwen3-Omni)");
         return false;
     }
-    // Feature tensor uses n_window * 2 (implementation detail of Qwen3-Omni audio encoder)
-    mNWindowDim = audioConfig["n_window"].get<int32_t>() * 2;
 
     LOG_INFO("AudioEncoder config: mel_bins=%d, n_window_dim=%d", mMelBins, mNWindowDim);
     return true;
@@ -401,9 +451,11 @@ bool AudioBuilder::setupAudioEncoderProfile(
     switch (mModelType)
     {
     case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile); break;
+    case multimodal::ModelType::GEMMA4_UNIFIED_AUDIO: result = setupGemma4UnifiedAudioEncoderProfile(*profile); break;
     case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
         result = setupNemotronOmniAudioEncoderProfile(*profile);
         break;
+    case multimodal::ModelType::GEMMA4_AUDIO_ENCODER: result = setupGemma4AudioEncoderProfile(*profile); break;
     default: LOG_ERROR("Unsupported model type for audio encoder: %d", static_cast<int>(mModelType)); return false;
     }
 
@@ -415,6 +467,23 @@ bool AudioBuilder::setupAudioEncoderProfile(
     LOG_DEBUG("%s", printOptimizationProfile(profile, "audio_encoder_profile", &network).c_str());
     config.addOptimizationProfile(profile);
     return true;
+}
+
+bool AudioBuilder::setupGemma4UnifiedAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    constexpr int64_t kBatch = 1;
+    constexpr int64_t kMinFrames = 1;
+    int64_t const maxFrames = mBuilderConfig.maxTimeSteps;
+    int64_t const optFrames = kMinFrames + (maxFrames - kMinFrames) / 2;
+
+    bool const result = setOptimizationProfile(&profile, binding_names::kAudioInputFeatures,
+        createDims({kBatch, kMinFrames, mAudioFeatureDim}), createDims({kBatch, optFrames, mAudioFeatureDim}),
+        createDims({kBatch, maxFrames, mAudioFeatureDim}));
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Gemma4 Unified audio encoder profile");
+    }
+    return result;
 }
 
 bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
@@ -449,6 +518,15 @@ bool AudioBuilder::setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProf
     result &= setOptimizationProfile(&profile, "attention_mask", createDims({minElems, minElems}),
         createDims({optElems, optElems}), createDims({maxElems, maxElems}));
 
+    mBuilderConfig.useTrtNativeAudioAttn = mModelConfig.value("use_trt_native_audio_attn", false);
+    if (mBuilderConfig.useTrtNativeAudioAttn)
+    {
+        int64_t const maxBatchSize = std::max<int64_t>(1, mModelConfig.value("max_batch_size", 16));
+        result &= setOptimizationProfile(
+            &profile, "cu_seqlens", createDims({2}), createDims({2}), createDims({maxBatchSize + 1}));
+        result &= setOptimizationProfile(
+            &profile, "kv_lengths", createDims({2}), createDims({2}), createDims({maxBatchSize + 1}));
+    }
     if (!result)
     {
         LOG_ERROR("Failed to setup Qwen3-Omni audio encoder profile");
@@ -567,6 +645,46 @@ bool AudioBuilder::setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationP
     if (!result)
     {
         LOG_ERROR("Failed to setup Nemotron-Omni audio encoder profile");
+    }
+    return result;
+}
+
+bool AudioBuilder::setupGemma4AudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    bool result = true;
+
+    // Gemma4 audio encoder runs at batch=1 (same as Nemotron-Omni): chunked
+    // local attention and depthwise convolution are local operators, so
+    // cross-clip batching with padding may corrupt outputs.
+    //
+    // Inputs:
+    //   input_features: [1, seq_len, mel_bins]
+    //   valid:          [1, seq_len/4]          (bool mask after 2× stride-2 subsampling)
+    //
+    // seq_len is mel-spectrogram frames (~16 kHz / 160 hop_length); the
+    // 2× stride-2 subsampling requires divisibility by 4.
+
+    constexpr int64_t kSubFactor = 4;
+    auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
+    int64_t const minSeqLen = alignUp(mBuilderConfig.minTimeSteps, kSubFactor);
+    int64_t const maxSeqLen = alignUp(mBuilderConfig.maxTimeSteps, kSubFactor);
+    int64_t const optSeqLen = alignUp((minSeqLen + maxSeqLen) / 2, kSubFactor);
+    constexpr int64_t kBatch = 1;
+
+    result &= setOptimizationProfile(&profile, "input_features", createDims({kBatch, minSeqLen, mMelBins}),
+        createDims({kBatch, optSeqLen, mMelBins}), createDims({kBatch, maxSeqLen, mMelBins}));
+
+    // Valid mask after subsampling: [1, seq_len/4]
+    int64_t const minValidLen = minSeqLen / kSubFactor;
+    int64_t const maxValidLen = maxSeqLen / kSubFactor;
+    int64_t const optValidLen = optSeqLen / kSubFactor;
+
+    result &= setOptimizationProfile(&profile, "valid", createDims({kBatch, minValidLen}),
+        createDims({kBatch, optValidLen}), createDims({kBatch, maxValidLen}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Gemma4 audio encoder profile");
     }
     return result;
 }

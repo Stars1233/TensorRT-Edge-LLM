@@ -18,11 +18,293 @@
 #include "trtUtils.h"
 #include "checkMacros.h"
 #include "cudaUtils.h"
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
 
 namespace trt_edgellm
 {
+namespace
+{
+
+constexpr std::size_t kEngineDeviceTransferChunkSize = 4U * 1024U * 1024U;
+constexpr std::size_t kEngineDeviceTransferBufferCount = 2U;
+
+bool isDeviceAccessiblePointer(void* ptr) noexcept
+{
+    cudaPointerAttributes attributes{};
+    cudaError_t const status = cudaPointerGetAttributes(&attributes, ptr);
+    if (status != cudaSuccess)
+    {
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+    return attributes.type == cudaMemoryTypeDevice || attributes.type == cudaMemoryTypeManaged;
+}
+
+class PinnedHostBuffer
+{
+public:
+    explicit PinnedHostBuffer(std::size_t size)
+        : mSize(size)
+    {
+        void* data{};
+        cudaError_t status = cudaMallocHost(&data, mSize);
+        if (status != cudaSuccess)
+        {
+            throw std::runtime_error(std::string("Failed to allocate pinned host buffer for engine deserialization: ")
+                + cudaGetErrorString(status));
+        }
+
+        cudaEvent_t event{};
+        status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (status != cudaSuccess)
+        {
+            cudaFreeHost(data);
+            throw std::runtime_error(
+                std::string("Failed to create CUDA event for engine deserialization: ") + cudaGetErrorString(status));
+        }
+
+        mData = static_cast<std::byte*>(data);
+        mEvent = event;
+    }
+
+    PinnedHostBuffer(PinnedHostBuffer const&) = delete;
+    PinnedHostBuffer& operator=(PinnedHostBuffer const&) = delete;
+
+    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
+        : mData(std::exchange(other.mData, nullptr))
+        , mSize(std::exchange(other.mSize, 0U))
+        , mEvent(std::exchange(other.mEvent, nullptr))
+        , mCopyPending(std::exchange(other.mCopyPending, false))
+    {
+    }
+
+    PinnedHostBuffer& operator=(PinnedHostBuffer&& other) = delete;
+
+    ~PinnedHostBuffer()
+    {
+        if (mCopyPending && mEvent != nullptr)
+        {
+            static_cast<void>(cudaEventSynchronize(mEvent));
+        }
+        if (mEvent != nullptr)
+        {
+            static_cast<void>(cudaEventDestroy(mEvent));
+        }
+        if (mData != nullptr)
+        {
+            static_cast<void>(cudaFreeHost(mData));
+        }
+    }
+
+    bool waitForPendingCopy() noexcept
+    {
+        if (!mCopyPending)
+        {
+            return true;
+        }
+        cudaError_t const status = cudaEventSynchronize(mEvent);
+        if (status != cudaSuccess)
+        {
+            return false;
+        }
+        mCopyPending = false;
+        return true;
+    }
+
+    bool recordPendingCopy(cudaStream_t stream) noexcept
+    {
+        cudaError_t const status = cudaEventRecord(mEvent, stream);
+        if (status != cudaSuccess)
+        {
+            return false;
+        }
+        mCopyPending = true;
+        return true;
+    }
+
+    std::byte* data() noexcept
+    {
+        return mData;
+    }
+
+    std::size_t size() const noexcept
+    {
+        return mSize;
+    }
+
+private:
+    std::byte* mData{nullptr};
+    std::size_t mSize{0};
+    cudaEvent_t mEvent{nullptr};
+    bool mCopyPending{false};
+};
+
+class FileStreamReaderV2 : public nvinfer1::IStreamReaderV2
+{
+public:
+    explicit FileStreamReaderV2(std::filesystem::path const& filePath)
+        : mPath(filePath.string())
+        , mDeviceTransferBuffers{
+              PinnedHostBuffer{kEngineDeviceTransferChunkSize}, PinnedHostBuffer{kEngineDeviceTransferChunkSize}}
+    {
+        mFd = open(mPath.c_str(), O_RDONLY);
+        if (mFd < 0)
+        {
+            throw std::runtime_error("Failed to open engine file: " + mPath + ": " + std::strerror(errno));
+        }
+
+        struct stat status;
+        if (fstat(mFd, &status) != 0)
+        {
+            close(mFd);
+            mFd = -1;
+            throw std::runtime_error("Failed to stat engine file: " + mPath + ": " + std::strerror(errno));
+        }
+        if (status.st_size <= 0)
+        {
+            close(mFd);
+            mFd = -1;
+            throw std::runtime_error("Engine file is empty: " + mPath);
+        }
+        mSize = static_cast<int64_t>(status.st_size);
+    }
+
+    FileStreamReaderV2(FileStreamReaderV2 const&) = delete;
+    FileStreamReaderV2& operator=(FileStreamReaderV2 const&) = delete;
+
+    ~FileStreamReaderV2() override
+    {
+        if (mFd >= 0)
+        {
+            close(mFd);
+        }
+    }
+
+    int64_t read(void* destination, int64_t nbBytes, cudaStream_t stream) noexcept override
+    {
+        if (destination == nullptr || nbBytes < 0)
+        {
+            return -1;
+        }
+        if (nbBytes == 0 || mOffset >= mSize)
+        {
+            return 0;
+        }
+
+        int64_t const bytesToRead = std::min(nbBytes, mSize - mOffset);
+        if (isDeviceAccessiblePointer(destination))
+        {
+            return readToDevice(destination, bytesToRead, stream);
+        }
+        return readToHost(destination, bytesToRead);
+    }
+
+    bool seek(int64_t offset, nvinfer1::SeekPosition where) noexcept override
+    {
+        int64_t base = 0;
+        switch (where)
+        {
+        case nvinfer1::SeekPosition::kSET: base = 0; break;
+        case nvinfer1::SeekPosition::kCUR: base = mOffset; break;
+        case nvinfer1::SeekPosition::kEND: base = mSize; break;
+        default: return false;
+        }
+
+        int64_t const nextOffset = base + offset;
+        if (nextOffset < 0 || nextOffset > mSize)
+        {
+            return false;
+        }
+        mOffset = nextOffset;
+        return true;
+    }
+
+private:
+    int64_t readToHost(void* destination, int64_t bytesToRead) noexcept
+    {
+        auto* output = static_cast<std::byte*>(destination);
+        int64_t totalRead = 0;
+        while (totalRead < bytesToRead)
+        {
+            ssize_t const chunk = pread(mFd, output + totalRead, static_cast<size_t>(bytesToRead - totalRead),
+                static_cast<off_t>(mOffset + totalRead));
+            if (chunk < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                return -1;
+            }
+            if (chunk == 0)
+            {
+                break;
+            }
+            totalRead += chunk;
+        }
+        mOffset += totalRead;
+        return totalRead;
+    }
+
+    int64_t readToDevice(void* destination, int64_t bytesToRead, cudaStream_t stream) noexcept
+    {
+        auto* output = static_cast<std::byte*>(destination);
+        int64_t totalRead = 0;
+        std::size_t bufferIndex = 0;
+        while (totalRead < bytesToRead)
+        {
+            auto& transferBuffer = mDeviceTransferBuffers[bufferIndex];
+            if (!transferBuffer.waitForPendingCopy())
+            {
+                return -1;
+            }
+
+            size_t const chunkSize = std::min(static_cast<size_t>(bytesToRead - totalRead), transferBuffer.size());
+            int64_t const hostRead = readToHost(transferBuffer.data(), static_cast<int64_t>(chunkSize));
+            if (hostRead <= 0)
+            {
+                return totalRead > 0 ? totalRead : hostRead;
+            }
+
+            cudaError_t status = cudaMemcpyAsync(output + totalRead, transferBuffer.data(),
+                static_cast<size_t>(hostRead), cudaMemcpyHostToDevice, stream);
+            if (status != cudaSuccess)
+            {
+                return -1;
+            }
+            if (!transferBuffer.recordPendingCopy(stream))
+            {
+                static_cast<void>(cudaStreamSynchronize(stream));
+                return -1;
+            }
+
+            totalRead += hostRead;
+            bufferIndex = (bufferIndex + 1U) % mDeviceTransferBuffers.size();
+        }
+        return totalRead;
+    }
+
+    std::string mPath;
+    int mFd{-1};
+    int64_t mSize{0};
+    int64_t mOffset{0};
+    std::array<PinnedHostBuffer, kEngineDeviceTransferBufferCount> mDeviceTransferBuffers;
+};
+
+} // namespace
 
 std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
     nvinfer1::IExecutionContext* context, cudaStream_t stream)
@@ -62,6 +344,29 @@ std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
     }
 
     return std::make_pair(graph, graphExec);
+}
+
+void setNonBlockingAuxStreams(
+    nvinfer1::IExecutionContext* context, nvinfer1::ICudaEngine const* engine, AuxStreamSet& out)
+{
+    int32_t const nbAuxStreams = engine->getNbAuxStreams();
+    if (nbAuxStreams <= 0)
+    {
+        return;
+    }
+
+    // `out` may already hold streams for another context, so record the offset to
+    // hand setAuxStreams only the streams created here.
+    size_t const start = out.size();
+    for (int32_t i = 0; i < nbAuxStreams; ++i)
+    {
+        cudaStream_t stream = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        out.add(stream);
+    }
+
+    context->setAuxStreams(out.data() + start, nbAuxStreams);
+    LOG_INFO("configured %d non-blocking auxiliary stream(s) for execution context", nbAuxStreams);
 }
 
 std::string dimsToString(nvinfer1::Dims const& dims) noexcept
@@ -112,10 +417,10 @@ bool isEngineInput(nvinfer1::ICudaEngine const& engine, std::string const& tenso
 {
     for (int32_t i = 0; i < engine.getNbIOTensors(); ++i)
     {
-        std::string const bindingName = engine.getIOTensorName(i);
-        if (bindingName == tensorName)
+        char const* const bindingName = engine.getIOTensorName(i);
+        if (std::string_view{bindingName} == tensorName)
         {
-            return engine.getTensorIOMode(bindingName.c_str()) == nvinfer1::TensorIOMode::kINPUT;
+            return engine.getTensorIOMode(bindingName) == nvinfer1::TensorIOMode::kINPUT;
         }
     }
     return false;
@@ -126,13 +431,13 @@ std::string printEngineInfo(nvinfer1::ICudaEngine const* engine, int32_t profile
     std::stringstream ss;
     for (int32_t i = 0; i < engine->getNbIOTensors(); ++i)
     {
-        std::string const bindingName = engine->getIOTensorName(i);
+        char const* const bindingName = engine->getIOTensorName(i);
         nvinfer1::Dims const maxDims
-            = engine->getProfileShape(bindingName.c_str(), profileIndex, nvinfer1::OptProfileSelector::kMAX);
+            = engine->getProfileShape(bindingName, profileIndex, nvinfer1::OptProfileSelector::kMAX);
         nvinfer1::Dims const minDims
-            = engine->getProfileShape(bindingName.c_str(), profileIndex, nvinfer1::OptProfileSelector::kMIN);
+            = engine->getProfileShape(bindingName, profileIndex, nvinfer1::OptProfileSelector::kMIN);
         nvinfer1::Dims const optDims
-            = engine->getProfileShape(bindingName.c_str(), profileIndex, nvinfer1::OptProfileSelector::kOPT);
+            = engine->getProfileShape(bindingName, profileIndex, nvinfer1::OptProfileSelector::kOPT);
         ss << "  " << bindingName << ": MIN=" << dimsToString(minDims) << ", OPT=" << dimsToString(optDims)
            << ", MAX=" << dimsToString(maxDims) << "\n";
     }
@@ -151,6 +456,19 @@ bool engineHasOutputTensor(nvinfer1::ICudaEngine const* engine, char const* tens
         }
     }
     return false;
+}
+
+std::unique_ptr<nvinfer1::ICudaEngine> deserializeCudaEngineFromFile(
+    nvinfer1::IRuntime& runtime, std::filesystem::path const& enginePath)
+{
+    FileStreamReaderV2 streamReader(enginePath);
+    auto engine = std::unique_ptr<nvinfer1::ICudaEngine>(runtime.deserializeCudaEngine(streamReader));
+    if (!engine)
+    {
+        LOG_ERROR("Failed to deserialize TensorRT engine from file: %s", enginePath.string().c_str());
+        throw std::runtime_error("Failed to deserialize TensorRT engine from file: " + enginePath.string());
+    }
+    return engine;
 }
 
 } // namespace trt_edgellm

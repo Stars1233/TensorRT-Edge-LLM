@@ -31,6 +31,7 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "runtime/state/systemPromptKVCache.h"
+#include "sampler/sampling.h"
 #include "tokenizer/tokenizer.h"
 
 #include <cstdint>
@@ -43,12 +44,15 @@ namespace trt_edgellm
 namespace rt
 {
 
+struct LogitBias;
+
 enum class DecodingStrategyKind : int32_t
 {
     kVanilla,
     kEAGLE,
     kMTP,
     kDFlash,
+    kGemma4MTP,
 };
 
 struct SamplingBuffers
@@ -59,6 +63,22 @@ struct SamplingBuffers
     Tensor& baseVocabMappingTable;
     Tensor& hostPackedTokenIds;
     Tensor& hostSelectedTokenIds;
+};
+
+/*!
+ * @brief GPU/CPU buffers for logprobs computation (owned by LLMInferenceRuntime).
+ * Referenced here so decoders can call log-softmax + top-K on the output logits.
+ */
+struct LogprobsBuffers
+{
+    Tensor& deviceLogprobsValues;  //!< GPU [logprobsMaxBatch, kMaxLogprobsK] top-K log-prob values
+    Tensor& deviceLogprobsIndices; //!< GPU [logprobsMaxBatch, kMaxLogprobsK] top-K token indices
+    Tensor& hostLogprobsValues;    //!< CPU pinned [logprobsMaxBatch, kMaxLogprobsK]
+    Tensor& hostLogprobsIndices;   //!< CPU pinned [logprobsMaxBatch, kMaxLogprobsK]
+    //! GPU [maxBatch * maxAcceptDepth, vocab] accepted verify rows gathered before extraction.
+    //! Used by the spec-decode verify paths whose accepted rows are non-contiguous in the
+    //! output logits (EAGLE / MTP / DFlash); Gemma4 MTP's sequential chain reads logits directly.
+    Tensor& gatheredLogits;
 };
 
 //! Base-engine execution infrastructure: executor, tensor map, KV cache,
@@ -92,7 +112,9 @@ struct DecodingRuntimeContext
     BaseEngineResources base;
     PreprocessResources preprocess;
     tokenizer::Tokenizer& tokenizer;
+    LogitBias& logitBias;
     SamplingBuffers sampling;
+    LogprobsBuffers logprobs;
 };
 
 class DecodingStrategy
@@ -103,10 +125,6 @@ public:
     virtual DecodingStrategyKind kind() const noexcept = 0;
     virtual char const* name() const noexcept = 0;
     virtual bool isSpeculative() const noexcept = 0;
-
-    //! Check whether this strategy can handle the given request.
-    //! @return nullptr if supported; a human-readable reason string if not.
-    virtual char const* unsupportedReason(LLMGenerationRequest const&) const noexcept = 0;
 
     virtual bool decodeStep(DecodingInferenceContext& context) = 0;
     virtual bool captureCudaGraphs(cudaStream_t stream) = 0;

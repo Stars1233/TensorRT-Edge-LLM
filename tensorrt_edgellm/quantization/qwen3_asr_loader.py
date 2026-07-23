@@ -45,16 +45,11 @@ import torch
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
+from .datasets import AudioDataset, dataset_name
 from .models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from .models.qwen3_asr.modeling_qwen3_asr_audio import prepare_audio_inputs
 
 logger = logging.getLogger(__name__)
-
-# Default config knobs for the LibriSpeech calibration loader so
-# ``--dataset openslr/librispeech_asr`` works for ASR calibration.
-_DEFAULT_LIBRISPEECH_NAME = "openslr/librispeech_asr"
-_DEFAULT_LIBRISPEECH_CONFIG = "clean"
-_DEFAULT_LIBRISPEECH_SPLIT = "train.100"
 
 
 def is_qwen3_asr_model(model_dir: str) -> bool:
@@ -93,14 +88,13 @@ def asr_calibration_dataloader(
     audio_token_id: int,
     audio_n_window: int,
     num_mel_bins: int = 128,
-    dataset_name: str = _DEFAULT_LIBRISPEECH_NAME,
-    dataset_config: str = _DEFAULT_LIBRISPEECH_CONFIG,
-    dataset_split: str = _DEFAULT_LIBRISPEECH_SPLIT,
+    *,
+    audio_dataset: AudioDataset,
     num_samples: int = 128,
     max_audio_seconds: float = 20.0,
     sample_rate: int = 16000,
 ) -> Iterator[Dict[str, torch.Tensor]]:
-    """Stream LibriSpeech (audio, transcript) pairs as joint-forward batches.
+    """Stream (audio, transcript) pairs as joint-forward batches.
 
     Yields one batch dict per sample; each dict is consumable directly by
     the joint forward in
@@ -114,7 +108,6 @@ def asr_calibration_dataloader(
     sees realistic generation activations as well as prompt-side ones.
     """
     import soundfile as sf
-    from datasets import Audio, load_dataset
     from transformers import WhisperFeatureExtractor
 
     def extract_mel_spectrogram(audio: np.ndarray, sample_rate: int,
@@ -156,13 +149,6 @@ def asr_calibration_dataloader(
         valid_len = int(out["attention_mask"][0].sum())
         return mel, valid_len
 
-    # ``decode=False`` avoids torchcodec; we decode bytes with soundfile.
-    stream = load_dataset(dataset_name,
-                          dataset_config,
-                          split=dataset_split,
-                          streaming=True)
-    stream = stream.cast_column("audio", Audio(decode=False))
-
     def _build_prompt(transcript: str) -> str:
         # Match the runtime chat_template.json. The single ``<|audio_pad|>``
         # is what the joint forward splices the audio embeddings into.
@@ -173,11 +159,10 @@ def asr_calibration_dataloader(
                 f"language English{transcript}<|im_end|>")
 
     yielded = 0
-    for example in stream:
+    for audio_bytes, transcript in audio_dataset():
         if yielded >= num_samples:
             break
         try:
-            audio_bytes = example["audio"]["bytes"]
             audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
             if audio.ndim > 1:
                 audio = audio.mean(axis=1)
@@ -186,15 +171,14 @@ def asr_calibration_dataloader(
             duration = audio.shape[0] / sr
             if duration > max_audio_seconds:
                 continue
-            transcript = example.get("text", "").strip()
+            transcript = (transcript or "").strip()
             if not transcript:
                 continue
-        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             # ``RuntimeError`` covers ``soundfile.LibsndfileError`` for
-            # corrupt audio bytes; ``KeyError`` covers a HF dataset schema
-            # drift. Real bugs (``TypeError``, ``AttributeError``, ...)
-            # propagate. The ``yielded == 0`` check below turns the
-            # all-samples-skipped case into a loud failure.
+            # corrupt audio bytes. Real bugs (``TypeError``,
+            # ``AttributeError``, ...) propagate. The ``yielded == 0`` check
+            # below turns the all-samples-skipped case into a loud failure.
             logger.debug("Skipping calib sample (read error): %s", exc)
             continue
 
@@ -234,9 +218,10 @@ def asr_calibration_dataloader(
     if yielded == 0:
         raise RuntimeError(
             f"ASR calibration dataloader produced 0 samples from "
-            f"{dataset_name!r}; check dataset access / streaming.")
-    logger.info("ASR calibration: %d samples streamed from %s/%s/%s", yielded,
-                dataset_name, dataset_config, dataset_split)
+            f"{dataset_name(audio_dataset)!r}. Check dataset access / "
+            f"streaming.")
+    logger.info("ASR calibration: %d samples streamed from %s", yielded,
+                dataset_name(audio_dataset))
 
 
 def postprocess_qwen3_asr_checkpoint(model_dir: str, output_dir: str) -> None:

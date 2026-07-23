@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ... import config as config_module
 from ..linear import make_linear
 
 if TYPE_CHECKING:
@@ -125,12 +126,13 @@ class InternVL3VisionAttention(nn.Module):
     def __init__(self,
                  hidden_size: int,
                  num_heads: int,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim**-0.5
+        self.attention_scale = attention_scale
         self.embed_dim = hidden_size
         self.qkv = make_linear(
             model_config,
@@ -151,8 +153,10 @@ class InternVL3VisionAttention(nn.Module):
                                               self.head_dim).permute(
                                                   2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # each [B, num_heads, N, head_dim]
-        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale,
-                         dim=-1)
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        if self.attention_scale != 1.0:
+            scores = scores * self.attention_scale
+        attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v).transpose(1, 2).contiguous().reshape(
             B, N, self.embed_dim)
         return self.proj(out)
@@ -220,6 +224,7 @@ class InternVL3VisionLayer(nn.Module):
                  hidden_act: str,
                  norm_type: str,
                  layer_norm_eps: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -227,6 +232,7 @@ class InternVL3VisionLayer(nn.Module):
         self.attn = InternVL3VisionAttention(
             hidden_size,
             num_heads,
+            attention_scale,
             model_config,
             name_prefix=f"{name_prefix}.attn" if name_prefix else "")
         self.ls1 = nn.Parameter(torch.ones(hidden_size))
@@ -266,6 +272,7 @@ class InternVL3VisionEncoder(nn.Module):
                  hidden_act: str,
                  norm_type: str,
                  layer_norm_eps: float,
+                 attention_scale: float,
                  model_config: "ModelConfig",
                  name_prefix: str = "") -> None:
         super().__init__()
@@ -277,6 +284,7 @@ class InternVL3VisionEncoder(nn.Module):
                 hidden_act,
                 norm_type,
                 layer_norm_eps,
+                attention_scale,
                 model_config,
                 name_prefix=f"{name_prefix}.layers.{i}" if name_prefix else "")
             for i in range(num_hidden_layers)
@@ -330,6 +338,9 @@ class InternVL3VisualModel(nn.Module):
         image_size = vc["image_size"]
         patch_size = vc["patch_size"]
         hidden_size: int = vc["hidden_size"]
+        head_dim = hidden_size // vc["num_attention_heads"]
+        attention_scale = config_module._get_attention_scaling(
+            vc, head_dim, 1.0 / (float(head_dim)**0.5))
 
         self.embeddings = InternVL3Embeddings(
             num_channels=vc.get("num_channels", 3),
@@ -345,6 +356,7 @@ class InternVL3VisualModel(nn.Module):
             hidden_act=vc.get("hidden_act", "gelu"),
             norm_type=vc.get("norm_type", "layer_norm"),
             layer_norm_eps=vc.get("layer_norm_eps", 1e-6),
+            attention_scale=attention_scale,
             model_config=model_config,
             name_prefix="vision_model.encoder",
         )
