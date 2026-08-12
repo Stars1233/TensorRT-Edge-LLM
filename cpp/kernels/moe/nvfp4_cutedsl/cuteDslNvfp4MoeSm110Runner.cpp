@@ -20,6 +20,7 @@
 #include "cuteDslNvfp4MoeSm110Runner.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "kernels/moe/NvFP4MoEUtils.h"
@@ -36,12 +37,10 @@
 namespace trt_edgellm
 {
 
-nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC1Relu2N128 = {};
-nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC1SwiGLUN128 = {};
-nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC1GeGLUN128 = {};
-nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_t CuteDslNvfp4MoeSm110Runner::sFC2N128Fp16 = {};
-bool CuteDslNvfp4MoeSm110Runner::sLoaded = false;
-std::mutex CuteDslNvfp4MoeSm110Runner::sLoadMutex;
+detail::LazyKernelModule<nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_t> CuteDslNvfp4MoeSm110Runner::sFC1Relu2N128{};
+detail::LazyKernelModule<nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_t> CuteDslNvfp4MoeSm110Runner::sFC1SwiGLUN128{};
+detail::LazyKernelModule<nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_t> CuteDslNvfp4MoeSm110Runner::sFC1GeGLUN128{};
+detail::LazyKernelModule<nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_t> CuteDslNvfp4MoeSm110Runner::sFC2N128Fp16{};
 
 namespace
 {
@@ -179,42 +178,35 @@ int32_t CuteDslNvfp4MoeSm110Runner::selectMmaTilerN(int32_t moeInterSize)
     return kLevelTileN;
 }
 
-bool CuteDslNvfp4MoeSm110Runner::loadKernelModules()
+bool CuteDslNvfp4MoeSm110Runner::ensureKernelModules(CuteDslNvfp4MoeSm110Params const& params, cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock(sLoadMutex);
-    if (sLoaded)
+    bool fc1Loaded{false};
+    if (params.activationType == kACT_RELU2)
     {
-        return true;
+        fc1Loaded = detail::ensureModuleLoaded<nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_Load,
+            nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_Unload>(
+            sFC1Relu2N128, "nvfp4_moe_sm110_fc1_relu2_n128", stream);
     }
-    try
+    else if (params.activationType == kACT_SWIGLU)
     {
-        nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_Load(&sFC1Relu2N128);
-        nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Load(&sFC1SwiGLUN128);
-        nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_Load(&sFC1GeGLUN128);
-        nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Load(&sFC2N128Fp16);
-        sLoaded = true;
-        LOG_DEBUG("CuTe DSL SM100/101/110 NVFP4 MoE modules loaded (FC1 relu2/swiglu n128 + FC2 n128 fp16)");
-        return true;
+        fc1Loaded = detail::ensureModuleLoaded<nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Load,
+            nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Unload>(
+            sFC1SwiGLUN128, "nvfp4_moe_sm110_fc1_swiglu_n128", stream);
     }
-    catch (...)
+    else if (params.activationType == kACT_GEGLU)
     {
-        LOG_ERROR("Failed to load CuTe DSL SM100/101/110 NVFP4 MoE modules");
+        fc1Loaded = detail::ensureModuleLoaded<nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_Load,
+            nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_Unload>(
+            sFC1GeGLUN128, "nvfp4_moe_sm110_fc1_geglu_n128", stream);
+    }
+    else
+    {
+        LOG_ERROR("CuteDslNvfp4MoeSm110Runner: unsupported activation_type=%d", params.activationType);
         return false;
     }
-}
-
-void CuteDslNvfp4MoeSm110Runner::unloadKernelModules()
-{
-    std::lock_guard<std::mutex> lock(sLoadMutex);
-    if (!sLoaded)
-    {
-        return;
-    }
-    nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_Unload(&sFC1Relu2N128);
-    nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_Unload(&sFC1SwiGLUN128);
-    nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_Unload(&sFC1GeGLUN128);
-    nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Unload(&sFC2N128Fp16);
-    sLoaded = false;
+    return fc1Loaded
+        && detail::ensureModuleLoaded<nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Load,
+            nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_Unload>(sFC2N128Fp16, "nvfp4_moe_sm110_fc2_n128_fp16", stream);
 }
 
 size_t CuteDslNvfp4MoeSm110Runner::getWorkspaceSize(int32_t maxNumTokens, int32_t maxRoutedRows, int32_t numExperts,
@@ -236,9 +228,8 @@ size_t CuteDslNvfp4MoeSm110Runner::getWorkspaceSize(int32_t maxNumTokens, int32_
 
 int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params, void* workspace, cudaStream_t stream)
 {
-    if (!sLoaded)
+    if (!ensureKernelModules(params, stream))
     {
-        LOG_ERROR("CuteDslNvfp4MoeSm110Runner: kernel modules not loaded; call loadKernelModules() first");
         return -1;
     }
     if (workspace == nullptr)
@@ -305,30 +296,30 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
 
     if (params.activationType == kACT_RELU2)
     {
-        ret = cute_dsl_nvfp4_moe_sm110_fc1_relu2_n128_wrapper(&sFC1Relu2N128, inputFP4,
+        ret = cute_dsl_nvfp4_moe_sm110_fc1_relu2_n128_wrapper(&sFC1Relu2N128.module, inputFP4,
             const_cast<void*>(params.fc1QWeights), inputSF, const_cast<void*>(params.fc1BlocksScale), fc1FP4, fc1SF,
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, getDeviceMultiProcessorCount(), stream);
     }
     else if (params.activationType == kACT_SWIGLU)
     {
-        ret = cute_dsl_nvfp4_moe_sm110_fc1_swiglu_n128_wrapper(&sFC1SwiGLUN128, inputFP4,
+        ret = cute_dsl_nvfp4_moe_sm110_fc1_swiglu_n128_wrapper(&sFC1SwiGLUN128.module, inputFP4,
             const_cast<void*>(params.fc1QWeights), inputSF, const_cast<void*>(params.fc1BlocksScale), fc1FP4, fc1SF,
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, getDeviceMultiProcessorCount(), stream);
     }
     else if (params.activationType == kACT_GEGLU)
     {
-        ret = cute_dsl_nvfp4_moe_sm110_fc1_geglu_n128_wrapper(&sFC1GeGLUN128, inputFP4,
+        ret = cute_dsl_nvfp4_moe_sm110_fc1_geglu_n128_wrapper(&sFC1GeGLUN128.module, inputFP4,
             const_cast<void*>(params.fc1QWeights), inputSF, const_cast<void*>(params.fc1BlocksScale), fc1FP4, fc1SF,
             const_cast<void*>(static_cast<void const*>(params.fc1Alpha)),
             const_cast<void*>(static_cast<void const*>(params.inputGlobalScale)),
             const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit,
-            permutedToExpanded, numTiles, origM, m, n1, h, e, stream);
+            permutedToExpanded, numTiles, origM, m, n1, h, e, getDeviceMultiProcessorCount(), stream);
     }
     else
     {
@@ -346,12 +337,12 @@ int32_t CuteDslNvfp4MoeSm110Runner::run(CuteDslNvfp4MoeSm110Params const& params
         = static_cast<size_t>(params.numTokens) * static_cast<size_t>(params.hiddenSize) * sizeof(__half);
     CUDA_CHECK(cudaMemsetAsync(params.output, 0, outputBytes, stream));
 
-    ret = cute_dsl_nvfp4_moe_sm110_fc2_n128_fp16_wrapper(&sFC2N128Fp16, fc1FP4, const_cast<void*>(params.fc2QWeights),
-        fc1SF, const_cast<void*>(params.fc2BlocksScale), params.output,
+    ret = cute_dsl_nvfp4_moe_sm110_fc2_n128_fp16_wrapper(&sFC2N128Fp16.module, fc1FP4,
+        const_cast<void*>(params.fc2QWeights), fc1SF, const_cast<void*>(params.fc2BlocksScale), params.output,
         const_cast<void*>(static_cast<void const*>(params.fc2Alpha)),
         const_cast<void*>(static_cast<void const*>(params.downInputScale)), tileGroup, tileLimit, permutedToExpanded,
         numTiles, const_cast<void*>(static_cast<void const*>(params.topkWeights)), m, h, params.moeInterSize, e,
-        params.numTokens, params.topK, stream);
+        params.numTokens, params.topK, getDeviceMultiProcessorCount(), stream);
     if (ret != 0)
     {
         LOG_ERROR("CuteDslNvfp4MoeSm110Runner: FC2 kernel returned error code %d", ret);

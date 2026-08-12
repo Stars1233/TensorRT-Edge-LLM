@@ -31,19 +31,28 @@ from dataclasses import dataclass
 
 import pytest
 from test_plugin_base import (DEPENDENCIES_AVAILABLE, IMPORT_ERROR,
-                              RAGGED_CASES, PluginRunner, assert_close,
-                              pf_int32, poison_padding)
+                              RAGGED_CASES, PluginRunner, _device_sm,
+                              assert_close, pf_int32, poison_padding)
+
+# CuTe DSL SM-support contract for GDN (mirrors kernelSrcs/build_cutedsl.py,
+# kept independent on purpose: a supported SM must RUN so a dropped kernel
+# fails, not skips green).
+CUTEDSL_GDN_SMS = frozenset({80, 86, 87, 89, 90, 100, 101, 110, 120, 121})
 
 if DEPENDENCIES_AVAILABLE:
     import tensorrt as trt
     import torch
 
-# The gated_delta_net plugin is built only with CUTE_DSL_GDN_ENABLED (newer
-# arches). Where it is not built, create_plugin returns no plugin and the
-# harness skips the test at build time.
-pytestmark = pytest.mark.skipif(
-    not DEPENDENCIES_AVAILABLE,
-    reason=f"TensorRT/torch CUDA not available: {IMPORT_ERROR}")
+# GDN is a CuTe DSL kernel, gated below on its promised SM support. On a
+# supported SM the build must provide the kernel -- a missing one fails the
+# test, it does not skip.
+pytestmark = [
+    pytest.mark.skipif(
+        not DEPENDENCIES_AVAILABLE,
+        reason=f"TensorRT/torch CUDA not available: {IMPORT_ERROR}"),
+    pytest.mark.skipif(_device_sm() not in CUTEDSL_GDN_SMS,
+                       reason="GDN (CuTe DSL) unsupported on this SM"),
+]
 
 DEV = "cuda"
 

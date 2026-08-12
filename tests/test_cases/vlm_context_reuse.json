@@ -1,0 +1,164 @@
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "max_generate_length": 64,
+    "context_cache_commit_policy": "prefill_state_only",
+    "requests": [
+        {
+            "_scenario": "First request with image A (cold start, populates cache)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe what you see in this image briefly."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Same image A, different question (cache hit on image prefix)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "What colors are dominant in this image?"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Different image B, same question as request 1 (cache miss despite identical text)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe what you see in this image briefly."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Image B again, different question (cache hit on image B prefix)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Is this animal in a zoo or in the wild?"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Multi-image request: A + B together (cache miss — different token layout)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Compare these two images briefly."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Same multi-image A + B again, different question (cache hit on multi-image prefix)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Which image shows an outdoor scene?"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Reversed image order B + A (cache miss — different content hash positions)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Compare these two images briefly."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "_scenario": "Text-only request (no media hash, tests text-only path still works)",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer in one word."
+                }
+            ]
+        }
+    ],
+    "_comment": "Multi-turn VLM context reuse test exercising: single-image hit/miss, multi-image hit/miss, image-order sensitivity, and text-only fallback. Cache hits: req2 (same img A), req4 (same img B), req6 (same A+B pair), plus system-prompt prefix hits on req7 (reversed B+A shares system tokens) and req8 (text-only shares system tokens). media_aware=7 confirms all VLM requests use content-hash-augmented block hashing while the text-only request does not.",
+    "expected_context_cache": {
+        "admitted_sequences": 8,
+        "hit_sequences": 5,
+        "media_aware_sequences": 7,
+        "reused_tokens": 2432
+    }
+}

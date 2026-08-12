@@ -596,7 +596,7 @@ void NemotronOmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& req
     // copy. Reuse ``batchInputIds`` if the ViT runner already tokenized
     // (combined image+audio); otherwise tokenize from scratch.
     bool const alreadyTokenized = batchInputIds.size() == request.requests.size();
-    int audioIndex = 0;
+    int64_t audioIndex = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -605,12 +605,19 @@ void NemotronOmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& req
             : tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "Failed to encode text");
 
+        // Per-request media window (one entry per clip): a placeholder may only consume this request's own clips (batch
+        // isolation).
+        int64_t const mediaEnd = audioIndex + static_cast<int64_t>(request.requests[i].audioBuffers.size());
+
         std::vector<int32_t> newIds;
         newIds.reserve(ids.size());
         for (auto const& id : ids)
         {
             if (id == mConfig.soundContextTokenId)
             {
+                ELLM_CHECK(audioIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: NemotronOmniAudioRunner::textPreprocess() placeholder count exceeds this "
+                    "request's clip count");
                 int64_t const numAudioTokens = audioTokenLengths.at(audioIndex);
                 for (int64_t k = 0; k < numAudioTokens; ++k)
                 {
@@ -631,6 +638,9 @@ void NemotronOmniAudioRunner::textPreprocess(rt::LLMGenerationRequest const& req
         {
             batchInputIds.emplace_back(std::move(newIds));
         }
+        ELLM_CHECK(audioIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: NemotronOmniAudioRunner::textPreprocess() placeholder count is smaller than this "
+            "request's clip count");
     }
 }
 
@@ -651,7 +661,18 @@ bool NemotronOmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Failed: %s", e.what());
+        }
+        // Drain async H2D copies still reading the request's PCM and the mel staging buffers, so
+        // the caller can safely release them -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

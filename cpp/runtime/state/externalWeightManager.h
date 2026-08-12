@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -32,75 +33,67 @@ namespace rt
 
 class EngineExecutor;
 
-//! Owns externalized model-weight tensors loaded from external weight files.
+//! Owns immutable, final-layout model weights prepared during initialization.
 //!
-//! Export can move selected ONNX initializers into safetensors external weight
-//! files and expose those weights as engine inputs. This manager loads the
-//! external weight files once, validates them against the TensorRT engine in a
-//! separate engine-aware step, and registers their stable tensor addresses into
-//! a TensorMap for execution.
+//! The checkpoint path allocates one persistent arena, then writes every final
+//! engine input directly from bounded CUDA-mapped checkpoint ranges. Each range
+//! is released after its transform; once load() returns, later methods only
+//! validate or publish stable arena addresses.
 class ExternalWeightManager
 {
 public:
-    //! @brief Default constructor.
     ExternalWeightManager() = default;
 
-    //! Deleted copy to prevent accidental duplication of GPU resources.
     ExternalWeightManager(ExternalWeightManager const&) = delete;
     ExternalWeightManager& operator=(ExternalWeightManager const&) = delete;
 
-    //! Allow move.
     ExternalWeightManager(ExternalWeightManager&&) noexcept = default;
     ExternalWeightManager& operator=(ExternalWeightManager&&) noexcept = default;
 
-    //! Load external weight tensors listed in @p configPath from @p engineDir.
+    //! Load plugin-ready sidecars or load and transform an original checkpoint.
     //!
-    //! Missing `external_weight_files` is treated as an empty external-weight set.
+    //! componentCheckpointDir overrides the checkpoint recorded while building
+    //! this engine. targetCheckpointDir supplies target-owned fallback weights
+    //! for a separately packaged draft.
     //!
-    //! Must be called exactly once before `validateAgainstEngine()`. Calling
-    //! `load()` a second time is a programming error and throws.
-    //!
-    //! @throws std::runtime_error if an external weight file cannot be loaded or
-    //! if `load()` has already been called.
-    void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream);
+    //! The stream is synchronized before this method returns, leaving only
+    //! engine-input tensors in their final plugin layouts.
+    void load(std::filesystem::path const& engineDir, std::filesystem::path const& configPath, cudaStream_t stream,
+        std::filesystem::path const& componentCheckpointDir = {},
+        std::filesystem::path const& targetCheckpointDir = {});
 
-    //! Validate loaded external weight tensors against @p executor.
-    //!
-    //! Must be called exactly once after `load()` and before
-    //! `registerTensorMapEntries()`. Calling it a second time is a programming
-    //! error and throws.
-    //!
-    //! @throws std::runtime_error if `load()` has not been called first, if
-    //! validation has already happened, or if an external weight tensor does
-    //! not match the TensorRT engine input it feeds.
     void validateAgainstEngine(EngineExecutor const& executor, std::string_view engineLabel);
 
-    //! Register all loaded weights in @p map using each tensor's safetensors name.
-    //!
-    //! This is separate from load() because TensorMap is constructed after
-    //! SharedResources, matching the other state managers that publish stable
-    //! tensor addresses after the runtime builds its engine binding map.
-    //!
-    //! Must be called exactly once after `validateAgainstEngine()`. Calling it a
-    //! second time is a programming error and throws.
-    //!
-    //! @throws std::runtime_error if validation has not run first or if
-    //! registration has already happened.
     void registerTensorMapEntries(TensorMap& map);
 
-    //! Number of externalized tensors currently owned by the manager.
+    //! Validate against a raw engine and point its inputs at the loaded weights.
+    //!
+    //! Encoder runners drive TensorRT directly instead of through EngineExecutor
+    //! and TensorMap, so they bind here. Weight addresses are immutable for the
+    //! life of the context, so one call at load time is enough.
+    void bindToContext(
+        nvinfer1::ICudaEngine const& engine, nvinfer1::IExecutionContext& context, std::string_view engineLabel);
+
+    //! Transfer the checkpoint-backed embedding prepared during load(), if any.
+    std::optional<Tensor> takeEmbedding();
+
+    //! Transfer the checkpoint-backed Gemma4 PLE table, if any.
+    std::optional<Tensor> takePleEmbedding();
+
     size_t size() const noexcept
     {
         return mWeights.size();
     }
 
 private:
+    // One allocation owns every checkpoint-backed engine input. Individual
+    // tensors below are stable, non-owning views into this storage.
+    Tensor mWeightStorage{};
     std::vector<Tensor> mWeights{};
-    //! True once `load()` has run successfully.
+    std::optional<Tensor> mEmbedding{};
+    std::optional<Tensor> mPleEmbedding{};
     bool mLoaded{false};
-    //! True once loaded weights have been validated against the engine.
     bool mValidated{false};
-    //! True once entries have been registered into a TensorMap.
     bool mRegistered{false};
 };
 

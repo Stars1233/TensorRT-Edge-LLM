@@ -40,6 +40,7 @@ Forward-pass conventions
     rope_rotary_cos_sin  [batch, max_pos, rotary_dim]               float32
     context_lengths      [batch]                                    int32
     kvcache_start_index  [batch]                                    int32
+    kv_page_table        [batch, 2, max_pages_per_seq]              int32
     last_token_ids       [batch, num_tokens]                        int64
     conv_states          tuple of [batch, conv_dim, conv_kernel-1] per mamba-layer
     ssm_states           tuple of [batch, num_heads, head_dim, ssm_state] per mamba-layer
@@ -58,11 +59,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import (LAYER_ATTN, LAYER_MAMBA, LAYER_MLP, LAYER_MOE,
-                       MambaConfig, ModelConfig)
+                       QUANT_NVFP4_A16, MambaConfig, ModelConfig)
 from ..default.modeling_default import OnnxSpec
 from ..linear import FP16Linear, make_linear
-from ..ops import (attention_plugin, causal_conv1d, nvfp4_moe_plugin,
-                   nvfp4_moe_plugin_geforce, update_ssm_state,
+from ..ops import (KV_PAGE_SIZE, attention_plugin, causal_conv1d,
+                   causal_conv1d_with_intermediate, nvfp4_a16_moe_plugin,
+                   nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+                   update_ssm_state, update_ssm_state_with_intermediate,
                    use_geforce_nvfp4_moe)
 
 _NVFP4_ACTIVATION_RELU2 = 4
@@ -104,7 +107,11 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _make_flat_wrapper_mamba(model: nn.Module, Na: int, Nm: int) -> nn.Module:
+def _make_flat_wrapper_mamba(model: nn.Module,
+                             Na: int,
+                             Nm: int,
+                             mtp_base: bool = False,
+                             dflash_base: bool = False) -> nn.Module:
     """Build an explicit flat forward wrapper for hybrid Mamba+Attention models.
 
     Extends the transformer wrapper with ``conv_state_i`` and ``ssm_state_i``
@@ -115,14 +122,22 @@ def _make_flat_wrapper_mamba(model: nn.Module, Na: int, Nm: int) -> nn.Module:
     by index during decomposition, causing an ``IndexError``.  An explicit,
     named parameter list avoids this entirely.
 
-    ``Na`` = number of attention layers, ``Nm`` = number of Mamba layers.
+    ``Na`` = number of attention layers, ``Nm`` = number of Mamba layers. When
+    ``mtp_base`` is set, the wrapper adds the tree-attention / spec-verify
+    inputs and returns the extra ``hidden_states`` + per-token intermediate
+    conv/recurrent state outputs consumed by the MTP draft runtime.
     """
-    param_names: List[str] = (["inputs_embeds"] +
-                              [f"past_key_values_{i}" for i in range(Na)] + [
-                                  "rope_rotary_cos_sin", "context_lengths",
-                                  "kvcache_start_index", "last_token_ids"
-                              ] + [f"conv_state_{i}" for i in range(Nm)] +
-                              [f"recurrent_state_{i}" for i in range(Nm)])
+    param_names: List[str] = (
+        ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
+            "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
+            "kv_page_table", "last_token_ids"
+        ] + [f"conv_state_{i}"
+             for i in range(Nm)] + [f"recurrent_state_{i}" for i in range(Nm)])
+    spec_base = mtp_base or dflash_base
+    if spec_base:
+        param_names += [
+            "attention_pos_id", "attention_mask", "spec_verify_phase_marker"
+        ]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
@@ -131,15 +146,37 @@ def _make_flat_wrapper_mamba(model: nn.Module, Na: int, Nm: int) -> nn.Module:
     ssm_tuple = "({},)".format(", ".join(f"recurrent_state_{i}"
                                          for i in range(Nm))) if Nm else "()"
 
-    body = (
-        f"    logits, present_key_values, present_conv_states, "
-        f"present_ssm_states = self._model(\n"
-        f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-        f"context_lengths, kvcache_start_index, last_token_ids,\n"
-        f"        {conv_tuple}, {ssm_tuple})\n"
-        f"    return ((logits,) + tuple(present_key_values)\n"
-        f"            + tuple(present_conv_states) + tuple(present_ssm_states))\n"
-    )
+    if spec_base:
+        second = "dflash_hidden_concat" if dflash_base else "hidden_states"
+        body = (
+            f"    (logits, {second}, present_key_values, "
+            f"present_conv_states, present_ssm_states, "
+            f"intermediate_conv_states, replay_da_states, replay_u_states, "
+            f"replay_b_states) = self._model(\n"
+            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
+            f"context_lengths, kvcache_start_index, kv_page_table, "
+            f"last_token_ids,\n"
+            f"        {conv_tuple}, {ssm_tuple},\n"
+            f"        attention_pos_id=attention_pos_id, "
+            f"attention_mask=attention_mask, "
+            f"spec_verify_phase_marker=spec_verify_phase_marker)\n"
+            f"    return ((logits, {second}) + tuple(present_key_values)\n"
+            f"            + tuple(present_conv_states) "
+            f"+ tuple(present_ssm_states)\n"
+            f"            + tuple(intermediate_conv_states) "
+            f"+ tuple(replay_da_states) + tuple(replay_u_states) "
+            f"+ tuple(replay_b_states))\n")
+    else:
+        body = (
+            f"    logits, present_key_values, present_conv_states, "
+            f"present_ssm_states = self._model(\n"
+            f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
+            f"context_lengths, kvcache_start_index, kv_page_table, "
+            f"last_token_ids,\n"
+            f"        {conv_tuple}, {ssm_tuple})\n"
+            f"    return ((logits,) + tuple(present_key_values)\n"
+            f"            + tuple(present_conv_states) + tuple(present_ssm_states))\n"
+        )
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -261,7 +298,10 @@ class MambaMixer(nn.Module):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         context_lengths: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state_start_index: torch.Tensor,
+        collect_intermediate_states: bool = False,
+        spec_verify_phase_marker: Optional[torch.Tensor] = None,
+    ):
         batch_size, seq_len, _ = hidden_states.shape
         d_inner = self.num_heads * self.head_dim
         d_state = self.n_groups * self.ssm_state_size
@@ -272,17 +312,34 @@ class MambaMixer(nn.Module):
             [d_inner, self.conv_dim, self.num_heads], dim=-1)
         dt = dt.clamp(-self._DT_CLAMP, self._DT_CLAMP)
 
-        hidden_states_for_conv, conv_state_out, _ = causal_conv1d(
-            hidden_states_for_conv,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            conv_state,
-            context_lengths,
-            stride=1,
-            padding=self.conv_kernel - 1,
-            dilation=1,
-            groups=self.conv_dim,
-        )
+        # MTP spec-verify (mtp_base) path emits per-token conv/SSM state snapshots
+        # so the runtime can roll recurrent state back to the last accepted token.
+        if collect_intermediate_states:
+            (hidden_states_for_conv, conv_state_out,
+             intermediate_conv_state) = causal_conv1d_with_intermediate(
+                 hidden_states_for_conv,
+                 self.conv1d.weight,
+                 self.conv1d.bias,
+                 conv_state,
+                 context_lengths,
+                 stride=1,
+                 padding=self.conv_kernel - 1,
+                 dilation=1,
+                 groups=self.conv_dim,
+                 spec_verify_phase_marker=spec_verify_phase_marker,
+             )
+        else:
+            hidden_states_for_conv, conv_state_out, _ = causal_conv1d(
+                hidden_states_for_conv,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_state,
+                context_lengths,
+                stride=1,
+                padding=self.conv_kernel - 1,
+                dilation=1,
+                groups=self.conv_dim,
+            )
         hidden_states_for_conv = F.silu(hidden_states_for_conv)
 
         ssm_input, ssm_b_flat, ssm_c_flat = hidden_states_for_conv.split(
@@ -297,22 +354,44 @@ class MambaMixer(nn.Module):
 
         ssm_A = -torch.exp(self.A_log.to(torch.float32))
 
-        ssm_output, ssm_state_out = update_ssm_state(
-            ssm_input_states,
-            ssm_A,
-            ssm_b_states,
-            ssm_c_states,
-            self.D,
-            dt,
-            self.dt_bias,
-            ssm_state,
-            context_lengths,
-            dt_softplus=1,
-            ngroups=self.n_groups,
-        )
+        if collect_intermediate_states:
+            (ssm_output, ssm_state_out, replay_da, replay_u,
+             replay_b) = update_ssm_state_with_intermediate(
+                 ssm_input_states,
+                 ssm_A,
+                 ssm_b_states,
+                 ssm_c_states,
+                 self.D,
+                 dt,
+                 self.dt_bias,
+                 ssm_state,
+                 context_lengths,
+                 state_start_index,
+                 spec_verify_phase_marker,
+                 dt_softplus=1,
+                 ngroups=self.n_groups,
+             )
+        else:
+            ssm_output, ssm_state_out = update_ssm_state(
+                ssm_input_states,
+                ssm_A,
+                ssm_b_states,
+                ssm_c_states,
+                self.D,
+                dt,
+                self.dt_bias,
+                ssm_state,
+                context_lengths,
+                state_start_index,
+                dt_softplus=1,
+                ngroups=self.n_groups,
+            )
 
         ssm_output = ssm_output.view(batch_size, seq_len, d_inner)
         normed = self._gated_rmsnorm(ssm_output, gate)
+        if collect_intermediate_states:
+            return (self.out_proj(normed), conv_state_out, ssm_state_out,
+                    intermediate_conv_state, replay_da, replay_u, replay_b)
         return self.out_proj(normed), conv_state_out, ssm_state_out
 
     def _gated_rmsnorm(self, hidden_states: torch.Tensor,
@@ -476,6 +555,14 @@ class NemotronHMoEMLP(nn.Module):
         self._padded_hidden_size = self.routed_hidden_size
         self.gate = NemotronHTopkRouter(config)
 
+        # Weight-only NVFP4 (W4A16) routes the experts through the Marlin
+        # Nvfp4A16MoePlugin instead of the W4A4 CuTeDSL Nvfp4MoePlugin.
+        self._is_a16 = config.quant.quant_type == QUANT_NVFP4_A16
+        # ReLU2 (non-gated) FC1 padded to a Marlin 128 multiple (1856 -> 1920).
+        self._a16_moe_inter_padded = (
+            ((self.moe_intermediate_size + 127) // 128) *
+            128 if self._is_a16 else self.moe_intermediate_size)
+
         self.experts = nn.ModuleList([
             self._make_expert(config,
                               config.moe_intermediate_size,
@@ -483,6 +570,12 @@ class NemotronHMoEMLP(nn.Module):
                               input_size=self.routed_hidden_size)
             for j in range(config.n_routed_experts)
         ])
+        if self._is_a16:
+            # Routed experts are stacked into the MoE plugin at export time;
+            # keep the per-linear dense repack from consuming their raw buffers.
+            for expert in self.experts:
+                expert.up_proj._skip_dense_a16_repack = True
+                expert.down_proj._skip_dense_a16_repack = True
 
         self.shared_experts = self._make_expert(
             config,
@@ -532,9 +625,59 @@ class NemotronHMoEMLP(nn.Module):
         """Pack ModelOpt NVFP4 expert tensors for ``Nvfp4MoePlugin``."""
         self._prepare_for_export_impl()
 
+    def _prepare_for_export_a16(self) -> None:
+        """Stack routed-expert NVFP4 (W4A16) weights for ``Nvfp4A16MoePlugin``."""
+        from ...checkpoint.repacking import repack_nvfp4_a16_marlin_moe_experts
+
+        def gather(attr):
+            return [getattr(e, attr)._buffers["weight"]
+                    for e in self.experts], [
+                        getattr(e, attr)._buffers["weight_scale"]
+                        for e in self.experts
+                    ], [
+                        getattr(e, attr)._buffers["weight_scale_2"]
+                        for e in self.experts
+                    ]
+
+        fc1_p, fc1_s, fc1_g = gather("up_proj")
+        fc2_p, fc2_s, fc2_g = gather("down_proj")
+        (fc1_qweights, fc1_block_scales, fc1_global, fc2_qweights,
+         fc2_block_scales, fc2_global) = repack_nvfp4_a16_marlin_moe_experts(
+             fc1_p, fc1_s, fc1_g, fc2_p, fc2_s, fc2_g,
+             self._a16_moe_inter_padded)
+        self._padded_moe_intermediate_size = self._a16_moe_inter_padded
+        self._padded_hidden_size = self.routed_hidden_size
+
+        device = self.gate.weight.device
+        self.register_buffer("fc1_qweights",
+                             fc1_qweights.to(device).contiguous())
+        self.register_buffer("fc1_block_scales",
+                             fc1_block_scales.to(device).contiguous())
+        self.register_buffer("fc1_global_scales",
+                             fc1_global.to(device).contiguous())
+        self.register_buffer("fc2_qweights",
+                             fc2_qweights.to(device).contiguous())
+        self.register_buffer("fc2_block_scales",
+                             fc2_block_scales.to(device).contiguous())
+        self.register_buffer("fc2_global_scales",
+                             fc2_global.to(device).contiguous())
+        self.register_buffer(
+            "_e_score_correction_bias_fp32",
+            self.gate.e_score_correction_bias.data.clone().to(
+                torch.float32).to(device))
+        # Free the per-expert buffers now that they are stacked.
+        for expert in self.experts:
+            for proj in ("up_proj", "down_proj"):
+                for name in ("weight", "weight_scale", "weight_scale_2"):
+                    getattr(expert, proj)._buffers.pop(name, None)
+        self._export_ready = True
+
     def _prepare_for_export_impl(self) -> None:
         """Pack ModelOpt NVFP4 expert tensors for the active NVFP4 MoE plugin."""
-        from ...checkpoint.repacking import repack_nvfp4_nemotron_moe_experts
+        if self._is_a16:
+            self._prepare_for_export_a16()
+            return
+        from ...checkpoint.repacking import repack_nvfp4_moe_experts
 
         # SM12x NvFP4MoEPluginGeforce requires H % 256 == 0; the SM100/101/110 path only needs
         # the kernel's regular alignment (the repack helper accepts H as-is
@@ -543,7 +686,7 @@ class NemotronHMoEMLP(nn.Module):
 
         (fc1_qweights, fc1_blocks_scale, fc1_alpha, fc2_qweights,
          fc2_blocks_scale, fc2_alpha, padded_inter_size,
-         padded_hidden_size) = (repack_nvfp4_nemotron_moe_experts(
+         padded_hidden_size) = (repack_nvfp4_moe_experts(
              self.experts,
              self.routed_hidden_size,
              self.moe_intermediate_size,
@@ -588,6 +731,35 @@ class NemotronHMoEMLP(nn.Module):
         router_logits = F.linear(hidden_states.view(-1, self.hidden_size),
                                  self.gate.weight).float()
         routed_hidden_states = self.fc1_latent_proj(hidden_states)
+
+        if self._is_a16:
+            # FP16 activations end-to-end: the Marlin MoE kernel has an FP16
+            # E2M1 path, so hidden states / global scales / output stay FP16.
+            moe_out = nvfp4_a16_moe_plugin(
+                router_logits,
+                routed_hidden_states,
+                self.fc1_qweights,
+                self.fc1_block_scales,
+                self.fc1_global_scales,
+                self.fc2_qweights,
+                self.fc2_block_scales,
+                self.fc2_global_scales,
+                self._e_score_correction_bias_fp32,
+                self.n_routed_experts,
+                self.num_experts_per_tok,
+                self.routed_hidden_size,
+                self._a16_moe_inter_padded,
+                self.activation_type,
+                self.gate.n_group,
+                self.gate.topk_group,
+                int(bool(self.gate.norm_topk_prob)),
+                float(self.gate.routed_scaling_factor),
+                _NVFP4_ROUTING_MODE_SIGMOID_GROUP_TOPK,
+                self.max_routed_rows,
+            )
+            moe_out = self.fc2_latent_proj(moe_out)
+            return moe_out + self._expert_forward(self.shared_experts,
+                                                  hidden_states)
 
         # SM12x NvFP4MoEPluginGeforce requires the plugin hidden_size to be a
         # multiple of 256. When the checkpoint H does not satisfy that,
@@ -657,8 +829,11 @@ class NemotronHAttentionMixer(nn.Module):
         q_proj, k_proj, v_proj, o_proj
     """
 
-    def __init__(self, config: ModelConfig, layer_idx: int,
-                 module_prefix: str) -> None:
+    def __init__(self,
+                 config: ModelConfig,
+                 layer_idx: int,
+                 module_prefix: str,
+                 enable_tree_attention: bool = False) -> None:
         super().__init__()
         num_attention_heads = config.num_attention_heads
         num_key_value_heads = config.num_key_value_heads
@@ -672,6 +847,9 @@ class NemotronHAttentionMixer(nn.Module):
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = -1
+        # Tree attention (with attention_mask / attention_pos_id inputs) is used
+        # by the MTP draft for speculative decoding; the base model leaves it off.
+        self.enable_tree_attention = enable_tree_attention
 
         self.q_proj = make_linear(config,
                                   hidden_size,
@@ -705,6 +883,9 @@ class NemotronHAttentionMixer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_pos_id: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -712,24 +893,33 @@ class NemotronHAttentionMixer(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        # Tree attention is used by the MTP draft (constructor flag) and by the
+        # mtp_base variant of the base model (mask + pos_id supplied at call time).
+        enable_tree = self.enable_tree_attention or (
+            attention_mask is not None and attention_pos_id is not None)
         kwargs: dict = {
             "num_q_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
             "head_size": self.head_dim,
             "sliding_window_size": self.sliding_window_size,
-            "enable_tree_attention": False,
+            "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
             "attention_scale": self.attention_scale,
+            "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
+            "skip_softmax_scale_factor": 0.0,
         }
+        if enable_tree:
+            kwargs["attention_mask"] = attention_mask
+            kwargs["attention_pos_id"] = attention_pos_id
         # Always pass qkv_scales so torch.export includes a valid FLOATS
         # value in the FX graph for the unified ONNX translation.
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
         attn_output, present_key_value = attention_plugin(
-            query_states, key_states, value_states, past_key_value,
-            context_lengths, rope_rotary_cos_sin, kvcache_start_index,
-            **kwargs)
+            torch.cat([query_states, key_states, value_states],
+                      dim=-1), past_key_value, context_lengths,
+            rope_rotary_cos_sin, kvcache_start_index, kv_page_table, **kwargs)
 
         attn_output = attn_output.reshape(batch_size, seq_len,
                                           self.num_heads * self.head_dim)
@@ -777,15 +967,34 @@ class NemotronHDecoderLayer(nn.Module):
         rope_rotary_cos_sin: Optional[torch.Tensor] = None,
         context_lengths: Optional[torch.Tensor] = None,
         kvcache_start_index: Optional[torch.Tensor] = None,
+        kv_page_table: Optional[torch.Tensor] = None,
         # Mamba-specific (ignored by Attention/MLP/MoE layers)
         conv_state: Optional[torch.Tensor] = None,
         ssm_state: Optional[torch.Tensor] = None,
+        # MTP spec-verify (mtp_base) — tree attention + per-token recurrent snapshots.
+        collect_intermediate_states: bool = False,
+        spec_verify_phase_marker: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_pos_id: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
         normed = self.norm(hidden_states)
         if self.layer_type == LAYER_MAMBA:
+            if collect_intermediate_states:
+                (mixer_out, conv_state_out, ssm_state_out, inter_conv,
+                 replay_da, replay_u, replay_b) = self.mixer(
+                     normed,
+                     conv_state,
+                     ssm_state,
+                     context_lengths,
+                     kvcache_start_index,
+                     collect_intermediate_states=True,
+                     spec_verify_phase_marker=spec_verify_phase_marker)
+                return (residual + mixer_out, conv_state_out, ssm_state_out,
+                        inter_conv, replay_da, replay_u, replay_b)
             mixer_out, conv_state_out, ssm_state_out = self.mixer(
-                normed, conv_state, ssm_state, context_lengths)
+                normed, conv_state, ssm_state, context_lengths,
+                kvcache_start_index)
             return residual + mixer_out, conv_state_out, ssm_state_out
         elif self.layer_type in (LAYER_MLP, LAYER_MOE):
             return residual + self.mixer(normed)
@@ -793,7 +1002,9 @@ class NemotronHDecoderLayer(nn.Module):
             attn_out, present_kv = self.mixer(normed, past_key_value,
                                               rope_rotary_cos_sin,
                                               context_lengths,
-                                              kvcache_start_index)
+                                              kvcache_start_index,
+                                              kv_page_table, attention_mask,
+                                              attention_pos_id)
             return residual + attn_out, present_kv
 
 
@@ -828,25 +1039,55 @@ class NemotronHBackbone(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         conv_states: Tuple[torch.Tensor, ...] = (),
         ssm_states: Tuple[torch.Tensor, ...] = (),
-    ) -> Tuple[torch.Tensor, Tuple, Tuple, Tuple]:
+        collect_intermediate_states: bool = False,
+        spec_verify_phase_marker: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        attention_pos_id: Optional[torch.Tensor] = None,
+        dflash_target_layer_ids: Optional[List[int]] = None,
+    ):
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
         present_conv_states_list: List[torch.Tensor] = []
         present_ssm_states_list: List[torch.Tensor] = []
+        intermediate_conv_states_list: List[torch.Tensor] = []
+        replay_da_states_list: List[torch.Tensor] = []
+        replay_u_states_list: List[torch.Tensor] = []
+        replay_b_states_list: List[torch.Tensor] = []
+        dflash_hidden_list: List[torch.Tensor] = []
+        dflash_target_set = set(dflash_target_layer_ids or [])
+        last_layer_idx = len(self.layers) - 1
         attn_idx = 0
         mamba_idx = 0
 
         for layer_idx, (layer,
                         lt) in enumerate(zip(self.layers, self.layer_types)):
             if lt == LAYER_MAMBA:
-                hidden_states, conv_out, ssm_out = layer(
-                    hidden_states,
-                    context_lengths=context_lengths,
-                    conv_state=conv_states[mamba_idx],
-                    ssm_state=ssm_states[mamba_idx],
-                )
+                if collect_intermediate_states:
+                    (hidden_states, conv_out, ssm_out, inter_conv, replay_da,
+                     replay_u, replay_b) = layer(
+                         hidden_states,
+                         context_lengths=context_lengths,
+                         kvcache_start_index=kvcache_start_index,
+                         conv_state=conv_states[mamba_idx],
+                         ssm_state=ssm_states[mamba_idx],
+                         collect_intermediate_states=True,
+                         spec_verify_phase_marker=spec_verify_phase_marker,
+                     )
+                    intermediate_conv_states_list.append(inter_conv)
+                    replay_da_states_list.append(replay_da)
+                    replay_u_states_list.append(replay_u)
+                    replay_b_states_list.append(replay_b)
+                else:
+                    hidden_states, conv_out, ssm_out = layer(
+                        hidden_states,
+                        context_lengths=context_lengths,
+                        kvcache_start_index=kvcache_start_index,
+                        conv_state=conv_states[mamba_idx],
+                        ssm_state=ssm_states[mamba_idx],
+                    )
                 present_conv_states_list.append(conv_out)
                 present_ssm_states_list.append(ssm_out)
                 mamba_idx += 1
@@ -859,13 +1100,33 @@ class NemotronHBackbone(nn.Module):
                     rope_rotary_cos_sin=rope_rotary_cos_sin,
                     context_lengths=context_lengths,
                     kvcache_start_index=kvcache_start_index,
+                    kv_page_table=kv_page_table,
+                    attention_mask=attention_mask,
+                    attention_pos_id=attention_pos_id,
                 )
                 present_key_values_list.append(present_kv)
                 attn_idx += 1
 
-        return (self.norm_f(hidden_states), tuple(present_key_values_list),
+            # The final layer's DFlash aux feature is the post-norm_f hidden.
+            # Earlier target layers use the raw residual stream.
+            if layer_idx in dflash_target_set and layer_idx != last_layer_idx:
+                dflash_hidden_list.append(hidden_states)
+
+        normed = self.norm_f(hidden_states)
+        if last_layer_idx in dflash_target_set:
+            dflash_hidden_list.append(normed)
+        dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
+                                if dflash_hidden_list else None)
+        if collect_intermediate_states:
+            return (normed, tuple(present_key_values_list),
+                    tuple(present_conv_states_list),
+                    tuple(present_ssm_states_list),
+                    tuple(intermediate_conv_states_list),
+                    tuple(replay_da_states_list), tuple(replay_u_states_list),
+                    tuple(replay_b_states_list), dflash_hidden_concat)
+        return (normed, tuple(present_key_values_list),
                 tuple(present_conv_states_list),
-                tuple(present_ssm_states_list))
+                tuple(present_ssm_states_list), dflash_hidden_concat)
 
 
 # ---------------------------------------------------------------------------
@@ -940,11 +1201,12 @@ class NemotronHCausalLM(nn.Module):
                                     device=device)
         kv_dtype = (torch.float8_e4m3fn
                     if config.quant.kv_cache_quant == "fp8" else dtype16)
+        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
         past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        2,
+            torch.zeros(2,
+                        1,
+                        KV_PAGE_SIZE,
                         config.num_key_value_heads,
-                        past_len,
                         config.head_dim,
                         dtype=kv_dtype,
                         device=device) for _ in range(Na)
@@ -960,6 +1222,11 @@ class NemotronHCausalLM(nn.Module):
         kvcache_start_index = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
+        kv_page_table = torch.zeros(batch_size,
+                                    2,
+                                    1,
+                                    dtype=torch.int32,
+                                    device=device)
         last_token_ids = torch.zeros(batch_size,
                                      1,
                                      dtype=torch.int64,
@@ -982,41 +1249,101 @@ class NemotronHCausalLM(nn.Module):
                         device=device) for _ in range(Nm)
         ]
 
-        args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, last_token_ids,
-                *conv_states, *ssm_states)
+        mtp_base = bool(getattr(config, "mtp_base", False))
+        dflash_base = bool(getattr(config, "dflash_base", False))
+        spec = mtp_base or dflash_base
 
-        input_names = (["inputs_embeds"] +
-                       [f"past_key_values_{i}" for i in range(Na)] + [
-                           "rope_rotary_cos_sin", "context_lengths",
-                           "kvcache_start_index", "last_token_ids"
-                       ] + [f"conv_state_{i}" for i in range(Nm)] +
-                       [f"recurrent_state_{i}" for i in range(Nm)])
+        batch = torch.export.Dim("batch", min=1, max=256)
+        seq = torch.export.Dim("seq_len", min=1, max=32768)
+        pos = torch.export.Dim("max_pos", min=1, max=32768)
+        rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
+        kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
+        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
+
+        # Spec-verify bases widen last_token_ids to select multiple positions.
+        if spec:
+            last_token_ids = torch.zeros(batch_size,
+                                         2,
+                                         dtype=torch.int64,
+                                         device=device)
+
+        args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
+                context_lengths, kvcache_start_index, kv_page_table,
+                last_token_ids, *conv_states, *ssm_states)
+
+        input_names = (
+            ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
+                "rope_rotary_cos_sin", "context_lengths",
+                "kvcache_start_index", "kv_page_table", "last_token_ids"
+            ] + [f"conv_state_{i}" for i in range(Nm)] +
+            [f"recurrent_state_{i}" for i in range(Nm)])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)] +
                         [f"present_conv_state_{i}" for i in range(Nm)] +
                         [f"present_recurrent_state_{i}" for i in range(Nm)])
 
-        batch = torch.export.Dim("batch", min=1, max=256)
-        seq = torch.export.Dim("seq_len", min=1, max=32768)
-        pos = torch.export.Dim("max_pos", min=1, max=32768)
-        past = torch.export.Dim("past_len", min=1, max=32768)
-        rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
-        kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
-
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
-            all_shapes.append({0: batch, 3: past})  # past_key_values_i
+            all_shapes.append({1:
+                               num_pages})  # past_key_values_i (pool-shaped)
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
-        all_shapes.append({0: batch})  # last_token_ids
+        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
+        if spec:
+            num_selected = torch.export.Dim("num_selected", min=1, max=256)
+            all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
+        else:
+            all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nm):
             all_shapes.append({0: batch})  # conv_state_i
         for _ in range(Nm):
             all_shapes.append({0: batch})  # recurrent_state_i
 
-        wrapped = _make_flat_wrapper_mamba(self, Na, Nm)
+        if spec:
+            # Tree-attention + spec-verify inputs.
+            attn_seq = torch.export.Dim("attn_seq_len", min=1, max=32768)
+            mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
+            attention_pos_id = torch.zeros(batch_size,
+                                           seq_len,
+                                           dtype=torch.int32,
+                                           device=device)
+            attention_mask = torch.zeros(batch_size,
+                                         seq_len,
+                                         seq_len + past_len,
+                                         dtype=torch.int32,
+                                         device=device)
+            spec_verify_phase_marker = torch.zeros(1,
+                                                   dtype=torch.int32,
+                                                   device=device)
+            args = args + (attention_pos_id, attention_mask,
+                           spec_verify_phase_marker)
+            input_names = input_names + [
+                "attention_pos_id", "attention_mask",
+                "spec_verify_phase_marker"
+            ]
+            all_shapes.append({0: batch, 1: attn_seq})  # attention_pos_id
+            all_shapes.append({0: batch, 1: attn_seq, 2: mask_kv_len})  # mask
+            all_shapes.append({0: torch.export.Dim.AUTO})  # phase marker
+            # Extra outputs: full hidden + intermediate conv snapshot + the
+            # per-token recurrent replay stash (dA / u / B) for spec-verify.
+            output_names = (
+                ["logits", "hidden_states"] +
+                [f"present_key_values_{i}" for i in range(Na)] +
+                [f"present_conv_state_{i}" for i in range(Nm)] +
+                [f"present_recurrent_state_{i}" for i in range(Nm)] +
+                [f"intermediate_conv_state_{i}" for i in range(Nm)] +
+                [f"replay_da_state_{i}" for i in range(Nm)] +
+                [f"replay_u_state_{i}" for i in range(Nm)] +
+                [f"replay_b_state_{i}" for i in range(Nm)])
+
+        wrapped = _make_flat_wrapper_mamba(self,
+                                           Na,
+                                           Nm,
+                                           mtp_base=mtp_base,
+                                           dflash_base=dflash_base)
         wrapped.eval()
 
         return OnnxSpec(wrapped=wrapped,
@@ -1026,23 +1353,66 @@ class NemotronHCausalLM(nn.Module):
                         dynamic_shapes=all_shapes)
 
     def forward(
-            self,
-            inputs_embeds: torch.Tensor,
-            past_key_values: Tuple[torch.Tensor, ...],
-            rope_rotary_cos_sin: torch.Tensor,
-            context_lengths: torch.Tensor,
-            kvcache_start_index: torch.Tensor,
-            last_token_ids: torch.Tensor,
-            conv_states: Tuple[torch.Tensor, ...] = (),
-            ssm_states: Tuple[torch.Tensor, ...] = (),
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        conv_states: Tuple[torch.Tensor, ...] = (),
+        ssm_states: Tuple[torch.Tensor, ...] = (),
+        attention_pos_id: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        spec_verify_phase_marker: Optional[torch.Tensor] = None,
     ) -> Tuple:
+        mtp_base = bool(getattr(self.config, "mtp_base", False))
+        dflash_base = bool(getattr(self.config, "dflash_base", False))
+        dflash_target_ids = (self.config.dflash_target_layer_ids
+                             if dflash_base else None)
+        spec = mtp_base or dflash_base
+        if spec:
+            (hidden_states, present_key_values, present_conv_states,
+             present_ssm_states, intermediate_conv_states, replay_da_states,
+             replay_u_states, replay_b_states,
+             dflash_hidden_concat) = self.backbone(
+                 inputs_embeds,
+                 past_key_values,
+                 rope_rotary_cos_sin,
+                 context_lengths,
+                 kvcache_start_index,
+                 kv_page_table,
+                 conv_states,
+                 ssm_states,
+                 collect_intermediate_states=True,
+                 spec_verify_phase_marker=spec_verify_phase_marker,
+                 attention_mask=attention_mask,
+                 attention_pos_id=attention_pos_id,
+                 dflash_target_layer_ids=dflash_target_ids,
+             )
+            # Draft consumes the full pre-lm_head hidden; logits use the
+            # gathered predicted-token positions.
+            selected = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
+            logits = self.lm_head(selected).to(torch.float32)
+            if dflash_base:
+                return (logits, dflash_hidden_concat, present_key_values,
+                        present_conv_states, present_ssm_states,
+                        intermediate_conv_states, replay_da_states,
+                        replay_u_states, replay_b_states)
+            return (logits, hidden_states, present_key_values,
+                    present_conv_states, present_ssm_states,
+                    intermediate_conv_states, replay_da_states,
+                    replay_u_states, replay_b_states)
+
         (hidden_states, present_key_values, present_conv_states,
-         present_ssm_states) = self.backbone(
+         present_ssm_states, _dflash_hidden_concat) = self.backbone(
              inputs_embeds,
              past_key_values,
              rope_rotary_cos_sin,
              context_lengths,
              kvcache_start_index,
+             kv_page_table,
              conv_states,
              ssm_states,
          )

@@ -647,7 +647,7 @@ Summary summarize(std::vector<float> const& got, std::vector<float> const& ref, 
     return {median, mag, maxAbs};
 }
 
-bool checkRequirementsAndLoad()
+bool checkRequirements()
 {
     int32_t const sm = getSMVersion();
     if (!isSupportedSm(sm))
@@ -659,7 +659,7 @@ bool checkRequirementsAndLoad()
     {
         return false;
     }
-    return CuteDslNvfp4MoeSm110Runner::loadKernelModules();
+    return true;
 }
 
 std::vector<MoeCase> defaultCases()
@@ -737,9 +737,9 @@ TEST(CuteDslNvfp4MoeSm110Test, smoke)
     {
         GTEST_SKIP() << "SM100/101/110 NVFP4 MoE CuTeDSL runner test requires SM100, SM101, or SM110, got SM=" << sm;
     }
-    if (!checkRequirementsAndLoad())
+    if (!checkRequirements())
     {
-        GTEST_SKIP() << "Failed to load SM100/101/110 NVFP4 MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "SM100/101/110 NVFP4 MoE CuTeDSL canImplement returned false";
     }
 
     for (auto const& cfg : defaultCases())
@@ -769,9 +769,9 @@ TEST(CuteDslNvfp4MoeSm110Test, accuracy)
     {
         GTEST_SKIP() << "SM100/101/110 NVFP4 MoE CuTeDSL runner test requires SM100, SM101, or SM110, got SM=" << sm;
     }
-    if (!checkRequirementsAndLoad())
+    if (!checkRequirements())
     {
-        GTEST_SKIP() << "Failed to load SM100/101/110 NVFP4 MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "SM100/101/110 NVFP4 MoE CuTeDSL canImplement returned false";
     }
 
     // Loose-but-meaningful bands for NVFP4 MoE: cosine >= 0.94 catches sign /

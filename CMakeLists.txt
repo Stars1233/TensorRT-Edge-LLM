@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.9.1
+  VERSION 0.10.0
   LANGUAGES C CXX CUDA)
 
 # Specify the C++ standard and flags
@@ -37,6 +37,16 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
 option(ENABLE_COVERAGE "Enable gcov code coverage instrumentation" OFF)
 include(${CMAKE_SOURCE_DIR}/cmake/CodeCoverage.cmake)
 
+# Declare unit-test options before cpp/ so its library targets can enable
+# test-only instrumentation when requested.
+option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
+option(ENABLE_CUTEDSL_MODULE_TEST_HOOK
+       "Enable deterministic CuTe DSL module-load failure injection" OFF)
+if(ENABLE_CUTEDSL_MODULE_TEST_HOOK AND NOT BUILD_UNIT_TESTS)
+  message(
+    FATAL_ERROR "ENABLE_CUTEDSL_MODULE_TEST_HOOK requires BUILD_UNIT_TESTS=ON")
+endif()
+
 macro(set_ifndef var val)
   if(NOT DEFINED ${var})
     set(${var} ${val})
@@ -45,9 +55,20 @@ macro(set_ifndef var val)
 endmacro()
 
 macro(add_cross_build_link_options target)
-  if(DEFINED AARCH64_BUILD)
-    target_link_options(${target} PRIVATE "-L${CUDA_DIR}/lib")
-    target_link_options(${target} PRIVATE "-L${CUDA_DIR}/lib/stubs")
+  if(AARCH64_BUILD)
+    get_target_property(_cross_link_options_added ${target}
+                        TRT_EDGELLM_CROSS_LINK_OPTIONS_ADDED)
+    if(NOT _cross_link_options_added)
+      get_target_property(_cross_target_type ${target} TYPE)
+      set(_cross_link_scope PRIVATE)
+      if(_cross_target_type STREQUAL "STATIC_LIBRARY")
+        set(_cross_link_scope INTERFACE)
+      endif()
+      target_link_options(${target} ${_cross_link_scope} "-L${CUDA_DIR}/lib"
+                          "-L${CUDA_DIR}/lib/stubs")
+      set_property(TARGET ${target}
+                   PROPERTY TRT_EDGELLM_CROSS_LINK_OPTIONS_ADDED TRUE)
+    endif()
   endif()
 endmacro(add_cross_build_link_options)
 
@@ -61,7 +82,7 @@ endif()
 set_ifndef(CUDA_CTK_VERSION 12.8)
 set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
-if(NOT DEFINED AARCH64_BUILD)
+if(NOT AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
@@ -88,6 +109,13 @@ find_library(
   CUDA_DRIVER_LIB cuda
   HINTS ${CUDA_DIR} ${CUDA_TARGET_DIR}
   PATH_SUFFIXES lib lib64 lib/stubs)
+set(CUDA_DRIVER_LINK_LIB "${CUDA_DRIVER_LIB}")
+if(AARCH64_BUILD)
+  # Cross builds link against the CUDA driver stub via -L.../lib/stubs -lcuda.
+  # Do not pass the absolute stub .so to target_link_libraries(), or CMake will
+  # bake the stub directory into build RUNPATH and target execution can load it.
+  set(CUDA_DRIVER_LINK_LIB cuda)
+endif()
 
 find_path(
   CURAND_KERNEL_INCLUDE_DIR
@@ -152,23 +180,13 @@ target_link_libraries(
 target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
-# Build Core libraries of the project. attentionPlugin shared library and
-# edgellmCore/edgellmBuilder static library will be generated.
-add_subdirectory(cpp)
-
-# Build C++ examples to showcase the usage
-add_subdirectory(examples)
-
-option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
-option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
-
 # CuTe DSL unified kernel option — declare here so it is always defined before
 # any subdirectory or include references it.
 # cmake-format: off
 # Choices:
-#   OFF              -- no CuTe DSL kernels
+#   fmha             -- FP16 Context/ViT FMHA, plus the optimized Blackwell
+#                       variants when the artifact has them
 #   ALL              -- enable every kernel group below
-#   fmha             -- FMHA Blackwell attention
 #   gdn              -- gated delta net (Mamba2-style hybrid SSM)
 #   f16_moe          -- target-specific FP16 grouped MoE for Ampere,
 #                       Blackwell DC, and Blackwell GeForce
@@ -179,11 +197,29 @@ option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 #   semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn)
 # cmake-format: on
 set(ENABLE_CUTE_DSL
-    "OFF"
+    "fmha"
     CACHE
       STRING
-      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe)"
+      "CuTe DSL kernels: fmha (default), ALL, or semicolon-separated group list (fmha;gdn;f16_moe)"
 )
+
+# Build Core libraries of the project. attentionPlugin shared library and
+# edgellmCore/edgellmBuilder static library will be generated.
+add_subdirectory(cpp)
+
+# Build C++ examples to showcase the usage
+add_subdirectory(examples)
+
+# Experimental models (opt-in). These are not first-class models; they live in a
+# separate tree and link against the core edgellm libraries. Cosmos3 is the
+# first.
+option(BUILD_EXPERIMENTAL_MODELS
+       "Enable building experimental models (e.g. cosmos3)" OFF)
+if(BUILD_EXPERIMENTAL_MODELS)
+  add_subdirectory(experimental_models)
+endif()
+
+option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
 
 if(BUILD_UNIT_TESTS)
   set(BUILD_GMOCK
@@ -198,13 +234,18 @@ if(BUILD_UNIT_TESTS)
   # Define project root path for tests to access resources
   target_compile_definitions(unitTest
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
-  target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
-                                         commonLibraryExt ${CUDA_DRIVER_LIB})
-  if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
-    include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
-    cute_dsl_setup(LINK_TARGETS unitTest)
+  if(ENABLE_CUTEDSL_MODULE_TEST_HOOK)
+    target_compile_definitions(unitTest PRIVATE ENABLE_CUTEDSL_MODULE_TEST_HOOK)
   endif()
+  # Resource-registration tests resolve the plugin's exported lifecycle ABI.
+  add_dependencies(unitTest NvInfer_edgellm_plugin)
+  target_link_libraries(
+    unitTest PRIVATE gtest gtest_main edgellmCore commonLibraryExt exampleUtils
+                     ${CUDA_DRIVER_LINK_LIB})
+  include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+  cute_dsl_setup(LINK_TARGETS unitTest)
   add_cross_build_link_options(unitTest)
+  add_subdirectory(unittests)
 endif()
 
 if(BUILD_PYTHON_BINDINGS)

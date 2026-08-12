@@ -79,6 +79,12 @@ std::string printNetworkInfo(nvinfer1::INetworkDefinition const* network, std::s
 std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profile, std::string const& profileName,
     nvinfer1::INetworkDefinition const* network);
 
+//! Apply TensorRT compile workarounds via the __LUNOWUD environment variable.
+//! Must be called before createInferBuilder.
+//! @param maxBatchSize Max batch size of the engine being built
+//! @return The applied __LUNOWUD flag string (empty if none)
+std::string applyCompileWorkarounds(int32_t maxBatchSize);
+
 //! Create TensorRT builder and network definition with strongly typed flag.
 //! @return Pair of builder and network, or {nullptr, nullptr} on failure
 std::pair<std::unique_ptr<nvinfer1::IBuilder>, std::unique_ptr<nvinfer1::INetworkDefinition>> createBuilderAndNetwork();

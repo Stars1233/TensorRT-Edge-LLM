@@ -54,7 +54,8 @@ enum ActionInferenceOptionId : int
     DUMP_OUTPUT = 909,
     BATCH_SIZE = 910,
     MAX_GENERATE_LENGTH = 911,
-    NOISE_SEED = 912
+    NOISE_SEED = 912,
+    CHECKPOINT_DIR = 913
 };
 
 struct ActionInferenceArgs
@@ -62,6 +63,7 @@ struct ActionInferenceArgs
     bool help{false};
     std::string engineDir;
     std::string multimodalEngineDir{""};
+    std::string checkpointDir{""};
     std::string inputFile;
     std::string outputFile{""};
     std::string profileOutputFile{""};
@@ -80,6 +82,7 @@ void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] [--engineDir=<path>] [--multimodalEngineDir=<path>] [--inputFile=<path>] "
+                 "[--checkpointDir=<path>] "
                  "[--outputFile=<path>] [--dumpProfile] [--profileOutputFile=<path>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--noiseSeed=<number>]"
               << std::endl;
@@ -89,6 +92,8 @@ void printUsage(char const* programName)
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
     std::cerr << "  --engineDir               Path to LLM engine directory" << std::endl;
     std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (required): visual/, action/, etc."
+              << std::endl;
+    std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint dir (required for runtime weight loading)"
               << std::endl;
     std::cerr << "  --outputFile              Path to output JSON file (required)" << std::endl;
     std::cerr << "  --dumpProfile             Dump profiling summary to console" << std::endl;
@@ -111,6 +116,7 @@ bool parseActionInferenceArgs(
         {"inputFile", required_argument, 0, ActionInferenceOptionId::INPUT_FILE},
         {"engineDir", required_argument, 0, ActionInferenceOptionId::ENGINE_DIR},
         {"multimodalEngineDir", required_argument, 0, ActionInferenceOptionId::MULTIMODAL_ENGINE_DIR},
+        {"checkpointDir", required_argument, 0, ActionInferenceOptionId::CHECKPOINT_DIR},
         {"outputFile", required_argument, 0, ActionInferenceOptionId::OUTPUT_FILE},
         {"debug", no_argument, 0, ActionInferenceOptionId::DEBUG},
         {"dumpProfile", no_argument, 0, ActionInferenceOptionId::DUMP_PROFILE},
@@ -130,6 +136,7 @@ bool parseActionInferenceArgs(
         case ActionInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case ActionInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
         case ActionInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
+        case ActionInferenceOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
         case ActionInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case ActionInferenceOptionId::DEBUG: args.debug = true; break;
         case ActionInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
@@ -475,6 +482,7 @@ std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGener
                                 auto image = rt::imageUtils::loadImageFromFile(msgContent.content);
                                 if (image.buffer != nullptr)
                                 {
+                                    image.doResize = contentItemJson.value("do_resize", true);
                                     imageBuffers.push_back(std::move(image));
                                 }
                             }
@@ -588,8 +596,8 @@ int main(int argc, char* argv[])
 
     try
     {
-        llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(
-            args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+        llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+            loraWeightsMap, stream, rt::ContextCacheConfig{}, args.checkpointDir);
     }
     catch (std::exception const& e)
     {

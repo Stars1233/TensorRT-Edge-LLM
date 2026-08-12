@@ -43,8 +43,8 @@ protected:
         rt::imageUtils::ImageData const& image, int64_t patchBase, std::vector<VisionSpan>& spans) override;
 
     //! Mirrors HF Qwen2_5_VLModel.get_rope_index: temporal step = secondPerGrid * tokens_per_second; spatial advance.
-    void getMRopePositionIds(
-        std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept override;
+    void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+        std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest) noexcept override;
 
     //! \brief Compute window indices + cu_window_seqlens for window attention (each span's gridT frames).
     void getWindowIndex(std::vector<VisionSpan> const& spans, int64_t curHW, cudaStream_t stream);

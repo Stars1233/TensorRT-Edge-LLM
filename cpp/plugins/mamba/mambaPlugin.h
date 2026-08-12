@@ -55,6 +55,12 @@ namespace plugins
 //!   [5] dt         [batch, (seq_len,) nheads]            FP16 or FP32
 //!   [6] dt_bias    [nheads]                              FP16 or FP32
 //!   [7] state      [batch, nheads, dim, dstate]          FP16 or FP32
+//!   [8] context_lengths [batch]                          INT32
+//!   [9] state_start_index [0] or [batch]                 INT32
+//!
+//! `state_start_index` shares the runtime's `kvcache_start_index` sentinel
+//! contract: shape [0] selects the faster zero-state prefill kernel, while
+//! shape [batch] means restored recurrent state must seed prefill.
 //!
 //! All data tensors (everything except A) must use the same type.
 //! TRT selects FP32 when the ONNX graph declares FP32, and may optimize to
@@ -69,8 +75,8 @@ class MambaPlugin : public nvinfer1::IPluginV3,
                     public nvinfer1::IPluginV3OneRuntime
 {
 public:
-    MambaPlugin(
-        std::string const& name, int32_t dim, int32_t dstate, int32_t nheads, int32_t ngroups, int32_t dtSoftplus);
+    MambaPlugin(std::string const& name, int32_t dim, int32_t dstate, int32_t nheads, int32_t ngroups,
+        int32_t dtSoftplus, int32_t useSpecVerifyState = 0);
 
     MambaPlugin() = delete;
     MambaPlugin(MambaPlugin const&) = delete;
@@ -108,6 +114,11 @@ public:
     void setPluginNamespace(char const* pluginNamespace) noexcept;
 
 protected:
+    //! Plugin input/output counts depend on the spec-verify mode: it adds a trailing
+    //! ``spec_verify_phase_marker`` input and an ``intermediate_recurrent_states`` output.
+    int32_t numInputs() const noexcept;
+    int32_t numOutputs() const noexcept;
+
     std::string mLayerName;
     std::string mNamespace;
 
@@ -116,6 +127,8 @@ protected:
     int32_t mNheads{};
     int32_t mNgroups{};
     int32_t mDtSoftplus{};
+    //! MTP spec-verify: emit per-token intermediate recurrent states for accepted-token rollback.
+    int32_t mUseSpecVerifyState{};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize;

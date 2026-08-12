@@ -76,5 +76,14 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle);
  */
 TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle);
 
+/*!
+ * @brief Build a TensorRegistry for a DSpark draft engine.
+ *
+ * DSpark draft engines use the same cached-KV proposal path as DFlash, but
+ * reuse cached-draft target-hidden/delta-length bindings and expose an extra
+ * dspark_hidden_states output for confidence scheduling.
+ */
+TensorRegistry buildRegistryForDSparkDraft(DeploymentConfig const& bundle);
+
 } // namespace rt
 } // namespace trt_edgellm

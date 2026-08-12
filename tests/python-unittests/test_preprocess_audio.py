@@ -35,6 +35,7 @@ Usage:
 """
 from __future__ import annotations
 
+import importlib
 import os
 from typing import Tuple
 
@@ -53,6 +54,10 @@ FIXTURE_FLAC = os.path.join(REPO_ROOT, "examples", "multimodal", "audio",
 
 @pytest.fixture(scope="module")
 def runtime():
+    # The pybind module may be built by test_build_project_with_pybind earlier in the same
+    # pytest process; refresh the import caches so a path entry that was empty
+    # at startup is rescanned.
+    importlib.invalidate_caches()
     try:
         import _edgellm_runtime  # type: ignore
     except ImportError:
@@ -117,6 +122,9 @@ def test_mel_accuracy_whisper(runtime, audio_pair):
 
 def test_mel_accuracy_parakeet(runtime, audio_pair):
     transformers = pytest.importorskip("transformers")
+    # ParakeetFeatureExtractor declares a torch backend requirement
+    # (requires_backends), unlike WhisperFeatureExtractor's numpy path.
+    pytest.importorskip("torch")
     flac_bytes, samples = audio_pair
 
     # NVIDIA Nemotron-Omni uses num_mel_bins=128 (NOT the HF library default 80).
@@ -228,3 +236,75 @@ def test_extract_mel_round_trip_synthetic(runtime, fe_type, container,
         assert mel.shape[0] == 128  # [n_mel=128, T]
     elif fe_type == "parakeet":
         assert mel.shape[1] == 128  # [T, n_mel=128]
+
+
+# ---------------------------------------------------------------------------
+# Source resolution (pure python, no runtime): OpenAI audio content -> local
+# path / bytes; the http(s) rejection is a security boundary (no remote fetch).
+# ---------------------------------------------------------------------------
+
+
+def _resolve(item):
+    import sys
+    sys.path.insert(0, REPO_ROOT)
+    from experimental.server.audio_preprocess import resolve_audio_message
+    return resolve_audio_message(item)
+
+
+def test_resolve_input_audio_base64():
+    import base64
+    raw = b"RIFF0000WAVEfmt "
+    out = _resolve({
+        "type": "input_audio",
+        "input_audio": {
+            "data": base64.b64encode(raw).decode(),
+            "format": "wav"
+        },
+    })
+    assert out == raw
+
+
+def test_resolve_input_audio_missing_data():
+    with pytest.raises(ValueError):
+        _resolve({"type": "input_audio", "input_audio": {}})
+
+
+@pytest.mark.parametrize("url", ["http://h/a.wav", "https://h/a.wav"])
+def test_resolve_audio_url_rejects_remote(url):
+    with pytest.raises(ValueError):
+        _resolve({"type": "audio_url", "audio_url": {"url": url}})
+
+
+def test_resolve_audio_url_data_and_file(tmp_path):
+    import base64
+    raw = b"ID3\x03"
+    out = _resolve({
+        "type": "audio_url",
+        "audio_url": {
+            "url": "data:audio/mpeg;base64," + base64.b64encode(raw).decode()
+        },
+    })
+    assert out == raw
+    f = tmp_path / "a.wav"
+    f.write_bytes(b"x")
+    assert _resolve({
+        "type": "audio_url",
+        "audio_url": {
+            "url": f"file://{f}"
+        }
+    }) == str(f)
+
+
+def test_resolve_audio_url_rejects_non_base64_data():
+    with pytest.raises(ValueError):
+        _resolve({
+            "type": "audio_url",
+            "audio_url": {
+                "url": "data:audio/wav,notb64"
+            }
+        })
+
+
+def test_resolve_unknown_type_raises():
+    with pytest.raises(ValueError):
+        _resolve({"type": "image"})

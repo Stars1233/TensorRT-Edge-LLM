@@ -21,7 +21,8 @@ from typing import Optional
 
 import pytest
 from conftest import EnvironmentConfig, RemoteConfig
-from pytest_helpers import run_command, timer_context
+from pytest_helpers import (record_library_size_report, run_command,
+                            timer_context)
 
 from .utils.device import DeviceConfig
 
@@ -38,6 +39,20 @@ def test_build_project(env_config: EnvironmentConfig,
                        remote_config: Optional[RemoteConfig],
                        test_logger: logging.Logger):
     """Test project build - builds all components"""
+    _build_project(env_config, remote_config, test_logger, build_pybind=False)
+
+
+def test_build_project_with_pybind(env_config: EnvironmentConfig,
+                                   remote_config: Optional[RemoteConfig],
+                                   test_logger: logging.Logger):
+    """Project build that also builds + import-checks the pybind runtime
+    (the unit-job lists use this; pipeline lists use test_build_project)."""
+    _build_project(env_config, remote_config, test_logger, build_pybind=True)
+
+
+def _build_project(env_config: EnvironmentConfig,
+                   remote_config: Optional[RemoteConfig],
+                   test_logger: logging.Logger, build_pybind: bool):
     execution_mode = "remote" if remote_config else "local"
     device_config = DeviceConfig.auto_detect(remote_config, test_logger)
     test_logger.info(
@@ -46,7 +61,21 @@ def test_build_project(env_config: EnvironmentConfig,
     build_dir = env_config.build_dir
 
     # Build cmake command with required components only
-    cmake_cmd = ['cmake', '..', '-DBUILD_UNIT_TESTS=ON']
+    cmake_cmd = [
+        'cmake', '..', '-DBUILD_UNIT_TESTS=ON',
+        '-DENABLE_CUTEDSL_MODULE_TEST_HOOK=ON'
+    ]
+
+    # Opt-in for jobs whose test lists import the pybind runtime (the
+    # preprocessing suites); resolved from the pytest interpreter's pybind11.
+    if build_pybind:
+        import pybind11
+        cmake_cmd.append('-DBUILD_PYTHON_BINDINGS=ON')
+        cmake_cmd.append(f'-Dpybind11_DIR={pybind11.get_cmake_dir()}')
+    else:
+        # Explicit OFF: a build/ dir previously configured ON would keep
+        # building pybind from the CMake cache.
+        cmake_cmd.append('-DBUILD_PYTHON_BINDINGS=OFF')
 
     # Use trt_package_dir from env_config
     if env_config.trt_package_dir:
@@ -60,42 +89,47 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')
 
-    # Enable CuteDSL kernels for Blackwell aarch64 targets.
-    if device_config.target in ['auto-thor', 'jetson-thor', 'gb10']:
-        # Prebuilt tarballs are committed in kernelSrcs/cuteDSLPrebuilt/.
-        # CMake auto-extracts them -- no on-device build needed.
+    # Enable all available CuTe DSL kernels for aarch64 targets.
+    if device_config.target in [
+            'jetson-orin', 'auto-thor', 'jetson-thor', 'gb10'
+    ]:
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
-        test_logger.info(
-            "CuTe DSL: using prebuilt tarball (CMake auto-extracts)")
+        test_logger.info("CuTe DSL: using available artifact")
 
-    # Jetson Orin (SM87): the GDN/SSD cuteDSL kernels have sm_87 variants, but
-    # only the unit-test job stages the tarball, so enable cuteDSL only when it
-    # is present (the pipeline jobs build without it, as before).
-    if device_config.target == 'jetson-orin' and glob.glob(
-            os.path.join(env_config.llm_sdk_dir, 'kernelSrcs',
-                         'cuteDSLPrebuilt', 'cutedsl_aarch64_sm_87_*.tar.gz')):
+    # Enable CuteDSL kernels for x86 Blackwell (SM120+) targets.
+    if (device_config.target == 'x86'
+            and device_config.compute_capability is not None
+            and device_config.compute_capability >= 120):
         cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
-        cmake_cmd.append('-DCUTE_DSL_ARTIFACT_TAG=sm_87')
-        test_logger.info("CuTe DSL: jetson-orin sm_87, using prebuilt tarball "
-                         "(CMake auto-extracts)")
+        test_logger.info("CuTe DSL: x86 Blackwell, using available artifact")
 
     # Enable CuteDSL kernels on x86 when the job staged a prebuilt tarball for
-    # the detected SM. The unit-test jobs stage one artifact per SKU (see the
-    # build_cutedsl_x86_sm*_artifact jobs); pipeline jobs that only stage the
-    # sm_120 tarball keep their previous behavior on other SMs. sm86 reuses the
-    # sm_80 artifact: cubins are forward compatible within a major compute
-    # capability and the sm_80/sm_86 kernel variant sets are identical.
-    x86_cutedsl_tags = {80: 'sm_80', 86: 'sm_80', 100: 'sm_100', 120: 'sm_120'}
-    x86_tag = x86_cutedsl_tags.get(device_config.compute_capability)
-    if (device_config.target == 'x86' and x86_tag and glob.glob(
+    # the detected SM. The unified matrix producer downloads tarballs directly
+    # into kernelSrcs/cuteDSLPrebuilt so CMake can auto-extract the matching
+    # architecture, SM, and CUDA-major artifact. SM86 reuses the SM80 artifact
+    # for forward-compatible groups. F16 MoE requires an exact artifact SM, so
+    # do not enable that group without a native SM86 artifact.
+    x86_cutedsl_selections = {
+        80: ('sm_80', 'ALL'),
+        86: ('sm_80', r'fmha\;gdn\;gemm\;int4_fp16_gemm\;ssd'),
+        100: ('sm_100', 'ALL'),
+        120: ('sm_120', 'ALL'),
+    }
+    x86_selection = x86_cutedsl_selections.get(
+        device_config.compute_capability)
+    if (device_config.target == 'x86' and x86_selection and glob.glob(
             os.path.join(env_config.llm_sdk_dir, 'kernelSrcs',
                          'cuteDSLPrebuilt',
-                         f'cutedsl_x86_64_{x86_tag}_*.tar.gz'))):
-        cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
+                         f'cutedsl_x86_64_{x86_selection[0]}_*.tar.gz'))):
+        x86_tag, x86_groups = x86_selection
+        enable_cutedsl_arg = f'-DENABLE_CUTE_DSL={x86_groups}'
+        if enable_cutedsl_arg not in cmake_cmd:
+            cmake_cmd.append(enable_cutedsl_arg)
         cmake_cmd.append(f'-DCUTE_DSL_ARTIFACT_TAG={x86_tag}')
+        x86_groups_log = x86_groups.replace(r'\;', ';')
         test_logger.info(
             f"CuTe DSL: x86 SM{device_config.compute_capability}, "
-            f"using prebuilt {x86_tag} tarball (CMake auto-extracts)")
+            f"using staged prebuilt artifact groups={x86_groups_log}")
 
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),
@@ -112,6 +146,20 @@ def test_build_project(env_config: EnvironmentConfig,
     if not success:
         pytest.fail("Build failed")
 
+    # Record how big the library this job just built is. Informational: a
+    # failure here must not fail a build that otherwise succeeded.
+    size_result = run_command(cmd=[
+        'python3', 'scripts/report_library_size.py', '--build-dir', build_dir,
+        '--label', device_config.target
+    ],
+                              remote_config=remote_config,
+                              timeout=120,
+                              logger=test_logger)
+    if size_result['success']:
+        record_library_size_report(size_result['output'])
+    else:
+        test_logger.warning("Library size report failed; continuing")
+
     expected_files = [
         'unitTest',
         'examples/llm/llm_build',
@@ -119,6 +167,23 @@ def test_build_project(env_config: EnvironmentConfig,
         'examples/multimodal/visual_build',
         'examples/multimodal/audio_build',
     ]
+    if build_pybind:
+        # The preprocessing suites skip when this module is missing; gate with
+        # a real import so a pybind link/ABI regression fails the build step
+        # instead of silently skipping every parity test.
+        import_check = ('import importlib; importlib.invalidate_caches(); '
+                        'import _edgellm_runtime')
+        result = run_command(cmd=[
+            'bash', '-c', f'PYTHONPATH={build_dir}/pybind '
+            f'python3 -c "{import_check}"'
+        ],
+                             remote_config=remote_config,
+                             timeout=120,
+                             logger=test_logger)
+        if not result['success']:
+            pytest.fail('pybind build requested but _edgellm_runtime is not '
+                        f'importable from {build_dir}/pybind: '
+                        f"{result.get('output', '')[-500:]}")
     # Executables that support --help smoke test
     help_check_files = [
         'examples/llm/llm_build',

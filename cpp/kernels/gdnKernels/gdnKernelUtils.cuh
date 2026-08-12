@@ -32,13 +32,6 @@ void launchGdnCalCuSeqLens(void const* context_lengths, // [N] int32
  *  Required preprocessing for the Blackwell GDN prefill kernel. */
 void launchGdnL2NormQK(void* q, void* k, int32_t n, int32_t seqLen, int32_t h, int32_t headDim, cudaStream_t stream);
 
-/** Precompute DDTree split-v scalar inputs.
- *  qkScales:   (N, seqLen, H, 2) float32, stores q_scale and k_scale.
- *  gateValues: (N, seqLen, HV, 2) float32, stores decay gate g and beta. */
-void launchGdnDDTreePrecompute(void const* q, void const* k, void const* a, void const* b, void const* a_log,
-    void const* dtBias, void* qkScales, void* gateValues, int32_t n, int32_t seqLen, int32_t h, int32_t hv,
-    int32_t headDim, cudaStream_t stream);
-
 /** Transpose the last two dimensions of the GDN state tensor (out-of-place).
  *  The Blackwell GDN prefill MMA produces state in V-major (d_v, d_k) order,
  *  while the sequential/decode kernels use K-major (d_k, d_v).

@@ -23,6 +23,7 @@ See ``modeling_code_predictor.py`` and ``modeling_qwen3_tts_code2wav.py``
 for details.
 """
 from .modeling_code_predictor import CodePredictorCausalLM
+from .modeling_qwen3_tts_clone_encoders import export_qwen3_tts_clone_encoders
 from .modeling_qwen3_tts_code2wav import export_qwen3_tts_code2wav
 from .modeling_qwen3_tts_talker import TalkerCausalLM
 from .modeling_qwen3_tts_text import Qwen3TTSLanguageModel
@@ -31,5 +32,6 @@ __all__ = [
     "Qwen3TTSLanguageModel",
     "TalkerCausalLM",
     "CodePredictorCausalLM",
+    "export_qwen3_tts_clone_encoders",
     "export_qwen3_tts_code2wav",
 ]

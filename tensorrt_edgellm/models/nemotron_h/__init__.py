@@ -13,3 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """NemotronH hybrid (Mamba + MLP + Attention) causal LM."""
+
+from .modeling_nemotron_h_mtp import NemotronHMtpDraftModel
+
+__all__ = ["NemotronHMtpDraftModel"]

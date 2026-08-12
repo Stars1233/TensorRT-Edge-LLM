@@ -87,8 +87,6 @@ bool Phi4MMViTRunner::validateAndFillConfig(std::string const& configPath)
         return false;
     }
 
-    mConfig.vocabSize = jsonConfig["vocab_size"].get<int32_t>();
-
     auto visionConfig = jsonConfig["embd_layer"]["image_embd_layer"];
     mConfig.blockImageSizeH = visionConfig["crop_size"].get<int32_t>();
     mConfig.blockImageSizeW = mConfig.blockImageSizeH;
@@ -166,14 +164,14 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Phi4MMViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Phi4MMViTRunner::mNormalizedImageDevice");
-    // Scratch buffer for resizeImage output (4D placeholder shape; resizeImage reshapes per call).
-    rt::Tensor resizeBuffer({1, 1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "Phi4MMViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    // Thumbnail image has fixed size: 1 x blockImageSizeH x blockImageSizeW x channels (4D, frames=1).
-    rt::Tensor thumbnailBuffer({1, mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kUINT8, "Phi4MMViTRunner::thumbnailBuffer");
-    mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
+
+    // GPU image-resize scratch.
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. computeBestBlockGridForResize snaps to a
+    // block grid and does NOT preserve aspect ratio, so bound each dimension independently: rawH by the
+    // raw cap and outW by the widest single-row block grid (maxNumBlocks * blockImageSizeW).
+    int64_t const kMaxResizeTmpElems
+        = kernel::kGpuResizeMaxRawDim * mConfig.maxNumBlocks * mConfig.blockImageSizeW * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     // Pre-allocate temporary index tensors for Phi4MM postprocess (assign to members)
     mHBlocks = rt::Tensor(
@@ -251,7 +249,6 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     int height = image.height;
     int width = image.width;
     int channels = image.channels;
-    unsigned char* imageData = image.data(); // In hwc order
 
     ELLM_CHECK(channels == mConfig.numChannels,
         "Image channels mismatch, got " + std::to_string(channels) + ", expected "
@@ -290,12 +287,8 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
         imageTokenLengths.back() += subLen;
     }
 
-    // Copy image to device.
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
-
-    // Normalize image
+    // mImageDevice already holds the [1, height, width, channels] image (resized on the GPU by the
+    // caller); normalize and patchify consume it in place.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
@@ -308,7 +301,7 @@ void Phi4MMViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
 }
 
 void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
-    std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW, bool doResize,
+    std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW,
     cudaStream_t stream)
 {
     int64_t totalNumBlocks = 0;
@@ -320,26 +313,34 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         std::vector<std::vector<int64_t>> blockGridHWPerBatch;
         for (auto const& image : req.imageBuffers)
         {
-            // Add thumbnail image by default
-            imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH,
-                imageUtils::InterpolationMode::kBICUBIC);
-            formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            // Thumbnail (global) crop: a fixed one-block resize of the original image, independent of
+            // image.doResize.
+            kernel::copyImageToDeviceAndResize(image.data(), 1, image.height, image.width, image.channels,
+                mRawImageDevice, mResizeTmpDevice, mImageDevice, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                stream);
+            formatPatch(image.resizedMeta(mConfig.blockImageSizeH, mConfig.blockImageSizeW), imageTokenLengths,
+                numImage, totalNumBlocks, true, stream);
 
-            if (doResize)
+            if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, imageUtils::InterpolationMode::kBICUBIC);
                 blockGridHWPerBatch.push_back(
                     {resizedHeight / mConfig.blockImageSizeH, resizedWidth / mConfig.blockImageSizeW});
-                formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage, totalNumBlocks,
+                    false, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
                 blockGridHWPerBatch.push_back(
                     {image.height / mConfig.blockImageSizeH, image.width / mConfig.blockImageSizeW});
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
         }
@@ -395,9 +396,7 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         throw std::runtime_error(errorMsg);
     }
 
-    int32_t imageTokenId = mConfig.vocabSize;
-
-    int imageIndex = 0;
+    int64_t imageIndex = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -405,18 +404,24 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "Phi4MMViTRunner::textPreprocess() Failed to encode text");
 
-        // Replace image placeholder tokens with sequential image token IDs
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
+        // Replace each image placeholder with copies of the image token id (matches HF)
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Phi4MMViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's image count");
                 // Expand to actual number of image tokens
                 int64_t numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int k = 0; k < numImageTokens; ++k)
                 {
-                    newIds.push_back(imageTokenId);
-                    ++imageTokenId;
+                    newIds.push_back(mConfig.imageTokenId);
                 }
                 ++imageIndex;
             }
@@ -426,19 +431,22 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             }
         }
         batchedInputIds.emplace_back(std::move(newIds));
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Phi4MMViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's image count");
     }
 }
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
     mImagesBlockGridHW.clear();
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, !imageOnly, stream);
+        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, stream);
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
@@ -446,7 +454,18 @@ bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Preprocess failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Preprocess failed: %s", e.what());
+        }
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

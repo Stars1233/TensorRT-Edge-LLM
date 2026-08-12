@@ -258,11 +258,6 @@ struct SsdCuteDslTestConfig
 
 class SsdCuteDslTest : public ::testing::TestWithParam<SsdCuteDslTestConfig>
 {
-protected:
-    void SetUp() override
-    {
-        ASSERT_TRUE(CuteDslSSDRunner::loadKernelModules()) << "Failed to load SSD CuTe DSL kernel modules";
-    }
 };
 
 TEST_P(SsdCuteDslTest, CorrectnessVsSerialReference)
@@ -607,7 +602,6 @@ protected:
         {
             GTEST_SKIP() << "Blackwell tests require SM100+ GPU (got SM" << prop.major << prop.minor << ")";
         }
-        ASSERT_TRUE(CuteDslSSDRunner::loadKernelModules()) << "Failed to load SSD CuTe DSL kernel modules";
     }
 };
 
@@ -829,12 +823,6 @@ int runSsdTmaBoundsCase(GuardedSsdInput guardedInput)
         if (vmmSupported == 0)
         {
             std::cerr << "CUDA VMM is required for the guard-page allocation\n";
-            return 1;
-        }
-
-        if (!CuteDslSSDRunner::loadKernelModules())
-        {
-            std::cerr << "Failed to load SSD CuTe DSL kernel modules\n";
             return 1;
         }
 
@@ -1076,8 +1064,6 @@ TEST(SsdCuteDslBlackwellChunkedPrefill, StateCarriesAcrossCalls)
     {
         GTEST_SKIP() << "Blackwell tests require SM100+ GPU";
     }
-    ASSERT_TRUE(CuteDslSSDRunner::loadKernelModules());
-
     int32_t const batch = 1;
     int32_t const chunkLen = 256;
     int32_t const totalLen = chunkLen * 2; // 512 -- exercises multi-chunk per call

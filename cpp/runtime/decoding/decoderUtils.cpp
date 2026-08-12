@@ -22,6 +22,7 @@
 #include "runtime/config/llmEngineConfig.h"
 #include "sampler/sampling.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -32,7 +33,8 @@ namespace rt
 {
 namespace decoder_utils
 {
-std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& engineDir, DeploymentConfig& deployment)
+std::unique_ptr<EngineExecutor> loadDraftEngine(
+    std::filesystem::path const& engineDir, DeploymentConfig const& deployment)
 {
     std::filesystem::path const draftEnginePath = engineDir / "spec_draft.engine";
     std::unique_ptr<EngineExecutor> draftExecutor;
@@ -88,6 +90,33 @@ void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptL
         // EOS / stop can end the slot mid-accept; write back the appended count so
         // collectSpecLogprobsFromHost skips verify rows past the end of the sequence.
         hostAcceptLengthsData[batchIdx] = appended;
+    }
+}
+
+void clampAcceptLengthsToRemainingGeneration(
+    DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& deviceAcceptLength, cudaStream_t stream)
+{
+    int32_t const activeBatchSize = context.activeBatchSize;
+    check::check(hostAcceptLengths.reshape({activeBatchSize}), "Tensor reshape failed");
+    int32_t* hostAcceptLengthsData = hostAcceptLengths.dataPointer<int32_t>();
+
+    CUDA_CHECK(cudaMemcpyAsync(hostAcceptLengthsData, deviceAcceptLength.rawPointer(),
+        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    bool changed = false;
+    for (int32_t batchIdx = 0; batchIdx < activeBatchSize; ++batchIdx)
+    {
+        int32_t const remaining = std::max(0, context.maxGenerateLength - context.currentGenerateLengths[batchIdx]);
+        int32_t const clamped = std::max(0, std::min(hostAcceptLengthsData[batchIdx], remaining));
+        changed |= clamped != hostAcceptLengthsData[batchIdx];
+        hostAcceptLengthsData[batchIdx] = clamped;
+    }
+
+    if (changed)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(deviceAcceptLength.rawPointer(), hostAcceptLengthsData,
+            activeBatchSize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     }
 }
 

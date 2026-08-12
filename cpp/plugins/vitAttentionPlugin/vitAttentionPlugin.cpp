@@ -21,13 +21,15 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
-#include "kernels/contextAttentionKernels/contextFMHARunner.h"
+#include "kernels/contextAttentionKernels/attentionScaleUtils.h"
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "plugins/utils/pluginUtils.h"
 
-#ifdef CUTE_DSL_FMHA_ENABLED
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
 #include "kernels/contextAttentionKernels/cuteDslFMHARunner.h"
 #endif
+
+#include "kernels/contextAttentionKernels/cuteDslFMHAV2Runner.h"
 
 #include <cassert>
 #include <cstdint>
@@ -60,6 +62,29 @@ constexpr int32_t kOUT_ATTENTION_IDX{0};
 // these definitions shall be consistent.
 constexpr int32_t kNUM_REQUIRED_INPUTS{5};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{1};
+
+struct ViTFMHAKernelSelection
+{
+    ViTFMHABackend backend{ViTFMHABackend::kNONE};
+    bool canImplement{false};
+};
+
+ViTFMHAKernelSelection selectViTFMHAKernels(int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
+{
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
+    if (CuteDslFMHARunner::canImplementViT(headSize, smVersion))
+    {
+        return {ViTFMHABackend::kCUTE_DSL_FMHA_BLACKWELL, true};
+    }
+#endif
+
+    if (CuteDslFMHAV2Runner::canImplementViT(headSize, smVersion, dataType))
+    {
+        return {ViTFMHABackend::kCUTE_DSL_FMHA_V2, true};
+    }
+
+    return {};
+}
 } // namespace
 
 // Static class fields initialization
@@ -78,39 +103,10 @@ ViTAttentionPlugin::ViTAttentionPlugin(
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-    bool canImplementFMHA = false;
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA)
-    {
-        if (!CuteDslFMHARunner::canImplementViT(mHeadSize, mSMVersion))
-        {
-            LOG_DEBUG("CuTe DSL ViT FMHA unsupported on SM%d with head_dim=%d, falling back to FMHA_v2", mSMVersion,
-                mHeadSize);
-            mUseCuteDslFMHA = false;
-        }
-        else if (CuteDslFMHARunner::loadViTKernelModule())
-        {
-            canImplementFMHA = true;
-            LOG_DEBUG("CuTe DSL ViT FMHA kernel loaded for SM%d", mSMVersion);
-        }
-        else
-        {
-            LOG_WARNING("CuTe DSL ViT FMHA kernel failed to load, falling back to FMHA_v2");
-            mUseCuteDslFMHA = false;
-        }
-    }
-    if (!canImplementFMHA)
-#endif
-    {
-        canImplementFMHA = ContextFMHARunner::canImplement(
-            mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::PADDING);
-        if (canImplementFMHA)
-        {
-            ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
-        }
-    }
+    ViTFMHAKernelSelection const fmhaSelection = selectViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
+    mFMHABackend = fmhaSelection.backend;
 
-    if (!canImplementFMHA)
+    if (!fmhaSelection.canImplement)
     {
         LOG_ERROR("Cannot implement ViTAttentionPlugin configuration. SM: %d, HeadSize: %d, NumHeads: %d", mSMVersion,
             mHeadSize, mNumHeads);
@@ -129,25 +125,13 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldColle
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA)
+    ViTFMHAKernelSelection const fmhaSelection = selectViTFMHAKernels(mHeadSize, mSMVersion, mDataType);
+    mFMHABackend = fmhaSelection.backend;
+    if (!fmhaSelection.canImplement)
     {
-        if (!CuteDslFMHARunner::canImplementViT(mHeadSize, mSMVersion))
-        {
-            LOG_DEBUG("CuTe DSL ViT FMHA unsupported on SM%d with head_dim=%d, falling back to FMHA_v2", mSMVersion,
-                mHeadSize);
-            mUseCuteDslFMHA = false;
-        }
-        else if (!CuteDslFMHARunner::loadViTKernelModule())
-        {
-            LOG_WARNING("CuTe DSL ViT FMHA kernel failed to load, falling back to FMHA_v2");
-            mUseCuteDslFMHA = false;
-        }
-    }
-    if (!mUseCuteDslFMHA)
-#endif
-    {
-        ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
+        LOG_ERROR("Cannot implement ViTAttentionPlugin configuration. SM: %d, HeadSize: %d, NumHeads: %d", mSMVersion,
+            mHeadSize, mNumHeads);
+        throw std::runtime_error("Cannot implement the ViTAttentionPlugin configuration.");
     }
 }
 
@@ -374,43 +358,50 @@ int32_t ViTAttentionPlugin::enqueue(PluginTensorDesc const* inputDesc,
     rt::Tensor cuSeqLensTensor(const_cast<void*>(inputs[kIN_CU_SEQLENS_IDX]), rt::Coords{cuSeqLensInputDesc.dims},
         rt::DeviceType::kGPU, cuSeqLensInputDesc.type);
 
-    PluginTensorDesc const& maxSeqLenCarrierDesc = inputDesc[kIN_MAX_SEQLEN_CARRIER_IDX];
-    int32_t runtimeMaxSeqLen = static_cast<int32_t>(maxSeqLenCarrierDesc.dims.d[0]);
-
     PluginTensorDesc const& attentionOutputDesc = outputDesc[kOUT_ATTENTION_IDX];
     rt::Tensor attentionOutputTensor(outputs[kOUT_ATTENTION_IDX], rt::Coords{attentionOutputDesc.dims},
         rt::DeviceType::kGPU, attentionOutputDesc.type);
 
+    PluginTensorDesc const& maxSeqLenCarrierDesc = inputDesc[kIN_MAX_SEQLEN_CARRIER_IDX];
+    int32_t runtimeMaxSeqLen = static_cast<int32_t>(maxSeqLenCarrierDesc.dims.d[0]);
     int32_t runtimeBatchSize = static_cast<int32_t>(cuSeqLensInputDesc.dims.d[0]) - 1;
 
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA)
+#ifdef CUTE_DSL_FMHA_BLACKWELL_ENABLED
+    if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_BLACKWELL)
     {
         int32_t totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
         CuteDslFMHARunner runner(mNumHeads, mNumHeads, mHeadSize);
-        runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(), vInputTensor.dataPointer<half>(),
-            attentionOutputTensor.dataPointer<half>(), cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen,
-            runtimeMaxSeqLen, runtimeBatchSize, stream, mAttentionScale);
+        if (!runner.preflightViT(stream))
+        {
+            return -1;
+        }
+        return runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
+                   vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                   cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, runtimeMaxSeqLen, runtimeBatchSize, stream,
+                   mAttentionScale)
+            ? 0
+            : -1;
     }
-    else
 #endif
+    if (mFMHABackend == ViTFMHABackend::kCUTE_DSL_FMHA_V2)
     {
-        auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeMaxSeqLen, mNumHeads, mNumHeads,
-            mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::PADDING, false);
-
-        FusedMultiheadAttentionParamsV2 params{};
-        fmhaRunner.setupParams(params, mAttentionScale);
-        params.q_ptr = qInputTensor.dataPointer<half>();
-        params.k_ptr = kInputTensor.dataPointer<half>();
-        params.v_ptr = vInputTensor.dataPointer<half>();
-        params.cu_q_seqlens = cuSeqLensTensor.dataPointer<int32_t>();
-        params.cu_kv_seqlens = cuSeqLensTensor.dataPointer<int32_t>();
-        params.o_ptr = attentionOutputTensor.dataPointer<half>();
-
-        fmhaRunner.dispatchFMHAKernel(params, stream);
+        int32_t const totalSeqLen = static_cast<int32_t>(qInputDesc.dims.d[0]);
+        CuteDslFMHAV2Runner runner(mNumHeads, mNumHeads, mHeadSize);
+        if (!runner.preflightViT(stream))
+        {
+            return -1;
+        }
+        if (!runner.run(qInputTensor.dataPointer<half>(), kInputTensor.dataPointer<half>(),
+                vInputTensor.dataPointer<half>(), attentionOutputTensor.dataPointer<half>(),
+                cuSeqLensTensor.dataPointer<int32_t>(), totalSeqLen, runtimeMaxSeqLen, runtimeBatchSize, stream,
+                mAttentionScale))
+        {
+            return -1;
+        }
+        return 0;
     }
-
-    return 0;
+    LOG_ERROR("No ViT FMHA backend is available for plugin '%s'.", mLayerName.c_str());
+    return -1;
 }
 
 int32_t ViTAttentionPlugin::onShapeChange([[maybe_unused]] PluginTensorDesc const* in,

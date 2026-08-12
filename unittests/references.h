@@ -67,17 +67,12 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
 
 // Embedding lookup reference functions
 std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::vector<half> const& embeddingTable,
-    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
-    std::optional<std::vector<half>> const& imageEmbeds = std::nullopt, int64_t imageTokenLen = 0);
+    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize);
 
 std::vector<half> embeddingLookupMultimodalRef(std::vector<int32_t> const& inputIds,
     std::vector<half> const& embeddingTable, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
     std::vector<int32_t> const& multimodalIndices, int32_t imageTokenId, std::vector<half> const& imageEmbeds,
     int64_t imageTokenLen, int32_t audioTokenId, std::vector<half> const& audioEmbeds, int64_t audioTokenLen);
-
-std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
-    std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
-    int64_t hiddenSize, int64_t numImageTokens);
 
 // Eagle reference functions
 void assembleDraftTreeDescReference(std::vector<int8_t> const& draftTreeMask,

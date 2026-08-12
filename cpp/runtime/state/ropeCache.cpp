@@ -90,6 +90,25 @@ bool RopeCache::configsMatch(RopeConfig const& a, int32_t rotaryDimA, int32_t ma
             }
         }
     }
+    if (a.type == RopeType::kYarn)
+    {
+        bool const aHasYarn = a.yarn.has_value();
+        bool const bHasYarn = b.yarn.has_value();
+        if (aHasYarn != bHasYarn)
+        {
+            return false;
+        }
+        if (aHasYarn)
+        {
+            auto const& ya = *a.yarn;
+            auto const& yb = *b.yarn;
+            if (ya.originalMaxPositionEmbeddings != yb.originalMaxPositionEmbeddings || ya.factor != yb.factor
+                || ya.betaFast != yb.betaFast || ya.betaSlow != yb.betaSlow || ya.mscale != yb.mscale)
+            {
+                return false;
+            }
+        }
+    }
     return true;
 }
 

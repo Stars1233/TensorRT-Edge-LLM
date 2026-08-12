@@ -28,6 +28,11 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+//! TRT-RTX reports NV_TENSORRT_MAJOR == 1; gate TRT-RTX-specific code paths on this. Usable in
+//! both `#if` preprocessor conditionals and normal expressions.
+#define IS_TRT_RTX (NV_TENSORRT_MAJOR == 1)
+
 namespace trt_edgellm
 {
 
@@ -196,10 +201,10 @@ constexpr char const* getDataTypeString(nvinfer1::DataType const dataType) noexc
     case nvinfer1::DataType::kINT8: return "INT8";
     case nvinfer1::DataType::kUINT8: return "UINT8";
     case nvinfer1::DataType::kBOOL: return "BOOL";
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 12)
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 12)
     case nvinfer1::DataType::kE8M0: return "FLOAT8_E8M0";
 #endif
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
     case nvinfer1::DataType::kFP4: return "FLOAT4";
 #endif
     case nvinfer1::DataType::kINT4: return "INT4";

@@ -26,15 +26,21 @@ find_path(
   TensorRT_INCLUDE_DIR NvInfer.h
   HINTS ${_trt_hints}
   PATH_SUFFIXES ${_trt_inc_suffixes})
+# Find either one of tensorrt_rtx or nvinfer from the provided path, so only one
+# lib should be presented in the lib folder.
 find_library(
-  TensorRT_LIBRARY nvinfer
+  TensorRT_LIBRARY
+  NAMES tensorrt_rtx nvinfer
   HINTS ${_trt_hints}
   PATH_SUFFIXES ${_trt_lib_suffixes})
 
 find_path(TensorRT_OnnxParser_INCLUDE_DIR NvOnnxParser.h
           HINTS ${TensorRT_INCLUDE_DIR})
+# TRT-RTX ships the parser as tensorrt_onnxparser_rtx; Enterprise as
+# nvonnxparser.
 find_library(
-  TensorRT_OnnxParser_LIBRARY nvonnxparser
+  TensorRT_OnnxParser_LIBRARY
+  NAMES nvonnxparser tensorrt_onnxparser_rtx
   HINTS ${_trt_hints}
   PATH_SUFFIXES ${_trt_lib_suffixes})
 
@@ -59,6 +65,19 @@ mark_as_advanced(TensorRT_INCLUDE_DIR TensorRT_LIBRARY
                  TensorRT_OnnxParser_INCLUDE_DIR TensorRT_OnnxParser_LIBRARY)
 
 if(TensorRT_FOUND)
+  # Make the resolved runtime unmistakable in the configure log.
+  get_filename_component(_trt_lib_name "${TensorRT_LIBRARY}" NAME)
+  if(_trt_lib_name MATCHES "tensorrt_rtx")
+    message(
+      STATUS
+        "TensorRT: linking TRT-RTX (${_trt_lib_name}) -> ${TensorRT_LIBRARY}")
+  else()
+    message(
+      STATUS
+        "TensorRT: linking TensorRT (${_trt_lib_name}) -> ${TensorRT_LIBRARY}")
+  endif()
+  unset(_trt_lib_name)
+
   if(NOT TARGET TensorRT::TensorRT)
     add_library(TensorRT::TensorRT UNKNOWN IMPORTED)
     set_target_properties(

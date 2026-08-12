@@ -437,26 +437,37 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 
 //! \brief Non-streaming fused assistant preamble construction kernel
 //!
-//! Each block handles one output row (blockIdx.x). Total rows = 8 + textLen + 2.
+//! Each block handles one output row (blockIdx.x). Total rows = P + textLen + 2, where
+//! P = 8 (no language) or 9 (languageId >= 0: CustomVoice language conditioning).
 //!
-//! Row definitions:
-//!   0-2:        copy projected[0-2]
-//!   3:          ttsPad + embTable[codecNothinkId]
-//!   4:          ttsPad + embTable[codecThinkBosId]
-//!   5:          ttsPad + embTable[codecThinkEosId]
-//!   6:          ttsPad + embTable[speakerId]
-//!   7:          ttsBos + embTable[codecPadId]
-//!   8..8+N-2:   projected[3+i] + embTable[codecPadId]  (i = rowIdx-8)
-//!   8+N-1:      projected[3+N-1] + embTable[codecBosId]  (last text row = start-of-generation)
-//!   8+N:        ttsEos + embTable[codecPadId]
-//!   8+N+1:      ttsPad + embTable[codecBosId]
+//! Canonical slot layout (slot == rowIdx when language is present; without language,
+//! rows >= 5 map to slot rowIdx+1, skipping the language slot):
+//!   slot 0-2:   copy projected[0-2]
+//!   slot 3:     ttsPad + embTable[codecThinkId]   (with language) / embTable[codecNothinkId] (without)
+//!   slot 4:     ttsPad + embTable[codecThinkBosId]
+//!   slot 5:     ttsPad + embTable[languageId]     (only present with language)
+//!   slot 6:     ttsPad + embTable[codecThinkEosId]
+//!   slot 7:     ttsPad + embTable[speakerId]
+//!   slot 8:     ttsBos + embTable[codecPadId]
+//! Text/suffix rows:
+//!   P..P+N-2:   projected[3+i] + embTable[codecPadId]  (i = rowIdx-P)
+//!   P+N-1:      projected[3+N-1] + embTable[codecBosId]  (last text row = start-of-generation)
+//!   P+N:        ttsEos + embTable[codecPadId]
+//!   P+N+1:      ttsPad + embTable[codecBosId]
+//!
+//! Matches PyTorch reference modeling_qwen3_tts.py codec_prefill_list:
+//!   language present -> [codec_think, think_bos, language_id, think_eos]
+//!   language absent  -> [codec_nothink, think_bos, think_eos]
 template <int32_t VEC_SIZE = 8>
 __global__ void assistantPreambleKernel(half const* __restrict__ projected, half const* __restrict__ ttsPadEmbed,
     half const* __restrict__ ttsBosEmbed, half const* __restrict__ ttsEosEmbed, half const* __restrict__ embTable,
     int32_t codecNothinkId, int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId,
-    int32_t codecBosId, int32_t textLen, int32_t hiddenDim, half* __restrict__ output)
+    int32_t codecBosId, int32_t codecThinkId, int32_t languageId, int32_t textLen, int32_t hiddenDim,
+    half* __restrict__ output)
 {
-    constexpr int32_t kFixedPrefixLen = 8; // rows 0-7
+    constexpr int32_t kFixedPrefixLen = 8; // canonical prefix rows without language
+    bool const hasLanguage = (languageId >= 0);
+    int32_t const prefixLen = kFixedPrefixLen + (hasLanguage ? 1 : 0);
     int32_t const rowIdx = blockIdx.x;
     int32_t const numVecs = hiddenDim / VEC_SIZE;
 
@@ -466,47 +477,53 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
     half const* srcB = nullptr;
     half* const dstRow = output + static_cast<int64_t>(rowIdx) * hiddenDim;
 
-    if (rowIdx < kFixedPrefixLen)
+    if (rowIdx < prefixLen)
     {
-        switch (rowIdx)
+        // Map row to canonical slot; without language, rows >= 5 skip the language slot.
+        int32_t const slot = (!hasLanguage && rowIdx >= 5) ? rowIdx + 1 : rowIdx;
+        switch (slot)
         {
         case 0: srcA = projected; break;
         case 1: srcA = projected + hiddenDim; break;
         case 2: srcA = projected + 2 * hiddenDim; break;
         case 3:
             srcA = ttsPadEmbed;
-            srcB = embTable + static_cast<int64_t>(codecNothinkId) * hiddenDim;
+            srcB = embTable + static_cast<int64_t>(hasLanguage ? codecThinkId : codecNothinkId) * hiddenDim;
             break;
         case 4:
             srcA = ttsPadEmbed;
             srcB = embTable + static_cast<int64_t>(codecThinkBosId) * hiddenDim;
             break;
-        case 5:
+        case 5: // language row — only reachable when hasLanguage
             srcA = ttsPadEmbed;
-            srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
+            srcB = embTable + static_cast<int64_t>(languageId) * hiddenDim;
             break;
         case 6:
             srcA = ttsPadEmbed;
+            srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
+            break;
+        case 7:
+            srcA = ttsPadEmbed;
             srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
             break;
-        default: // rowIdx == 7
+        default: // slot 8
             srcA = ttsBosEmbed;
             srcB = embTable + static_cast<int64_t>(codecPadId) * hiddenDim;
             break;
         }
     }
-    else if (rowIdx < kFixedPrefixLen + textLen)
+    else if (rowIdx < prefixLen + textLen)
     {
-        // Text token rows: projected[3 + (rowIdx-8)] + embTable[codec]
+        // Text token rows: projected[3 + (rowIdx-prefixLen)] + embTable[codec]
         // Last text row uses codecBosId (start-of-generation marker);
         // all preceding text rows use codecPadId. Matches PyTorch reference:
-        //   assistant_codec_hidden = [zeros(3), no-think, thinkBos, thinkEos, speaker, codecPad, codecBos]
-        int32_t const textIdx = rowIdx - kFixedPrefixLen;
+        //   assistant_codec_hidden = [zeros(3), think-block, speaker, codecPad, codecBos]
+        int32_t const textIdx = rowIdx - prefixLen;
         srcA = projected + static_cast<int64_t>(3 + textIdx) * hiddenDim;
-        int32_t const codecId = (rowIdx == kFixedPrefixLen + textLen - 1) ? codecBosId : codecPadId;
+        int32_t const codecId = (rowIdx == prefixLen + textLen - 1) ? codecBosId : codecPadId;
         srcB = embTable + static_cast<int64_t>(codecId) * hiddenDim;
     }
-    else if (rowIdx == kFixedPrefixLen + textLen)
+    else if (rowIdx == prefixLen + textLen)
     {
         // ttsEos + embTable[codecPadId]
         srcA = ttsEosEmbed;
@@ -540,15 +557,16 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
 
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
-    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
-    rt::Tensor& output, cudaStream_t stream)
+    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t codecThinkId,
+    int32_t languageId, int32_t textLen, rt::Tensor& output, cudaStream_t stream)
 {
     constexpr int32_t kVecSize = 8;
 
     int32_t const hiddenDim = static_cast<int32_t>(projected.getShape()[1]);
     int32_t const numVecs = hiddenDim / kVecSize;
-    // totalRows = 8 fixed prefix + textLen text rows + 2 suffix rows
-    int32_t const totalRows = 8 + textLen + 2;
+    // totalRows = prefix (8, or 9 with language row) + textLen text rows + 2 suffix rows
+    int32_t const prefixLen = 8 + ((languageId >= 0) ? 1 : 0);
+    int32_t const totalRows = prefixLen + textLen + 2;
 
     // 128 threads covers H=1024 with VEC_SIZE=8 in one pass
     dim3 const block(std::min(numVecs, 128));
@@ -562,8 +580,103 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
     half* outPtr = static_cast<half*>(output.rawPointer());
 
     assistantPreambleKernel<kVecSize><<<grid, block, 0, stream>>>(projPtr, padPtr, bosPtr, eosPtr, embPtr,
-        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, textLen, hiddenDim,
-        outPtr);
+        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, codecThinkId, languageId,
+        textLen, hiddenDim, outPtr);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+//! Descriptor-driven prefill row assembly. Per-row math is identical to
+//! assistantPreambleKernel (same uint4 loads + half2 adds), so identical row descriptions
+//! produce bit-identical output.
+template <int32_t VEC_SIZE = 8>
+__global__ void prefillRowAssembleKernel(
+    kernel::PrefillRowDesc const* __restrict__ descs, int32_t hiddenDim, half* __restrict__ output)
+{
+    int32_t const rowIdx = blockIdx.x;
+    int32_t const numVecs = hiddenDim / VEC_SIZE;
+
+    using vec_t = uint4;
+
+    kernel::PrefillRowDesc const desc = descs[rowIdx];
+    half* const dstRow = output + static_cast<int64_t>(rowIdx) * hiddenDim;
+
+    for (int32_t i = threadIdx.x; i < numVecs; i += blockDim.x)
+    {
+        vec_t va = reinterpret_cast<vec_t const*>(desc.srcA)[i];
+        if (desc.srcB != nullptr)
+        {
+            vec_t vb = reinterpret_cast<vec_t const*>(desc.srcB)[i];
+            half2* aPtr = reinterpret_cast<half2*>(&va);
+            half2 const* bPtr = reinterpret_cast<half2 const*>(&vb);
+#pragma unroll
+            for (int32_t j = 0; j < VEC_SIZE / 2; ++j)
+            {
+                aPtr[j] = __hadd2(aPtr[j], bPtr[j]);
+            }
+        }
+        reinterpret_cast<vec_t*>(dstRow)[i] = va;
+    }
+}
+
+void invokePrefillRowAssemble(
+    PrefillRowDesc const* deviceDescs, int32_t numRows, int32_t hiddenDim, rt::Tensor& output, cudaStream_t stream)
+{
+    constexpr int32_t kVecSize = 8;
+    int32_t const numVecs = hiddenDim / kVecSize;
+
+    dim3 const block(std::min(numVecs, 128));
+    dim3 const grid(numRows);
+
+    prefillRowAssembleKernel<kVecSize>
+        <<<grid, block, 0, stream>>>(deviceDescs, hiddenDim, static_cast<half*>(output.rawPointer()));
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+//! One block per reference frame; each thread accumulates its hidden elements over all
+//! code groups in FP32 before the final half round.
+__global__ void sumCodecEmbeddingsKernel(int64_t const* __restrict__ refCodes,
+    half const* const* __restrict__ tablePtrs, int32_t numGroups, int32_t hiddenDim, half* __restrict__ output)
+{
+    int32_t const frame = blockIdx.x;
+    int64_t const* frameCodes = refCodes + static_cast<int64_t>(frame) * numGroups;
+    half* dstRow = output + static_cast<int64_t>(frame) * hiddenDim;
+
+    for (int32_t d = threadIdx.x; d < hiddenDim; d += blockDim.x)
+    {
+        float acc = 0.0f;
+        for (int32_t g = 0; g < numGroups; ++g)
+        {
+            half const* table = tablePtrs[g];
+            acc += __half2float(table[frameCodes[g] * hiddenDim + d]);
+        }
+        dstRow[d] = __float2half(acc);
+    }
+}
+
+void invokeSumCodecEmbeddings(int64_t const* refCodes, half const* const* tablePtrs, int32_t numFrames,
+    int32_t numGroups, int32_t hiddenDim, rt::Tensor& output, cudaStream_t stream)
+{
+    dim3 const block(std::min(hiddenDim, 256));
+    dim3 const grid(numFrames);
+    sumCodecEmbeddingsKernel<<<grid, block, 0, stream>>>(
+        refCodes, tablePtrs, numGroups, hiddenDim, static_cast<half*>(output.rawPointer()));
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+__global__ void castFp32ToFp16Kernel(float const* __restrict__ input, half* __restrict__ output, int64_t numElements)
+{
+    int64_t const idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < numElements)
+    {
+        output[idx] = __float2half(input[idx]);
+    }
+}
+
+void invokeCastFp32ToFp16(float const* input, half* output, int64_t numElements, cudaStream_t stream)
+{
+    constexpr int32_t kBlock = 256;
+    int32_t const grid = static_cast<int32_t>((numElements + kBlock - 1) / kBlock);
+    castFp32ToFp16Kernel<<<grid, kBlock, 0, stream>>>(input, output, numElements);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
@@ -704,6 +817,53 @@ void invokeTalkerLogitAdjust(rt::Tensor const& seenTokens, rt::Tensor& logits, i
 
     talkerLogitAdjustKernel<<<gridSize, kBlockSize, 0, stream>>>(logitsPtr, suppressStart, suppressCount, codecEosId,
         seenTokens.dataPointer<int32_t>(), numSeenTokens, repetitionPenalty);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+//! \brief Per-position sum across codec groups (Qwen3.5-Omni speaker codec embedding fold).
+//!
+//! Mirrors HF ``_get_codec_input_embeddings``: concatenate per-group embeddings then sum across
+//! the group axis. Implemented here as a single-row reduction so the caller only invokes one
+//! kernel per row of the speaker codec template.
+namespace
+{
+__global__ void speakerCodecSumKernel(int64_t const* __restrict__ codes, __half const* const* __restrict__ embTables,
+    int32_t const* __restrict__ embVocabSizes, int32_t numCodeGroups, int32_t hiddenSize, __half* __restrict__ output)
+{
+    int32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= hiddenSize)
+    {
+        return;
+    }
+    float acc = 0.0f;
+    for (int32_t g = 0; g < numCodeGroups; ++g)
+    {
+        int64_t const code = codes[g];
+        if (code < 0 || code >= embVocabSizes[g])
+        {
+            continue; // HF: -1 entries are no-ops; OOB defensively skipped
+        }
+        acc += __half2float(embTables[g][code * hiddenSize + tid]);
+    }
+    output[tid] = __float2half(acc);
+}
+} // namespace
+
+void invokeSpeakerCodecSum(rt::Tensor const& codes, rt::Tensor const& embPtrTable, rt::Tensor const& embVocabSizes,
+    rt::Tensor& output, cudaStream_t stream)
+{
+    check::check(codes.getDataType() == nvinfer1::DataType::kINT64, "codes must be INT64");
+    check::check(embVocabSizes.getDataType() == nvinfer1::DataType::kINT32, "embVocabSizes must be INT32");
+    check::check(output.getDataType() == nvinfer1::DataType::kHALF, "output must be FP16");
+
+    int32_t const numCodeGroups = static_cast<int32_t>(codes.getShape()[0]);
+    int32_t const hiddenSize = static_cast<int32_t>(output.getShape().volume());
+
+    constexpr int32_t kBlockSize = 256;
+    int32_t const blocks = (hiddenSize + kBlockSize - 1) / kBlockSize;
+    speakerCodecSumKernel<<<blocks, kBlockSize, 0, stream>>>(codes.dataPointer<int64_t>(),
+        static_cast<__half const* const*>(embPtrTable.rawPointer()), embVocabSizes.dataPointer<int32_t>(),
+        numCodeGroups, hiddenSize, static_cast<__half*>(output.rawPointer()));
     CUDA_CHECK(cudaPeekAtLastError());
 }
 

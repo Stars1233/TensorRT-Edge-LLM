@@ -41,11 +41,11 @@ MmapReader::MmapReader() noexcept
 {
 }
 
-MmapReader::MmapReader(std::filesystem::path const& fp)
+MmapReader::MmapReader(std::filesystem::path const& fp, Mode mode)
     : mData(nullptr)
     , mBytes(0)
 {
-    bool const fileLoaded = loadFile(fp);
+    bool const fileLoaded = loadFile(fp, mode);
     ELLM_CHECK(fileLoaded, "Failed to load file in MmapReader constructor");
 }
 
@@ -64,14 +64,14 @@ void MmapReader::release() noexcept
     }
 }
 
-bool MmapReader::loadFile(std::filesystem::path const& fp)
+bool MmapReader::loadFile(std::filesystem::path const& fp, Mode mode)
 {
     // Release any existing memory
     release();
 
     std::string const filePath = fp.string();
     int fd = open(filePath.c_str(), O_RDONLY);
-    if (fd <= 0)
+    if (fd < 0)
     {
         std::string errorMsg = format::fmtstr("MmapReader: Cannot open file: %s", filePath.c_str());
         std::cerr << errorMsg << std::endl;
@@ -94,7 +94,9 @@ bool MmapReader::loadFile(std::filesystem::path const& fp)
         std::cerr << errorMsg << std::endl;
         return false;
     }
-    mData = mmap(nullptr, mBytes, PROT_READ, MAP_SHARED, fd, 0);
+    int const protection = mode == Mode::kCopyOnWrite ? PROT_READ | PROT_WRITE : PROT_READ;
+    int const flags = mode == Mode::kCopyOnWrite ? MAP_PRIVATE : MAP_SHARED;
+    mData = mmap(nullptr, mBytes, protection, flags, fd, 0);
     if (mData == MAP_FAILED)
     {
         mData = nullptr;

@@ -18,11 +18,14 @@
 #include "runtime/decoding/decoderRegistry.h"
 
 #include "common/logger.h"
+#include "runtime/decoding/blockDiffusionDecoder.h"
 #include "runtime/decoding/dflashDecoder.h"
+#include "runtime/decoding/dsparkDecoder.h"
 #include "runtime/decoding/eagleDecoder.h"
 #include "runtime/decoding/gemma4MTPDecoder.h"
 #include "runtime/decoding/mtpDecoder.h"
 #include "runtime/decoding/vanillaDecoder.h"
+#include "sampler/sampling.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -31,28 +34,52 @@ namespace trt_edgellm
 {
 namespace rt
 {
-DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryConfig const& config)
-    : mDefaultDecoder(std::make_unique<VanillaDecoder>(runtime))
+
+bool shouldSelectDefaultDecoder(
+    DecodingStrategyKind speculativeDecoderKind, LLMGenerationRequest const& request) noexcept
 {
-    if (config.draftingConfig.has_value())
+    // EAGLE verification currently assumes greedy sampling; vanilla preserves non-greedy request semantics.
+    bool const nonGreedyEagleFallback = speculativeDecoderKind == DecodingStrategyKind::kEAGLE
+        && shouldUseNonGreedySampling(request.temperature, request.topK, request.topP);
+    return request.disableSpecDecode || nonGreedyEagleFallback;
+}
+
+DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryInit init)
+    : mDefaultDecoder([&runtime, &init]() -> std::unique_ptr<DecodingStrategy> {
+        if (runtime.deployment.base.isDiffusionBackbone)
+        {
+            return std::make_unique<BlockDiffusionDecoder>(runtime, init.engineDir, init.stream);
+        }
+        return std::make_unique<VanillaDecoder>(runtime);
+    }())
+{
+    if (runtime.deployment.base.isDiffusionBackbone)
+    {
+        LOG_INFO("Selected block_diffusion decoding strategy.");
+    }
+    if (init.draftingConfig.has_value())
     {
         switch (runtime.deployment.specDecodeMode())
         {
         case SpecDecodeMode::kMTP:
-            mSpeculativeDecoder
-                = std::make_unique<MTPDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<MTPDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kEAGLE:
-            mSpeculativeDecoder
-                = std::make_unique<EagleDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<EagleDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kDFlash:
-            mSpeculativeDecoder
-                = std::make_unique<DFlashDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<DFlashDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kGemma4MTP:
-            mSpeculativeDecoder
-                = std::make_unique<Gemma4MTPDecoder>(runtime, config.engineDir, *config.draftingConfig, config.stream);
+            mSpeculativeDecoder = std::make_unique<Gemma4MTPDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
+            break;
+        case SpecDecodeMode::kDSpark:
+            mSpeculativeDecoder = std::make_unique<DSparkDecoder>(
+                runtime, init.engineDir, *init.draftingConfig, std::move(init.draftExecutor), init.stream);
             break;
         case SpecDecodeMode::kNONE:
             throw std::runtime_error("SpecDecode drafting config was set but no mode is active.");
@@ -63,7 +90,7 @@ DecoderRegistry::DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistr
 
 DecodingStrategy& DecoderRegistry::select(LLMGenerationRequest const& request) const noexcept
 {
-    if (!mSpeculativeDecoder || request.disableSpecDecode)
+    if (!mSpeculativeDecoder || shouldSelectDefaultDecoder(mSpeculativeDecoder->kind(), request))
     {
         return *mDefaultDecoder;
     }

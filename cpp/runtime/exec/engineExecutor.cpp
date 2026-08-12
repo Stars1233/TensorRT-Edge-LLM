@@ -98,6 +98,13 @@ EngineExecutor::EngineExecutor(std::filesystem::path const& enginePath, TensorRe
     registerOptionalTreeMetadata(binding_names::kTreeParentIds);
     registerOptionalTreeMetadata(binding_names::kTreeDepths);
 
+    if (engineHasInputTensor(*mEngine, binding_names::kSkipSoftmaxScale)
+        && !mRegistry.contains(binding_names::kSkipSoftmaxScale))
+    {
+        mRegistry.addTensor({binding_names::kSkipSoftmaxScale, TensorIO::kInput, nvinfer1::DataType::kINT8,
+            {sym(&InferenceDims::skipSoftmaxScaleLen)}});
+    }
+
     LOG_INFO("engine loaded successfully (%d I/O tensors)", mEngine->getNbIOTensors());
 }
 
@@ -127,6 +134,11 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
     case SpecDecodeMode::kGemma4MTP:
     {
         auto registry = buildRegistryForGemma4MTPDraft(bundle);
+        return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+    }
+    case SpecDecodeMode::kDSpark:
+    {
+        auto registry = buildRegistryForDSparkDraft(bundle);
         return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
     }
     case SpecDecodeMode::kNONE:
@@ -163,11 +175,12 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
         return false;
     }
 
-    if (!mContext->setOptimizationProfileAsync(profileIndex, stream))
+    if (mCurrentProfileIndex != profileIndex && !mContext->setOptimizationProfileAsync(profileIndex, stream))
     {
         LOG_ERROR("failed to set optimization profile %d", profileIndex);
         return false;
     }
+    mCurrentProfileIndex = profileIndex;
 
     if (!mRegistry.bindAll(mContext.get(), map, dims))
     {

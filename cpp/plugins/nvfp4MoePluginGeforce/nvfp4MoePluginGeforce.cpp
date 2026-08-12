@@ -755,11 +755,6 @@ int32_t NvFP4MoEPluginGeforce::enqueue(PluginTensorDesc const* inputDesc, Plugin
 #else
     try
     {
-        if (!CuteDslNvfp4MoeRunner::loadKernelModules())
-        {
-            LOG_ERROR("NvFP4MoEPluginGeforce: failed to load CuTe DSL AOT kernel modules");
-            return -1;
-        }
         if (mIdentityExpertTable == nullptr)
         {
             LOG_ERROR(
@@ -811,6 +806,16 @@ int32_t NvFP4MoEPluginGeforce::enqueue(PluginTensorDesc const* inputDesc, Plugin
         }
         int32_t const maxRoutedRows
             = mMaxRoutedRows > 0 ? mMaxRoutedRows : computeProfileMaxRoutedRows(numTokens64, mTopK);
+        CuteDslNvfp4MoeParams moduleParams{};
+        moduleParams.numTokens = numTokens;
+        moduleParams.topK = mTopK;
+        moduleParams.activation = toRunnerActivation(mActivationType);
+        moduleParams.backend = toRunnerBackend(mBackend);
+        if (!CuteDslNvfp4MoeRunner::ensureKernelModules(moduleParams, stream))
+        {
+            LOG_ERROR("NvFP4MoEPluginGeforce: failed to load the selected CuTe DSL AOT module");
+            return -1;
+        }
 
         // ==== Workspace carving (order must match getWorkspaceSize) ====
         size_t const softmaxWs = trt_edgellm::kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, mNumExperts);
@@ -961,18 +966,8 @@ IPluginV3* NvFP4MoEPluginGeforce::attachToContext(IPluginResourceContext* contex
         return nullptr;
     }
 #ifdef CUTE_DSL_NVFP4_FUSED_MOE_ENABLED
-    // attachToContext() is the canonical IPluginV3OneRuntime hook for one-time
-    // per-execution-context setup: it runs once per clone after deserialization
-    // and before the first enqueue. Loading the AOT modules and allocating
-    // per-plugin scratch here keeps cudaMalloc / H2D init out of the timed
-    // enqueue path. enqueue() retains a cheap idempotent loadKernelModules()
-    // guard for non-TRT callers but does NOT re-allocate the identity table.
-    if (!CuteDslNvfp4MoeRunner::loadKernelModules())
-    {
-        LOG_ERROR("NvFP4MoEPluginGeforce: attachToContext failed to load CuTe DSL AOT kernel modules");
-        delete plugin;
-        return nullptr;
-    }
+    // attachToContext() owns only per-context identity-table setup. The selected
+    // AOT module is loaded on the first enqueue, after runtime dispatch is known.
     if (context == nullptr)
     {
         LOG_ERROR("NvFP4MoEPluginGeforce::attachToContext: TRT did not provide a resource context");

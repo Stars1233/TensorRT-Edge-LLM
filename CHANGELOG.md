@@ -1,5 +1,24 @@
 # Release Notes
 
+## 0.10.0
+- Added NVIDIA Nemotron-3.5 Lightning support with MTP and DFlash speculative decoding
+- Added an experimental ONNX-less workflow to build TensorRT engines directly from supported checkpoints
+- Added Cosmos3-Edge multimodal reasoning and experimental policy/action-generation support
+- Added DiffusionGemma block-diffusion inference support
+- Added Nemotron-3.5-ASR support
+- Added DSpark speculative decoding with DDTree drafting
+- Added paged KV-cache reuse for multi-turn LLM requests and media-aware KV reuse for VLM requests
+- Added video input support to the experimental server
+- Expanded Qwen3-TTS with language and instruction conditioning, VoiceDesign, and on-device voice cloning
+- Replaced the legacy embedded-cubin FMHA-v2 backend with CuTe DSL FMHA-v2 and removed the checked-in FMHA-v2 cubin artifacts
+- Added paired-checkpoint MTP support for Gemma 4 12B
+- Added Gemma 4 26B-A4B INT4 AWQ MoE quantization and export support
+- Added Qwen3-Omni 30B-A3B INT4 AWQ quantization and export support
+- Added Qwen3-Omni streaming audio output, `/v1/audio/speech` for Qwen3-TTS, and `/v1/audio/transcriptions` for Qwen3-ASR
+- Added Claude Code and OpenClaw integration to the experimental server
+- Fixed DFlash verification
+- Fixed MTP/GDN accepted-state replay
+
 ## 0.9.1
 - Added Gemma 4 12B, 26B-A4B, and 31B full support with MTP
 - Expanded DFlash with DDTree for Qwen3 and Qwen3.5 hybrid models, plus 128K/64K/32K draft vocabulary reduction

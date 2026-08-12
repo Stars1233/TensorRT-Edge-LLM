@@ -34,7 +34,8 @@ class EagleDecoder final : public DecodingStrategy
 {
 public:
     EagleDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream);
+        SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+        cudaStream_t stream);
 
     DecodingStrategyKind kind() const noexcept override
     {
@@ -53,6 +54,8 @@ public:
 
     bool decodeStep(DecodingInferenceContext& context) override;
     bool captureCudaGraphs(cudaStream_t stream) override;
+    bool initializeForGeneration(DecodingInferenceContext& context) override;
+    std::vector<int32_t> const& commonMaterializedStateLengths() const noexcept override;
 
     int64_t getRequiredContextMemorySize() const noexcept override;
     void setContextMemory(Tensor& memory) override;
@@ -65,7 +68,7 @@ public:
 
     void resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream) override;
     void onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch, int32_t newActiveBatch,
-        Tensor& deviceBatchMapping, cudaStream_t stream) override;
+        Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode) override;
 
 private:
     bool runDraftModelPrefill(DecodingInferenceContext& context);
@@ -97,6 +100,12 @@ private:
     Tensor mAcceptLength;
     Tensor mHostAcceptLengths;
     Tensor mHostAcceptedTokenIds;
+    //! Per-slot greatest logical prefix whose continuation state is materialized by both base and draft models.
+    std::vector<int32_t> mCommonMaterializedStateLengths;
+    //! Per-slot accepted lengths from the previous verification, pending draft-state materialization.
+    std::vector<int32_t> mPendingDraftAcceptLengths;
+    //! Draft-prefill logits and hidden state are waiting for first-proposal construction.
+    bool mDraftPrefillOutputsPending{};
 
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 };

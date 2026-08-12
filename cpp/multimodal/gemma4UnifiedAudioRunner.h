@@ -47,7 +47,7 @@ public:
 
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream,
-        bool imageOnly = false) noexcept override;
+        bool imageOnly = false) override;
     bool infer(cudaStream_t stream) noexcept override;
     bool validateAndFillConfig(std::string const& engineDir) override;
     bool allocateBuffer(cudaStream_t stream) override;

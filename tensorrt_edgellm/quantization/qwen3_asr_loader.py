@@ -42,8 +42,10 @@ from typing import Dict, Iterator
 
 import numpy as np
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from transformers import AutoTokenizer
+
+from tensorrt_edgellm._safetensors_io import save_file
 
 from .datasets import AudioDataset, dataset_name
 from .models.qwen3_asr import Qwen3ASRForConditionalGeneration

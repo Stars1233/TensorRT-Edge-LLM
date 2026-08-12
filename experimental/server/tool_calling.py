@@ -414,6 +414,44 @@ def _call_from_dict(data: Dict[str, Any],
     )
 
 
+def _param_types_for(name: str, tool_config: ToolConfig) -> Dict[str, str]:
+    """Map each parameter name -> its JSON-schema ``type`` for the named function."""
+    for tool in tool_config.tools:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(fn, dict) and fn.get("name") == name:
+            props = (fn.get("parameters") or {}).get("properties")
+            if isinstance(props, dict):
+                return {
+                    k: v.get("type")
+                    for k, v in props.items()
+                    if isinstance(v, dict) and isinstance(v.get("type"), str)
+                }
+    return {}
+
+
+def _coerce_param(value: str, ptype: Optional[str]) -> Any:
+    """Coerce an XML-extracted string to its declared JSON-schema type.
+
+    Qwen's ``<parameter=...>...</parameter>`` values are always text; without
+    this the arguments stay stringly-typed (``base="10"``) and fail strict
+    consumers such as BFCL AST matching, which expects ``base=10``.
+    """
+    v = value.strip()
+    try:
+        if ptype == "integer":
+            return int(v)
+        if ptype == "number":
+            f = float(v)
+            return int(f) if f.is_integer() else f
+        if ptype == "boolean":
+            return v.lower() in ("true", "1", "yes")
+        if ptype in ("array", "object"):
+            return json.loads(v)
+    except (ValueError, json.JSONDecodeError):
+        return value
+    return value
+
+
 def _parse_qwen_xml_calls(text: str,
                           tool_config: ToolConfig) -> List[ToolCall]:
     calls = []
@@ -423,11 +461,14 @@ def _parse_qwen_xml_calls(text: str,
         name = match.group(1).strip()
         if not _tool_name_allowed(name, tool_config):
             continue
+        ptypes = _param_types_for(name, tool_config)
         args: Dict[str, Any] = {}
         for param in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>",
                                  match.group(2),
                                  flags=re.S):
-            args[param.group(1).strip()] = param.group(2).strip()
+            pname = param.group(1).strip()
+            args[pname] = _coerce_param(
+                param.group(2).strip(), ptypes.get(pname))
         calls.append(
             ToolCall(id=_new_call_id(),
                      name=name,

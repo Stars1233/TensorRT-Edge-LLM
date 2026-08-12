@@ -40,6 +40,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <optional>
@@ -58,6 +60,208 @@ namespace
 constexpr char const* kFFFD = "\xEF\xBF\xBD";
 constexpr size_t kFFFDLen = 3;
 } // namespace
+
+TEST(TokenizerTest, SetAdditionalEosIdsFromEngineConfig)
+{
+    auto const dir = std::filesystem::temp_directory_path() / "edgellm_tokenizer_multi_eos_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    std::ofstream(dir / "tokenizer.json") << R"JSON({
+  "model": {"type": "BPE", "vocab": {"a": 0, "<eos>": 1, "<bos>": 2, "<turn|>": 106}, "merges": []},
+  "added_tokens": [
+    {"id": 1, "content": "<eos>"},
+    {"id": 2, "content": "<bos>"},
+    {"id": 106, "content": "<turn|>"}
+  ],
+  "pre_tokenizer": {"type": "Split", "pattern": {"String": ""}}
+})JSON";
+    std::ofstream(dir / "tokenizer_config.json")
+        << R"JSON({"eos_token": {"content": "<eos>"}, "bos_token": {"content": "<bos>"}})JSON";
+    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
+  "model_path": "unit",
+  "roles": {
+    "system": {"prefix": "", "suffix": ""},
+    "user": {"prefix": "", "suffix": ""},
+    "assistant": {"prefix": "", "suffix": ""}
+  },
+  "generation_prompt": ""
+})JSON";
+
+    tokenizer::Tokenizer tokenizer;
+    ASSERT_TRUE(tokenizer.loadFromHF(dir));
+    tokenizer.setAdditionalEosIds({1, 106, 106});
+    EXPECT_EQ(tokenizer.getEosId(), 1);
+    EXPECT_TRUE(tokenizer.isEosId(1));
+    EXPECT_TRUE(tokenizer.isEosId(106));
+    EXPECT_FALSE(tokenizer.isEosId(7));
+    EXPECT_EQ(tokenizer.getEosIds(), (std::vector<tokenizer::Rank>{1, 106}));
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TokenizerTest, AppliesThinkingChatTemplateFields)
+{
+    auto const dir = std::filesystem::temp_directory_path() / "edgellm_tokenizer_thinking_template_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
+  "model_path": "unit",
+  "roles": {
+    "system": {
+      "prefix": "<bos><|turn>system\n",
+      "suffix": "<turn|>\n",
+      "prefix_thinking": "<bos><|turn>system\n<|think|>\n",
+      "suffix_thinking": "<turn|>\n"
+    },
+    "user": {"prefix": "<bos><|turn>user\n", "suffix": "<turn|>\n"},
+    "assistant": {"prefix": "<|turn>model\n", "suffix": "<turn|>\n"}
+  },
+  "generation_prompt": "<|turn>model\n<|channel>thought\n<channel|>",
+  "generation_prompt_thinking": "<|turn>model\n"
+})JSON";
+
+    tokenizer::Tokenizer tokenizer;
+    ASSERT_TRUE(tokenizer.loadChatTemplate(dir / "processed_chat_template.json"));
+
+    rt::LLMGenerationRequest::Request request;
+    request.messages = {
+        rt::Message{"system", {rt::Message::MessageContent{"text", "Reply with only the letter."}}},
+        rt::Message{"user", {rt::Message::MessageContent{"text", "Question?\nAnswer: "}}},
+    };
+
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    ASSERT_TRUE(tokenizer.applyChatTemplate(
+        request, formatted, /*applyChatTemplate=*/true, /*addGenerationPrompt=*/true, /*enableThinking=*/false));
+    EXPECT_EQ(formatted.formattedCompleteRequest,
+        "<bos><|turn>system\nReply with only the letter.<turn|>\n"
+        "<bos><|turn>user\nQuestion?\nAnswer: <turn|>\n"
+        "<|turn>model\n<|channel>thought\n<channel|>");
+
+    ASSERT_TRUE(tokenizer.applyChatTemplate(
+        request, formatted, /*applyChatTemplate=*/true, /*addGenerationPrompt=*/true, /*enableThinking=*/true));
+    EXPECT_EQ(formatted.formattedCompleteRequest,
+        "<bos><|turn>system\n<|think|>\nReply with only the letter.<turn|>\n"
+        "<bos><|turn>user\nQuestion?\nAnswer: <turn|>\n"
+        "<|turn>model\n");
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TokenizerTest, AppliesTrimContentChatTemplateFields)
+{
+    auto const dir = std::filesystem::temp_directory_path() / "edgellm_tokenizer_trim_template_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
+  "model_path": "unit",
+  "roles": {
+    "system": {"prefix": "<bos><|turn>system\n", "suffix": "<turn|>\n", "trim_content": true},
+    "user": {"prefix": "<|turn>user\n", "suffix": "<turn|>\n", "trim_content": true},
+    "assistant": {"prefix": "<|turn>model\n", "suffix": "<turn|>\n", "trim_content": true}
+  },
+  "generation_prompt": "<|turn>model\n"
+})JSON";
+
+    tokenizer::Tokenizer tokenizer;
+    ASSERT_TRUE(tokenizer.loadChatTemplate(dir / "processed_chat_template.json"));
+
+    rt::LLMGenerationRequest::Request request;
+    request.messages = {
+        rt::Message{"system", {rt::Message::MessageContent{"text", "  Reply with only the letter.  "}}},
+        rt::Message{"user", {rt::Message::MessageContent{"text", "  Question?\nAnswer:  "}}},
+    };
+
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    ASSERT_TRUE(tokenizer.applyChatTemplate(
+        request, formatted, /*applyChatTemplate=*/true, /*addGenerationPrompt=*/true, /*enableThinking=*/false));
+    EXPECT_EQ(formatted.formattedCompleteRequest,
+        "<bos><|turn>system\nReply with only the letter.<turn|>\n"
+        "<|turn>user\nQuestion?\nAnswer:<turn|>\n"
+        "<|turn>model\n");
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TokenizerTest, AppliesGlobalPrefixOnce)
+{
+    auto const dir = std::filesystem::temp_directory_path() / "edgellm_tokenizer_global_prefix_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
+  "model_path": "unit",
+  "global_prefix": "<bos>",
+  "roles": {
+    "system": {"prefix": "<|turn>system\n", "suffix": "<turn|>\n"},
+    "user": {"prefix": "<|turn>user\n", "suffix": "<turn|>\n"},
+    "assistant": {"prefix": "<|turn>model\n", "suffix": "<turn|>\n"}
+  },
+  "generation_prompt": "<|turn>model\n"
+})JSON";
+
+    tokenizer::Tokenizer tokenizer;
+    ASSERT_TRUE(tokenizer.loadChatTemplate(dir / "processed_chat_template.json"));
+
+    rt::LLMGenerationRequest::Request userOnlyRequest;
+    userOnlyRequest.messages = {
+        rt::Message{"user", {rt::Message::MessageContent{"text", "Question?"}}},
+    };
+
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    ASSERT_TRUE(tokenizer.applyChatTemplate(userOnlyRequest, formatted, /*applyChatTemplate=*/true,
+        /*addGenerationPrompt=*/true, /*enableThinking=*/false));
+    EXPECT_EQ(formatted.formattedCompleteRequest, "<bos><|turn>user\nQuestion?<turn|>\n<|turn>model\n");
+    EXPECT_EQ(formatted.formattedSystemPrompt, "");
+
+    rt::LLMGenerationRequest::Request systemRequest;
+    systemRequest.messages = {
+        rt::Message{"system", {rt::Message::MessageContent{"text", "System."}}},
+        rt::Message{"user", {rt::Message::MessageContent{"text", "Question?"}}},
+    };
+
+    ASSERT_TRUE(tokenizer.applyChatTemplate(systemRequest, formatted, /*applyChatTemplate=*/true,
+        /*addGenerationPrompt=*/true, /*enableThinking=*/false));
+    EXPECT_EQ(formatted.formattedSystemPrompt, "<bos><|turn>system\nSystem.<turn|>\n");
+    EXPECT_EQ(formatted.formattedCompleteRequest,
+        "<bos><|turn>system\nSystem.<turn|>\n"
+        "<|turn>user\nQuestion?<turn|>\n"
+        "<|turn>model\n");
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(TokenizerTest, RawPromptModePreservesWhitespaceWithTrimTemplate)
+{
+    auto const dir = std::filesystem::temp_directory_path() / "edgellm_tokenizer_raw_prompt_trim_test";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    std::ofstream(dir / "processed_chat_template.json") << R"JSON({
+  "model_path": "unit",
+  "roles": {
+    "user": {"prefix": "<|turn>user\n", "suffix": "<turn|>\n", "trim_content": true}
+  },
+  "generation_prompt": "<|turn>model\n"
+})JSON";
+
+    tokenizer::Tokenizer tokenizer;
+    ASSERT_TRUE(tokenizer.loadChatTemplate(dir / "processed_chat_template.json"));
+
+    rt::LLMGenerationRequest::Request request;
+    request.messages = {
+        rt::Message{"user", {rt::Message::MessageContent{"text", "  raw prompt<|turn>model\n"}}},
+    };
+
+    rt::LLMGenerationRequest::FormattedRequest formatted;
+    ASSERT_TRUE(tokenizer.applyChatTemplate(
+        request, formatted, /*applyChatTemplate=*/false, /*addGenerationPrompt=*/false, /*enableThinking=*/false));
+    EXPECT_EQ(formatted.formattedCompleteRequest, "  raw prompt<|turn>model\n");
+
+    std::filesystem::remove_all(dir);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UTF-8 Sanitizer Tests
@@ -636,6 +840,57 @@ TEST(StreamChunkTest, IsMovable)
     EXPECT_EQ(d.text, "abc");
     EXPECT_TRUE(d.finished);
     EXPECT_EQ(d.reason, FinishReason::kEndId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Token callback emission
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(TokenCallbackTest, EmitsAllNewTokensAndMarksOnlyLastFinished)
+{
+    rt::DecodingInferenceContext context;
+    context.activeBatchSize = 1;
+    context.generationRound = 7;
+    context.tokenIds = {{10, 20, 30, 40}};
+    context.finishedStates = {1};
+    context.callbackEmittedTokenCounts = {2};
+
+    std::vector<rt::TokenCallbackInfo> seen;
+    context.onTokenGenerated = [&](rt::TokenCallbackInfo const& info) { seen.push_back(info); };
+
+    rt::emitTokenCallbacks(context);
+
+    ASSERT_EQ(seen.size(), 2U);
+    EXPECT_EQ(seen[0].tokenId, 30);
+    EXPECT_EQ(seen[0].batchIdx, 0);
+    EXPECT_EQ(seen[0].generationStep, 7);
+    EXPECT_FALSE(seen[0].isFinished);
+    EXPECT_EQ(seen[1].tokenId, 40);
+    EXPECT_EQ(seen[1].batchIdx, 0);
+    EXPECT_EQ(seen[1].generationStep, 7);
+    EXPECT_TRUE(seen[1].isFinished);
+    EXPECT_EQ(context.callbackEmittedTokenCounts[0], 4);
+}
+
+TEST(TokenCallbackTest, DoesNotReplayPreviouslyEmittedTokens)
+{
+    rt::DecodingInferenceContext context;
+    context.activeBatchSize = 1;
+    context.generationRound = 3;
+    context.tokenIds = {{11, 12}};
+    context.finishedStates = {0};
+    context.callbackEmittedTokenCounts = {0};
+
+    std::vector<rt::TokenCallbackInfo> seen;
+    context.onTokenGenerated = [&](rt::TokenCallbackInfo const& info) { seen.push_back(info); };
+
+    rt::emitTokenCallbacks(context);
+    rt::emitTokenCallbacks(context);
+
+    ASSERT_EQ(seen.size(), 2U);
+    EXPECT_EQ(seen[0].tokenId, 11);
+    EXPECT_EQ(seen[1].tokenId, 12);
+    EXPECT_EQ(context.callbackEmittedTokenCounts[0], 2);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -35,17 +35,23 @@ void allocateBasicIO(
     PipelineIO& io, int32_t maxBatch, int32_t maxSeq, int32_t hiddenSize, int32_t vocabSize, nvinfer1::DataType dtype)
 {
     io.inputsEmbeds = Tensor({maxBatch, maxSeq, hiddenSize}, DeviceType::kGPU, dtype, "PipelineIO::inputsEmbeds");
-    // outputLogits is always FLOAT for the sampler; vocabSize is kept here to hold the
-    // allocation next to the other "basic" tensors and to match the existing signature.
+    // Standard LLM logits are FLOAT for the sampler. DiffusionGemma keeps the
+    // same dtype for canvas logits because final logit softcapping exports an
+    // F32 logits binding.
     io.outputLogits
         = Tensor({maxBatch, vocabSize}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
     io.selectTokenIndices
         = Tensor({maxBatch, 1}, DeviceType::kGPU, nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
+    io.phaseIsEncoder = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::phaseIsEncoder");
+    io.contextMaskSelector
+        = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextMaskSelector");
     io.contextLengths = Tensor({maxBatch}, DeviceType::kGPU, nvinfer1::DataType::kINT32, "PipelineIO::contextLengths");
     io.hostContextLengths
         = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostContextLengths");
     io.hostSelectTokenIndices
         = Tensor({maxBatch, 1}, DeviceType::kCPU, nvinfer1::DataType::kINT64, "PipelineIO::hostSelectTokenIndices");
+    io.hostPhaseIsEncoder
+        = Tensor({maxBatch}, DeviceType::kCPU, nvinfer1::DataType::kINT32, "PipelineIO::hostPhaseIsEncoder");
 }
 
 void allocateDeepstackEmbeds(
@@ -80,6 +86,48 @@ void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity,
     io.mropeCosSin = Tensor({maxBatch, maxKVCacheCapacity, rotaryDim}, DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
         "PipelineIO::mropeCosSin");
 }
+
+namespace
+{
+enum class BackboneTensorMapKind
+{
+    kAutoregressive,
+    kDiffusionGemma,
+};
+
+bool hasDeepstackFeatures(LLMEngineConfig const& cfg) noexcept
+{
+    return !cfg.isDiffusionBackbone && cfg.numDeepstackFeatures > 0;
+}
+
+void bindAutoregressiveBackboneTensorMap(TensorMap& map, PipelineIO& io)
+{
+    map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+}
+
+void bindDiffusionGemmaBackboneTensorMap(TensorMap& map, PipelineIO& io, LLMEngineConfig const& cfg)
+{
+    map.set(binding_names::kPhaseIsEncoder, io.phaseIsEncoder);
+    // DiffusionGemma gathers logits for a canvas of positions, so its engine
+    // input is the model-owned select_token_indices binding rather than the
+    // single-token autoregressive last_token_ids binding.
+    map.set(binding_names::kSelectTokenIndices, io.selectTokenIndices);
+    if (cfg.contextMaskSelectorEnabled)
+    {
+        map.set(binding_names::kContextMaskSelector, io.contextMaskSelector);
+    }
+}
+
+void bindBackboneTensorMap(
+    TensorMap& map, PipelineIO& io, LLMEngineConfig const& cfg, BackboneTensorMapKind tensorMapKind)
+{
+    switch (tensorMapKind)
+    {
+    case BackboneTensorMapKind::kAutoregressive: bindAutoregressiveBackboneTensorMap(map, io); break;
+    case BackboneTensorMapKind::kDiffusionGemma: bindDiffusionGemmaBackboneTensorMap(map, io, cfg); break;
+    }
+}
+} // namespace
 
 void StreamingPrefillBuffers::populateFromPrefill(Tensor const& liveInputEmbeds, Tensor const& liveEngineHiddenStates,
     int32_t batch, int32_t prefillLen, int32_t hiddenSize, int32_t maxBatch, int32_t maxSeq, cudaStream_t stream)
@@ -124,14 +172,14 @@ void bindRopeTensors(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEn
     }
 }
 
-void buildTensorMap(
-    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+static void buildTensorMapImpl(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg,
+    int32_t kvCacheIndex, BackboneTensorMapKind tensorMapKind)
 {
     // Core I/O
     map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
     map.set(binding_names::kLogits, io.outputLogits);
     map.set(binding_names::kContextLengths, io.contextLengths);
-    map.set(binding_names::kLastTokenIds, io.selectTokenIndices);
+    bindBackboneTensorMap(map, io, cfg, tensorMapKind);
     if (cfg.useVisionBidirectionalAttention)
     {
         map.set(binding_names::kVisionBlockIds, io.visionBlockIds);
@@ -157,9 +205,12 @@ void buildTensorMap(
                 ? cfg.kvSharingDonors[localAttnIdx]
                 : -1;
 
-            // Plugin (combined KV): bind to donor's tensor if shared, else own tensor.
-            auto& combinedKV
-                = (donorIdx >= 0) ? kvMgr.getCombinedKVCache(donorIdx) : kvMgr.getCombinedKVCache(localAttnIdx);
+            // Plugin (combined KV): bind to donor's tensor if shared, else own tensor. Bind the
+            // pool-shaped view — the AttentionPlugin engine binding contract is the paged pool
+            // [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim], not the internal slot-shaped
+            // allocation (see KVCacheManager::getCombinedKVCachePoolView()).
+            auto& combinedKV = (donorIdx >= 0) ? kvMgr.getCombinedKVCachePoolView(donorIdx)
+                                               : kvMgr.getCombinedKVCachePoolView(localAttnIdx);
             map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/true), combinedKV);
             map.set(binding_names::formatKVCacheName(localAttnIdx, /*isPast=*/false), combinedKV); // alias: in-place
             ++localAttnIdx;
@@ -179,8 +230,23 @@ void buildTensorMap(
             // so this branch wouldn't fire for it regardless.
             if (mambaMgr.hasIntermediateRecurrentStates())
             {
-                map.set(binding_names::formatIntermediateRecurrentStateName(localMambaIdx),
-                    mambaMgr.getIntermediateRecurrentState(localMambaIdx));
+                if (mambaMgr.recurrentUsesReplay())
+                {
+                    // Mamba: bind the three replay-stash outputs (dA/u/B). The accepted recurrent
+                    // state is reconstructed from these after verification.
+                    map.set(binding_names::formatReplayDaStateName(localMambaIdx),
+                        mambaMgr.getReplayDaState(localMambaIdx));
+                    map.set(
+                        binding_names::formatReplayUStateName(localMambaIdx), mambaMgr.getReplayUState(localMambaIdx));
+                    map.set(
+                        binding_names::formatReplayBStateName(localMambaIdx), mambaMgr.getReplayBState(localMambaIdx));
+                }
+                else
+                {
+                    // GDN/DDTree: bind the per-token full-state snapshot output.
+                    map.set(binding_names::formatIntermediateRecurrentStateName(localMambaIdx),
+                        mambaMgr.getIntermediateRecurrentState(localMambaIdx));
+                }
             }
             if (mambaMgr.hasIntermediateConvStates())
             {
@@ -202,13 +268,20 @@ void buildTensorMap(
     // per-step rebind.
     map.set(binding_names::kKVCacheStartIndex, cacheMgr.getKVCacheLengths());
 
+    // kv_page_table: one stable-address table per cache manager. It remains identity-mapped on the legacy path and is
+    // updated in place by the context-cache coordinator.
+    map.set(binding_names::kKVPageTable, res.kvPageTables[kvCacheIndex]->kernelView());
+
     // Deepstack: initial bind is the shared zero buffer (sized large enough
     // to cover the worst-case non-prefill shape). DeepstackBinding (owned by
     // the runtime) swaps to `io.deepstackEmbeds[i]` just before base prefill
     // and back on non-prefill phases.
-    for (size_t i = 0; i < io.deepstackEmbeds.size(); ++i)
+    if (hasDeepstackFeatures(cfg))
     {
-        map.set(binding_names::formatDeepstackEmbedsName(static_cast<int32_t>(i)), res.zeroBuffer);
+        for (size_t i = 0; i < io.deepstackEmbeds.size(); ++i)
+        {
+            map.set(binding_names::formatDeepstackEmbedsName(static_cast<int32_t>(i)), res.zeroBuffer);
+        }
     }
 
     // Hidden states output. SpecDecode base engines write their target features
@@ -238,6 +311,10 @@ void buildTensorMap(
     {
         map.set(binding_names::kSpecVerifyPhaseMarker, io.specVerifyPhaseMarker);
     }
+    if (!io.skipSoftmaxScale.isEmpty())
+    {
+        map.set(binding_names::kSkipSoftmaxScale, io.skipSoftmaxScale);
+    }
     if (!io.specTreeParentIds.isEmpty())
     {
         map.set(binding_names::kTreeParentIds, io.specTreeParentIds);
@@ -250,6 +327,38 @@ void buildTensorMap(
     // LoRA bindings are NOT set here because adapter tensor names may differ
     // from engine binding names (e.g. fused QKV).  LoRAManager::refreshTensorMap()
     // populates them after buildTensorMap().
+}
+
+void buildTensorMap(
+    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+{
+    BackboneTensorMapKind const tensorMapKind
+        = cfg.isDiffusionBackbone ? BackboneTensorMapKind::kDiffusionGemma : BackboneTensorMapKind::kAutoregressive;
+    buildTensorMapImpl(map, io, res, cfg, kvCacheIndex, tensorMapKind);
+}
+
+void buildTensorMapForDiffusionBackbone(
+    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex)
+{
+    check::check(cfg.isDiffusionBackbone, "buildTensorMapForDiffusionBackbone requires a DiffusionGemma backbone.");
+    buildTensorMapImpl(map, io, res, cfg, kvCacheIndex, BackboneTensorMapKind::kDiffusionGemma);
+}
+
+void bindDiffusionUnifiedBackboneTensors(TensorMap& map, PipelineIO& io, Tensor& logits, Tensor& canvasIds,
+    Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds, Tensor& selfConditioningTemperature)
+{
+    map.set(binding_names::kInputsEmbeds, io.inputsEmbeds);
+    map.set(binding_names::kLogits, logits);
+    map.set(binding_names::kCanvasIds, canvasIds);
+    bindDiffusionUnifiedBackboneSelfConditioningTensors(map, prevSelfConditioningEmbeds, nextSelfConditioningEmbeds);
+    map.set(binding_names::kSelfConditioningTemperature, selfConditioningTemperature);
+}
+
+void bindDiffusionUnifiedBackboneSelfConditioningTensors(
+    TensorMap& map, Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds)
+{
+    map.set(binding_names::kPrevSelfConditioningEmbeds, prevSelfConditioningEmbeds);
+    map.set(binding_names::kNextSelfConditioningEmbeds, nextSelfConditioningEmbeds);
 }
 
 void buildTensorMapForSpecDecodeDraft(TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg)
@@ -294,9 +403,12 @@ void buildTensorMapForGemma4MTPDraft(
 
     auto& baseCacheManager = *res.cacheManagers[0];
     map.set(binding_names::kContextLengths, baseCacheManager.getKVCacheLengths());
+    // kv_page_table: the assistant reads the TARGET model's paged pool, so it binds the
+    // target's page table (identity while reuse is off) — same object the base engine binds.
+    map.set(binding_names::kKVPageTable, res.kvPageTables[0]->kernelView());
     for (auto const& entry : draftCfg.gemma4MTPKVSharingMap)
     {
-        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCache(entry.targetAbsoluteLayerIdx);
+        rt::Tensor& targetKV = baseCacheManager.getCombinedKVCachePoolView(entry.targetAbsoluteLayerIdx);
         map.set(binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), targetKV);
     }
 }
@@ -305,8 +417,21 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
 {
     PipelineIO io;
 
-    allocateBasicIO(io, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize, cfg.outputVocabSize,
-        nvinfer1::DataType::kHALF);
+    int32_t const maxSeqLen = cfg.isDiffusionBackbone ? std::max(cfg.diffusionCanvasLength, cfg.maxSupportedInputLength)
+                                                      : cfg.maxSupportedInputLength;
+    allocateBasicIO(
+        io, cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize, cfg.outputVocabSize, nvinfer1::DataType::kHALF);
+
+    if (cfg.isDiffusionBackbone)
+    {
+        int32_t const maxCanvasLen = cfg.diffusionCanvasLength;
+        io.outputLogits = Tensor({cfg.maxSupportedBatchSize, maxCanvasLen, cfg.outputVocabSize}, DeviceType::kGPU,
+            nvinfer1::DataType::kFLOAT, "PipelineIO::outputLogits");
+        io.selectTokenIndices = Tensor({cfg.maxSupportedBatchSize, maxCanvasLen}, DeviceType::kGPU,
+            nvinfer1::DataType::kINT64, "PipelineIO::selectTokenIndices");
+        io.hostSelectTokenIndices = Tensor({cfg.maxSupportedBatchSize, maxCanvasLen}, DeviceType::kCPU,
+            nvinfer1::DataType::kINT64, "PipelineIO::hostSelectTokenIndices");
+    }
 
     if (cfg.useVisionBidirectionalAttention)
     {
@@ -314,7 +439,7 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
             nvinfer1::DataType::kINT32, "PipelineIO::visionBlockIds");
     }
 
-    if (cfg.numDeepstackFeatures > 0)
+    if (hasDeepstackFeatures(cfg))
     {
         allocateDeepstackEmbeds(io, cfg.numDeepstackFeatures, cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength,
             cfg.hiddenSize, nvinfer1::DataType::kHALF);
@@ -326,8 +451,8 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
     // streaming consumers (Qwen3-Omni Talker) read it; if the engine emits
     // hidden_states but no consumer is set, the buffer is harmless write-target;
     // if the engine has no hidden_states output the binding is silently skipped.
-    io.outputHiddenStates = Tensor({cfg.maxSupportedBatchSize, cfg.maxSupportedInputLength, cfg.hiddenSize},
-        DeviceType::kGPU, nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
+    io.outputHiddenStates = Tensor({cfg.maxSupportedBatchSize, maxSeqLen, cfg.hiddenSize}, DeviceType::kGPU,
+        nvinfer1::DataType::kHALF, "PipelineIO::outputHiddenStates");
 
     if (cfg.ropeConfig.type == RopeType::kMRope)
     {
@@ -336,6 +461,10 @@ PipelineIO PipelineIO::createForLLM(LLMEngineConfig const& cfg, cudaStream_t str
         kernel::initializeTextOnlyMRopeCosSin(io.mropeCosSin.dataPointer<float>(), cfg.ropeConfig.rotaryTheta,
             cfg.rotaryDim, cfg.maxKVCacheCapacity, cfg.maxSupportedBatchSize, stream);
     }
+
+    // Runtime skip-softmax override carrier (shape-only).
+    io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
+    CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
 
     return io;
 }
@@ -378,7 +507,7 @@ PipelineIO PipelineIO::createForSpecDecode(
     allocateSpecDecodeHiddenStates(io, maxRuntimeBatchSize, maxTensorSeqLen, baseOutputHiddenDim,
         draftRuntimeHiddenSize, nvinfer1::DataType::kHALF, bundle.specDecodeMode() != SpecDecodeMode::kDFlash);
 
-    if (bundle.base.numDeepstackFeatures > 0)
+    if (hasDeepstackFeatures(bundle.base))
     {
         allocateDeepstackEmbeds(io, bundle.base.numDeepstackFeatures, maxRuntimeBatchSize, maxInputLength,
             bundle.base.hiddenSize, nvinfer1::DataType::kHALF);
@@ -419,9 +548,13 @@ PipelineIO PipelineIO::createForSpecDecode(
     CUDA_CHECK(cudaMemsetAsync(
         io.specVerifyPhaseMarker.rawPointer(), 0, io.specVerifyPhaseMarker.getMemoryCapacity(), stream));
 
-    bool const useDFlashTree
-        = bundle.specDecodeMode() == SpecDecodeMode::kDFlash && bundle.specConfig->draftingTopK > 1;
-    if (useDFlashTree)
+    io.skipSoftmaxScale = Tensor({1}, DeviceType::kGPU, nvinfer1::DataType::kINT8, "PipelineIO::skipSoftmaxScale");
+    CUDA_CHECK(cudaMemsetAsync(io.skipSoftmaxScale.rawPointer(), 0, io.skipSoftmaxScale.getMemoryCapacity(), stream));
+
+    bool const useSpecTree
+        = (bundle.specDecodeMode() == SpecDecodeMode::kDFlash || bundle.specDecodeMode() == SpecDecodeMode::kMTP)
+        && bundle.specConfig->draftingTopK > 1;
+    if (useSpecTree)
     {
         io.specTreeParentIds = Tensor({maxRuntimeBatchSize, effectiveMaxDraftProposalSize}, DeviceType::kGPU,
             nvinfer1::DataType::kINT32, "PipelineIO::specTreeParentIds");

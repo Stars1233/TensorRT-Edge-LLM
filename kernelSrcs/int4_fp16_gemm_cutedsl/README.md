@@ -12,7 +12,7 @@ with:
 - `C`: FP16 row-major output `[M, N]`
 - FP32 accumulation
 
-**Constraints**: `K % 64 == 0`, `N % 64 == 0`, and `group_size` a multiple of 16
+**Constraints**: `K % 64 == 0`, positive `N`, and `group_size` a multiple of 16
 where one of `group_size` / `bK` (=64) divides the other (i.e. `group_size`
 divides 64, or is a multiple of 64) — validated for **128 and 32**. The
 scale granularity is decoupled from the K-tile: a `bK=64` kernel stages
@@ -52,26 +52,26 @@ Each compiled variant exports one C function with the signature:
   per-call memset.
 - `swizzle` — runtime `Int32` grouped-M rasterization width (`1` = none).
 
-## Baked configuration space (75 variants)
+## Baked configuration space (16 GEMM variants)
 
-An AOT artifact cannot pick a config at runtime, so the **full universe of
-tile / stage / split-K configs is baked** — one exported function per config —
-and the consumer selects per shape:
+An AOT artifact cannot pick a config at runtime, so one exported function is
+baked per selected tile / stage / split-K config and the plugin selects per
+shape:
 
 | Dimension | Values | Baked? |
 |---|---|---|
-| CTA tile `(M,N,K)` | `16x128x64`, `16x256x64`, `32x128x64`, `64x128x64`, `128x128x64` | yes |
+| CTA tile `(M,N,K)` | `16x128x64`, `32x128x64`, `64x128x64`, `128x128x64` | yes |
 | `num_stages` | `2`, `3`, `4` | yes |
-| `split_k` | `1`, `2`, `4`, `8`, `16` (in-kernel reduction for `>1`) | yes |
+| `split_k` | selected values from `1`, `2`, `4` (in-kernel reduction for `>1`) | yes |
 | `group_size` | `128` only (kernel also supports `32`) | **yes — but fixed at 128 today** |
 | `swizzle` | grouped-M width | **no — runtime arg** |
 | `num_k_tiles` | `ceil(K/64)` | **no — dynamic in K** |
 
-`5 tiles × 3 stages × 5 split_k = 75` exported functions, **all at the single
-baked `group_size = 128`**, named `int4_fp16_gemm_<tile>_s<stages>_sk<splitk>`
-(e.g. `int4_fp16_gemm_16x128x64_s2_sk4`). `group_size` is baked too but pinned to
-one value — building another (e.g. 32), or shipping both, is a one-knob change in
-`build_cutedsl.py`; doing so would multiply the count.
+The 16-entry set is listed in `_INT4_FP16_GEMM_CONFIGS` in
+`kernelSrcs/build_cutedsl.py` and mirrored by the plugin and C++ test X-macros.
+All use the single baked `group_size = 128` and names of the form
+`int4_fp16_gemm_<tile>_s<stages>_sk<splitk>`. Building another group size, or
+shipping both, would multiply the artifact count.
 
 ### Important: split-K correctness contract
 
@@ -83,25 +83,22 @@ consumer must pick a factor that divides `ceil(K/64)` for the runtime `K`. For
 semaphore — no separate reduction kernel and no extra workspace (the running sum
 folds into `C`).
 
-## Building
+## Artifact Development
 
-```bash
-cd tensorrt-edge-llm
-
-# Build all 75 INT4 variants for the current Ampere GPU
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm
-
-# Or for a specific Ampere SM
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm --gpu_arch sm_80
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm --gpu_arch sm_87
-```
+If you modify this kernel or its registry entries, manually regenerate the
+`int4_fp16_gemm` group before running CMake. Otherwise, CMake uses the matching
+prebuilt tarball by default. Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
+for the supported Docker and local-venv commands, dependency versions,
+cross-compilation, artifact layout, and CMake configuration. This group emits
+the 16 selected GEMM variants plus eight small-M GEMV variants.
 
 Supported SMs: **SM80 and newer**. The kernel uses the SM80 instruction floor
 (`cp.async` + `mma.sync` 16×8×16 + `ldmatrix`), which is forward-compatible and
 runs on Ampere, Ada, Hopper, and Blackwell. `build_cutedsl.py` registers it for
-`80 / 86 / 87 / 89 / 100 / 101 / 110 / 120 / 121`. All 75 configs fit the SM86/89
-99 KB opt-in shared-memory floor (the largest, `128x128x64` at 4 stages, is ~81
-KB). A full build runs 75 `cute.compile`s and produces a correspondingly large `libcutedsl_<arch>.a`.
+`80 / 86 / 87 / 89 / 100 / 101 / 110 / 120 / 121`. All selected configs fit the
+SM86/89 99 KB opt-in shared-memory floor (the largest, `128x128x64` at 4 stages,
+is ~81 KB).
 
 > This is the Ampere-ISA path: it runs on Hopper/Blackwell via forward
 > compatibility but does **not** use their native tensor-core instructions
@@ -138,17 +135,14 @@ imports Torch via `int4_reference`.
 
 | File | Role |
 |---|---|
-| `unittests/int4Fp16GemmCuteDslTests.cu` | gtest: random inputs → CPU FP32 reference → launch → compare. Covers **all 75 variants** (each at a canonical shape) + a few edge-case shapes; tolerance `relErr < 0.05` (matches SSD/GDN). |
+| `unittests/int4Fp16GemmCuteDslTests.cu` | gtest: random inputs → CPU FP32 reference → launch → compare. Covers all 16 baked GEMM variants plus residual-M and non-64-aligned-N cases; tolerance `relErr < 0.05`. |
+| `unittests/int4Fp16GemvCuteDslTests.cu` | gtest for the eight decode GEMV variants, including non-64-aligned `N`. |
 
-Unlike the SSD/GDN tests, there is **no C++ runner** — those kernels have a
-consumer (and the runner is its launch API, co-located with that consumer's
-family), whereas this kernel has no consumer yet. So the test drives the AOT
-artifact **directly**: an `X`-macro table over all 75 variants generates the
-module declarations, the one-time load, and the runtime dispatch; it marshals
-the generated tensor structs, calls the generated `cute_dsl_<variant>_wrapper(...)`,
-and ports the (tile-bN-specific) host weight repack inline. When a consumer is
-added, that launch/repack glue migrates into a runner co-located with the
-consumer.
+The tests drive the AOT artifact directly, independently of
+`Int4GroupwiseGemmPluginV2`: an X-macro table generates module declarations,
+one-time loading, and runtime dispatch; the test marshals generated tensor
+structs, launches the generated wrapper, and compares against an FP32 reference.
+This isolates kernel geometry from plugin tactic selection.
 
 The test is gated on `CUTE_DSL_INT4_FP16_GEMM_ENABLED` and auto-discovered by
 CMake (the `unittests/**/*.cu` glob), so **no CMake edits are required** — the
@@ -158,19 +152,16 @@ wires the artifact include dir + define onto `unitTest`.
 ### Build + run the test
 
 ```bash
-# 1. Build the int4 artifact (all 75 variants) for the current Ampere GPU
-python kernelSrcs/build_cutedsl.py --kernels int4_fp16_gemm
-
-# 2. Configure with unit tests + the int4 group enabled, then build
+# After manually generating the full group with the shared workflow:
 cmake -B build -DBUILD_UNIT_TESTS=ON -DENABLE_CUTE_DSL=int4_fp16_gemm \
       -DTRT_PACKAGE_DIR=/path/to/TensorRT ..
 cmake --build build -j
 
-# 3. Run just the int4 accuracy cases
+# Run just the int4 accuracy cases
 ./build/unitTest --gtest_filter='Int4Fp16GemmAllVariants/*'
 ```
 
-The test loads and exercises **all 75** variant modules, so it expects a full
+The tests load and exercise every baked GEMM/GEMV module, so they expect a full
 `--kernels int4_fp16_gemm` build.
 
 > **CUDA < 12.8 hosts (x86):** the AOT-generated headers use `cudaLibrary_t`,
@@ -179,4 +170,3 @@ The test loads and exercises **all 75** variant modules, so it expects a full
 > `EMBEDDED_TARGET=jetson-orin`):
 > `-DCMAKE_CXX_FLAGS=-DTRT_EDGELLM_CUDA_LIBRARY_T_COMPAT -DCMAKE_CUDA_FLAGS=-DTRT_EDGELLM_CUDA_LIBRARY_T_COMPAT`.
 > CI x86 uses CUDA 13.2 so it is not needed there.
-

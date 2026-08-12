@@ -20,13 +20,16 @@ Forward-pass conventions
 ``CausalLM.forward``:
 
     inputs_embeds        [batch, seq_len, hidden_size]            float16/bfloat16
-    past_key_values      tuple of [batch, 2, num_kv_heads, past_len, head_dim] per attn-layer
+    past_key_values      tuple of [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim] per
+                         attn-layer — the paged KV pool (in-place aliased; num_pages is a
+                         fixed value per engine build, see llmBuilder.cpp setupKVCacheProfiles)
     rope_rotary_cos_sin  [batch, max_pos, rotary_dim]  float32
     context_lengths      [batch]                        int32
     kvcache_start_index  [batch]                        int32
+    kv_page_table        [batch, 2, max_pages_per_seq]  int32
     ──────────────────────────────────────────────────────────────────────
     -> logits             [batch, seq_len, vocab_size]              float32
-    -> present_key_values tuple of [batch, 2, num_kv_heads, past_len+seq_len, head_dim] per attn-layer
+    -> present_key_values tuple of the same pool tensors as past_key_values (aliased, no growth)
 
 Checkpoint key correspondence
 ------------------------------
@@ -36,6 +39,7 @@ LayerNorm        -> model.layers.N.input_layernorm.*, post_attention_layernorm.*
 """
 
 import itertools
+import logging
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -44,8 +48,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...config import ModelConfig
-from ..linear import FP16Linear, TPMode, make_linear
-from ..ops import attention_plugin
+from ..linear import (FP16Linear, NVFP4LinearMethod, ReplicatedLinear, TPMode,
+                      is_nvfp4_linear, make_linear)
+from ..ops import KV_PAGE_SIZE, attention_plugin
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "OnnxSpec",
@@ -109,13 +116,14 @@ def _make_flat_wrapper(model: nn.Module,
     """
     has_hidden_output = eagle_base or emit_hidden_states
 
-    param_names: List[str] = (["inputs_embeds"] +
-                              [f"past_key_values_{i}" for i in range(Na)] + [
-                                  "rope_rotary_cos_sin", "context_lengths",
-                                  "kvcache_start_index", "last_token_ids"
-                              ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+    param_names: List[str] = (
+        ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
+            "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
+            "kv_page_table", "last_token_ids"
+        ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
     if eagle_base:
         param_names += ["attention_pos_id", "attention_mask"]
+    param_names += ["skip_softmax_scale"]
 
     past_kv_tuple = "({},)".format(", ".join(
         f"past_key_values_{i}" for i in range(Na))) if Na else "()"
@@ -125,21 +133,24 @@ def _make_flat_wrapper(model: nn.Module,
     eagle_kwargs = (", attention_mask=attention_mask"
                     ", attention_pos_id=attention_pos_id"
                     if eagle_base else "")
+    skip_kwarg = ", skip_softmax_scale=skip_softmax_scale"
 
     if has_hidden_output:
         body = (
             f"    logits, hidden_states, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-            f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{ds_kwarg}{eagle_kwargs})\n"
+            f"context_lengths, kvcache_start_index, kv_page_table, "
+            f"last_token_ids"
+            f"{ds_kwarg}{eagle_kwargs}{skip_kwarg})\n"
             f"    return (logits, hidden_states) + tuple(present_key_values)\n"
         )
     else:
         body = (
             f"    logits, present_key_values = self._model(\n"
             f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-            f"context_lengths, kvcache_start_index, last_token_ids"
-            f"{ds_kwarg})\n"
+            f"context_lengths, kvcache_start_index, kv_page_table, "
+            f"last_token_ids"
+            f"{ds_kwarg}{skip_kwarg})\n"
             f"    return (logits,) + tuple(present_key_values)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
@@ -216,6 +227,8 @@ class Attention(nn.Module):
         self.attention_scale = config.attention_scaling
         self.enable_fp8_kv_cache = config.quant.kv_cache_quant == "fp8"
         self.sliding_window_size = config.sliding_window_size  # -1 means no sliding window
+        # Skip-softmax (BLASST) calibrated scale factor S (0.0 = disabled).
+        self.skip_softmax_scale_factor = config.skip_softmax_scale_factor
         module_prefix = f"layers.{layer_idx}.self_attn"
 
         self.q_proj = make_linear(config,
@@ -257,6 +270,39 @@ class Attention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+        # Cache RMSNorm eps as a plain float so the attention_plugin custom-op gets a stable
+        # default-free kwarg in the FX graph (torch.export strips default-matching kwargs).
+        self._rms_norm_eps = float(
+            config.rms_norm_eps) if config.has_qk_norm else 1e-6
+
+        # Per-head q/k_norm gamma weights as plain list[float] (NOT tensors): the
+        # attention_plugin custom-op needs literal List[float] kwargs at trace time.
+        self._q_norm_gamma_list: list = []
+        self._k_norm_gamma_list: list = []
+        if config.has_qk_norm:
+            # Capture again whenever weights change (e.g. after `load_state_dict`).
+            self.register_load_state_dict_post_hook(
+                lambda *_args, **_kwargs: self._capture_qk_norm_gamma_lists())
+
+    def _capture_qk_norm_gamma_lists(self) -> None:
+        """Extract gamma weights from `self.q_norm` / `self.k_norm` into plain Python lists.
+
+        Called from the post-state-dict-load hook so the lists reflect real checkpoint values
+        (not the random `__init__` values). Idempotent — safe to call multiple times.
+
+        Uses ``getattr`` defaults: subclasses may delete the norm submodules
+        (e.g. Gemma4Attention removes ``k_norm`` on KV-shared layers) while
+        still inheriting this method.
+        """
+        q_norm = getattr(self, "q_norm", None)
+        k_norm = getattr(self, "k_norm", None)
+        if q_norm is not None:
+            self._q_norm_gamma_list = q_norm.weight.detach().to(
+                torch.float32).cpu().flatten().tolist()
+        if k_norm is not None:
+            self._k_norm_gamma_list = k_norm.weight.detach().to(
+                torch.float32).cpu().flatten().tolist()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -264,27 +310,27 @@ class Attention(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Packed QKV: prefer the single fused GEMM installed by
+        # `fuse_qkv_projections`; fall back to three projections + concat.
+        if hasattr(self, "qkv_proj_fused"):
+            qkv = self.qkv_proj_fused(hidden_states)
+        else:
+            qkv = torch.cat([
+                self.q_proj(hidden_states),
+                self.k_proj(hidden_states),
+                self.v_proj(hidden_states),
+            ],
+                            dim=-1)
 
-        if self.q_norm is not None:
-            query_states = self.q_norm(
-                query_states.reshape(batch_size, seq_len, self.num_heads,
-                                     self.head_dim)).reshape(
-                                         batch_size, seq_len,
-                                         self.num_heads * self.head_dim)
-        if self.k_norm is not None:
-            key_states = self.k_norm(
-                key_states.reshape(batch_size, seq_len, self.num_kv_heads,
-                                   self.head_dim)).reshape(
-                                       batch_size, seq_len,
-                                       self.num_kv_heads * self.head_dim)
+        # qk_norm is fused inside the AttentionPlugin — do NOT apply q_norm / k_norm here.
+        # The modules stay registered only so checkpoint loading finds their weights.
 
         enable_tree = attention_mask is not None and attention_pos_id is not None
         kwargs: dict = {
@@ -295,8 +341,14 @@ class Attention(nn.Module):
             "enable_tree_attention": enable_tree,
             "enable_fp8_kv_cache": self.enable_fp8_kv_cache,
             "attention_scale": self.attention_scale,
+            "enable_context_mask_selector": False,
             "enable_vision_block_attention": False,
+            "skip_softmax_scale_factor": self.skip_softmax_scale_factor,
         }
+        # Wire the runtime override carrier iff skip-softmax is enabled (scale
+        # factor > 0).
+        if skip_softmax_scale is not None and self.skip_softmax_scale_factor > 0.0:
+            kwargs["skip_softmax_scale"] = skip_softmax_scale
         if enable_tree:
             kwargs["attention_mask"] = attention_mask
             kwargs["attention_pos_id"] = attention_pos_id
@@ -304,15 +356,21 @@ class Attention(nn.Module):
         # value in the FX graph for the unified ONNX translation.
         kwargs["qkv_scales"] = getattr(self, "_qkv_scales_float",
                                        [1.0, 1.0, 1.0])
+        # Gamma kwargs are passed only when the model uses qk_norm; otherwise the ONNX
+        # node carries no enable_qk_norm attribute.
+        if self._q_norm_gamma_list or self._k_norm_gamma_list:
+            kwargs["q_norm_gamma"] = self._q_norm_gamma_list
+            kwargs["k_norm_gamma"] = self._k_norm_gamma_list
+            kwargs["rms_norm_eps"] = float(self._rms_norm_eps)
+            kwargs["enable_qk_norm"] = 1
 
         attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
+            qkv,
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,
             kvcache_start_index,
+            kv_page_table,
             **kwargs,
         )
         # AttentionPlugin returns [batch, seq_len, num_heads, head_dim]; reshape for o_proj.
@@ -320,6 +378,158 @@ class Attention(nn.Module):
                                           self.num_heads * self.head_dim)
 
         return self.o_proj(attn_output), present_key_value
+
+
+# ---------------------------------------------------------------------------
+# Post-load optimisation: fuse attention Q/K/V projections into one GEMM
+# (mirrors qwen3_5.fuse_gdn_input_projections)
+# ---------------------------------------------------------------------------
+
+_QKV_PROJ_NAMES = ("q_proj", "k_proj", "v_proj")
+_NVFP4_SCALAR_SCALE_SUFFIXES = ("input_scale", "weight_scale_2")
+
+
+def _can_fuse_nvfp4_scales(attn: "Attention") -> bool:
+    """True if all 3 NVFP4 Q/K/V projections have identical scalar scales."""
+    for suffix in _NVFP4_SCALAR_SCALE_SUFFIXES:
+        tensors = []
+        for name in _QKV_PROJ_NAMES:
+            proj = getattr(attn, name, None)
+            if proj is None:
+                return False
+            t = getattr(proj, suffix, None)
+            if t is None:
+                return False
+            tensors.append(t)
+        if not all(torch.equal(tensors[0], t) for t in tensors[1:]):
+            return False
+    return True
+
+
+def fuse_qkv_projections(model: nn.Module) -> int:
+    """Post-load optimisation: fuse attention Q/K/V projections into one GEMM.
+
+    A single fused GEMM feeds the packed-QKV plugin input directly (no Concat,
+    no reliance on the compiler backend's horizontal GEMM fusion).
+
+    Per quant type: FP16 always fuses; NVFP4 fuses only when the per-tensor
+    scales (``input_scale``, ``weight_scale_2``) match across Q/K/V (mismatch
+    => warn and fall back to 3 GEMMs + concat); other quant types skip.
+    FP8-KV-cache layers also skip — ``k_scale`` / ``v_scale`` live on
+    ``k_proj`` / ``v_proj`` and are read at export time.
+
+    Fused layers replace the three sub-modules with ``qkv_proj_fused``
+    (auto-detected in ``Attention.forward``). Returns the number fused.
+    """
+
+    fused_count = 0
+    for name, module in model.named_modules():
+        # Exact type match: subclasses (e.g. Gemma4Attention) have their own
+        # forward() and may not own k_proj / v_proj.
+        if type(module) is not Attention:
+            continue
+        attn: Attention = module
+        if hasattr(attn, "qkv_proj_fused"):
+            continue  # idempotent
+        if attn.enable_fp8_kv_cache:
+            continue  # k_scale / v_scale buffers must stay on k_proj / v_proj
+        # Defensive: skip any layer that doesn't own all three projections.
+        if any(getattr(attn, n, None) is None for n in _QKV_PROJ_NAMES):
+            continue
+
+        proj_modules = [getattr(attn, n) for n in _QKV_PROJ_NAMES]
+        first_proj = attn.q_proj
+        # Mixed quantization across Q/K/V cannot be fused into one GEMM.
+        if any(type(p) is not type(first_proj) for p in proj_modules):
+            logger.warning(
+                "QKV fusion skipped for %s: mixed projection types (%s).",
+                name, [type(p).__name__ for p in proj_modules])
+            continue
+        if isinstance(first_proj, FP16Linear):
+            pass  # always fusible
+        elif is_nvfp4_linear(first_proj):
+            if not _can_fuse_nvfp4_scales(attn):
+                logger.warning(
+                    "QKV fusion skipped for %s: NVFP4 scalar scales differ "
+                    "across projections. Re-quantize with resmoothing "
+                    "enabled to equalise scales.", name)
+                continue
+        else:
+            # INT4, FP8, MXFP8, etc. — not fusible.
+            continue
+
+        # --- Fuse: concatenate weights along output dim (dim 0) ----------
+        fused_buffers: dict = {}
+        # Union across all three projections so an attribute missing on any
+        # side is caught (fail-loud below) instead of silently dropped.
+        attr_names = list(
+            dict.fromkeys(
+                itertools.chain.from_iterable(
+                    itertools.chain(p._buffers, p._parameters)
+                    for p in proj_modules)))
+        # The checkpoint loader may rebind `bias` as a plain attribute
+        # (outside _buffers/_parameters); include it explicitly.
+        if "bias" not in attr_names and any(
+                getattr(p, "bias", None) is not None for p in proj_modules):
+            attr_names.append("bias")
+        for attr in attr_names:
+            parts = [getattr(p, attr, None) for p in proj_modules]
+            if all(p is None for p in parts):
+                continue
+            # An attribute present on only a subset of Q/K/V would either
+            # crash torch.cat or be silently dropped — fail loudly instead.
+            if any(p is None for p in parts):
+                raise RuntimeError(
+                    f"QKV fusion: attribute '{attr}' present on only a "
+                    "subset of q/k/v projections; cannot fuse.")
+            if parts[0].numel() == 1:
+                # Per-tensor scalar (0-d or (1,)-shaped): take first —
+                # equality across Q/K/V is a fusion precondition.
+                fused_buffers[attr] = parts[0]
+            else:
+                # Per-output-channel: concat along dim 0.
+                fused_buffers[attr] = torch.cat(parts, dim=0)
+
+        # Build a fused linear with correct type.
+        fused_out_dim = sum(p.out_features for p in proj_modules)
+        in_features = first_proj.in_features
+        has_bias = getattr(first_proj, "bias", None) is not None
+        if is_nvfp4_linear(first_proj):
+            method = NVFP4LinearMethod(
+                group_size=first_proj.quant_method.group_size)
+            fused_linear = ReplicatedLinear(in_features,
+                                            fused_out_dim,
+                                            bias=has_bias,
+                                            dtype=torch.float16,
+                                            mapping=first_proj.mapping,
+                                            quant_method=method)
+        else:
+            fused_linear = FP16Linear(in_features,
+                                      fused_out_dim,
+                                      bias=has_bias)
+
+        # Assign fused buffers/params.
+        for attr, tensor in fused_buffers.items():
+            if attr in fused_linear._buffers:
+                fused_linear._buffers[attr] = tensor
+            elif attr in fused_linear._parameters:
+                fused_linear._parameters[attr] = nn.Parameter(
+                    tensor, requires_grad=False)
+            else:
+                setattr(fused_linear, attr, tensor)
+
+        # Replace: add fused, delete originals.
+        attn.qkv_proj_fused = fused_linear
+        for proj_name in _QKV_PROJ_NAMES:
+            delattr(attn, proj_name)
+
+        fused_count += 1
+        logger.debug("Fused QKV projections for %s", name)
+
+    if fused_count:
+        logger.info("Fused attention QKV projections in %d layer(s)",
+                    fused_count)
+    return fused_count
 
 
 # ---------------------------------------------------------------------------
@@ -370,11 +580,16 @@ class DecoderLayer(nn.Module):
         self_attn, mlp, input_layernorm, post_attention_layernorm
     """
 
+    #: Subclasses override to swap the per-layer feed-forward implementation
+    #: (e.g. Cosmos3-Edge's non-gated squared-ReLU MLP) without rebuilding or
+    #: patching modules after construction.
+    mlp_cls = MLP
+
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config, layer_idx=layer_idx)
+        self.mlp = type(self).mlp_cls(config, layer_idx=layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps)
@@ -386,8 +601,10 @@ class DecoderLayer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
@@ -396,8 +613,10 @@ class DecoderLayer(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_page_table,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
+            skip_softmax_scale=skip_softmax_scale,
         )
         hidden_states = residual + attn_output
 
@@ -426,11 +645,14 @@ class Transformer(nn.Module):
     them as an extra ONNX output (see :class:`CausalLM.emit_hidden_states`).
     """
 
+    #: Subclasses override to swap the decoder-layer implementation.
+    decoder_layer_cls = DecoderLayer
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            DecoderLayer(config, layer_idx=i)
+            type(self).decoder_layer_cls(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -444,9 +666,11 @@ class Transformer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
         output_hidden_states: bool = False,
         dflash_target_layer_ids: "List[int] | None" = None,
     ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
@@ -466,8 +690,10 @@ class Transformer(nn.Module):
                 rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
+                kv_page_table,
                 attention_mask=attention_mask,
                 attention_pos_id=attention_pos_id,
+                skip_softmax_scale=skip_softmax_scale,
             )
             present_key_values_list.append(next_key_value)
 
@@ -486,12 +712,14 @@ class Transformer(nn.Module):
         # consumes exactly this tensor.
         self.last_pre_norm_hidden_states = hidden_states
 
-        # DFlash hidden concat: concatenate target-layer hidden states.
+        # Target-hidden concat for DFlash/DSpark-style draft feedback.
         # Stored as an attribute (like last_pre_norm_hidden_states) so that
         # Transformer.forward() keeps its 3-value return signature and
         # downstream callers (TTS talker, Qwen3.5 text, etc.) are unaffected.
-        self.dflash_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
+        self.target_hidden_concat = (torch.cat(dflash_hidden_list, dim=-1)
                                      if dflash_hidden_list else None)
+        # Backward-compatible alias used by existing DFlash callers.
+        self.dflash_hidden_concat = self.target_hidden_concat
 
         normed = self.norm(hidden_states)
 
@@ -523,11 +751,14 @@ class CausalLM(nn.Module):
     #: as an ONNX output in addition to ``logits``.
     emit_hidden_states: bool = False
 
+    #: Subclasses override to swap the transformer stack implementation.
+    transformer_cls = Transformer
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
 
-        self.model = Transformer(config)
+        self.model = type(self).transformer_cls(config)
 
         self.lm_head = make_linear(config,
                                    config.hidden_size,
@@ -562,10 +793,11 @@ class CausalLM(nn.Module):
         Builds dummy inputs, I/O name lists, and dynamic shape descriptors
         matching the flat wrapper signature produced by :func:`_make_flat_wrapper`.
 
-        When ``config.eagle_base`` or ``config.dflash_base`` is True, extra inputs
-        (``attention_pos_id``, ``attention_mask``) and an extra output
-        (``hidden_states``) are added. For DFlash base, hidden_states is the
-        concatenated target-layer hidden (shape: [B, S, len(target_layer_ids)*H]).
+        When ``config.eagle_base``, ``config.dflash_base``, or
+        ``config.dspark_base`` is True, extra inputs (``attention_pos_id``,
+        ``attention_mask``) and an extra output (``hidden_states``) are added.
+        For DFlash/DSpark base, hidden_states is the concatenated target-layer
+        hidden (shape: [B, S, len(target_layer_ids)*H]).
 
         When ``config.eagle_base`` is True, extra inputs (``attention_pos_id``,
         ``attention_mask``) and an extra output (``hidden_states``) are added
@@ -575,9 +807,12 @@ class CausalLM(nn.Module):
         Na = config.num_hidden_layers
         Nd = config.num_deepstack_features
         dflash_base = getattr(config, 'dflash_base', False)
-        # DFlash base uses the same export structure as Eagle base (tree-attention
-        # inputs + hidden_states output), so we treat it as eagle_base for the wrapper.
-        eagle_base = config.eagle_base or dflash_base
+        dspark_base = getattr(config, 'dspark_base', False)
+        target_hidden_base = dflash_base or dspark_base
+        # DFlash/DSpark base uses the same export structure as Eagle base
+        # (tree-attention inputs + hidden_states output), so we treat it as
+        # eagle_base for the wrapper.
+        eagle_base = config.eagle_base or target_hidden_base
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
@@ -591,11 +826,14 @@ class CausalLM(nn.Module):
                                     device=device)
         kv_dtype = (torch.float8_e4m3fn
                     if config.quant.kv_cache_quant == "fp8" else dtype16)
+        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
+        # num_pages is a dummy placeholder for export; the builder sets the real fixed
+        # value (see llmBuilder.cpp setupKVCacheProfiles).
         past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        2,
+            torch.zeros(2,
+                        1,
+                        KV_PAGE_SIZE,
                         config.num_key_value_heads,
-                        past_len,
                         config.head_dim,
                         dtype=kv_dtype,
                         device=device) for _ in range(Na)
@@ -612,6 +850,11 @@ class CausalLM(nn.Module):
         kvcache_start_index = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
+        kv_page_table = torch.zeros(batch_size,
+                                    2,
+                                    1,
+                                    dtype=torch.int32,
+                                    device=device)
         last_token_ids = torch.zeros(batch_size,
                                      1,
                                      dtype=torch.int64,
@@ -625,15 +868,17 @@ class CausalLM(nn.Module):
                         device=device) for _ in range(Nd)
         ]
 
-        args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, last_token_ids,
-                *deepstack_embeds_list)
+        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
 
-        input_names = (["inputs_embeds"] +
-                       [f"past_key_values_{i}" for i in range(Na)] + [
-                           "rope_rotary_cos_sin", "context_lengths",
-                           "kvcache_start_index", "last_token_ids"
-                       ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+        args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
+                context_lengths, kvcache_start_index, kv_page_table,
+                last_token_ids, *deepstack_embeds_list)
+
+        input_names = (
+            ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
+                "rope_rotary_cos_sin", "context_lengths",
+                "kvcache_start_index", "kv_page_table", "last_token_ids"
+            ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states and not eagle_base:
@@ -643,18 +888,22 @@ class CausalLM(nn.Module):
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
-        past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
+        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
         num_selected = torch.export.Dim("num_selected", min=1,
                                         max=256) if eagle_base else None
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
-            all_shapes.append({0: batch, 3: past})  # past_key_values_i
+            all_shapes.append({1:
+                               num_pages})  # past_key_values_i (pool-shaped)
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
+        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
         if eagle_base:
             all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         else:
@@ -692,6 +941,14 @@ class CausalLM(nn.Module):
                 2: mask_kv_len
             })  # attention_mask
 
+        # Trailing runtime skip-softmax override input.
+        skip_dim = torch.export.Dim("skip_softmax_scale_len",
+                                    min=0,
+                                    max=1048576)
+        args = args + (skip_softmax_scale, )
+        input_names = input_names + ["skip_softmax_scale"]
+        all_shapes.append({0: skip_dim})  # skip_softmax_scale
+
         wrapped = _make_flat_wrapper(
             self,
             Na,
@@ -713,15 +970,23 @@ class CausalLM(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         last_token_ids: torch.Tensor,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
         attention_mask: "torch.Tensor | None" = None,
         attention_pos_id: "torch.Tensor | None" = None,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple:
         eagle_base = self.config.eagle_base
         dflash_base = getattr(self.config, 'dflash_base', False)
+        dspark_base = getattr(self.config, 'dspark_base', False)
+        target_hidden_base = dflash_base or dspark_base
         dflash_target_layer_ids = getattr(self.config,
                                           'dflash_target_layer_ids', None)
+        dspark_target_layer_ids = getattr(self.config,
+                                          'dspark_target_layer_ids', None)
+        target_layer_ids = (dspark_target_layer_ids
+                            if dspark_base else dflash_target_layer_ids)
 
         hidden_states, present_key_values, all_hidden_states = self.model(
             inputs_embeds,
@@ -729,14 +994,16 @@ class CausalLM(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_page_table,
             deepstack_embeds,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
-            output_hidden_states=eagle_base and not dflash_base,
-            dflash_target_layer_ids=dflash_target_layer_ids
-            if dflash_base else None,
+            skip_softmax_scale=skip_softmax_scale,
+            output_hidden_states=eagle_base and not target_hidden_base,
+            dflash_target_layer_ids=target_layer_ids
+            if target_hidden_base else None,
         )
-        dflash_hidden_concat = getattr(self.model, 'dflash_hidden_concat',
+        target_hidden_concat = getattr(self.model, 'target_hidden_concat',
                                        None)
 
         # Select hidden states for specified token positions before lm_head.
@@ -748,11 +1015,11 @@ class CausalLM(nn.Module):
 
         logits = self.lm_head(selected_hidden_states).to(torch.float32)
 
-        if dflash_base and dflash_hidden_concat is not None:
-            # DFlash base: concatenate hidden states from target layers.
+        if target_hidden_base and target_hidden_concat is not None:
+            # DFlash/DSpark base: concatenate hidden states from target layers.
             # Output the full-sequence hidden states (NOT gathered) — the C++
-            # runtime passes these to the DFlash draft engine per round.
-            return logits, dflash_hidden_concat, present_key_values
+            # runtime passes these to the draft engine per round.
+            return logits, target_hidden_concat, present_key_values
 
         if eagle_base and all_hidden_states is not None:
             # EAGLE3 base: concatenate hidden states from 3 selected layers.

@@ -72,6 +72,23 @@ struct SelectiveStateUpdateParams
     int32_t seq_len{1};
     int32_t const* context_lengths{nullptr}; // Per-batch actual token count (prefill only)
 
+    // MTP spec-verify (replay): rather than snapshotting the full [nheads, dim, dstate] recurrent
+    // state after every draft token, the prefill kernel stashes the minimal per-token replay inputs
+    // needed to rebuild the accepted state. During verification the committed state is left read-only
+    // (update_state=false); after acceptance the runtime replays the recurrence
+    //   S = dA * S + u ⊗ B
+    // over the first ``p`` accepted tokens from the read-only committed state (see
+    // invokeMambaReplayReconstruct). The stash buffers are fp32 and contiguous:
+    //   replay_dA [batch, replay_seq_len, nheads]           per-token decay exp(A * softplus(dt))
+    //   replay_u  [batch, replay_seq_len, nheads, dim]      per-token input factor dt * x
+    //   replay_B  [batch, replay_seq_len, ngroups, dstate]  per-token key B
+    // replay_seq_len is the seq-dim capacity; writes at t >= replay_seq_len are dropped (CUDA-graph
+    // capture may pass a dummy context length exceeding the buffer extent).
+    void* __restrict__ replay_dA{nullptr};
+    void* __restrict__ replay_u{nullptr};
+    void* __restrict__ replay_B{nullptr};
+    int64_t replay_seq_len{};
+
     void* __restrict__ state{nullptr};
     void* __restrict__ x{nullptr};
     void* __restrict__ dt{nullptr};
@@ -381,6 +398,38 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
                                     + head * params.out_stride_head + _d],
                     out_val);
             }
+
+            // MTP spec-verify (replay): stash the minimal per-token replay inputs so the accepted
+            // state can be reconstructed from the read-only committed state after verification.
+            // Clamp to the buffer's seq capacity: during CUDA-graph capture effectiveSeqLen can
+            // exceed replay_seq_len (dummy context lengths), which would write OOB.
+            if (params.replay_u && t < params.replay_seq_len)
+            {
+                int64_t const tokenRow = static_cast<int64_t>(batch) * params.replay_seq_len + t;
+                // u[batch, t, head, _d] = dt * x — identical across lanes, so only lane 0 writes.
+                if (lane == 0)
+                {
+                    reinterpret_cast<float*>(params.replay_u)[(tokenRow * nheads + head) * DIM + _d] = dt_val * x_val;
+                    // dA[batch, t, head] — one value per (batch, t, head).
+                    if (_d == 0)
+                        reinterpret_cast<float*>(params.replay_dA)[tokenRow * nheads + head] = dA;
+                }
+                // B[batch, t, group, i] — one value per (batch, t, group); the first head of each
+                // group (first dim row) writes it, lanes split the dstate slice.
+                if (_d == 0 && (head % (nheads / ngroups)) == 0)
+                {
+                    auto* __restrict__ replayB = reinterpret_cast<float*>(params.replay_B);
+                    int64_t const bOff = (tokenRow * ngroups + group) * DSTATE;
+#pragma unroll
+                    for (int ii = 0; ii < dstatePerLane; ++ii)
+                    {
+                        int const i = lane * dstatePerLane + ii;
+                        if (i < DSTATE)
+                            replayB[bOff + i] = toFloat(
+                                B[batch * params.B_stride_batch + t * params.B_stride_seq + group * DSTATE + i]);
+                    }
+                }
+            }
         }
 
         // Zero output at padded positions.
@@ -404,6 +453,76 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
                 if (i < DSTATE)
                     convertAndStore(&state[_d * params.state_stride_dim + i], runState[ii]);
             }
+        }
+    }
+}
+
+// MTP spec-verify (replay): rebuild the committed recurrent state after acceptance by re-running the
+// SSD recurrence  S = dA * S + u ⊗ B  over the first ``p`` accepted tokens (params.context_lengths[b])
+// from the read-only committed state. The stash (replay_dA/u/B) was produced by the prefill kernel.
+// Same block/warp/lane mapping as the forward scan; the update is in-place on disjoint state elements.
+template <typename state_t, int DIM, int DSTATE, int numWarps>
+__global__ void mamba_replay_reconstruct_kernel(SelectiveStateUpdateParams params)
+{
+    constexpr int dstatePerLane = (DSTATE + kWARP_SIZE - 1) / kWARP_SIZE;
+
+    auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);
+    auto const* __restrict__ replayDA = reinterpret_cast<float const*>(params.replay_dA);
+    auto const* __restrict__ replayU = reinterpret_cast<float const*>(params.replay_u);
+    auto const* __restrict__ replayB = reinterpret_cast<float const*>(params.replay_B);
+
+    int const nheads = params.nheads;
+    int const ngroups = params.ngroups;
+
+    auto const batch = blockIdx.x;
+    auto const head = blockIdx.y;
+    auto const group = head / (nheads / ngroups);
+    auto const lane = threadIdx.x % kWARP_SIZE;
+    auto const warp = threadIdx.y;
+
+    bool const validSlot = (params.pad_slot_id < 0 || batch != static_cast<uint32_t>(params.pad_slot_id));
+    // Accepted-token count for this batch; 0 accepted => committed state already correct.
+    int const p = params.context_lengths ? params.context_lengths[batch] : params.seq_len;
+    if (!validSlot || p <= 0)
+        return;
+
+    state += batch * params.state_stride_batch + head * params.state_stride_head;
+    constexpr auto rowsPerWarp = (DIM + numWarps - 1) / numWarps;
+
+    for (int _d = warp * rowsPerWarp; _d < (warp + 1) * rowsPerWarp; _d++)
+    {
+        if (_d >= DIM)
+            break;
+
+        float runState[dstatePerLane];
+#pragma unroll
+        for (int ii = 0; ii < dstatePerLane; ++ii)
+        {
+            int const i = lane * dstatePerLane + ii;
+            runState[ii] = (i < DSTATE) ? toFloat(state[_d * params.state_stride_dim + i]) : 0.f;
+        }
+
+        for (int t = 0; t < p && t < params.replay_seq_len; ++t)
+        {
+            int64_t const tokenRow = static_cast<int64_t>(batch) * params.replay_seq_len + t;
+            float const dA = replayDA[tokenRow * nheads + head];
+            float const u = replayU[(tokenRow * nheads + head) * DIM + _d];
+            int64_t const bOff = (tokenRow * ngroups + group) * DSTATE;
+#pragma unroll
+            for (int ii = 0; ii < dstatePerLane; ++ii)
+            {
+                int const i = lane * dstatePerLane + ii;
+                if (i < DSTATE)
+                    runState[ii] = runState[ii] * dA + u * replayB[bOff + i];
+            }
+        }
+
+#pragma unroll
+        for (int ii = 0; ii < dstatePerLane; ++ii)
+        {
+            int const i = lane * dstatePerLane + ii;
+            if (i < DSTATE)
+                convertAndStore(&state[_d * params.state_stride_dim + i], runState[ii]);
         }
     }
 }
@@ -449,6 +568,22 @@ struct SsmPrefillKernelLauncher
         dim3 grid(params.batch, params.nheads);
         selective_state_update_prefill_kernel_simple<input_t, weight_t, matrixA_t, state_t, stateIndex_t, DIM, DSTATE,
             numWarps><<<grid, block, 0, stream>>>(params);
+    }
+};
+
+template <typename state_t>
+struct SsmReplayReconstructLauncher
+{
+    SelectiveStateUpdateParams& params;
+    cudaStream_t stream;
+
+    template <int DIM, int DSTATE>
+    void operator()()
+    {
+        constexpr int numWarps = 4;
+        dim3 block(kWARP_SIZE, numWarps);
+        dim3 grid(params.batch, params.nheads);
+        mamba_replay_reconstruct_kernel<state_t, DIM, DSTATE, numWarps><<<grid, block, 0, stream>>>(params);
     }
 };
 
@@ -545,11 +680,25 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
     trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
     trt_edgellm::rt::OptionalInputTensor dt_bias, trt_edgellm::rt::OptionalInputTensor D,
     trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
-    bool dt_softplus, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream)
+    bool dt_softplus, trt_edgellm::rt::OptionalInputTensor contextLengths,
+    trt_edgellm::rt::OptionalOutputTensor replayDA, trt_edgellm::rt::OptionalOutputTensor replayU,
+    trt_edgellm::rt::OptionalOutputTensor replayB, cudaStream_t stream)
 {
     SelectiveStateUpdateParams params{};
     fillCommonParamsFromTensors(x, A, B, C, dt, dt_bias, D, z, state, output, dt_softplus, params);
     params.context_lengths = contextLengths.has_value() ? contextLengths->get().dataPointer<int32_t>() : nullptr;
+
+    // MTP spec-verify (replay): optional per-token replay stash. When present, keep the committed
+    // recurrent state read-only (the runtime reconstructs the accepted state after verification via
+    // invokeMambaReplayReconstruct) and stash dA/u/B [batch, seq_len, ...] for that replay.
+    if (replayU.has_value())
+    {
+        params.replay_dA = replayDA->get().rawPointer();
+        params.replay_u = replayU->get().rawPointer();
+        params.replay_B = replayB->get().rawPointer();
+        params.replay_seq_len = replayU->get().getShape()[1];
+        params.update_state = false;
+    }
 
     params.seq_len = static_cast<int32_t>(x.getShape()[1]);
     params.x_stride_batch = x.getStride(0);
@@ -581,6 +730,56 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
     else
     {
         throw std::runtime_error("invokeSelectiveStateUpdatePrefill: only (x=half, dt=half or float) is supported.");
+    }
+}
+
+// Public non-templated API (MTP spec-verify replay reconstruction).
+void invokeMambaReplayReconstruct(trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor const& replayDA,
+    trt_edgellm::rt::Tensor const& replayU, trt_edgellm::rt::Tensor const& replayB,
+    trt_edgellm::rt::Tensor const& acceptedLengths, int32_t activeBatchSize, cudaStream_t stream)
+{
+    if (activeBatchSize <= 0)
+    {
+        return;
+    }
+    if (activeBatchSize > static_cast<int32_t>(state.getShape()[0]))
+    {
+        throw std::runtime_error("invokeMambaReplayReconstruct: activeBatchSize exceeds the state pool batch size.");
+    }
+
+    SelectiveStateUpdateParams params{};
+    // State pools are sized to maxBatch; bound the reconstruction to the active
+    // sequences so the kernel does not read past acceptedLengths[activeBatch).
+    params.batch = static_cast<uint32_t>(activeBatchSize);
+    params.nheads = static_cast<uint32_t>(state.getShape()[1]);
+    params.dim = static_cast<uint32_t>(state.getShape()[2]);
+    params.dstate = static_cast<uint32_t>(state.getShape()[3]);
+    params.ngroups = static_cast<uint32_t>(replayB.getShape()[2]); // [batch, seq_len, ngroups, dstate]
+
+    params.state_stride_batch = state.getStride(0);
+    params.state_stride_head = state.getStride(1);
+    params.state_stride_dim = state.getStride(2);
+
+    params.state = state.rawPointer();
+    params.replay_dA = const_cast<void*>(replayDA.rawPointer());
+    params.replay_u = const_cast<void*>(replayU.rawPointer());
+    params.replay_B = const_cast<void*>(replayB.rawPointer());
+    params.replay_seq_len = replayU.getShape()[1]; // [batch, seq_len, nheads, dim]
+    params.context_lengths = acceptedLengths.dataPointer<int32_t>();
+
+    if (state.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        SsmReplayReconstructLauncher<half> launcher{params, stream};
+        dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
+    }
+    else if (state.getDataType() == nvinfer1::DataType::kFLOAT)
+    {
+        SsmReplayReconstructLauncher<float> launcher{params, stream};
+        dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, launcher);
+    }
+    else
+    {
+        throw std::runtime_error("invokeMambaReplayReconstruct: state must be half or float.");
     }
 }
 

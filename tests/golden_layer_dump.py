@@ -101,6 +101,33 @@ DEFAULT_INPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _ADD_GENERATION_PROMPT = True
 _ENABLE_THINKING = False
 
+_ATTENTION_BLOCK_TYPES = {
+    "full_attention", "sliding_attention", "chunked_attention"
+}
+
+
+def _normalize_cache_layer_types(model) -> None:
+    """Make truncated hybrid configs acceptable to Transformers' DynamicCache.
+
+    Nemotron-H's first few layers can be ``linear_attention, mlp, ...`` with no
+    full-attention layer. The model layers are already constructed, so this only
+    adjusts the config that Transformers reads when it builds the cache in
+    ``forward``: ``mlp`` is a stateless cache slot and a trailing unused
+    full-attention slot lets mask helpers resolve the sequence offset.
+    """
+    block_types = getattr(model.config, "layer_types", None)
+    if not block_types or "mlp" not in block_types:
+        return
+
+    cache_layer_types = ["moe" if t == "mlp" else t for t in block_types]
+    if not any(t in _ATTENTION_BLOCK_TYPES for t in cache_layer_types):
+        cache_layer_types.append("full_attention")
+
+    if hasattr(model.config, "layers_block_type"):
+        model.config.layers_block_type = cache_layer_types
+    else:
+        model.config.layer_types = cache_layer_types
+
 
 def _pick_ckpt(user_ckpt: str | None) -> str:
     """Resolve the checkpoint path: prefer the user's, else the first candidate that exists."""
@@ -303,6 +330,7 @@ def main() -> None:
         model = _build(attn_impl)
     model.to(args.device)
     model.eval()
+    _normalize_cache_layer_types(model)
 
     # position_ids: pad tokens must not consume position ids -> cumsum(mask) - 1, clamped to >= 0.
     position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
@@ -434,7 +462,17 @@ def _state_at(past, abs_idx: int, ltype: str):
             layers):  # transformers 5.x unified cache.
         layer = layers[abs_idx]
         if ltype == "recurrent":
-            return layer.recurrent_states, getattr(layer, "conv_states", None)
+            recurrent = layer.recurrent_states
+            conv = getattr(layer, "conv_states", None)
+            # transformers 5.14.x stores a recurrent layer's states as
+            # ``{state_idx: tensor}`` (its cache layer supports multiple states);
+            # Nemotron-H Mamba uses a single state, so unwrap index 0. Earlier 5.x
+            # exposed a plain tensor -- keep both paths.
+            if isinstance(recurrent, dict):
+                recurrent = recurrent.get(0)
+            if isinstance(conv, dict):
+                conv = conv.get(0)
+            return recurrent, conv
         return layer.keys, layer.values
     if hasattr(past, "key_cache"):  # legacy attention-only cache.
         return past.key_cache[abs_idx], past.value_cache[abs_idx]

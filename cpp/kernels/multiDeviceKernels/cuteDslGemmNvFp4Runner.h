@@ -114,6 +114,7 @@ public:
 private:
     int32_t mMmaTilerN;
 
+#ifdef CUTE_DSL_GEMM_NVFP4_ENABLED
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED
     static gemm_blackwell_nvfp4_fp16_tn64_Kernel_Module_t sModFp16Tn64;
 #endif
@@ -141,6 +142,7 @@ private:
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED
     static gemm_blackwell_nvfp4_ws_fp8_tn128_Kernel_Module_t sModWsFp8Tn128;
 #endif
+#endif // CUTE_DSL_GEMM_NVFP4_ENABLED
     static std::mutex sMutex;
     static bool sLoaded;
 };

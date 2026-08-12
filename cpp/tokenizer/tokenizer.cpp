@@ -20,6 +20,8 @@
 #include "common/utf8.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizerUtils.h"
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iterator>
 #include <nlohmann/json.hpp>
@@ -44,6 +46,24 @@ static int hexCharToInt(char c)
     return -1;
 }
 
+static std::string trimAsciiWhitespace(std::string const& text)
+{
+    // Common chat-template helper for Jinja-style `|trim` behavior.
+    auto const isWs = [](unsigned char ch) { return std::isspace(ch) != 0; };
+    size_t begin = 0;
+    while (begin < text.size() && isWs(static_cast<unsigned char>(text[begin])))
+    {
+        ++begin;
+    }
+
+    size_t end = text.size();
+    while (end > begin && isWs(static_cast<unsigned char>(text[end - 1])))
+    {
+        --end;
+    }
+    return text.substr(begin, end - begin);
+}
+
 // Chat template role names
 constexpr char kRoleSystem[] = "system";
 
@@ -57,7 +77,7 @@ Tokenizer::Tokenizer() noexcept
 {
 }
 
-bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
+bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir, bool requireChatTemplate)
 {
     if (!std::filesystem::exists(modelDir) || !std::filesystem::is_directory(modelDir))
     {
@@ -71,6 +91,12 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
     mTokenEncoder.reset();
     mSpecialTokensEncoder.clear();
     mSpecialTokensDecoder.clear();
+    mBosId = -1;
+    mEosId = -1;
+    mAdditionalEosIds.clear();
+    mPadId = -1;
+    mUnkId = -1;
+    mImgContextId = -1;
 
     std::filesystem::path tokenizerFile = modelDir / "tokenizer.json";
     std::filesystem::path configFile = modelDir / "tokenizer_config.json";
@@ -105,6 +131,7 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
     {
         LOG_WARNING("tokenizer_config.json not found, using default special token configuration");
     }
+
     LOG_INFO("Loaded %zu special tokens", specialTokens.size());
 
     if (mTokenEncoder)
@@ -121,9 +148,14 @@ bool Tokenizer::loadFromHF(std::filesystem::path const& modelDir)
     // Pre-initialize Unicode lookup tables to avoid first-call latency during encode
     unicodeCptFlags(0);
 
-    // Load chat template (required)
+    // Load chat template (required unless the caller opts out, e.g. for
+    // decode-only ASR pipelines with no chat structure).
     std::filesystem::path const chatTemplatePath = modelDir / "processed_chat_template.json";
-    if (!loadChatTemplate(chatTemplatePath))
+    if (!requireChatTemplate && !std::filesystem::exists(chatTemplatePath))
+    {
+        LOG_INFO("No processed_chat_template.json (optional for this pipeline); chat template disabled.");
+    }
+    else if (!loadChatTemplate(chatTemplatePath))
     {
         LOG_ERROR(
             "Please ensure processed_chat_template.json exists in the model/engine directory, and it follows the "
@@ -252,6 +284,16 @@ bool Tokenizer::parseTokenizerConfig(
         else if (decType == "ByteFallback")
         {
             mByteFallbackDecode = true;
+        }
+        else if (decType == "Metaspace")
+        {
+            // SentencePiece-style decoder: word-boundary marker (default
+            // U+2581 "▁") becomes a space; with prepend_scheme != "never"
+            // the marker prepended to the first word yields a leading space
+            // that decode() must strip.
+            std::string replacement = decConfig.value("replacement", "\xE2\x96\x81");
+            mDecoderReplacements.emplace_back(std::move(replacement), " ");
+            mMetaspaceStripLeading = decConfig.value("prepend_scheme", "always") != "never";
         }
     }
 
@@ -424,6 +466,7 @@ bool Tokenizer::parseSpecialTokenConfig(std::filesystem::path const& configFile,
 
     mBosId = parseSpecialToken(jsonConfig, "bos_token");
     mEosId = parseSpecialToken(jsonConfig, "eos_token");
+    mAdditionalEosIds.clear();
     mPadId = parseSpecialToken(jsonConfig, "pad_token");
     mUnkId = parseSpecialToken(jsonConfig, "unk_token");
     mImgContextId = parseSpecialToken(jsonConfig, "context_image_token");
@@ -446,12 +489,18 @@ std::unique_ptr<PreTokenizer> Tokenizer::createPreTokenizer(Json const& preToken
 
                 if (type == "Split" && step.contains("pattern"))
                 {
-                    // Handle Split with Regex pattern
+                    // Handle Split with Regex pattern. Split/String is kept as
+                    // a no-op for tokenizer JSONs where the preceding
+                    // normalizer already consumed that separator.
                     if (step["pattern"].is_object() && step["pattern"].contains("Regex"))
                     {
                         std::string pattern = step["pattern"]["Regex"].get<std::string>();
                         std::string normalizedPattern = normalizeRegex(pattern);
                         sequence->addStep(std::make_unique<RegexSplit>(normalizedPattern));
+                    }
+                    else if (step["pattern"].is_object() && step["pattern"].contains("String"))
+                    {
+                        continue;
                     }
                 }
             }
@@ -472,6 +521,12 @@ std::unique_ptr<PreTokenizer> Tokenizer::createPreTokenizer(Json const& preToken
                 std::string pattern = preTokenizerConfig["pattern"]["Regex"].get<std::string>();
                 std::string normalizedPattern = normalizeRegex(pattern);
                 return std::make_unique<RegexSplit>(normalizedPattern);
+            }
+            if (preTokenizerConfig["pattern"].is_object() && preTokenizerConfig["pattern"].contains("String"))
+            {
+                // See the sequence path above: this is a general tokenizer
+                // JSON fallback, not a DiffusionGemma-specific branch.
+                return std::make_unique<Sequence>();
             }
         }
         else if (type == "Regex" && preTokenizerConfig.contains("pattern"))
@@ -833,6 +888,13 @@ std::string Tokenizer::decode(std::vector<Rank> const& tokens, bool skipSpecialT
         }
     }
 
+    // Metaspace prepend_scheme: the marker prepended to the first word
+    // becomes a leading space that HF's decoder strips.
+    if (mMetaspaceStripLeading && !raw.empty() && raw.front() == ' ')
+    {
+        raw.erase(0, 1);
+    }
+
     // Route through the UTF-8 sanitizer to guarantee well-formed output. This
     // is a single-shot decode, so any trailing incomplete bytes must surface
     // as U+FFFD rather than be held for a later call.
@@ -989,6 +1051,9 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
             ChatTemplateRole templateRole;
             templateRole.prefix = roleConfig.value("prefix", "");
             templateRole.suffix = roleConfig.value("suffix", "");
+            templateRole.prefixThinking = roleConfig.value("prefix_thinking", "");
+            templateRole.suffixThinking = roleConfig.value("suffix_thinking", "");
+            templateRole.trimContent = roleConfig.value("trim_content", false);
             mChatTemplate.roles[role] = templateRole;
         }
 
@@ -1013,7 +1078,8 @@ bool Tokenizer::loadChatTemplate(std::filesystem::path const& chatTemplateFile)
         mChatTemplate.generationPromptThinking = jsonData.value("generation_prompt_thinking", "");
         mChatTemplate.defaultSystemPrompt = jsonData.value("default_system_prompt", mChatTemplate.defaultSystemPrompt);
         mChatTemplate.trimContent = jsonData.value("trim_content", false);
-        mChatTemplate.promptPrefix = jsonData.value("prompt_prefix", mChatTemplate.promptPrefix);
+        mChatTemplate.promptPrefix
+            = jsonData.value("prompt_prefix", jsonData.value("global_prefix", mChatTemplate.promptPrefix));
     }
     catch (std::exception const& e)
     {
@@ -1075,8 +1141,16 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
             auto roleIt = mChatTemplate.roles.find(kRoleSystem);
             if (roleIt != mChatTemplate.roles.end())
             {
-                formattedPrefixSystemPrompt
-                    = mChatTemplate.promptPrefix + roleIt->second.prefix + systemPrompt + roleIt->second.suffix;
+                std::string const& prefix = (enableThinking && !roleIt->second.prefixThinking.empty())
+                    ? roleIt->second.prefixThinking
+                    : roleIt->second.prefix;
+                std::string const& suffix = (enableThinking && !roleIt->second.suffixThinking.empty())
+                    ? roleIt->second.suffixThinking
+                    : roleIt->second.suffix;
+                bool const shouldTrimSystemContent = roleIt->second.trimContent || mChatTemplate.trimContent;
+                std::string const formattedSystemContent
+                    = shouldTrimSystemContent ? trimAsciiWhitespace(systemPrompt) : systemPrompt;
+                formattedPrefixSystemPrompt = mChatTemplate.promptPrefix + prefix + formattedSystemContent + suffix;
             }
             else
             {
@@ -1117,7 +1191,9 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
         // Add role prefix only in chat template mode
         if (applyChatTemplate)
         {
-            formattedMessage = roleIt->second.prefix;
+            formattedMessage = (enableThinking && !roleIt->second.prefixThinking.empty())
+                ? roleIt->second.prefixThinking
+                : roleIt->second.prefix;
         }
 
         // Process content items
@@ -1125,20 +1201,9 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
         {
             if (contentItem.type == "text")
             {
-                if (mChatTemplate.trimContent)
-                {
-                    auto const& s = contentItem.content;
-                    auto start = s.find_first_not_of(" \t\n\r");
-                    auto end = s.find_last_not_of(" \t\n\r");
-                    if (start != std::string::npos)
-                    {
-                        formattedMessage += s.substr(start, end - start + 1);
-                    }
-                }
-                else
-                {
-                    formattedMessage += contentItem.content;
-                }
+                bool const shouldTrimContent
+                    = applyChatTemplate && (roleIt->second.trimContent || mChatTemplate.trimContent);
+                formattedMessage += shouldTrimContent ? trimAsciiWhitespace(contentItem.content) : contentItem.content;
             }
             else if (contentItem.type == "trajectory")
             {
@@ -1177,7 +1242,9 @@ bool Tokenizer::applyChatTemplate(rt::LLMGenerationRequest::Request const& reque
         // Add role suffix only in chat template mode
         if (applyChatTemplate)
         {
-            formattedMessage += roleIt->second.suffix;
+            formattedMessage += (enableThinking && !roleIt->second.suffixThinking.empty())
+                ? roleIt->second.suffixThinking
+                : roleIt->second.suffix;
         }
 
         formattedCompleteRequest += formattedMessage;

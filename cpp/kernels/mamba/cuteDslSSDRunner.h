@@ -32,7 +32,14 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #endif // CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
 #endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
+#include "kernels/cuteDslModuleLoader.h"
+
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -87,8 +94,9 @@ public:
     //! SM100+: additionally, dim == 64 && dstate == 128 uses Blackwell TMA/wgmma persistent kernel.
     static bool canImplement(int32_t dim, int32_t dstate, int32_t smVersion);
 
-    static bool loadKernelModules();
-    static void unloadKernelModules();
+    //! Load only the module selected by \p params. The plugin calls this before
+    //! its state copy so a load failure cannot mutate output buffers.
+    static bool ensureKernelModules(SSDParams const& params, cudaStream_t stream);
 
     /// Run SSD prefill (Blackwell path when smVersion >= 100, else Ampere path).
     int run(SSDParams const& params, cudaStream_t stream);
@@ -105,18 +113,19 @@ private:
 #endif
 
     // SM80 modules — one per (dim, dstate) combination
-    static ssd_prefill_d128_n128_Kernel_Module_t sD128N128Module;
-    static ssd_prefill_d64_n128_Kernel_Module_t sD64N128Module;
-    static ssd_prefill_d128_n64_Kernel_Module_t sD128N64Module;
-    static ssd_prefill_d64_n64_Kernel_Module_t sD64N64Module;
+    static detail::LazyKernelModule<ssd_prefill_d128_n128_Kernel_Module_t> sD128N128Module;
+    static detail::LazyKernelModule<ssd_prefill_d64_n128_Kernel_Module_t> sD64N128Module;
+    static detail::LazyKernelModule<ssd_prefill_d128_n64_Kernel_Module_t> sD128N64Module;
+    static detail::LazyKernelModule<ssd_prefill_d64_n64_Kernel_Module_t> sD64N64Module;
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     // Two has_init_states variants per (D, N); runner dispatches on params.has_init_states.
-    static ssd_prefill_blackwell_d64_n128_Kernel_Module_t sBlackwellD64N128Module;
-    static ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t sBlackwellD64N128InitStatesModule;
-    static ssd_prefill_blackwell_d64_n64_Kernel_Module_t sBlackwellD64N64Module;
-    static ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t sBlackwellD64N64InitStatesModule;
+    static detail::LazyKernelModule<ssd_prefill_blackwell_d64_n128_Kernel_Module_t> sBlackwellD64N128Module;
+    static detail::LazyKernelModule<ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t>
+        sBlackwellD64N128InitStatesModule;
+    static detail::LazyKernelModule<ssd_prefill_blackwell_d64_n64_Kernel_Module_t> sBlackwellD64N64Module;
+    static detail::LazyKernelModule<ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t>
+        sBlackwellD64N64InitStatesModule;
 #endif
-    static bool sLoaded;
 };
 
 } // namespace trt_edgellm

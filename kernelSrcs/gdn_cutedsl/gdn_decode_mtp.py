@@ -243,7 +243,7 @@ def _define_mtp_kernels():
                 inv_norm_k = sNorm[1]
 
                 if tidx < TILE_K:
-                    sQ_all[(t, tidx)] = sQ_all[(t, tidx)] * inv_norm_q * scale
+                    sQ_all[(t, tidx)] = sQ_all[(t, tidx)] * scale * inv_norm_q
                     sK_all[(t, tidx)] = sK_all[(t, tidx)] * inv_norm_k
                 cute.arch.barrier()
             else:

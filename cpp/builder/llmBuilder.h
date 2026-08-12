@@ -17,8 +17,12 @@
 
 #pragma once
 
+#include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
+
 #include <NvInfer.h>
 #include <filesystem>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
@@ -45,6 +49,34 @@ struct LLMBuilderConfig
     int64_t maxVerifyTreeSize{60};    //!< Maximum length of input_ids passed into spec base model for verification
     int64_t maxDraftTreeSize{60};     //!< Maximum length of input_ids passed into spec draft model for draft generation
     bool profilingDetailed{false};    //!< Enable detailed profiling verbosity for layer info extraction
+    //! Exact physical K-page count for the engine's KV pool. Zero selects the minimum active pages.
+    //! Kept after the original aggregate fields so existing positional initializers remain source-compatible.
+    int64_t maxKVPoolPages{0};
+
+    //! Resolve the exact physical K-page count serialized into the engine binding shape.
+    //! @return `maxKVPoolPages`, or the minimum active pages when it is zero
+    //! @throws std::runtime_error for invalid dimensions, overflow, or a below-minimum override
+    int64_t resolvedKVPoolPages() const
+    {
+        ELLM_CHECK(maxBatchSize > 0 && maxBatchSize <= std::numeric_limits<int32_t>::max(),
+            "LLMBuilderConfig: maxBatchSize must fit a positive int32.");
+        ELLM_CHECK(maxKVCacheCapacity > 0 && maxKVCacheCapacity <= rt::kMAX_KV_CACHE_CAPACITY,
+            "LLMBuilderConfig: maxKVCacheCapacity must remain int32 after page alignment (maximum "
+                + std::to_string(rt::kMAX_KV_CACHE_CAPACITY) + ").");
+        int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(maxBatchSize, maxKVCacheCapacity);
+        ELLM_CHECK(minimumActivePages <= rt::kMAX_KV_POOL_PAGES,
+            "LLMBuilderConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
+                + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(rt::kMAX_KV_POOL_PAGES)
+                + ".");
+        ELLM_CHECK(maxKVPoolPages == 0 || maxKVPoolPages >= minimumActivePages,
+            "LLMBuilderConfig: maxKVPoolPages (" + std::to_string(maxKVPoolPages)
+                + ") must be zero or at least the minimum active pages (" + std::to_string(minimumActivePages) + ").");
+        ELLM_CHECK(maxKVPoolPages <= rt::kMAX_KV_POOL_PAGES,
+            "LLMBuilderConfig: maxKVPoolPages (" + std::to_string(maxKVPoolPages)
+                + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(rt::kMAX_KV_POOL_PAGES)
+                + ").");
+        return maxKVPoolPages == 0 ? minimumActivePages : maxKVPoolPages;
+    }
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -57,6 +89,7 @@ struct LLMBuilderConfig
         json["max_batch_size"] = maxBatchSize;
         json["max_lora_rank"] = maxLoraRank;
         json["max_kv_cache_capacity"] = maxKVCacheCapacity;
+        json["max_kv_pool_pages"] = resolvedKVPoolPages();
         // Only include speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -108,6 +141,10 @@ struct LLMBuilderConfig
         {
             config.maxKVCacheCapacity = json["max_kv_cache_capacity"];
         }
+        if (json.contains("max_kv_pool_pages"))
+        {
+            config.maxKVPoolPages = json["max_kv_pool_pages"];
+        }
         if (json.contains("max_verify_tree_size"))
         {
             config.maxVerifyTreeSize = json["max_verify_tree_size"];
@@ -131,6 +168,7 @@ struct LLMBuilderConfig
         oss << "  maxBatchSize: " << maxBatchSize << "\n";
         oss << "  maxLoraRank: " << maxLoraRank << "\n";
         oss << "  maxKVCacheCapacity: " << maxKVCacheCapacity << "\n";
+        oss << "  maxKVPoolPages: " << resolvedKVPoolPages() << "\n";
         // Only show speculative-decoding limits for the engine role that owns them.
         if (specBase)
         {
@@ -197,8 +235,8 @@ private:
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupCommonProfiles(
-        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+    bool setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up RoPE optimization profiles for single-RoPE or dual-RoPE model inputs.
     //! Configures only the RoPE cache bindings that are present in the network.
@@ -217,6 +255,26 @@ private:
     bool setupVanillaProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
+    //! Effective opt-shape token count for a generation-time optimization profile.
+    //!
+    //! Set opt = max for spec-decode base engines. Empirical measurements on Qwen3-8B
+    //! (Jetson Thor) show that anchoring the TRT autotuner target at max picks better
+    //! kernels for the actual runtime workload than the historical max/2 fallback,
+    //! regardless of spec_decode_type or how max relates to the runtime verifyTreeSize:
+    //!
+    //!   - DFlash `max=64` at runtime ts=64: opt=max is ~9 ms faster than opt=max/2
+    //!   - DFlash `max=128` at runtime ts=64: opt=max is ~0.7 ms faster
+    //!   - Eagle3 `max=150` at runtime ts=32/64: opt=max is ~1.5 ms faster
+    //!   - Eagle3 `max=150` at runtime ts=72 (close to max/2): tied within noise
+    //!
+    //! opt=max is never worse than max/2 in any tested configuration. See
+    //! `dflash-edgellm-vs-zlab/docs/2026-07-13-opt-shape-experiment-findings.md`
+    //! for the full dataset.
+    //!
+    //! @param maxToken The `max` shape count for this profile
+    //!                 (e.g., `maxVerifyTreeSize` for verify, `maxDraftTreeSize` for draft).
+    int64_t effectiveOptTokens(int64_t maxToken) const;
+
     //! Set up optimization profiles for speculative tree-decoding models.
     //! Configures hidden-state and attention-mask inputs used by spec decode.
     //! @param contextProfile Optimization profile for context processing
@@ -224,6 +282,14 @@ private:
     //! @return true if setup was successful, false otherwise
     bool setupSpecDecodeProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
+
+    //! Set up optimization profiles for the DiffusionGemma backbone engine.
+    //! Configures full-canvas denoise shapes and finalized-token commit shapes.
+    //! @param contextProfile Optimization profile for prompt/commit processing
+    //! @param generationProfile Optimization profile for denoise processing
+    //! @return true if setup was successful, false otherwise
+    bool setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+        nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
 
     //! Set up optimization profiles for DFlash draft models.
     //! DFlash draft consumes proposal embeddings, dflash_target_hidden_concat,
@@ -236,6 +302,12 @@ private:
     //! and dual RoPE caches, but do not own KV cache or tree-mask inputs.
     bool setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& contextProfile,
         nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network);
+
+    //! Set up optimization profiles for DSpark draft models.
+    //! DSpark draft consumes proposal embeddings, target-hidden delta, delta-lengths,
+    //! a proposal self-attention page table, and per-layer paged KV cache bindings.
+    bool setupDSparkDraftProfiles(
+        nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
     //! Set up optimization profiles for Gemma4 PLE tensor inputs.
     //! Gemma4 E-model engines receive one ple_token_embeds_* tensor per layer.
@@ -298,7 +370,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate recurrent state output tensors.
     //! These are per-step checkpoints of GDN recurrent states during tree verification.
-    //! Only needed for hybrid MTP/DFlash base verification engines.
+    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -307,7 +379,7 @@ private:
 
     //! Set up optimization profiles for MTP intermediate conv state output tensors.
     //! These are per-step checkpoints of conv1d states during tree verification.
-    //! Only needed for hybrid MTP/DFlash base verification engines.
+    //! Only needed for hybrid MTP/DFlash/DSpark base verification engines.
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -338,6 +410,10 @@ private:
     //! Copies d2t.safetensors file for Eagle3 draft models.
     //! @return true if copying was successful, false otherwise
     bool copyEagleFiles();
+
+    //! Copy DSpark Markov/confidence head sidecars to the engine directory.
+    //! @return true if copying was successful or this is not a DSpark draft.
+    bool copyDSparkFiles();
 
     //! Copy vocabulary mapping files to the engine directory.
     //! Copies vocab_map.safetensors file if reduced vocabulary is used.
@@ -374,6 +450,8 @@ private:
     int32_t mConvDim{0};                //!< Conv state dimension
     int32_t mConvKernel{0};             //!< Conv kernel size (d_conv)
     Json mModelConfig;                  //!< Parsed model configuration
+    bool mIsDiffusionBackbone{false};   //!< Whether this builder builds the DiffusionGemma DLLM engine
+    int64_t mDiffusionCanvasLength{0};  //!< DiffusionGemma fixed canvas/block length
 };
 
 } // namespace builder

@@ -411,10 +411,90 @@ struct BlockPrefixCallbackOp
 // TOP-K SAMPLING KERNELS (Based on TensorRT-LLM two-stage approach)
 // =======================================================================================
 
-// Stage 1: Find top-K elements using iterative block-level reduction (FP32 only)
-template <int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
-__global__ void topKStage1(float const* __restrict__ logits, float* tmpLogits, int32_t* topKTmpIdBuf,
-    float* topKTmpValBuf, SamplingParams const params)
+template <typename T>
+__device__ float logitToFloat(T value)
+{
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ float logitToFloat<half>(half value)
+{
+    return __half2float(value);
+}
+
+template <>
+__device__ float logitToFloat<__nv_bfloat16>(__nv_bfloat16 value)
+{
+    return __bfloat162float(value);
+}
+
+template <typename T, int32_t BLOCK_SIZE_>
+__global__ void argmaxEntropyKernel(T const* __restrict__ logits, int32_t* __restrict__ topIndices,
+    float* __restrict__ entropy, int32_t rows, int32_t vocabSize, float temperature)
+{
+    using TopKReduce = cub::BlockReduce<TopK_2, BLOCK_SIZE_>;
+    using FloatReduce = cub::BlockReduce<float, BLOCK_SIZE_>;
+
+    __shared__ typename TopKReduce::TempStorage topKStorage;
+    __shared__ typename FloatReduce::TempStorage floatStorage;
+    __shared__ float rowMax;
+    __shared__ float rowSumExp;
+
+    auto const row = static_cast<int32_t>(blockIdx.x);
+    auto const tid = static_cast<int32_t>(threadIdx.x);
+    if (row >= rows)
+    {
+        return;
+    }
+
+    int64_t const rowOffset = static_cast<int64_t>(row) * vocabSize;
+    auto const invTemp = invTemp_device(temperature);
+
+    TopK_2 partial;
+    partial.init();
+    for (int32_t v = tid; v < vocabSize; v += BLOCK_SIZE_)
+    {
+        float const logit = logitToFloat(logits[rowOffset + v]) * invTemp;
+        partial.insert(logit, v);
+    }
+
+    TopK_2 const best = TopKReduce(topKStorage).Reduce(partial, topk2MaxOpFunctor());
+    if (tid == 0)
+    {
+        rowMax = best.value;
+        topIndices[row] = best.index >= 0 ? best.index : vocabSize - 1;
+    }
+    __syncthreads();
+
+    float localSumExp = 0.0F;
+    float localWeightedShift = 0.0F;
+    for (int32_t v = tid; v < vocabSize; v += BLOCK_SIZE_)
+    {
+        float const shifted = logitToFloat(logits[rowOffset + v]) * invTemp - rowMax;
+        float const expShifted = expf(shifted);
+        localSumExp += expShifted;
+        localWeightedShift += expShifted * shifted;
+    }
+
+    float const sumExp = FloatReduce(floatStorage).Reduce(localSumExp, sumOpFunctor());
+    if (tid == 0)
+    {
+        rowSumExp = sumExp;
+    }
+    __syncthreads();
+
+    float const weightedShift = FloatReduce(floatStorage).Reduce(localWeightedShift, sumOpFunctor());
+    if (tid == 0)
+    {
+        entropy[row] = rowSumExp > 0.0F ? logf(rowSumExp) - weightedShift / rowSumExp : 0.0F;
+    }
+}
+
+// Stage 1: Find top-K elements using iterative block-level reduction.
+template <typename T, int32_t BLOCK_SIZE_, int32_t BLOCKS_PER_BEAM_>
+__global__ void topKStage1(T const* __restrict__ logits, float* tmpLogits, int32_t* topKTmpIdBuf, float* topKTmpValBuf,
+    SamplingParams const params)
 {
     typedef cub::BlockReduce<TopK_2, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -443,7 +523,7 @@ __global__ void topKStage1(float const* __restrict__ logits, float* tmpLogits, i
     for (auto elemId = tid + blockLane * BLOCK_SIZE_; elemId < vocabSize; elemId += BLOCK_SIZE_ * BLOCKS_PER_BEAM_)
     {
         auto localIndex = elemId + tmpLogBufIndex;
-        float logit = logits[localIndex];
+        float logit = logitToFloat(logits[localIndex]);
         tmpLogits[localIndex] = logit * invTemp;
     }
 
@@ -885,7 +965,7 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
         dim3 grid1(params.batchSize * BLOCKS_PER_BEAM);
         dim3 block1(BLOCK_SIZE);
 
-        topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
+        topKStage1<float, BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
             logits.dataPointer<float>(), ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
 
         // Stage 2: Sample from top-K elements
@@ -937,6 +1017,121 @@ void topKtopPSamplingFromLogits(rt::Tensor const& logits, rt::Tensor& selectedIn
     }
 }
 
+template <int BLOCK_SIZE>
+__global__ void topKLogitsToDenseProbabilitiesKernel(float const* __restrict__ topKValues,
+    int32_t const* __restrict__ topKIndices, float* __restrict__ probabilities, int32_t batchSize, int32_t vocabSize,
+    int32_t topK, float temperature)
+{
+    int32_t const batchIdx = static_cast<int32_t>(blockIdx.x);
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    if (batchIdx >= batchSize || vocabSize <= 0 || topK <= 0)
+    {
+        return;
+    }
+
+    float* rowProbs = probabilities + static_cast<int64_t>(batchIdx) * vocabSize;
+    for (int32_t vocabIdx = tid; vocabIdx < vocabSize; vocabIdx += BLOCK_SIZE)
+    {
+        rowProbs[vocabIdx] = 0.0F;
+    }
+    __syncthreads();
+
+    int32_t const effectiveTopK = topK < vocabSize ? topK : vocabSize;
+    float const invTemp = invTemp_device(temperature);
+    float const* rowValues = topKValues + static_cast<int64_t>(batchIdx) * topK;
+    int32_t const* rowIndices = topKIndices + static_cast<int64_t>(batchIdx) * topK;
+
+    typedef cub::BlockReduce<float, BLOCK_SIZE> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+    __shared__ float sharedMax;
+    __shared__ float sharedSum;
+
+    float localMax = -FLT_MAX;
+    for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+    {
+        int32_t const token = rowIndices[k];
+        if (token >= 0 && token < vocabSize)
+        {
+            localMax = fmaxf(localMax, rowValues[k] * invTemp);
+        }
+    }
+    float const maxValue = BlockReduce(tempStorage).Reduce(localMax, maxOpFunctor());
+    if (tid == 0)
+    {
+        sharedMax = maxValue;
+    }
+    __syncthreads();
+
+    float localSum = 0.0F;
+    for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+    {
+        int32_t const token = rowIndices[k];
+        if (token >= 0 && token < vocabSize)
+        {
+            localSum += expf(rowValues[k] * invTemp - sharedMax);
+        }
+    }
+    float const sumValue = BlockReduce(tempStorage).Reduce(localSum, sumOpFunctor());
+    if (tid == 0)
+    {
+        sharedSum = sumValue;
+    }
+    __syncthreads();
+
+    if (sharedSum <= 0.0F || !isfinite(sharedSum))
+    {
+        for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+        {
+            int32_t const token = rowIndices[k];
+            if (token >= 0 && token < vocabSize)
+            {
+                rowProbs[token] = 1.0F / static_cast<float>(effectiveTopK);
+            }
+        }
+        return;
+    }
+
+    for (int32_t k = tid; k < effectiveTopK; k += BLOCK_SIZE)
+    {
+        int32_t const token = rowIndices[k];
+        if (token >= 0 && token < vocabSize)
+        {
+            rowProbs[token] = expf(rowValues[k] * invTemp - sharedMax) / sharedSum;
+        }
+    }
+}
+
+void topKLogitsToDenseProbabilities(rt::Tensor const& topKValues, rt::Tensor const& topKIndices,
+    rt::Tensor& probabilities, int32_t vocabSize, float temperature, cudaStream_t stream)
+{
+    check::check(topKValues.getDeviceType() == rt::DeviceType::kGPU
+            && topKIndices.getDeviceType() == rt::DeviceType::kGPU
+            && probabilities.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check(topKValues.getDataType() == nvinfer1::DataType::kFLOAT
+            && topKIndices.getDataType() == nvinfer1::DataType::kINT32
+            && probabilities.getDataType() == nvinfer1::DataType::kFLOAT,
+        "Invalid tensor data types");
+
+    auto const topKValuesShape = topKValues.getShape();
+    auto const topKIndicesShape = topKIndices.getShape();
+    auto const probabilitiesShape = probabilities.getShape();
+    check::check(
+        topKValuesShape.getNumDims() == 2 && topKIndicesShape.getNumDims() == 2 && probabilitiesShape.getNumDims() == 2,
+        "Invalid tensor dimensions");
+    int32_t const batchSize = topKValuesShape[0];
+    int32_t const topK = topKValuesShape[1];
+    check::check(topKIndicesShape[0] == batchSize && topKIndicesShape[1] == topK, "TopK tensor shape mismatch");
+    check::check(
+        probabilitiesShape[0] == batchSize && probabilitiesShape[1] == vocabSize, "Probability tensor shape mismatch");
+
+    constexpr int32_t BLOCK_SIZE = 256;
+    topKLogitsToDenseProbabilitiesKernel<BLOCK_SIZE>
+        <<<batchSize, BLOCK_SIZE, 0, stream>>>(topKValues.dataPointer<float>(), topKIndices.dataPointer<int32_t>(),
+            probabilities.dataPointer<float>(), batchSize, vocabSize, topK, temperature);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues, rt::Tensor& topKIndices, int32_t topK,
     rt::Tensor& workspace, cudaStream_t stream)
 {
@@ -944,7 +1139,7 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
     check::check(input.getDeviceType() == rt::DeviceType::kGPU && topKIndices.getDeviceType() == rt::DeviceType::kGPU
             && workspace.getDeviceType() == rt::DeviceType::kGPU,
         "All tensors must be on GPU");
-    check::check(input.getDataType() == nvinfer1::DataType::kFLOAT
+    check::check((input.getDataType() == nvinfer1::DataType::kFLOAT || input.getDataType() == nvinfer1::DataType::kHALF)
             && topKIndices.getDataType() == nvinfer1::DataType::kINT32
             && workspace.getDataType() == nvinfer1::DataType::kINT8,
         "Invalid tensor data types");
@@ -988,8 +1183,16 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
     dim3 grid1(batchSize * BLOCKS_PER_BEAM);
     dim3 block1(BLOCK_SIZE);
 
-    topKStage1<BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
-        input.dataPointer<float>(), ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
+    if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        topKStage1<half, BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
+            input.dataPointer<half>(), ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
+    }
+    else
+    {
+        topKStage1<float, BLOCK_SIZE, BLOCKS_PER_BEAM><<<grid1, block1, 0, stream>>>(
+            input.dataPointer<float>(), ws.topkTempLogits, ws.topkIndices, ws.topkValues, params);
+    }
 
     // Stage 2: Select final top-K from 8*K candidates and return indices + raw values
     dim3 grid2(batchSize);
@@ -999,6 +1202,54 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
     float* topKValuesPtr = topKValues.has_value() ? topKValues.value().get().dataPointer<float>() : nullptr;
     topKStage2ReturnAllTopK<BLOCK_SIZE><<<grid2, block2, sharedMemSize, stream>>>(ws.topkIndices, ws.topkValues,
         topKIndices.dataPointer<int32_t>(), topKValuesPtr, batchSize, vocabSize, topK, BLOCKS_PER_BEAM);
+}
+
+void selectArgmaxAndComputeEntropy(
+    rt::Tensor const& input, rt::Tensor& topIndices, rt::Tensor& entropy, float temperature, cudaStream_t stream)
+{
+    check::check(input.getDeviceType() == rt::DeviceType::kGPU && topIndices.getDeviceType() == rt::DeviceType::kGPU
+            && entropy.getDeviceType() == rt::DeviceType::kGPU,
+        "All tensors must be on GPU");
+    check::check((input.getDataType() == nvinfer1::DataType::kFLOAT || input.getDataType() == nvinfer1::DataType::kHALF
+                     || input.getDataType() == nvinfer1::DataType::kBF16)
+            && topIndices.getDataType() == nvinfer1::DataType::kINT32
+            && entropy.getDataType() == nvinfer1::DataType::kFLOAT,
+        "Invalid tensor data types");
+
+    auto const inputShape = input.getShape();
+    auto const indexShape = topIndices.getShape();
+    auto const entropyShape = entropy.getShape();
+    check::check(inputShape.getNumDims() == 2 && indexShape.getNumDims() == 2 && entropyShape.getNumDims() == 1,
+        "Invalid tensor dimensions");
+
+    int32_t const rows = inputShape[0];
+    int32_t const vocabSize = inputShape[1];
+    check::check(indexShape[0] == rows && indexShape[1] == 1, "Top index tensor shape mismatch");
+    check::check(entropyShape[0] == rows, "Entropy tensor shape mismatch");
+    if (rows <= 0 || vocabSize <= 0)
+    {
+        return;
+    }
+
+    constexpr int32_t kBlockSize = 256;
+    dim3 const grid(rows);
+    dim3 const block(kBlockSize);
+    if (input.getDataType() == nvinfer1::DataType::kHALF)
+    {
+        argmaxEntropyKernel<half, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<half>(),
+            topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows, vocabSize, temperature);
+    }
+    else if (input.getDataType() == nvinfer1::DataType::kBF16)
+    {
+        argmaxEntropyKernel<__nv_bfloat16, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<__nv_bfloat16>(),
+            topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows, vocabSize, temperature);
+    }
+    else
+    {
+        argmaxEntropyKernel<float, kBlockSize><<<grid, block, 0, stream>>>(input.dataPointer<float>(),
+            topIndices.dataPointer<int32_t>(), entropy.dataPointer<float>(), rows, vocabSize, temperature);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // =======================================================================================

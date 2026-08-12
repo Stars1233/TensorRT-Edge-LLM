@@ -18,6 +18,11 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 - Git submodules must be initialized: `git submodule update --init` (googletest, nlohmann/json, NVTX)
 - Model validation must exercise `export -> build -> inference` in that order. Export-only checks are useful smoke
   tests, but they are not sufficient evidence that a model works.
+- Source comments must be precise and sparse. Add comments only for non-obvious invariants, ownership/lifetime
+  constraints, math/precision assumptions, platform constraints, or surprising control flow. Do not add AI-style
+  narration that restates the code, long block comments that do not change maintainability, or repeated comments
+  explaining the same local pattern. Do not add change narration that compares against previous code, such as
+  "replaces X" or "now uses Y"; that belongs in the commit message or PR description.
 
 ## Common Commands
 
@@ -27,6 +32,7 @@ TensorRT Edge-LLM: NVIDIA C++/CUDA/Python inference runtime for deploying LLMs a
 | Build (with unit tests) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DBUILD_UNIT_TESTS=ON && make -j$(nproc)` |
 | Build (cross-compile AArch64) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DAARCH64_BUILD=ON && make -j$(nproc)` |
 | Build (NVTX profiling) | `cmake .. -DTRT_PACKAGE_DIR=$TRT_PACKAGE_DIR -DENABLE_NVTX_PROFILING=ON && make -j$(nproc)` |
+| Build against TRT-RTX | Same as above, but point `TRT_PACKAGE_DIR` at a TRT-RTX package (`libtensorrt_rtx.so` + `tensorrt_onnxparser_rtx`). `FindTensorRT.cmake` selects the correct lib automatically. |
 | C++ unit tests (all) | `./build/unitTest` |
 | C++ unit tests (filter) | `./build/unitTest --gtest_filter="LoggerTest.*"` |
 | Python package (install) | `pip install -r requirements.txt && python -m build --wheel --outdir dist . && pip install dist/*.whl` |
@@ -99,6 +105,32 @@ The pipeline is: `HuggingFace Model → Python Export (quantize + ONNX) → C++ 
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **HF checkpoint consistency** — Python model classes in `models/` must stay compatible with HuggingFace checkpoint tensor names when adding new models.
 - **Pinned dependencies** — `transformers`, `nvidia-modelopt`, `onnx`, and `torch` versions are pinned in `pyproject.toml`. Changing them can break export/quantization. Check compatibility before bumping.
+- **No noisy source comments** — remove or avoid comments that merely narrate statements, repeat names/types, or
+  explain obvious control flow. A useful comment should shorten future debugging by stating intent, constraints, or
+  non-obvious behavior. Comments should not describe how the code changed relative to an older implementation.
+
+### CUDA / GPU
+
+- **Pageable memory with `cudaMemcpyAsync`** — pageable host buffers (`std::vector`, stack
+  arrays) cause CUDA to fall back to a synchronous internal copy. Use pinned member buffers
+  (`cudaMallocHost` / `cudaHostAlloc`) for async H2D/D2H transfers.
+- **Hot-path buffer allocation** — prefer preallocating buffers at init/`allocateBuffer` time over allocating per-step or per-frame.
+- **Synchronous CUDA APIs** — avoid APIs without an `Async` suffix (`cudaMemcpy`, `cudaMemset`,
+  etc.) and `cudaDeviceSynchronize`/`cudaThreadSynchronize` in library and hot-path code; they
+  block the CPU and may serialize the entire device. Prefer async variants with an explicit stream
+  argument.
+- **Redundant `cudaStreamSynchronize`** — operations on the same stream are serialized
+  automatically. Sync is only justified when (1) the CPU must read a D2H result, or
+  (2) immediately before CUDA graph capture.
+- **Cross-stream dependencies** — operations with data dependencies must either share the same
+  stream or use `cudaStreamWaitEvent` for explicit inter-stream sync. Never assume ordering
+  between different streams.
+- **Default stream (stream 0)** — never use the default/NULL stream in library code; it has
+  implicit device-wide synchronization semantics (all other streams wait for it and vice versa),
+  equivalent to `cudaDeviceSynchronize`. Always pass an explicit `cudaStream_t` argument.
+- **Unified memory** — avoid `cudaMallocManaged`; on Tegra/edge SoCs the driver manages
+  coherence non-deterministically, adding unpredictable overhead. Use pinned memory
+  (`cudaMallocHost`) for H2D/D2H transfers and device memory (`cudaMalloc`) otherwise.
 
 ## Development Workflow
 
@@ -138,7 +170,8 @@ as producer/smoke coverage for downstream pipeline jobs.
 
 | Stage | Purpose |
 |-------|---------|
-| `setup` | Pre-commit validation, cache cleanup |
+| `precheck` | Fatal source validation before setup or test resources are allocated |
+| `setup` | Cache cleanup and test artifact preparation |
 | `l0_test` | MR-triggered — export, pipeline, unit tests per GPU/device |
 | `l1_test` | Manual (`L1=true`) — extended coverage |
 | `build-sonar` | SonarQube static analysis |

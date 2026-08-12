@@ -15,5 +15,6 @@
 """Qwen3.5 MoE model components."""
 
 from .modeling_qwen3_5_moe import Qwen3_5MoeCausalLM
+from .modeling_qwen3_5_moe_mtp import Qwen3_5MoeMtpDraftModel
 
-__all__ = ["Qwen3_5MoeCausalLM"]
+__all__ = ["Qwen3_5MoeCausalLM", "Qwen3_5MoeMtpDraftModel"]

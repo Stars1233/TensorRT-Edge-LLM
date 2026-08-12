@@ -268,6 +268,11 @@ MelExtractor makeGemma4AudioExtractor();
 //! Nemotron-Omni.
 MelExtractor makeParakeetExtractor();
 
+//! Build a Nemotron-3.5-ASR extractor: identical to Parakeet except the
+//! model consumes raw log-mel — NO per-feature mean/std normalization
+//! (HF ``NemotronAsrStreamingFeatureExtractor`` never normalizes).
+MelExtractor makeNemotronAsrExtractor();
+
 //! Dispatch helper: build extractor from a string tag.
 //!
 //! Accepts ``"whisper"``, ``"parakeet"``. Throws

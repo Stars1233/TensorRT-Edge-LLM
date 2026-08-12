@@ -19,6 +19,7 @@
 
 #include "cuteDslGemmRunner.h"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 
 #include <algorithm>
@@ -674,8 +675,8 @@ bool CuteDslGemmRunner::run(
             tensorC.dynamic_strides[0] = N;
             tensorC.dynamic_strides[1] = static_cast<int64_t>(M) * N;
 
-            cute_dsl_gemm_bw_geforce_small_fp16_wrapper(
-                &sBlackwellGeforceSmallModule, &tensorA, &tensorB, &tensorC, stream);
+            cute_dsl_gemm_bw_geforce_small_fp16_wrapper(&sBlackwellGeforceSmallModule, &tensorA, &tensorB, &tensorC,
+                trt_edgellm::getDeviceMultiProcessorCount(), stream);
             return true;
         }
 #endif
@@ -703,7 +704,8 @@ bool CuteDslGemmRunner::run(
         tensorC.dynamic_strides[0] = N;
         tensorC.dynamic_strides[1] = static_cast<int64_t>(M) * N;
 
-        cute_dsl_gemm_bw_geforce_fp16_wrapper(&sBlackwellGeforceModule, &tensorA, &tensorB, &tensorC, stream);
+        cute_dsl_gemm_bw_geforce_fp16_wrapper(&sBlackwellGeforceModule, &tensorA, &tensorB, &tensorC,
+            trt_edgellm::getDeviceMultiProcessorCount(), stream);
         return true;
     }
 #endif
@@ -783,7 +785,9 @@ bool dispatchAmpere2dFused(ModuleT& mod, WrapFn wrapperFn, void const* aPtr, voi
 
 // Helper to dispatch a Blackwell/BW-GeForce 3D fused kernel (a, b, c, mBias).
 // 3D tensor ABI: (mode0, mode1, L=1) with strides (mode1, 1, mode0*mode1).
-template <typename ModuleT, typename TensorA, typename TensorB, typename TensorC, typename TensorBias, typename WrapFn>
+// Persistent wrappers additionally take max_active_clusters before stream.
+template <typename ModuleT, typename TensorA, typename TensorB, typename TensorC, typename TensorBias,
+    bool IsPersistent = false, typename WrapFn>
 bool dispatch3dFused(ModuleT& mod, WrapFn wrapperFn, void const* aPtr, void const* bPtr, void* cPtr,
     void const* biasPtr, int32_t M, int32_t N, int32_t K, cudaStream_t stream)
 {
@@ -815,7 +819,14 @@ bool dispatch3dFused(ModuleT& mod, WrapFn wrapperFn, void const* aPtr, void cons
     tensorBias.data = const_cast<void*>(biasPtr);
     tensorBias.dynamic_shapes[0] = N;
 
-    wrapperFn(&mod, &tensorA, &tensorB, &tensorC, stream, &tensorBias);
+    if constexpr (IsPersistent)
+    {
+        wrapperFn(&mod, &tensorA, &tensorB, &tensorC, trt_edgellm::getDeviceMultiProcessorCount(), stream, &tensorBias);
+    }
+    else
+    {
+        wrapperFn(&mod, &tensorA, &tensorB, &tensorC, stream, &tensorBias);
+    }
     return true;
 }
 
@@ -870,7 +881,7 @@ bool CuteDslGemmRunner::runBiasSiLU(void const* aPtr, void const* bPtr, void* cP
     {
         return dispatch3dFused<gemm_bw_geforce_bias_silu_fp16_Kernel_Module_t,
             gemm_bw_geforce_bias_silu_fp16_Tensor_a_t, gemm_bw_geforce_bias_silu_fp16_Tensor_b_t,
-            gemm_bw_geforce_bias_silu_fp16_Tensor_c_t, gemm_bw_geforce_bias_silu_fp16_Tensor_mBias_t>(
+            gemm_bw_geforce_bias_silu_fp16_Tensor_c_t, gemm_bw_geforce_bias_silu_fp16_Tensor_mBias_t, true>(
             sBlackwellGeforceBiasSiLUModule, cute_dsl_gemm_bw_geforce_bias_silu_fp16_wrapper, aPtr, bPtr, cPtr, biasPtr,
             M, N, K, stream);
     }
@@ -929,7 +940,7 @@ bool CuteDslGemmRunner::runBias(void const* aPtr, void const* bPtr, void* cPtr, 
     {
         return dispatch3dFused<gemm_bw_geforce_bias_fp16_Kernel_Module_t, gemm_bw_geforce_bias_fp16_Tensor_a_t,
             gemm_bw_geforce_bias_fp16_Tensor_b_t, gemm_bw_geforce_bias_fp16_Tensor_c_t,
-            gemm_bw_geforce_bias_fp16_Tensor_mBias_t>(sBlackwellGeforceBiasModule,
+            gemm_bw_geforce_bias_fp16_Tensor_mBias_t, true>(sBlackwellGeforceBiasModule,
             cute_dsl_gemm_bw_geforce_bias_fp16_wrapper, aPtr, bPtr, cPtr, biasPtr, M, N, K, stream);
     }
 #endif

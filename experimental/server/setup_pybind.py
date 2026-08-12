@@ -72,6 +72,11 @@ class CMakeBuild(build_ext):
         ):
             cmake_args.append("-DENABLE_CUTE_DSL_FMHA=ON")
 
+        # e.g. ENABLE_CUTE_DSL=gemm — required for Qwen3-Omni Talker MLP.
+        if os.environ.get("ENABLE_CUTE_DSL"):
+            cmake_args.append(
+                f"-DENABLE_CUTE_DSL={os.environ['ENABLE_CUTE_DSL']}")
+
         try:
             import pybind11
             cmake_args.append(f"-Dpybind11_DIR={pybind11.get_cmake_dir()}")

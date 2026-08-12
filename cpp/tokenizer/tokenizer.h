@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
 #include <forward_list>
@@ -43,8 +44,11 @@ namespace tokenizer
  */
 struct ChatTemplateRole
 {
-    std::string prefix; //!< Prefix for this role
-    std::string suffix; //!< Suffix for this role
+    std::string prefix;         //!< Prefix for this role
+    std::string suffix;         //!< Suffix for this role
+    std::string prefixThinking; //!< Prefix when thinking mode is enabled
+    std::string suffixThinking; //!< Suffix when thinking mode is enabled
+    bool trimContent{false};    //!< Trim text content before applying suffix
 };
 
 /*!
@@ -178,11 +182,18 @@ public:
     /**
      * @brief Load tokenizer from HuggingFace model directory
      * @param modelDir Path to the model directory containing tokenizer files
+     * @param requireChatTemplate When true (default), a missing
+     *        processed_chat_template.json fails the load. Pipelines that only
+     *        decode token ids and never build a chat prompt pass false; the
+     *        sole current caller is the Nemotron-3.5-ASR RNN-T runtime, whose
+     *        checkpoint ships no chat template. (Chat-templated models,
+     *        including thinker-based ASR such as Qwen3-ASR, keep the default.)
+     *        An existing template is still loaded when present.
      * @return true if directory exists, tokenizer.json is found and parsed successfully,
      *         pretokenizer and encoder are created successfully; false if directory doesn't exist,
      *         tokenizer.json is missing/corrupt, or initialization fails
      */
-    bool loadFromHF(std::filesystem::path const& modelDir);
+    bool loadFromHF(std::filesystem::path const& modelDir, bool requireChatTemplate = true);
 
     /*!
      * @brief Get total vocabulary size
@@ -212,6 +223,31 @@ public:
     }
 
     /*!
+     * @brief Get all configured end-of-sequence token IDs.
+     * @return EOS token IDs, including IDs injected from engine config when present.
+     */
+    std::vector<Rank> getEosIds() const
+    {
+        std::vector<Rank> eosIds;
+        if (mEosId >= 0)
+        {
+            eosIds.push_back(mEosId);
+        }
+        eosIds.insert(eosIds.end(), mAdditionalEosIds.begin(), mAdditionalEosIds.end());
+        return eosIds;
+    }
+
+    /*!
+     * @brief Check whether a token is one of the configured EOS IDs.
+     * @param token Token ID to check
+     * @return true if the token is an EOS token
+     */
+    bool isEosId(Rank token) const noexcept
+    {
+        return isEosToken(token);
+    }
+
+    /*!
      * @brief Check if a token is an end-of-sequence token
      * @param tokenId Token ID to check
      * @return true if the token is any EOS token (primary or additional)
@@ -234,7 +270,7 @@ public:
 
     /*!
      * @brief Set additional end-of-sequence token IDs
-     * @param ids Vector of additional EOS token IDs (from config.json eos_token_id array)
+     * @param ids Vector of EOS token IDs from engine config.
      */
     void setAdditionalEosIds(std::vector<Rank> const& ids)
     {
@@ -243,7 +279,12 @@ public:
         {
             if (id != mEosId && id >= 0)
             {
-                mAdditionalEosIds.push_back(id);
+                bool const duplicate
+                    = std::find(mAdditionalEosIds.begin(), mAdditionalEosIds.end(), id) != mAdditionalEosIds.end();
+                if (!duplicate)
+                {
+                    mAdditionalEosIds.push_back(id);
+                }
             }
         }
     }
@@ -421,6 +462,10 @@ protected:
 
     // Decoder replacements: list of (pattern, replacement) pairs applied after decoding (reverse of normalizer).
     std::vector<std::pair<std::string, std::string>> mDecoderReplacements;
+
+    //! Metaspace decoder with prepend_scheme != "never": strip the single
+    //! leading space produced by the prepended word-boundary marker.
+    bool mMetaspaceStripLeading{false};
 
     // ByteFallback: whether to convert <0xNN> pieces back to raw bytes during decode.
     // Set when tokenizer.json decoder contains a "ByteFallback" step (SentencePiece-style).

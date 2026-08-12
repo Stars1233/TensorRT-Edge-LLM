@@ -21,6 +21,7 @@
 #include "runtime/kvCacheManager.h"
 #include "runtime/mambaCacheManager.h"
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace trt_edgellm
@@ -110,8 +111,19 @@ public:
 
     //! Get the combined KV cache for a given absolute layer index (must be an attention layer).
     //! @param absLayerIdx Absolute decoder-layer index.
-    //! @return Reference to the per-layer tensor [maxBatch, 2, numKVHeads, maxSeqLen, headDim].
+    //! @return Reference to the per-layer NHD tensor [2, maxBatch, capPadded, numKVHeads, headDim].
     rt::Tensor& getCombinedKVCache(int32_t absLayerIdx);
+
+    //! Get the pool-shaped view of a given attention layer's combined KV cache — the tensor to bind
+    //! to the engine's past/present_key_values_i inputs; see KVCacheManager::getCombinedKVCachePoolView().
+    //! @param absLayerIdx Absolute decoder-layer index.
+    //! @return Reference to the pool-view tensor [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
+    rt::Tensor& getCombinedKVCachePoolView(int32_t absLayerIdx);
+
+    //! Get the K-half and V-half of a given attention layer's pool as separate tensor views.
+    //! @param absLayerIdx Absolute decoder-layer index.
+    //! @return {kView, vView}, each shaped [maxBatch, capPadded, numKVHeads, headDim].
+    std::pair<rt::Tensor, rt::Tensor> getSeparateKVCache(int32_t absLayerIdx);
 
     //! Get the recurrent state for a given absolute layer index (must be a Mamba layer).
     //! @param absLayerIdx Absolute decoder-layer index.
@@ -209,6 +221,10 @@ public:
     //! @param newBatch Batch size after eviction.
     //! @param stream CUDA stream.
     void compactBatch(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
+
+    //! Compact only slot-addressed sequence lengths and recurrent/conv state. Global paged KV remains in place;
+    //! callers using non-identity page tables compact those table rows separately.
+    void compactBatchSlotState(rt::Tensor const& batchMapping, int32_t oldBatch, int32_t newBatch, cudaStream_t stream);
 
     // ------------------------------------------------------------------
     // System prompt cache

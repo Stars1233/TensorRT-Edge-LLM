@@ -113,8 +113,8 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
 //!     acceptLengths [GPU, Int32]: Accept lengths, shape [batch].
 //!     kvCacheLengths [GPU, Int32]: KVCache lengths, shape [batch].
 //!     deviceLayerInfos: Device-resident array of `KVLayerInfo` (size == numLayers) with each
-//!         entry's `data` pointing to a per-layer buffer of shape
-//!         [maxBatch, 2, numKVHeads_i, maxSeqLen_i, headDim].
+//!         entry's `data` pointing to a per-layer two-pool NHD buffer of shape
+//!         [2, maxBatch_i, capPadded_i(=maxSeqLen_i), numKVHeads_i, headDim].
 //!     numLayers: Number of KV layers in this head-dim group.
 //!     headDim: Head dimension shared by all layers in this group (currently 64 or 128).
 //!     maxKVHeads: Largest `numKVHeads` across the group's layers (used for grid sizing).
@@ -122,12 +122,19 @@ void prepareEagleBaseTreeDecodingInputs(rt::Tensor const& baseTreeDecodingMask, 
 //!     maxDepth: max-depth of acceptedIndices (acceptedIndices.shape[1]).
 //!     kvCacheType: Storage dtype of the per-layer buffers (kHALF or kFP8).
 //!     stream: CUDA stream to execute the kernel.
+//!     pageTable: Optional device page table, [batch, 2, maxPagesPerSeq] (K-then-V rows per
+//!         V page id == K page id + numPages). When non-null, the committed token's absolute position is
+//!         resolved to (page, offset) through the table's K row (for K writes) / V row (for V
+//!         writes) instead of the identity-contiguous NHD stride; under an identity table this
+//!         is byte-identical to the nullptr path. Default nullptr preserves the identity-only
+//!         addressing for callers without a page table.
+//!     maxPagesPerSeq: Row stride of `pageTable` (ignored when `pageTable` is nullptr).
 //!
 //! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
 void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
     rt::Tensor const& kvCacheLengths, KVLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t headDim,
     int32_t maxKVHeads, int32_t activeBatchSize, int32_t maxDepth, nvinfer1::DataType kvCacheType,
-    cudaStream_t stream);
+    cudaStream_t stream, int32_t const* pageTable = nullptr, int32_t maxPagesPerSeq = 0);
 
 //! In-place compact the hidden-state buffer to keep only the accepted tokens.
 //!
@@ -146,14 +153,14 @@ void eagleBaseAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor 
     rt::Tensor& hiddenState, cudaStream_t stream);
 
 //! The kernel will initialize the draft table for a new round of drafting.
-//! Draft token ids will be translated towards full vocab size. During eagle spec-decode draft tree construction,
-//! we will build multiple full data tables to record the complete description of a draft tree. The full table will contain
+//! First-level draft logits are translated to target-vocabulary token ids. During eagle spec-decode draft tree
+//! construction, we build multiple full data tables to record the complete description of a draft tree. The full table will contain
 //! the root node so the full-table size is (1 + draft-topK + total-draft-round x draft-topK x draft-topK).
 //! Inputs:
-//!     selectedIndices [GPU, Int32]: Selected indices from logits, shape [batch, draftTopK].
+//!     selectedIndices [GPU, Int32]: Draft-vocabulary selected token ids, shape [batch, draftTopK].
 //!     logProbs [GPU, Float]: Log probabilities of the selected tokens, shape [batch, draftTopK].
 //!     rootTokens [GPU, Int32]: Committed tokens selected by base model to act as the root token of the draft tree [batch].
-//!     vocabMappingTable [GPU, Int32]: The mapping table from draft vocab token to full vocab token, shape [draft-vocab-size].
+//!     vocabMappingTable [GPU, Int32]: Draft-token to target-token offset table, shape [draft-vocab-size].
 //!     stream: The CUDA stream to execute the kernel.
 //! Outputs:
 //!     draftIdFullTable [GPU, Int32]: Table to store the token ids of the whole tree. [batch, full-table-size]

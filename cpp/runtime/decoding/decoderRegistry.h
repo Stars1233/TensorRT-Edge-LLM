@@ -19,6 +19,7 @@
 
 #include "runtime/config/deploymentConfig.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/exec/engineExecutor.h"
 
 #include <filesystem>
 #include <memory>
@@ -29,17 +30,23 @@ namespace trt_edgellm
 namespace rt
 {
 
-struct DecoderRegistryConfig
+struct DecoderRegistryInit
 {
     std::filesystem::path engineDir;
     std::optional<SpecDecodeDraftingConfig> draftingConfig;
+    //! Validated draft executor whose ownership is consumed by the selected speculative decoder.
+    std::unique_ptr<EngineExecutor> draftExecutor;
     cudaStream_t stream{};
 };
+
+//! Return whether an available speculative decoder should yield to the default decoder for this request.
+bool shouldSelectDefaultDecoder(
+    DecodingStrategyKind speculativeDecoderKind, LLMGenerationRequest const& request) noexcept;
 
 class DecoderRegistry final
 {
 public:
-    DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryConfig const& config);
+    DecoderRegistry(DecodingRuntimeContext& runtime, DecoderRegistryInit init);
 
     DecodingStrategy& select(LLMGenerationRequest const& request) const noexcept;
     DecodingStrategy& cachePrimingStrategy() const noexcept;

@@ -31,29 +31,37 @@ namespace rt
 {
 
 Gemma4EmbeddingPreprocessor::Gemma4EmbeddingPreprocessor(std::filesystem::path const& engineDir,
-    LLMEngineConfig const& config, int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream)
+    LLMEngineConfig const& config, int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream,
+    std::optional<Tensor> checkpointTable)
     : mConfig(config)
 {
     ELLM_CHECK(mConfig.pleEnabled, "Gemma4EmbeddingPreprocessor constructed while PLE is disabled");
     ELLM_CHECK(maxBatchSize > 0, "Gemma4EmbeddingPreprocessor requires positive max batch size");
     ELLM_CHECK(maxSeqLen > 0, "Gemma4EmbeddingPreprocessor requires positive max sequence length");
 
-    std::filesystem::path const plePath = engineDir / binding_names::kPleEmbeddingFileName;
-    std::vector<Tensor> pleTensors;
-    ELLM_CHECK(safetensors::loadSafetensors(plePath, pleTensors, stream),
-        "Failed to load " + std::string(binding_names::kPleEmbeddingFileName)
-            + " from model directory: " + engineDir.string());
-    ELLM_CHECK(pleTensors.size() == 1, "ple_embedding.safetensors must contain exactly one tensor named weight");
-    ELLM_CHECK(pleTensors[0].getName() == "weight", "ple_embedding.safetensors tensor must be named weight");
+    if (checkpointTable.has_value())
+    {
+        mPleTable = std::move(*checkpointTable);
+    }
+    else
+    {
+        std::filesystem::path const plePath = engineDir / binding_names::kPleEmbeddingFileName;
+        std::vector<Tensor> pleTensors;
+        ELLM_CHECK(safetensors::loadSafetensors(plePath, pleTensors, stream),
+            "Failed to load " + std::string(binding_names::kPleEmbeddingFileName)
+                + " from model directory: " + engineDir.string());
+        ELLM_CHECK(pleTensors.size() == 1, "ple_embedding.safetensors must contain exactly one tensor named weight");
+        ELLM_CHECK(pleTensors[0].getName() == "weight", "ple_embedding.safetensors tensor must be named weight");
+        mPleTable = std::move(pleTensors[0]);
+    }
 
-    auto const pleShape = pleTensors[0].getShape();
+    auto const pleShape = mPleTable.getShape();
     ELLM_CHECK(pleShape.getNumDims() == 2, "PLE table must be 2D [vocab, num_layers * hidden]");
     ELLM_CHECK(pleShape[1] == static_cast<int64_t>(mConfig.numPleInputs) * mConfig.pleHiddenSize,
         "PLE table second dimension must equal num_ple_inputs * ple_hidden_size");
-    ELLM_CHECK(pleTensors[0].getDataType() == nvinfer1::DataType::kHALF
-            || pleTensors[0].getDataType() == nvinfer1::DataType::kBF16,
+    ELLM_CHECK(
+        mPleTable.getDataType() == nvinfer1::DataType::kHALF || mPleTable.getDataType() == nvinfer1::DataType::kBF16,
         "PLE table must be FP16 or BF16");
-    mPleTable = std::move(pleTensors[0]);
 
     mPleOutputBuffer = Tensor({mConfig.numPleInputs, maxBatchSize, maxSeqLen, mConfig.pleHiddenSize}, DeviceType::kGPU,
         mPleTable.getDataType(), "Gemma4EmbeddingPreprocessor::mPleOutputBuffer");

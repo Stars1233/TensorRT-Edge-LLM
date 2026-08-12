@@ -201,7 +201,7 @@ class DenseGemmKernel:
         sfb: cute.Tensor,
         c: cute.Tensor,
         alpha: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -1449,7 +1449,7 @@ class DenseGemmKernel:
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         current_stream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,

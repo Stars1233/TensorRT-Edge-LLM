@@ -32,20 +32,26 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #endif // CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
 #endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
+#include "kernels/cuteDslModuleLoader.h"
+
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <mutex>
 
 namespace trt_edgellm
 {
 
 //! Activation variants exposed by the fused NVFP4 MoE CuTeDSL kernel family.
 //! All six activations (identity, silu, swiglu, gelu, relu2, geglu) are wired through the runner:
-//! each is backed by its own AOT module (KernelVariant rows in kernelSrcs/build_cutedsl.py),
-//! loaded by loadKernelModules(), and dispatched by the decode/prefill switch ladders.
+//! each is backed by its own AOT module (KernelVariant rows in kernelSrcs/build_cutedsl.py)
+//! and loaded lazily by the decode/prefill switch ladders.
 enum class CuteDslMoeActivation : int32_t
 {
     kIdentity = 0,
@@ -129,13 +135,11 @@ struct CuteDslNvfp4MoeParams
 
 //! Runner for the SM120/SM121 fused NVFP4 MoE kernel (decode + prefill backends).
 //!
-//! Mirrors the load/unload + dispatch pattern of CuteDslFMHARunner /
-//! CuteDslGDNRunner: a mutex-guarded loadKernelModules() populates static
-//! Kernel_Module_t instances once per process, and run() dispatches to one of
-//! the (activation x backend x N-tile) wrappers. Shape axes H / I / E / top_k
-//! and the batch / sequence dims are runtime; H must be a positive multiple
-//! of kHiddenSizeAlignment (= kCuteDslTileK * kStaticAbStage) so the K-tile
-//! pipeline drains cleanly. canImplement() enforces this contract.
+//! Each (activation x backend x N-tile) module is loaded on its first selected
+//! dispatch and then remains resident for process lifetime. Shape axes H / I /
+//! E / top_k and the batch / sequence dims are runtime; H must be a positive
+//! multiple of kHiddenSizeAlignment (= kCuteDslTileK * kStaticAbStage) so the
+//! K-tile pipeline drains cleanly. canImplement() enforces this contract.
 class CuteDslNvfp4MoeRunner
 {
 public:
@@ -190,16 +194,9 @@ public:
     static bool canImplement(int32_t hiddenSize, int32_t moeInterSize, int32_t numExperts, int32_t topK,
         int32_t smVersion, CuteDslMoeActivation activation, CuteDslMoeIoDtype ioDtype, CuteDslMoeBackend backend);
 
-    //! Load every AOT kernel module the runner might dispatch to. Safe to call multiple times
-    //! (idempotent). activation and ioDtype are accepted for symmetry but all five modules
-    //! are loaded unconditionally in v1.
-    //!
-    //! NOTE: the AOT module handles are process-global (matching CuteDslFMHARunner /
-    //! CuteDslGDNRunner). Per-plugin / per-context state (e.g. the identity expert-id
-    //! table) is owned by the plugin and threaded through \c CuteDslNvfp4MoeParams so the
-    //! runner has no allocations on the enqueue path.
-    static bool loadKernelModules();
-    static void unloadKernelModules();
+    //! Load only the activation/backend module selected by \p params. The plugin
+    //! calls this before routing so failure cannot mutate device buffers.
+    static bool ensureKernelModules(CuteDslNvfp4MoeParams const& params, cudaStream_t stream);
 
     //! Workspace size (bytes) upper bound for the given runtime caps.
     //!
@@ -246,21 +243,18 @@ private:
 
     // AOT kernel modules -- FP16 io_dtype, all six activations
     // (identity/silu/swiglu/gelu/relu2/geglu) x both backends (decode/prefill) x n128 = 12 modules.
-    static nvfp4_fused_moe_decode_identity_n128_Kernel_Module_t sDecodeIdentity_n128;
-    static nvfp4_fused_moe_decode_silu_n128_Kernel_Module_t sDecodeSiLU_n128;
-    static nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_t sDecodeSwiGLU_n128;
-    static nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_t sDecodeGeLU_n128;
-    static nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_t sDecodeReLU2_n128;
-    static nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_t sDecodeGeGLU_n128;
-    static nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_t sPrefillIdentity_n128;
-    static nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_t sPrefillSiLU_n128;
-    static nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_t sPrefillSwiGLU_n128;
-    static nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_t sPrefillGeLU_n128;
-    static nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_t sPrefillReLU2_n128;
-    static nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_t sPrefillGeGLU_n128;
-
-    static bool sLoaded;
-    static std::mutex sLoadMutex;
+    static detail::LazyKernelModule<nvfp4_fused_moe_decode_identity_n128_Kernel_Module_t> sDecodeIdentity_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_decode_silu_n128_Kernel_Module_t> sDecodeSiLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_t> sDecodeSwiGLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_t> sDecodeGeLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_t> sDecodeReLU2_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_t> sDecodeGeGLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_t> sPrefillIdentity_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_t> sPrefillSiLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_t> sPrefillSwiGLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_t> sPrefillGeLU_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_t> sPrefillReLU2_n128;
+    static detail::LazyKernelModule<nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_t> sPrefillGeGLU_n128;
 };
 
 } // namespace trt_edgellm

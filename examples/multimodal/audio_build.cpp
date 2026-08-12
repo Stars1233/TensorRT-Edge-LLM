@@ -67,8 +67,10 @@ void printUsage(char const* programName)
     std::cerr << "  --debug              Use debug mode with verbose output" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Build Type Auto-Detection (from config.json):" << std::endl;
-    std::cerr << "  - If 'audio_config' exists: builds audio_encoder.engine" << std::endl;
+    std::cerr << "  - If 'audio_config'/'sound_config'/'encoder_config' exists: builds audio_encoder.engine"
+              << std::endl;
     std::cerr << "  - If 'code2wav_config' exists: builds code2wav.engine" << std::endl;
+    std::cerr << "  - If 'rnnt_decoder_config' exists: builds rnnt_step.engine (Nemotron-3.5-ASR)" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Audio Encoder Profile Options (when audio_config detected):" << std::endl;
     std::cerr << "  --minTimeSteps       Minimum audio time steps. Default = 100 (~0.64s audio)" << std::endl;

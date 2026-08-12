@@ -26,14 +26,13 @@ import torch.nn.functional as F
 from ...config import ModelConfig
 from ..default.modeling_default import OnnxSpec, RMSNorm
 from ..linear import TPMode, make_linear
-from ..ops import attention_plugin
+from ..ops import KV_PAGE_SIZE, attention_plugin
 from .modeling_gemma4_text import Gemma4MLP, _rotary_dim_from_rope_config
 
 __all__ = ["Gemma4AssistantForCausalLM", "Gemma4AssistantDecoderLayer"]
 
 _DUMMY_BATCH_SIZE = 1
 _DUMMY_SEQ_LEN = 1
-_DUMMY_PAST_LEN = 1
 _DUMMY_ROPE_CACHE_LEN = 4096
 
 
@@ -44,6 +43,7 @@ def _make_gemma4_assistant_flat_wrapper(model: nn.Module,
         "inputs_embeds",
         "hidden_states_input",
         "context_lengths",
+        "kv_page_table",
         "rope_rotary_cos_sin_sliding",
         "rope_rotary_cos_sin_full",
     ] + [f"past_key_values_{i}" for i in range(num_layers)])
@@ -53,6 +53,7 @@ def _make_gemma4_assistant_flat_wrapper(model: nn.Module,
         for i in range(num_layers))) if num_layers else "()"
     body = (f"    logits, hidden_states = self._model(\n"
             f"        inputs_embeds, hidden_states_input, context_lengths,\n"
+            f"        kv_page_table,\n"
             f"        rope_rotary_cos_sin_sliding, rope_rotary_cos_sin_full,\n"
             f"        {past_kv_tuple})\n"
             f"    return logits, hidden_states\n")
@@ -133,6 +134,7 @@ class Gemma4SharedKVAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         target_past_key_value: torch.Tensor,
+        kv_page_table: torch.Tensor,
         context_lengths: torch.Tensor,
         rope_rotary_cos_sin: torch.Tensor,
     ) -> torch.Tensor:
@@ -144,11 +146,6 @@ class Gemma4SharedKVAttention(nn.Module):
                                      batch_size, seq_len,
                                      self.num_heads * self.head_dim)
 
-        dummy_kv = torch.zeros(batch_size,
-                               0,
-                               self.num_kv_heads * self.head_dim,
-                               dtype=query_states.dtype,
-                               device=query_states.device)
         attention_mask = torch.ones(batch_size,
                                     seq_len,
                                     seq_len,
@@ -159,14 +156,15 @@ class Gemma4SharedKVAttention(nn.Module):
         frontier_pos_id = torch.clamp(context_lengths - 1, min=0)
         attention_pos_id = frontier_pos_id.reshape(batch_size, 1).expand(
             batch_size, seq_len)
+        # Shared-KV layer: qkv carries Q only; K/V are read from the donated
+        # target cache without being written.
         attn_output, _ = attention_plugin(
             query_states,
-            dummy_kv,
-            dummy_kv,
             target_past_key_value,
             context_lengths,
             rope_rotary_cos_sin,
             context_lengths,
+            kv_page_table,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -174,10 +172,13 @@ class Gemma4SharedKVAttention(nn.Module):
             enable_tree_attention=True,
             enable_fp8_kv_cache=self.enable_fp8_kv_cache,
             attention_scale=self.attention_scale,
+            enable_context_mask_selector=False,
             enable_vision_block_attention=False,
+            skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],
+            enable_kv_shared=1,
         )
         return self.o_proj(
             attn_output.reshape(batch_size, seq_len,
@@ -204,13 +205,14 @@ class Gemma4AssistantDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         target_past_key_value: torch.Tensor,
+        kv_page_table: torch.Tensor,
         context_lengths: torch.Tensor,
         rope_rotary_cos_sin: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
         attn_output = self.self_attn(self.input_layernorm(hidden_states),
-                                     target_past_key_value, context_lengths,
-                                     rope_rotary_cos_sin)
+                                     target_past_key_value, kv_page_table,
+                                     context_lengths, rope_rotary_cos_sin)
         hidden_states = residual + self.post_attention_layernorm(attn_output)
 
         residual = hidden_states
@@ -314,6 +316,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor,
         hidden_states_input: torch.Tensor,
         context_lengths: torch.Tensor,
+        kv_page_table: torch.Tensor,
         rope_rotary_cos_sin_sliding: torch.Tensor,
         rope_rotary_cos_sin_full: torch.Tensor,
         past_key_values: Tuple[torch.Tensor, ...],
@@ -325,7 +328,8 @@ class Gemma4AssistantForCausalLM(nn.Module):
                 rope_rotary_cos_sin_full if layer.self_attn.attention_type
                 == "full_attention" else rope_rotary_cos_sin_sliding)
             hidden_states = layer(hidden_states, past_key_values[layer_idx],
-                                  context_lengths, rope_rotary_cos_sin)
+                                  kv_page_table, context_lengths,
+                                  rope_rotary_cos_sin)
         hidden_states = self.model.norm(hidden_states)
         if self.masked_embedding is not None:
             logits = self.masked_embedding(hidden_states,
@@ -345,10 +349,8 @@ class Gemma4AssistantForCausalLM(nn.Module):
         device = next(itertools.chain(self.parameters(),
                                       self.buffers())).device
         dtype16 = torch.float16
-        batch_size, seq_len, past_len, max_pos = (_DUMMY_BATCH_SIZE,
-                                                  _DUMMY_SEQ_LEN,
-                                                  _DUMMY_PAST_LEN,
-                                                  _DUMMY_ROPE_CACHE_LEN)
+        batch_size, seq_len, max_pos = (_DUMMY_BATCH_SIZE, _DUMMY_SEQ_LEN,
+                                        _DUMMY_ROPE_CACHE_LEN)
 
         inputs_embeds = torch.zeros(batch_size,
                                     seq_len,
@@ -380,25 +382,34 @@ class Gemma4AssistantForCausalLM(nn.Module):
                                                device=device)
         kv_dtype = (torch.float8_e4m3fn
                     if config.quant.kv_cache_quant == "fp8" else dtype16)
+        # Target paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads,
+        # head_dim] — the assistant reads the TARGET model's pool, so the dummy
+        # mirrors the target's per-layer pool shape.
         past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        2,
+            torch.zeros(2,
+                        1,
+                        KV_PAGE_SIZE,
                         Gemma4SharedKVAttention._num_kv_heads_for_layer(
                             config, layer_idx),
-                        past_len,
                         Gemma4SharedKVAttention._head_dim_for_layer(
                             config, layer_idx),
                         dtype=kv_dtype,
                         device=device) for layer_idx in range(num_layers)
         ]
+        kv_page_table = torch.zeros(batch_size,
+                                    2,
+                                    1,
+                                    dtype=torch.int32,
+                                    device=device)
 
         args = (inputs_embeds, hidden_states_input, context_lengths,
-                rope_rotary_cos_sin_sliding, rope_rotary_cos_sin_full,
-                *past_key_values_list)
+                kv_page_table, rope_rotary_cos_sin_sliding,
+                rope_rotary_cos_sin_full, *past_key_values_list)
         input_names = [
             "inputs_embeds",
             "hidden_states_input",
             "context_lengths",
+            "kv_page_table",
             "rope_rotary_cos_sin_sliding",
             "rope_rotary_cos_sin_full",
         ] + [f"past_key_values_{i}" for i in range(num_layers)]
@@ -406,8 +417,10 @@ class Gemma4AssistantForCausalLM(nn.Module):
 
         batch = torch.export.Dim("batch", min=1, max=256)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
-        past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
+        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
+        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
         dynamic_shapes: list = [
             {
@@ -420,6 +433,10 @@ class Gemma4AssistantForCausalLM(nn.Module):
                 0: batch
             },
             {
+                0: page_batch,
+                2: max_pages
+            },
+            {
                 0: rope_batch,
                 1: pos
             },
@@ -429,7 +446,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
             },
         ]
         for _ in range(num_layers):
-            dynamic_shapes.append({0: batch, 3: past})
+            dynamic_shapes.append({1: num_pages})
 
         wrapped = _make_gemma4_assistant_flat_wrapper(self, num_layers)
         wrapped.eval()

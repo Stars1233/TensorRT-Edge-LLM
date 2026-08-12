@@ -19,23 +19,12 @@
 
 #if defined(CUTE_DSL_F16_MOE_ENABLED)
 
-#include <cuda_runtime.h>
-
-namespace trt_edgellm
-{
-namespace detail
-{
-
-//! Capture CUDA status values that the generated void module loaders otherwise only print.
-void recordCuteDslF16MoeCudaError(cudaError_t error) noexcept;
-
-} // namespace detail
-} // namespace trt_edgellm
+#include "kernels/cuteDslModuleLoader.h"
 
 #if defined(CUTE_DSL_CUDA_ERROR_CHECK)
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 #endif
-#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslF16MoeCudaError(error)
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_f16_moe_all.h"
 #undef CUTE_DSL_CUDA_ERROR_CHECK
 
@@ -97,8 +86,9 @@ public:
     static bool canImplement(int32_t hiddenSize, int32_t moeInterSize, int32_t numExperts, int32_t topK,
         int32_t smVersion, int32_t activationType) noexcept;
 
-    //! Load once for process lifetime so attached plugin contexts cannot race an unload.
-    static bool loadKernelModules() noexcept;
+    //! Load only the architecture module selected for \p smVersion. The plugin
+    //! calls this before routing so failure cannot mutate device buffers.
+    static bool ensureKernelModules(int32_t smVersion, cudaStream_t stream) noexcept;
     static int32_t getPersistentBlockCount() noexcept;
 
     static size_t getWorkspaceSize(int32_t maxRoutedRows, int32_t numExperts, int32_t hiddenSize, int32_t moeInterSize,
@@ -116,18 +106,17 @@ private:
     };
 
 #if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
-    static f16_moe_ampere_grouped_fp16_Kernel_Module_t sAmpereModule;
+    static detail::LazyKernelModule<f16_moe_ampere_grouped_fp16_Kernel_Module_t> sAmpereModule;
 #endif
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
-    static f16_moe_blackwell_grouped_fp16_Kernel_Module_t sBlackwellModule;
+    static detail::LazyKernelModule<f16_moe_blackwell_grouped_fp16_Kernel_Module_t> sBlackwellModule;
 #endif
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
-    static f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_t sBlackwellGeforceModule;
+    static detail::LazyKernelModule<f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_t> sBlackwellGeforceModule;
 #endif
-    static Variant sActiveVariant;
+    static Variant selectVariant(int32_t smVersion) noexcept;
     static std::unordered_map<int32_t, int32_t> sPersistentBlockCounts;
-    static bool sLoaded;
-    static std::mutex sLoadMutex;
+    static std::mutex sPersistentBlockCountsMutex;
 };
 
 } // namespace trt_edgellm

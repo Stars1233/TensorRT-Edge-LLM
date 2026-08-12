@@ -43,7 +43,8 @@ enum LLMBuildOptionId : int
     SPEC_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
     MAX_DRAFT_TREE_SIZE = 712,
-    PROFILING_DETAILED = 713
+    PROFILING_DETAILED = 713,
+    MAX_KV_POOL_PAGES = 714,
 };
 
 struct LLMBuildArgs
@@ -53,6 +54,7 @@ struct LLMBuildArgs
     std::string engineDir;
     int64_t maxInputLen{1024};
     int64_t maxKVCacheCapacity{4096};
+    int64_t maxKVPoolPages{0};
     bool debug{false};
     int64_t maxBatchSize{4};
     int64_t maxLoraRank{0}; // Default to 0 means no LoRA
@@ -68,7 +70,8 @@ void printUsage(char const* programName)
     std::cerr << "Usage: " << programName
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
-                 "[--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
+                 " [--maxKVPoolPages <int>]"
+                 " [--specDraft] [--specBase] [--maxVerifyTreeSize <int>] "
                  "[--maxDraftTreeSize <int>] [--profilingDetailed]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
@@ -80,6 +83,9 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --maxKVCacheCapacity      Provide the maximum KV cache capacity (sequence length). "
                  "Default = 4096"
+              << std::endl;
+    std::cerr << "  --maxKVPoolPages          Exact physical K-page count for the KV pool. Default = 0 "
+                 "(minimum active pages)"
               << std::endl;
     std::cerr << "  --maxBatchSize            Provide the maximum batch_size for builder. Default = 4" << std::endl;
     std::cerr << "  --debug                   Use debug mode, which outputs more logs." << std::endl;
@@ -94,8 +100,8 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --profilingDetailed       Enable detailed profiling verbosity to include ONNX op names "
                  "in layer info. Use for DLSim analysis."
-              << std::endl
               << std::endl;
+    std::cerr << std::endl;
 }
 
 bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
@@ -105,6 +111,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"engineDir", required_argument, 0, LLMBuildOptionId::ENGINE_DIR},
         {"maxInputLen", required_argument, 0, LLMBuildOptionId::MAX_INPUT_LEN},
         {"maxKVCacheCapacity", required_argument, 0, LLMBuildOptionId::MAX_KV_CACHE_CAPACITY},
+        {"maxKVPoolPages", required_argument, 0, LLMBuildOptionId::MAX_KV_POOL_PAGES},
         {"debug", no_argument, 0, LLMBuildOptionId::DEBUG},
         {"maxBatchSize", required_argument, 0, LLMBuildOptionId::MAX_BATCH_SIZE},
         {"maxLoraRank", required_argument, 0, LLMBuildOptionId::MAX_LORA_RANK},
@@ -153,7 +160,13 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         case LLMBuildOptionId::MAX_KV_CACHE_CAPACITY:
             if (optarg)
             {
-                args.maxKVCacheCapacity = std::stoi(optarg);
+                args.maxKVCacheCapacity = std::stoll(optarg);
+            }
+            break;
+        case LLMBuildOptionId::MAX_KV_POOL_PAGES:
+            if (optarg)
+            {
+                args.maxKVPoolPages = std::stoll(optarg);
             }
             break;
         case LLMBuildOptionId::DEBUG: args.debug = true; break;
@@ -228,6 +241,7 @@ int main(int argc, char** argv)
     builder::LLMBuilderConfig config;
     config.maxInputLen = args.maxInputLen;
     config.maxKVCacheCapacity = args.maxKVCacheCapacity;
+    config.maxKVPoolPages = args.maxKVPoolPages;
     config.maxBatchSize = args.maxBatchSize;
     config.maxLoraRank = args.maxLoraRank;
     config.specDraft = args.specDraft;

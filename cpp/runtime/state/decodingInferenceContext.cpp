@@ -52,6 +52,8 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     logitBiasPerSlot.resize(batchSize);
     hasLogitBias = false;
     logitBiasGpuDirty = false;
+    callbackEmittedTokenCounts.clear();
+    callbackEmittedTokenCounts.resize(batchSize, 0);
     shouldStopAfterAcceptedToken = {};
 
     batchIndexMapping.resize(batchSize);
@@ -70,6 +72,7 @@ void DecodingInferenceContext::initialize(int32_t batchSize, int32_t maxGenLengt
     deepstackFeatures = deepstack;
     generationRound = 0;
     maxGenerateLength = maxGenLength;
+    diffusionMaxDenoisingSteps = 0;
     activeBatchSize = batchSize;
     loraWeightsName = loraName;
     stream = cudaStream;

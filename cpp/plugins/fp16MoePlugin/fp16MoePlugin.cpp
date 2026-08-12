@@ -21,6 +21,7 @@
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
+#include "kernels/moe/moeSigmoidGroupTopkKernels.h"
 #include "kernels/moe/moeTopkSoftmaxKernels.h"
 #include "plugins/utils/pluginUtils.h"
 
@@ -29,6 +30,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -51,14 +53,18 @@ constexpr int32_t kIN_ROUTER_LOGITS{0};
 constexpr int32_t kIN_HIDDEN_STATES{1};
 constexpr int32_t kIN_FC1_WEIGHTS{2};
 constexpr int32_t kIN_FC2_WEIGHTS{3};
-constexpr int32_t kOUT_OUTPUT{4};
-constexpr int32_t kNB_INPUTS{4};
+// Trailing optional input, present only when routing_mode == sigmoid group top-k.
+constexpr int32_t kIN_EXPERT_SCORE_BIAS{4};
+constexpr int32_t kNB_INPUTS_SOFTMAX{4};
+constexpr int32_t kNB_INPUTS_SIGMOID{5};
 constexpr int32_t kNB_OUTPUTS{1};
 
 constexpr char const* kPLUGIN_NAME{"Fp16MoePlugin"};
 constexpr char const* kPLUGIN_VERSION{"1"};
 constexpr int32_t kACT_SWIGLU{2};
 constexpr int32_t kACT_RELU2{4};
+constexpr int32_t kROUTING_SOFTMAX_TOPK{0};
+constexpr int32_t kROUTING_SIGMOID_GROUP_TOPK{1};
 constexpr int32_t kMAX_TOP_K{8};
 constexpr int32_t kROW_ALIGNMENT{128};
 constexpr int32_t kINTER_ALIGNMENT{64};
@@ -97,8 +103,56 @@ int32_t getRequiredIntField(PluginFieldCollection const* fields, char const* nam
     return value;
 }
 
+//! Read an optional INT32 scalar field; returns @p defaultValue when the field is absent. This keeps the
+//! softmax-routing (Qwen) export — which omits the sigmoid-group-topk fields — working unchanged.
+int32_t getOptionalIntField(PluginFieldCollection const* fields, char const* name, int32_t defaultValue)
+{
+    if (fields == nullptr)
+    {
+        return defaultValue;
+    }
+    for (int32_t index = 0; index < fields->nbFields; ++index)
+    {
+        PluginField const& field = fields->fields[index];
+        if (field.name != nullptr && std::string(field.name) == name)
+        {
+            if (field.type != PluginFieldType::kINT32 || field.length != 1 || field.data == nullptr)
+            {
+                throw std::invalid_argument(
+                    std::string("Fp16MoePlugin: field ") + name + " must be one non-null INT32 scalar");
+            }
+            return *static_cast<int32_t const*>(field.data);
+        }
+    }
+    return defaultValue;
+}
+
+//! Read an optional FP32 scalar field; returns @p defaultValue when the field is absent.
+float getOptionalFloatField(PluginFieldCollection const* fields, char const* name, float defaultValue)
+{
+    if (fields == nullptr)
+    {
+        return defaultValue;
+    }
+    for (int32_t index = 0; index < fields->nbFields; ++index)
+    {
+        PluginField const& field = fields->fields[index];
+        if (field.name != nullptr && std::string(field.name) == name)
+        {
+            if (field.type != PluginFieldType::kFLOAT32 || field.length != 1 || field.data == nullptr)
+            {
+                throw std::invalid_argument(
+                    std::string("Fp16MoePlugin: field ") + name + " must be one non-null FP32 scalar");
+            }
+            return *static_cast<float const*>(field.data);
+        }
+    }
+    return defaultValue;
+}
+
 void validateAttributes(int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
-    int32_t activationType, int32_t normTopkProb, int32_t maxRoutedRows)
+    int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb, float routedScalingFactor,
+    int32_t routingMode, int32_t maxRoutedRows)
 {
     // Match CuteDslF16MoeRunner::kSupportedNumExperts.
     if (numExperts != 128 && numExperts != 256)
@@ -132,6 +186,31 @@ void validateAttributes(int32_t numExperts, int32_t topK, int32_t hiddenSize, in
     if (maxRoutedRows < 0)
     {
         throw std::invalid_argument("Fp16MoePlugin: max_routed_rows must be nonnegative");
+    }
+    if (routingMode != kROUTING_SOFTMAX_TOPK && routingMode != kROUTING_SIGMOID_GROUP_TOPK)
+    {
+        throw std::invalid_argument("Fp16MoePlugin: routing_mode must be 0 (softmax top-k) or 1 (sigmoid group top-k)");
+    }
+    if (routingMode == kROUTING_SIGMOID_GROUP_TOPK)
+    {
+        if (!std::isfinite(routedScalingFactor) || routedScalingFactor <= 0.0F)
+        {
+            throw std::invalid_argument(
+                "Fp16MoePlugin: routed_scaling_factor must be finite and positive for sigmoid group top-k");
+        }
+        if (nGroup <= 0 || numExperts % nGroup != 0 || numExperts / nGroup < 2)
+        {
+            throw std::invalid_argument(
+                "Fp16MoePlugin: n_group must divide num_experts with at least two experts per group");
+        }
+        if (topkGroup <= 0 || topkGroup > nGroup)
+        {
+            throw std::invalid_argument("Fp16MoePlugin: topk_group must be in [1, n_group]");
+        }
+        if (topK > topkGroup * (numExperts / nGroup))
+        {
+            throw std::invalid_argument("Fp16MoePlugin: selected expert groups cannot contain top_k experts");
+        }
     }
 }
 
@@ -175,26 +254,40 @@ std::vector<PluginField> Fp16MoePluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(Fp16MoePluginCreator);
 
 Fp16MoePlugin::Fp16MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize,
-    int32_t moeInterSize, int32_t activationType, int32_t normTopkProb, int32_t maxRoutedRows)
+    int32_t moeInterSize, int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb,
+    float routedScalingFactor, int32_t routingMode, int32_t maxRoutedRows)
     : mLayerName(name)
     , mNumExperts(numExperts)
     , mTopK(topK)
     , mHiddenSize(hiddenSize)
     , mMoeInterSize(moeInterSize)
     , mActivationType(activationType)
+    , mNGroup(nGroup)
+    , mTopkGroup(topkGroup)
     , mNormTopkProb(normTopkProb)
+    , mRoutedScalingFactor(routedScalingFactor)
+    , mRoutingMode(routingMode)
     , mMaxRoutedRows(maxRoutedRows)
     , mAutoMaxRoutedRows(maxRoutedRows == 0)
 {
-    validateAttributes(mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mNormTopkProb, mMaxRoutedRows);
+    validateAttributes(mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mNGroup, mTopkGroup,
+        mNormTopkProb, mRoutedScalingFactor, mRoutingMode, mMaxRoutedRows);
 }
 
 Fp16MoePlugin::Fp16MoePlugin(std::string const& name, PluginFieldCollection const* fields)
     : Fp16MoePlugin(name, getRequiredIntField(fields, "num_experts"), getRequiredIntField(fields, "top_k"),
           getRequiredIntField(fields, "hidden_size"), getRequiredIntField(fields, "moe_inter_size"),
-          getRequiredIntField(fields, "activation_type"), getRequiredIntField(fields, "norm_topk_prob"),
+          getRequiredIntField(fields, "activation_type"), getOptionalIntField(fields, "n_group", 0),
+          getOptionalIntField(fields, "topk_group", 0), getRequiredIntField(fields, "norm_topk_prob"),
+          getOptionalFloatField(fields, "routed_scaling_factor", 1.0F),
+          getOptionalIntField(fields, "routing_mode", kROUTING_SOFTMAX_TOPK),
           getRequiredIntField(fields, "max_routed_rows"))
 {
+}
+
+int32_t Fp16MoePlugin::numInputs() const noexcept
+{
+    return mRoutingMode == kROUTING_SIGMOID_GROUP_TOPK ? kNB_INPUTS_SIGMOID : kNB_INPUTS_SOFTMAX;
 }
 
 IPluginCapability* Fp16MoePlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
@@ -214,8 +307,8 @@ IPluginV3* Fp16MoePlugin::clone() noexcept
 {
     try
     {
-        auto* plugin = new Fp16MoePlugin(
-            mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType, mNormTopkProb, mMaxRoutedRows);
+        auto* plugin = new Fp16MoePlugin(mLayerName, mNumExperts, mTopK, mHiddenSize, mMoeInterSize, mActivationType,
+            mNGroup, mTopkGroup, mNormTopkProb, mRoutedScalingFactor, mRoutingMode, mMaxRoutedRows);
         plugin->mAutoMaxRoutedRows = mAutoMaxRoutedRows;
         plugin->mPersistentBlockCount = mPersistentBlockCount;
         plugin->setPluginNamespace(mNamespace.c_str());
@@ -263,9 +356,9 @@ int32_t Fp16MoePlugin::getNbOutputs() const noexcept
 int32_t Fp16MoePlugin::getOutputDataTypes(
     DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
-    if (outputTypes == nullptr || inputTypes == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+    if (outputTypes == nullptr || inputTypes == nullptr || nbInputs != numInputs() || nbOutputs != kNB_OUTPUTS)
     {
-        LOG_ERROR("Fp16MoePlugin: getOutputDataTypes expected four inputs and one output");
+        LOG_ERROR("Fp16MoePlugin: getOutputDataTypes expected %d inputs and one output", numInputs());
         return -1;
     }
     outputTypes[0] = DataType::kHALF;
@@ -277,9 +370,9 @@ int32_t Fp16MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs
 {
     (void) shapeInputs;
     (void) nbShapeInputs;
-    if (inputs == nullptr || outputs == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+    if (inputs == nullptr || outputs == nullptr || nbInputs != numInputs() || nbOutputs != kNB_OUTPUTS)
     {
-        LOG_ERROR("Fp16MoePlugin: getOutputShapes expected four inputs and one output");
+        LOG_ERROR("Fp16MoePlugin: getOutputShapes expected %d inputs and one output", numInputs());
         return -1;
     }
     outputs[0].nbDims = 3;
@@ -292,8 +385,8 @@ int32_t Fp16MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs
 bool Fp16MoePlugin::supportsFormatCombination(
     int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
-    if (inOut == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS || pos < 0
-        || pos >= nbInputs + nbOutputs)
+    int32_t const nbIn = numInputs();
+    if (inOut == nullptr || nbInputs != nbIn || nbOutputs != kNB_OUTPUTS || pos < 0 || pos >= nbInputs + nbOutputs)
     {
         return false;
     }
@@ -301,6 +394,11 @@ bool Fp16MoePlugin::supportsFormatCombination(
     if (tensor.format != TensorFormat::kLINEAR)
     {
         return false;
+    }
+
+    if (pos == nbIn) // sole output, at the position past the last input.
+    {
+        return tensor.type == DataType::kHALF && tensor.dims.nbDims == 3 && tensor.dims.d[2] == mHiddenSize;
     }
 
     int32_t const fc1N = static_cast<int32_t>(mActivationType == kACT_SWIGLU ? 2LL * mMoeInterSize : mMoeInterSize);
@@ -314,8 +412,9 @@ bool Fp16MoePlugin::supportsFormatCombination(
         return tensor.type == DataType::kHALF && hasExactDims3(tensor.dims, mNumExperts, fc1N, mHiddenSize);
     case kIN_FC2_WEIGHTS:
         return tensor.type == DataType::kHALF && hasExactDims3(tensor.dims, mNumExperts, mHiddenSize, mMoeInterSize);
-    case kOUT_OUTPUT:
-        return tensor.type == DataType::kHALF && tensor.dims.nbDims == 3 && tensor.dims.d[2] == mHiddenSize;
+    case kIN_EXPERT_SCORE_BIAS:
+        return mRoutingMode == kROUTING_SIGMOID_GROUP_TOPK && tensor.type == DataType::kFLOAT && tensor.dims.nbDims == 1
+            && tensor.dims.d[0] == mNumExperts;
     default: return false;
     }
 }
@@ -325,9 +424,16 @@ int32_t Fp16MoePlugin::configurePlugin(DynamicPluginTensorDesc const* inputs, in
 {
     try
     {
-        if (inputs == nullptr || outputs == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+        if (inputs == nullptr || outputs == nullptr || nbInputs != numInputs() || nbOutputs != kNB_OUTPUTS)
         {
-            LOG_ERROR("Fp16MoePlugin: configurePlugin expected four inputs and one output");
+            LOG_ERROR("Fp16MoePlugin: configurePlugin expected %d inputs and one output", numInputs());
+            return -1;
+        }
+        if (mRoutingMode == kROUTING_SIGMOID_GROUP_TOPK
+            && (inputs[kIN_EXPERT_SCORE_BIAS].desc.dims.nbDims != 1
+                || inputs[kIN_EXPERT_SCORE_BIAS].desc.dims.d[0] != mNumExperts))
+        {
+            LOG_ERROR("Fp16MoePlugin: e_score_correction_bias must be a length-%d 1-D tensor", mNumExperts);
             return -1;
         }
         if (!validateTokenShape(inputs[kIN_ROUTER_LOGITS].min, inputs[kIN_HIDDEN_STATES].min, mNumExperts, "minimum")
@@ -403,9 +509,9 @@ size_t Fp16MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, in
     DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
     (void) outputs;
-    if (inputs == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+    if (inputs == nullptr || nbInputs != numInputs() || nbOutputs != kNB_OUTPUTS)
     {
-        LOG_ERROR("Fp16MoePlugin: getWorkspaceSize expected four inputs and one output");
+        LOG_ERROR("Fp16MoePlugin: getWorkspaceSize expected %d inputs and one output", numInputs());
         return 0;
     }
 #if !defined(CUTE_DSL_F16_MOE_ENABLED)
@@ -470,6 +576,11 @@ int32_t Fp16MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             LOG_ERROR("Fp16MoePlugin: null descriptor, tensor, output, or workspace");
             return -1;
         }
+        if (mRoutingMode == kROUTING_SIGMOID_GROUP_TOPK && inputs[kIN_EXPERT_SCORE_BIAS] == nullptr)
+        {
+            LOG_ERROR("Fp16MoePlugin: sigmoid group top-k routing requires the e_score_correction_bias input");
+            return -1;
+        }
         if (mPersistentBlockCount <= 0)
         {
             LOG_ERROR("Fp16MoePlugin: runtime context has no cached f16_moe launch configuration");
@@ -497,6 +608,11 @@ int32_t Fp16MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             return -1;
         }
         int32_t const numTokens = static_cast<int32_t>(numTokens64);
+        if (!CuteDslF16MoeRunner::ensureKernelModules(getSMVersion(), stream))
+        {
+            LOG_ERROR("Fp16MoePlugin: failed to load the selected f16_moe CuTe DSL module");
+            return -1;
+        }
 
         size_t const softmaxBytes = kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, mNumExperts);
         std::byte* next = static_cast<std::byte*>(workspace);
@@ -521,8 +637,19 @@ int32_t Fp16MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             rt::DeviceType::kGPU, DataType::kFLOAT);
         rt::Tensor topkWeightsTensor(topkWeights, {numTokens, mTopK}, rt::DeviceType::kGPU, DataType::kFLOAT);
         rt::Tensor topkIdsTensor(topkIds, {numTokens, mTopK}, rt::DeviceType::kGPU, DataType::kINT32);
-        kernel::moeTopkSoftmax(routerTensor, topkWeightsTensor, topkIdsTensor, mTopK,
-            softmaxBytes == 0 ? nullptr : softmaxWorkspace, softmaxBytes, stream, mNormTopkProb != 0);
+        if (mRoutingMode == kROUTING_SIGMOID_GROUP_TOPK)
+        {
+            rt::Tensor expertScoreBias(const_cast<void*>(inputs[kIN_EXPERT_SCORE_BIAS]), {mNumExperts},
+                rt::DeviceType::kGPU, DataType::kFLOAT);
+            rt::OptionalInputTensor expertScoreBiasOpt = expertScoreBias;
+            kernel::moeSigmoidGroupTopk(routerTensor, topkWeightsTensor, topkIdsTensor, mTopK, mNGroup, mTopkGroup,
+                mNormTopkProb != 0, mRoutedScalingFactor, stream, expertScoreBiasOpt);
+        }
+        else
+        {
+            kernel::moeTopkSoftmax(routerTensor, topkWeightsTensor, topkIdsTensor, mTopK,
+                softmaxBytes == 0 ? nullptr : softmaxWorkspace, softmaxBytes, stream, mNormTopkProb != 0);
+        }
         CUDA_CHECK(cudaGetLastError());
 
         CuteDslF16MoeParams parameters{};
@@ -564,9 +691,9 @@ int32_t Fp16MoePlugin::onShapeChange(
     PluginTensorDesc const* inputs, int32_t nbInputs, PluginTensorDesc const* outputs, int32_t nbOutputs) noexcept
 {
     (void) outputs;
-    if (inputs == nullptr || nbInputs != kNB_INPUTS || nbOutputs != kNB_OUTPUTS)
+    if (inputs == nullptr || nbInputs != numInputs() || nbOutputs != kNB_OUTPUTS)
     {
-        LOG_ERROR("Fp16MoePlugin: onShapeChange expected four inputs and one output");
+        LOG_ERROR("Fp16MoePlugin: onShapeChange expected %d inputs and one output", numInputs());
         return -1;
     }
     Dims const& hidden = inputs[kIN_HIDDEN_STATES].dims;
@@ -620,7 +747,11 @@ PluginFieldCollection const* Fp16MoePlugin::getFieldsToSerialize() noexcept
         mDataToSerialize.emplace_back("hidden_size", &mHiddenSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("moe_inter_size", &mMoeInterSize, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("activation_type", &mActivationType, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("n_group", &mNGroup, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("topk_group", &mTopkGroup, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("norm_topk_prob", &mNormTopkProb, PluginFieldType::kINT32, 1);
+        mDataToSerialize.emplace_back("routed_scaling_factor", &mRoutedScalingFactor, PluginFieldType::kFLOAT32, 1);
+        mDataToSerialize.emplace_back("routing_mode", &mRoutingMode, PluginFieldType::kINT32, 1);
         mDataToSerialize.emplace_back("max_routed_rows", &mMaxRoutedRows, PluginFieldType::kINT32, 1);
         mFieldsToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
         mFieldsToSerialize.fields = mDataToSerialize.data();
@@ -643,7 +774,11 @@ Fp16MoePluginCreator::Fp16MoePluginCreator()
     mPluginAttributes.emplace_back("hidden_size", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("moe_inter_size", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("activation_type", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back("n_group", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back("topk_group", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("norm_topk_prob", nullptr, PluginFieldType::kINT32, 1);
+    mPluginAttributes.emplace_back("routed_scaling_factor", nullptr, PluginFieldType::kFLOAT32, 1);
+    mPluginAttributes.emplace_back("routing_mode", nullptr, PluginFieldType::kINT32, 1);
     mPluginAttributes.emplace_back("max_routed_rows", nullptr, PluginFieldType::kINT32, 1);
     mFieldCollection.nbFields = static_cast<int32_t>(mPluginAttributes.size());
     mFieldCollection.fields = mPluginAttributes.data();
@@ -685,6 +820,12 @@ IPluginV3* Fp16MoePluginCreator::createPlugin(
     char const* name, PluginFieldCollection const* fields, TensorRTPhase phase) noexcept
 {
     (void) phase;
+#if !defined(CUTE_DSL_F16_MOE_ENABLED)
+    (void) name;
+    (void) fields;
+    LOG_WARNING("Fp16MoePlugin: f16_moe CuTeDSL artifact is not linked for this build.");
+    return nullptr;
+#else
     try
     {
         if (name == nullptr)
@@ -700,6 +841,7 @@ IPluginV3* Fp16MoePluginCreator::createPlugin(
         LOG_ERROR("Fp16MoePlugin creation failed: %s", error.what());
         return nullptr;
     }
+#endif
 }
 
 } // namespace plugins

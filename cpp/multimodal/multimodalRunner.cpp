@@ -19,6 +19,7 @@
 #include "common/checkMacros.h"
 #include "common/trtUtils.h"
 #include "multimodal/audioRunner.h"
+#include "multimodal/cosmos3EdgeViTRunner.h"
 #include "multimodal/gemma4AudioRunner.h"
 #include "multimodal/gemma4UnifiedAudioRunner.h"
 #include "multimodal/gemma4UnifiedVisionRunner.h"
@@ -72,6 +73,33 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     }
 }
 
+void MultimodalRunner::loadExternalWeights(
+    std::string const& engineDir, std::string const& checkpointDir, cudaStream_t stream)
+{
+    if (mExternalWeightsLoaded)
+    {
+        return;
+    }
+    mExternalWeightsLoaded = true;
+
+    std::filesystem::path const configPath = std::filesystem::path(engineDir) / "config.json";
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    auto* context = mAudioEngine ? mAudioContext.get() : mVisualContext.get();
+    if (!engine || !context || !std::filesystem::exists(configPath))
+    {
+        return;
+    }
+
+    mExternalWeights = std::make_unique<ExternalWeightManager>();
+    mExternalWeights->load(std::filesystem::path(engineDir), configPath, stream, checkpointDir);
+    if (mExternalWeights->size() == 0)
+    {
+        mExternalWeights.reset();
+        return;
+    }
+    mExternalWeights->bindToContext(*engine, *context, mAudioEngine ? "audio" : "visual");
+}
+
 int64_t MultimodalRunner::getRequiredContextMemorySize() const
 {
     auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
@@ -104,18 +132,22 @@ bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
 namespace
 {
 //! \brief Construct a QwenViTRunner-family runner, then run its two-phase initialize().
+//!
+//! External weights are bound between the two phases: initialize() may enqueue
+//! the engine, which needs every input address already set.
 template <typename RunnerT>
-std::unique_ptr<RunnerT> makeInitializedQwenViTRunner(
-    std::string const& engineDir, int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
+std::unique_ptr<RunnerT> makeInitializedQwenViTRunner(std::string const& engineDir, int32_t llmMaxBatchSize,
+    int64_t llmMaxPositionEmbeddings, cudaStream_t stream, std::string const& checkpointDir)
 {
     auto runner = std::make_unique<RunnerT>(engineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+    runner->loadExternalWeights(engineDir, checkpointDir, stream);
     runner->initialize(stream);
     return runner;
 }
 } // namespace
 
 std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir,
-    int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream)
+    int32_t llmMaxBatchSize, int64_t llmMaxPositionEmbeddings, cudaStream_t stream, std::string const& checkpointDir)
 {
     std::unique_ptr<MultimodalRunner> multimodalRunner;
 
@@ -142,26 +174,34 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     if (modelType == multimodal::ModelType::QWEN2_VL)
     {
         multimodalRunner = makeInitializedQwenViTRunner<QwenViTRunner>(
-            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream, checkpointDir);
     }
     else if (modelType == multimodal::ModelType::QWEN2_5_VL)
     {
         multimodalRunner = makeInitializedQwenViTRunner<Qwen25VLViTRunner>(
-            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream, checkpointDir);
     }
     else if (modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
     {
         multimodalRunner = makeInitializedQwenViTRunner<Qwen3VLViTRunner>(
-            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream, checkpointDir);
     }
-    else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER)
+    else if (modelType == multimodal::ModelType::COSMOS3_EDGE)
     {
+        multimodalRunner = makeInitializedQwenViTRunner<Cosmos3EdgeViTRunner>(
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream, checkpointDir);
+    }
+    else if (modelType == multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER
+        || modelType == multimodal::ModelType::QWEN3_OMNI_NEXT_AUDIO_ENCODER)
+    {
+        // Qwen3OmniAudioRunner handles both variants (it branches internally on the
+        // config model_type for the Next encoder's 8x-downsample front end).
         multimodalRunner = std::make_unique<Qwen3OmniAudioRunner>(multimodalEngineDir, stream);
     }
     else if (modelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
     {
         multimodalRunner = makeInitializedQwenViTRunner<Qwen3OmniViTRunner>(
-            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
+            multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream, checkpointDir);
     }
     else if (modelType == multimodal::ModelType::INTERNVL)
     {
@@ -199,6 +239,10 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     {
         throw std::runtime_error("Unsupported model type: " + modelTypeStr);
     }
+
+    // The Qwen family already bound inside its factory helper, before
+    // initialize(); this is a no-op there and the real call for everyone else.
+    multimodalRunner->loadExternalWeights(multimodalEngineDir, checkpointDir, stream);
 
     return multimodalRunner;
 }

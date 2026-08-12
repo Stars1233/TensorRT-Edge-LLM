@@ -163,6 +163,32 @@ void selectAllTopK(rt::Tensor const& input, rt::OptionalOutputTensor topKValues,
     rt::Tensor& workspace, cudaStream_t stream);
 
 /*!
+ * \brief Scatter selected top-k logits into a dense probability tensor.
+ *
+ * topKValues/topKIndices are [batch-size, top-k] outputs from selectAllTopK().
+ * The output probabilities tensor is [batch-size, vocab-size] and is zero
+ * outside the selected top-k support.
+ */
+void topKLogitsToDenseProbabilities(rt::Tensor const& topKValues, rt::Tensor const& topKIndices,
+    rt::Tensor& probabilities, int32_t vocabSize, float temperature, cudaStream_t stream);
+
+/*!
+ * \brief Select argmax and compute softmax entropy for each input row.
+ *
+ * Returns the top-1 token ID and entropy for every row in a logits tensor.
+ * The logits are temperature-scaled for entropy computation; argmax is
+ * unchanged for positive temperatures.
+ *
+ * \param[in] input Input tensor [GPU, Float/Half/BF16] with shape [rows, vocab-size]
+ * \param[out] topIndices Top-1 indices [GPU, Int32] with shape [rows, 1]
+ * \param[out] entropy Entropy values [GPU, Float] with shape [rows]
+ * \param[in] temperature Softmax temperature
+ * \param[in] stream CUDA stream to execute the kernel
+ */
+void selectArgmaxAndComputeEntropy(
+    rt::Tensor const& input, rt::Tensor& topIndices, rt::Tensor& entropy, float temperature, cudaStream_t stream);
+
+/*!
  * \brief Get workspace size required for top-K/top-P sampling (FP32 only).
  *
  * Calculates the amount of GPU memory needed for intermediate computations

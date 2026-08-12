@@ -127,6 +127,92 @@ def test_externalize_nvfp4_moe_plugin_initializers(tmp_path):
     assert "non_plugin_weight" in remaining_initializers
 
 
+def test_externalize_nvfp4_moe_streams_existing_external_data(tmp_path):
+    onnx_path = tmp_path / "model_external.onnx"
+    data_path = tmp_path / "model.onnx.data"
+    plugin_inputs = [
+        "router_logits",
+        "hidden_states",
+        "fc1_qweights",
+        "fc1_blocks_scale",
+        "fc1_alpha",
+        "e_score_correction_bias",
+    ]
+    arrays = {
+        "fc1_qweights": np.arange(16, dtype=np.int8).reshape(2, 2, 4),
+        "fc1_blocks_scale": np.arange(8, dtype=np.int8).reshape(2, 2, 2),
+        "fc1_alpha": np.ones((2, ), dtype=np.float32),
+        "e_score_correction_bias": np.zeros((2, ), dtype=np.float32),
+        "retained_weight": np.arange(4, dtype=np.float16),
+    }
+    expected_external_names = plugin_inputs[2:]
+    initializers = [
+        _make_initializer(name, array) for name, array in arrays.items()
+    ]
+    node = onnx.helper.make_node(
+        "Nvfp4MoePlugin",
+        plugin_inputs,
+        ["moe_output"],
+        domain="trt_edgellm",
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "nvfp4_moe_external_data_test",
+        [
+            _make_float_value_info("hidden_states"),
+            _make_float_value_info("router_logits"),
+        ],
+        [_make_float_value_info("moe_output")],
+        initializers,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 24),
+            onnx.helper.make_opsetid("trt_edgellm", 1),
+        ],
+    )
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_path.name,
+        size_threshold=0,
+    )
+    metadata_model = onnx.load(onnx_path, load_external_data=False)
+    assert all(init.external_data for init in metadata_model.graph.initializer)
+
+    manifest = external_weights.externalize_model_weights(
+        str(onnx_path), object(), externalize_weights=["nvfp4_moe"])
+
+    assert manifest == [{
+        "file": "external_nvfp4_moe_weights.safetensors",
+        "kind": "nvfp4_moe_weights",
+        "tensors": expected_external_names,
+    }]
+    assert data_path.exists()
+    saved_tensors = safetensors_torch.load_file(
+        str(tmp_path / "external_nvfp4_moe_weights.safetensors"))
+    for tensor_name in expected_external_names:
+        np.testing.assert_array_equal(saved_tensors[tensor_name].numpy(),
+                                      arrays[tensor_name])
+
+    patched_model = onnx.load(onnx_path, load_external_data=False)
+    graph_inputs = {
+        graph_input.name
+        for graph_input in patched_model.graph.input
+    }
+    remaining_initializers = {
+        initializer.name
+        for initializer in patched_model.graph.initializer
+    }
+
+    assert set(expected_external_names).issubset(graph_inputs)
+    assert set(expected_external_names).isdisjoint(remaining_initializers)
+    assert "retained_weight" in remaining_initializers
+
+
 def test_externalize_nvfp4_moe_geforce_plugin_initializers(tmp_path):
     onnx_path = tmp_path / "model_geforce.onnx"
     plugin_inputs = [

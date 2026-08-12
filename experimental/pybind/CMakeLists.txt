@@ -59,6 +59,10 @@ if(_PYBIND_STANDALONE)
     CUDA_DRIVER_LIB cuda
     HINTS ${CUDA_DIR}
     PATH_SUFFIXES lib lib64 lib/stubs)
+  set(CUDA_DRIVER_LINK_LIB "${CUDA_DRIVER_LIB}")
+  if(AARCH64_BUILD)
+    set(CUDA_DRIVER_LINK_LIB cuda)
+  endif()
   find_path(
     TRT_INCLUDE_DIR NvInfer.h
     HINTS ${TRT_PACKAGE_DIR}
@@ -133,8 +137,9 @@ set_target_properties(
              PREFIX ""
              OUTPUT_NAME "_edgellm_runtime")
 
-# Place the .so next to the core libraries in subdirectory mode.
-if(NOT _PYBIND_STANDALONE)
+# Place the .so next to the core libraries in subdirectory mode, unless the
+# caller (e.g. setup_pybind.py) already pinned CMAKE_LIBRARY_OUTPUT_DIRECTORY.
+if(NOT _PYBIND_STANDALONE AND NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
   set_target_properties(
     _edgellm_runtime PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                 "${CMAKE_BINARY_DIR}/pybind")
@@ -166,7 +171,7 @@ if(_PYBIND_STANDALONE)
             ${EDGELLM_BUILDER_LIB}
             ${NVINFER_LIB}
             ${NV_ONNX_PARSER_LIB}
-            ${CUDA_DRIVER_LIB}
+            ${CUDA_DRIVER_LINK_LIB}
             ${CUDART_LIB})
 else()
   # Subdirectory mode: TRT cmake targets are provided by FindTensorRT.cmake
@@ -181,14 +186,17 @@ else()
             edgellmBuilder
             TensorRT::TensorRT
             TensorRT::OnnxParser
-            ${CUDA_DRIVER_LIB}
+            ${CUDA_DRIVER_LINK_LIB}
             ${CUDART_LIB})
 endif()
 
 # On aarch64 (Orin/Thor), add CUDA library search paths so the device-link step
-# can find cudadevrt and cudart_static.
-if(NOT _PYBIND_STANDALONE)
+# can find cudadevrt/cudart_static and -lcuda can resolve the driver stub.
+if(COMMAND add_cross_build_link_options)
   add_cross_build_link_options(_edgellm_runtime)
+elseif(AARCH64_BUILD)
+  target_link_options(_edgellm_runtime PRIVATE "-L${CUDA_DIR}/lib")
+  target_link_options(_edgellm_runtime PRIVATE "-L${CUDA_DIR}/lib/stubs")
 endif()
 
 # Allow unresolved symbols that will be satisfied at load time (e.g. libnvdla).

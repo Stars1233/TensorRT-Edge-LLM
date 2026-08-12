@@ -27,7 +27,8 @@ import onnx
 import onnx_graphsurgeon as gs
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
+
+from tensorrt_edgellm._safetensors_io import save_file
 
 from .phi4mm_utils import load_phi4mm_model
 

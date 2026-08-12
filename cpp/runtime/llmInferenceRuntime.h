@@ -34,12 +34,16 @@
 #include "runtime/preprocess/embeddingPreprocessor.h"
 #include "runtime/preprocess/gemma4EmbeddingPreprocessor.h"
 #include "runtime/preprocess/stepPreparer.h"
+#include "runtime/state/contextCache/contextCacheConfig.h"
+#include "runtime/state/contextCache/contextCacheMetrics.h"
 #include "runtime/state/decodingInferenceContext.h"
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "runtime/state/systemPromptKVCache.h"
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
+#include <atomic>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -50,6 +54,9 @@ namespace trt_edgellm
 {
 namespace rt
 {
+class ContextCacheCoordinator;
+class ContextCacheRequest;
+
 /*!
  * @brief Unified LLM inference runtime with optional speculative decoding
  *
@@ -57,6 +64,10 @@ namespace rt
  * When constructed without a drafting config, operates as a pure vanilla decoding runtime
  * with zero draft-model memory overhead.
  * Coordinates base model, optional draft model, and multimodal processing (vision + audio).
+ *
+ * @note This class is not thread-safe. Callers must externally serialize every method invocation and the object
+ * lifetime. handleRequest() defensively rejects accidental overlapping calls before mutating runtime state, but that
+ * gate does not authorize concurrent use of this object.
  */
 class LLMInferenceRuntime
 {
@@ -68,11 +79,16 @@ public:
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param draftingConfig Speculative decoding drafting configuration
      * @param stream CUDA stream for operations
+     * @param contextCacheConfig Context-cache configuration
+     * @param checkpointDir HF/ModelOpt checkpoint directory for runtime weight loading
+     * @param draftCheckpointDir Separate draft checkpoint directory for paired speculative models
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
-        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream);
+        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "",
+        std::string const& draftCheckpointDir = "");
 
     /*!
      * @brief Construct runtime for vanilla-only decoding (no draft model)
@@ -80,13 +96,16 @@ public:
      * @param multimodalEngineDir Directory containing multimodal engine files
      * @param loraWeightsMap Map of LoRA weight names to file paths
      * @param stream CUDA stream for operations
+     * @param contextCacheConfig Context-cache configuration
+     * @param checkpointDir HF/ModelOpt checkpoint directory for runtime weight loading
      * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
      */
     LLMInferenceRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
-        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig = {}, std::string const& checkpointDir = "");
 
     //! @brief Destructor
-    ~LLMInferenceRuntime() noexcept = default;
+    ~LLMInferenceRuntime() noexcept;
 
     //! @brief Capture CUDA graphs for decoding stages to optimize performance.
     //!
@@ -108,6 +127,9 @@ public:
      * @param stream CUDA stream
      * @return True on success, false on failure
      * @throws std::runtime_error if an LLM or CUDA operation fails
+     * @note Calls on the same runtime must be externally serialized. An accidental overlap with another
+     * handleRequest() is rejected before runtime or response state is mutated; this is not a general thread-safety
+     * guarantee.
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream,
         bool outputThinkerEmbeddings = false);
@@ -150,6 +172,9 @@ public:
     {
         return mGenerationMetrics;
     }
+
+    //! Get context-cache metrics, or nullopt when the runtime cache is disabled.
+    std::optional<ContextCacheMetrics> getContextCacheMetrics() const noexcept;
 
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
@@ -213,7 +238,9 @@ private:
     //! @brief Common initialization logic shared between both constructors
     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
-        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream);
+        std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
+        ContextCacheConfig const& contextCacheConfig, std::string const& checkpointDir,
+        std::string const& draftCheckpointDir);
 
     //! @brief Capture a CUDA graph on the base executor for the default (no-adapter)
     //! state, then one additional graph per registered LoRA adapter. Returns the
@@ -224,15 +251,20 @@ private:
     //! @brief Build the strategy runtime reference bundle after common resources are allocated.
     void buildDecodingRuntimeContext();
 
-    rt::Tensor mSharedExecContextMemory{}; //!< Shared device memory for all execution contexts
-    int32_t mMaxRuntimeBatchSize{1};       //!< Maximum runtime batch size
+    std::atomic<bool> mHandleRequestInProgress{false}; //!< Defensive overlap gate, not a thread-safety contract.
+    rt::Tensor mSharedExecContextMemory{};             //!< Shared device memory for all execution contexts
+    int32_t mMaxRuntimeBatchSize{1};                   //!< Maximum runtime batch size
 
     DeploymentConfig mDeployment{};                    //!< Parsed base+draft configs + consolidated strategy settings
     std::unique_ptr<EngineExecutor> mBaseExecutor;     //!< Base model TRT wrapper
     std::unique_ptr<SharedResources> mSharedResources; //!< KV caches / RoPE / LoRA / context memory
-    std::unique_ptr<PipelineIO> mPipelineIO;           //!< Per-pipeline I/O tensors
-    TensorMap mBaseTensorMap;                          //!< Base engine binding map
-    LogitBias mLogitBias; //!< Runtime-owned resources that outlive decoding objects borrowing them
+    //! Declared after SharedResources so shutdown and destruction release cache ownership before physical buffers.
+    std::unique_ptr<ContextCacheCoordinator> mContextCache;
+    std::unique_ptr<PipelineIO> mPipelineIO;   //!< Per-pipeline I/O tensors
+    TensorMap mBaseTensorMap;                  //!< Base engine binding map
+    std::filesystem::path mCheckpointDir;      //!< Provider checkpoint used during startup weight loading
+    std::filesystem::path mDraftCheckpointDir; //!< Separate provider draft checkpoint, empty for integrated drafts
+    LogitBias mLogitBias;                      //!< Runtime-owned resources that outlive decoding objects borrowing them
     std::unique_ptr<DecodingRuntimeContext> mDecodingRuntimeContext;
     std::unique_ptr<DecoderRegistry> mDecoderRegistry;
     std::unique_ptr<StepPreparer> mStepPreparer;             //!< Per-step sequence preprocessor
@@ -275,8 +307,8 @@ private:
     // [5] Multimodal support tensors for audio/image token indexing
     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
 
-    // [6] Logprobs support tensors (allocated once in the constructor)
-    // logprobsRows = B (vanilla) or B * maxAcceptDepth (EAGLE, accepted rows only, not the full verify tree).
+    // [6] Logprobs support tensors. Non-Diffusion paths allocate at construction to preserve existing behavior.
+    // DiffusionGemma allocates lazily when a request asks for numLogprobs because its row count is B * canvasLen.
     rt::Tensor mDeviceLogprobsValues;  //!< GPU [logprobsRows, kMaxLogprobsK] top-K log-prob values
     rt::Tensor mDeviceLogprobsIndices; //!< GPU [logprobsRows, kMaxLogprobsK] top-K token indices
     rt::Tensor mHostLogprobsValues;    //!< CPU pinned D2H target for mDeviceLogprobsValues
@@ -295,8 +327,8 @@ private:
     int32_t mLastPrefillLength{0};                                        //!< Valid prefill length in buffers
     std::vector<std::vector<int32_t>> mLastInputTokenIds;                 //!< Per-batch input token IDs
 
-    //! @brief Allocate logprobs tensors. Called once from the constructor.
-    void allocateLogprobsTensors();
+    //! @brief Allocate or grow logprobs tensors/workspace to cover a request that enabled numLogprobs.
+    void ensureLogprobsCapacity(int32_t logprobsRows, int32_t topK);
 
     //! @brief Restore recurrent/conv states from a cached system prompt.
     void restoreRecurrentStates(int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream);
@@ -307,7 +339,7 @@ private:
     // Key functions to drive the runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
-    bool runBaseModelPrefill(DecodingInferenceContext& context);
+    bool runBaseModelPrefill(DecodingInferenceContext& context, ContextCacheRequest* contextCacheRequest = nullptr);
 
     //! Validate request shape/runtime compatibility.
     bool validateRequestConfig(LLMGenerationRequest const& request);
@@ -326,14 +358,16 @@ private:
     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
     //! @throws std::runtime_error if system prompt is malformed
-    bool setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy);
+    bool setUpForPrefillExecution(DecodingInferenceContext& context, DecodingStrategy& strategy,
+        std::vector<int32_t> const* contextCachePrefillStarts = nullptr);
 
     // Batch eviction support
     //! @brief Perform batch eviction
     //! @param context Inference context
     //! @return True on success, false on failure
     //! @throws std::runtime_error if a CUDA error occurs
-    bool performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy);
+    bool performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy,
+        std::vector<int8_t>& thinkingDone, ContextCacheRequest* contextCacheRequest);
 
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;

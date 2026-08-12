@@ -22,8 +22,9 @@ messages:
   - ``{"type": "audio_url", "audio_url": {"url": "file:///abs/path | data:audio/...;base64,..."}}``
   - ``{"type": "audio", "audio": "<local path>"}``  (legacy shorthand)
 
-``http(s)://`` audio URLs are rejected by design — host the audio locally and
-use ``file://``. There is no remote-fetch on the server.
+``http(s)://`` audio URLs are rejected by design; there is no remote-fetch on
+the server. Local paths and ``file://`` are only accepted over HTTP when the
+server runs with ``--allowed-local-media-path``, and then only inside it.
 
 This module resolves each accepted form to raw audio bytes and hands them
 to the C++ runtime via ``_edgellm_runtime.load_audio_buffer_from_bytes``.
@@ -34,46 +35,28 @@ Qwen3-ASR, ``parakeet`` for Nemotron-Omni) from
 never touches a feature extractor or PCM samples.
 """
 
-import base64
 import logging
 from typing import Any, Dict, List
-from urllib.parse import unquote, urlparse
+
+from .media_source import (decode_base64_data_url, decode_base64_payload,
+                           resolve_file_url)
 
 logger = logging.getLogger("edgellm.audio")
 
+# Audio bytes are buffered in memory (and copied again as base64), and
+# compressed audio expands further when decoded (the C++ loader also caps the
+# decoded duration); 25 MiB matches the OpenAI/vLLM limit, shared by the chat
+# and transcription paths.
+MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024
+
 
 def _decode_data_url(url: str) -> bytes:
-    """Decode ``data:audio/...;base64,<payload>`` URLs.
-
-    Non-base64 ``data:`` URLs are rejected — audio payloads are binary and
-    always base64-encoded in practice.
-    """
-    head, _, payload = url.partition(",")
-    if ";base64" not in head:
-        raise ValueError("data: audio URLs must use base64 encoding")
-    try:
-        return base64.b64decode(payload, validate=False)
-    except Exception as exc:
-        raise ValueError(f"Malformed base64 data URL: {exc}") from exc
-
-
-def _resolve_file_url(url: str) -> str:
-    """Convert a ``file://`` URL to a local filesystem path.
-
-    Callers guard with ``url.startswith("file:")`` before calling, so this
-    handles only ``file:///abs/path`` / ``file://localhost/abs/path``;
-    non-local ``netloc`` and empty paths raise ``ValueError``.
-    """
-    parsed = urlparse(url)
-    # Reject anything that isn't local. `urlparse('file:///x').netloc` is ''.
-    if parsed.netloc and parsed.netloc not in ("", "localhost"):
-        raise ValueError(
-            f"file:// URL must be local (no host); got netloc={parsed.netloc!r}"
-        )
-    path = unquote(parsed.path)
-    if not path:
-        raise ValueError("file:// URL has empty path")
-    return path
+    """Decode ``data:audio/...;base64,<payload>`` URLs (lenient base64, the
+    historical audio behavior)."""
+    return decode_base64_data_url(url,
+                                  "audio",
+                                  strict=False,
+                                  max_bytes=MAX_AUDIO_UPLOAD_BYTES)
 
 
 def resolve_audio_message(item: Dict[str, Any]):
@@ -91,17 +74,16 @@ def resolve_audio_message(item: Dict[str, Any]):
     content_type = item.get("type")
 
     if content_type == "input_audio":
-        # OpenAI canonical form. We don't validate `format` against soundfile's
-        # supported list — soundfile will raise a clear error on read.
+        # OpenAI canonical form. `format` is not validated here: the C++ decoder
+        # raises a clear error on an unsupported container.
         payload = item.get("input_audio") or {}
         data_b64 = payload.get("data")
-        if not data_b64:
+        if not data_b64 or not isinstance(data_b64, str):
             raise ValueError("input_audio.data is required (base64 string)")
-        try:
-            return base64.b64decode(data_b64, validate=False)
-        except Exception as exc:
-            raise ValueError(
-                f"Malformed base64 in input_audio.data: {exc}") from exc
+        return decode_base64_payload(data_b64,
+                                     "input_audio.data",
+                                     strict=False,
+                                     max_bytes=MAX_AUDIO_UPLOAD_BYTES)
 
     if content_type == "audio_url":
         url = ((item.get("audio_url") or {}).get("url") or "").strip()
@@ -116,7 +98,7 @@ def resolve_audio_message(item: Dict[str, Any]):
         if url.startswith("data:"):
             return _decode_data_url(url)
         if url.startswith("file:"):
-            return _resolve_file_url(url)
+            return resolve_file_url(url)
         # Bare path tolerated for ergonomics — same as shorthand `audio`.
         return url
 
@@ -129,7 +111,7 @@ def resolve_audio_message(item: Dict[str, Any]):
             raise ValueError(
                 "Remote audio URLs (http/https) are not supported.")
         if path.startswith("file:"):
-            return _resolve_file_url(path)
+            return resolve_file_url(path)
         if path.startswith("data:"):
             return _decode_data_url(path)
         return path
@@ -165,7 +147,13 @@ def load_audio_buffers(
             if isinstance(source, (bytes, bytearray)):
                 audio_bytes = bytes(source)
             else:
+                # Bounded read: one extra byte detects oversize without
+                # buffering an unbounded file.
                 with open(source, "rb") as f:
-                    audio_bytes = f.read()
+                    audio_bytes = f.read(MAX_AUDIO_UPLOAD_BYTES + 1)
+                if len(audio_bytes) > MAX_AUDIO_UPLOAD_BYTES:
+                    raise ValueError(
+                        f"audio file exceeds the supported maximum "
+                        f"of {MAX_AUDIO_UPLOAD_BYTES} bytes: {source}")
             audios.append(rt_module.load_audio_buffer_from_bytes(audio_bytes))
     return audios

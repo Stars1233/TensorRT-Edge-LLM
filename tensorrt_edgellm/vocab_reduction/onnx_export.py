@@ -25,7 +25,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from safetensors.torch import save_file
+
+from tensorrt_edgellm._safetensors_io import save_file
 
 from .constants import VOCAB_INFO_NAME, VOCAB_MAP_NAME
 

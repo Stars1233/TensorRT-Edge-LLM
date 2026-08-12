@@ -26,10 +26,10 @@
 #   python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN>
 #
 # ENABLE_CUTE_DSL cache variable controls which kernel groups are linked:
-#   OFF      — disable entirely (default)
+#   OFF      — disable entirely
 #   ALL      — enable all groups found in metadata.json
-#   fmha     — enable only the Blackwell FMHA group
-#   ffpa     — enable only the Ampere FFPA FMHA group
+#   fmha     — enable the FP16 Context/ViT FMHA baseline, plus the optimized
+#              Blackwell overlay when the artifact has it (default)
 #   gdn      — enable only the GDN group
 #   f16_moe  — enable the target-specific homogeneous-FP16 MoE group
 #   fmha;gdn — semicolon-separated list of groups (CMake list syntax)
@@ -43,7 +43,8 @@
 #
 # Per-group compile definitions set on each target:
 #   CUTE_DSL_FMHA_ENABLED  — set when the fmha group is active
-#   CUTE_DSL_FFPA_ENABLED  — set when the ffpa group is active
+#   CUTE_DSL_FMHA_BLACKWELL_ENABLED — set when the artifact carries the
+#                            optimized Blackwell FMHA variants
 #   CUTE_DSL_GDN_ENABLED   — set when the gdn group is active
 #   CUTE_DSL_F16_MOE_ENABLED — set when the f16_moe group is active
 #   CUTE_DSL_SSD_ENABLED   — set when the ssd group is active
@@ -52,7 +53,7 @@
 # cmake-format: on
 
 set(ENABLE_CUTE_DSL
-    "OFF"
+    "fmha"
     CACHE
       STRING
       "CuTe DSL kernels: OFF, ALL, or semicolon-separated group list (fmha;gdn)"
@@ -118,6 +119,9 @@ function(_cute_dsl_infer_artifact_tag OUT_VAR ARCH)
     string(REPLACE "-" "_" _embedded_target "${_embedded_target}")
     if(_embedded_target STREQUAL "gb10")
       set(_default_tag "sm_121")
+    elseif(_embedded_target STREQUAL "auto_thor" AND CUDA_CTK_VERSION
+                                                     VERSION_LESS 13.0)
+      set(_default_tag "sm_101")
     elseif(_embedded_target STREQUAL "auto_thor" OR _embedded_target STREQUAL
                                                     "jetson_thor")
       set(_default_tag "sm_110")
@@ -238,19 +242,19 @@ function(cute_dsl_setup)
   endif()
 
   set(_static_lib "${_artifact_dir}/libcutedsl_${_arch}.a")
-  set(_runtime_lib "${_artifact_dir}/libcute_dsl_runtime.so")
   set(_inc_dir "${_artifact_dir}/include")
   set(_metadata "${_artifact_dir}/metadata.json")
+  set(_prebuilt_dir "${CMAKE_SOURCE_DIR}/kernelSrcs/cuteDSLPrebuilt")
+  string(REGEX MATCH "^[0-9]+" _cute_dsl_cuda_major "${CUDA_CTK_VERSION}")
 
-  # Auto-extract prebuilt tarball if artifacts are not present. Tarballs live in
-  # kernelSrcs/cuteDSLPrebuilt/ and are named:
-  # cutedsl_{arch}_{artifact_tag}_cuda{VER}.tar.gz
+  # Auto-extract a CUDA-major-matched prebuilt tarball if artifacts are not
+  # present. Tarballs live in kernelSrcs/cuteDSLPrebuilt/ and are named:
+  # cutedsl_{arch}_{artifact_tag}_cuda{MAJOR}.tar.gz
   if(NOT EXISTS "${_metadata}" AND NOT _artifact_tag STREQUAL "")
-    set(_prebuilt_dir "${CMAKE_SOURCE_DIR}/kernelSrcs/cuteDSLPrebuilt")
-    file(GLOB _prebuilt_tarballs
-         "${_prebuilt_dir}/cutedsl_${_arch}_${_artifact_tag}_cuda*.tar.gz")
-    if(_prebuilt_tarballs)
-      list(GET _prebuilt_tarballs 0 _tarball)
+    set(_tarball
+        "${_prebuilt_dir}/cutedsl_${_arch}_${_artifact_tag}_cuda${_cute_dsl_cuda_major}.tar.gz"
+    )
+    if(EXISTS "${_tarball}")
       message(STATUS "CuTe DSL: extracting prebuilt from ${_tarball}")
       file(MAKE_DIRECTORY "${_artifact_root}")
       execute_process(
@@ -260,6 +264,11 @@ function(cute_dsl_setup)
       if(NOT _tar_rc EQUAL 0)
         message(FATAL_ERROR "CuTe DSL: failed to extract ${_tarball}")
       endif()
+    else()
+      message(
+        STATUS
+          "CuTe DSL: no prebuilt artifact found for ${_arch}/${_artifact_tag}/cuda${_cute_dsl_cuda_major} at ${_tarball}"
+      )
     endif()
   endif()
 
@@ -269,8 +278,10 @@ function(cute_dsl_setup)
       FATAL_ERROR
         "Prebuilt CuTe DSL library not found:\n"
         "  ${_static_lib}\n"
+        "Expected prebuilt tarball:\n"
+        "  ${_prebuilt_dir}/cutedsl_${_arch}_${_artifact_tag}_cuda${_cute_dsl_cuda_major}.tar.gz\n"
         "Generate it with:\n"
-        "  python kernelSrcs/build_cutedsl.py --gpu_arch <sm_NN> --arch ${_arch}\n"
+        "  python kernelSrcs/build_cutedsl.py --gpu_arch ${_artifact_tag} --arch ${_arch}\n"
         "Artifacts are generated locally under:\n"
         "  cpp/kernels/cuteDSLArtifact/<arch>/<artifact_tag>/")
   endif()
@@ -355,13 +366,18 @@ function(cute_dsl_setup)
     set(_cute_dsl_cuda_ver "")
   endif()
 
-  # CUDA 11.4 is allowed only for special CuTe DSL package deliveries.
-  if(NOT _cute_dsl_cuda_ver STREQUAL ""
-     AND NOT _cute_dsl_cuda_ver VERSION_EQUAL 11.4
-     AND _cute_dsl_cuda_ver VERSION_LESS 12.6)
+  if(_cute_dsl_cuda_ver STREQUAL "")
+    message(
+      FATAL_ERROR "CuTe DSL could not determine the CUDA Toolkit version. "
+                  "Set -DCUDA_CTK_VERSION to the toolkit used for this build.")
+  endif()
+
+  # 11.4 is buildable from a prebuilt artifact only: upstream nvidia-cutlass-dsl
+  # ships cu12/cu13 wheels, so kernels cannot be generated there.
+  if(_cute_dsl_cuda_ver VERSION_LESS 11.4)
     message(
       FATAL_ERROR
-        "CuTe DSL requires CUDA Toolkit 12.6+ (detected ${_cute_dsl_cuda_ver}). "
+        "CuTe DSL requires CUDA Toolkit 11.4+ (detected ${_cute_dsl_cuda_ver}). "
         "Use -DENABLE_CUTE_DSL=OFF or set -DCUDA_CTK_VERSION to a supported toolkit."
     )
   endif()
@@ -369,14 +385,16 @@ function(cute_dsl_setup)
   # Shim: cudaLibrary* → cu* when libcudart omits exports (e.g. some 12.0–12.6
   # embedded). From CUDA 12.8 onward, cuda_runtime_api.h declares these APIs
   # with runtime types; compiling the weak shim conflicts with those
-  # declarations. Use INTERFACE only (no .c) for 12.8+.
+  # declarations. Below 12.0 the cuLibrary*/cuKernel* entry points it forwards
+  # to do not exist, and the 11.4 artifact resolves modules through cuModule*
+  # instead, so it is not needed there either. Use INTERFACE only (no .c)
+  # outside 12.0–12.6.
   set(_cutedsl_cudart_shim_src
       "${CMAKE_SOURCE_DIR}/cpp/kernels/gdnKernels/cutedsl_cuda_runtime_library_shim.c"
   )
   if(NOT TARGET trt_edgellm_cutedsl_cudart_shim)
-    if(_cute_dsl_cuda_ver STREQUAL ""
-       OR _cute_dsl_cuda_ver VERSION_LESS 12.0
-       OR _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.8)
+    if(_cute_dsl_cuda_ver VERSION_LESS 12.0 OR _cute_dsl_cuda_ver
+                                               VERSION_GREATER_EQUAL 12.8)
       add_library(trt_edgellm_cutedsl_cudart_shim INTERFACE)
     else()
       if(NOT EXISTS "${_cutedsl_cudart_shim_src}")
@@ -391,9 +409,8 @@ function(cute_dsl_setup)
                                  PRIVATE ${CUDA_INCLUDE_DIR})
       # 12.0–12.6: AOT uses cudaKernel_t; shim needs
       # CUTEDSL_WRAP_LAUNCH_KERNEL_EX.
-      if(NOT _cute_dsl_cuda_ver STREQUAL ""
-         AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
-         AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
+      if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                           VERSION_LESS 12.8)
         target_compile_definitions(trt_edgellm_cutedsl_cudart_shim
                                    PRIVATE CUTEDSL_WRAP_LAUNCH_KERNEL_EX)
       endif()
@@ -436,6 +453,11 @@ function(cute_dsl_setup)
     endif()
   endif()
 
+  # build_cutedsl.py packs the generated kernel objects and the target-arch CuTe
+  # DSL static runtime shim objects into libcutedsl_${_arch}.a. CMake does not
+  # link libcute_dsl_runtime.so; native and cross artifacts are self-contained
+  # apart from the normal CUDA driver/runtime libraries.
+
   # Apply compile definitions and include path to all targets.
   foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
     target_include_directories(${_tgt} SYSTEM PRIVATE "${_inc_dir}")
@@ -445,52 +467,13 @@ function(cute_dsl_setup)
     endforeach()
   endforeach()
 
-  # Per-variant defines for FFPA GQA kernels (native grouped-query attention
-  # without K/V head expansion). Each GQA group size is a separate AOT cubin.
-  list(FIND _variants "ffpa_d512_causal_gqa4" _ffpa_gqa4_idx)
-  if(NOT ${_ffpa_gqa4_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA4_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa4 variant found — CUTE_DSL_FFPA_GQA4_ENABLED set"
-    )
-  endif()
-
-  list(FIND _variants "ffpa_d512_causal_gqa8" _ffpa_gqa8_idx)
-  if(NOT ${_ffpa_gqa8_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA8_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa8 variant found — CUTE_DSL_FFPA_GQA8_ENABLED set"
-    )
-  endif()
-
-  list(FIND _variants "ffpa_d512_causal_gqa16" _ffpa_gqa16_idx)
-  if(NOT ${_ffpa_gqa16_idx} EQUAL -1)
-    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
-      target_compile_definitions(${_tgt} PRIVATE "CUTE_DSL_FFPA_GQA16_ENABLED")
-    endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_gqa16 variant found - CUTE_DSL_FFPA_GQA16_ENABLED set"
-    )
-  endif()
-
-  # FFPA vision-block overlay variant.
-  list(FIND _variants "ffpa_d512_causal_visionblock" _ffpa_visionblock_idx)
-  if(NOT ${_ffpa_visionblock_idx} EQUAL -1)
+  # The optimized Blackwell FMHA kernels are generated for SM100, SM101 and
+  # SM110 only.
+  if(NOT _meta_gpu_arch_err AND _meta_gpu_arch MATCHES "^sm_(100|101|110)$")
     foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
       target_compile_definitions(${_tgt}
-                                 PRIVATE "CUTE_DSL_FFPA_VISIONBLOCK_ENABLED")
+                                 PRIVATE "CUTE_DSL_FMHA_BLACKWELL_ENABLED")
     endforeach()
-    message(
-      STATUS
-        "CuTe DSL: ffpa_d512_causal_visionblock variant found — CUTE_DSL_FFPA_VISIONBLOCK_ENABLED set"
-    )
   endif()
 
   # Check for Blackwell GDN variant specifically and set a clean define.
@@ -503,6 +486,20 @@ function(cute_dsl_setup)
     message(
       STATUS
         "CuTe DSL: Blackwell GDN prefill variant found — CUTE_DSL_GDN_BLACKWELL_ENABLED set"
+    )
+  endif()
+
+  # Check for the Blackwell GeForce GDN prefill variant.
+  list(FIND _variants "gdn_prefill_blackwell_geforce"
+       _gdn_blackwell_geforce_idx)
+  if(NOT ${_gdn_blackwell_geforce_idx} EQUAL -1)
+    foreach(_tgt ${ARG_TARGETS} ${ARG_LINK_TARGETS})
+      target_compile_definitions(
+        ${_tgt} PRIVATE "CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED")
+    endforeach()
+    message(
+      STATUS
+        "CuTe DSL: Blackwell GeForce GDN prefill variant found — CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED set"
     )
   endif()
 
@@ -1036,26 +1033,32 @@ function(cute_dsl_setup)
   # edgellmKernels also inherit the CuTe DSL archive. Otherwise unresolved AOT
   # wrapper symbols only show up at the final executable link step.
   set(_link_libs "${_static_lib}")
-  if(EXISTS "${_runtime_lib}")
-    list(APPEND _link_libs "${_runtime_lib}")
-    message(STATUS "CuTe DSL: runtime library found: ${_runtime_lib}")
+  # The libcudart shim only exists for CUDA 12.0–12.6; outside that range the
+  # target is an empty INTERFACE library.
+  set(_cudart_shim_lib)
+  if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                       VERSION_LESS 12.8)
+    set(_cudart_shim_lib trt_edgellm_cutedsl_cudart_shim)
   endif()
   foreach(_tgt ${ARG_LINK_TARGETS})
     get_target_property(_tgt_type ${_tgt} TYPE)
     if(_tgt_type STREQUAL "STATIC_LIBRARY")
-      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
+      target_link_libraries(${_tgt} PUBLIC ${_link_libs} ${_cudart_shim_lib})
     else()
-      target_link_libraries(${_tgt} PRIVATE ${_link_libs}
-                                            trt_edgellm_cutedsl_cudart_shim)
+      target_link_libraries(${_tgt} PRIVATE ${_link_libs} ${_cudart_shim_lib})
     endif()
-    if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
-      target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
+    if(CUDA_DRIVER_LINK_LIB AND NOT CUDA_DRIVER_LINK_LIB MATCHES "-NOTFOUND$")
+      target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LINK_LIB}")
+      if(CUDA_DRIVER_LINK_LIB STREQUAL "cuda" AND COMMAND
+                                                  add_cross_build_link_options)
+        add_cross_build_link_options(${_tgt})
+      endif()
     endif()
     # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
-    # JetPack 6). CUDA 11.x artifacts use CUmodule ABI instead.
-    if(NOT _cute_dsl_cuda_ver STREQUAL ""
-       AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
-       AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
+    # JetPack 6). cudaLaunchKernelEx is 11.8+, so there is nothing to wrap at
+    # 11.4.
+    if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                         VERSION_LESS 12.8)
       target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
     endif()
   endforeach()

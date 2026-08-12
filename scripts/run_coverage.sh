@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -24,6 +24,8 @@
 # Environment variables (alternative to flags):
 #   TRT_PACKAGE_DIR   Path to TensorRT package (required)
 #   CUDA_VERSION      CUDA version (default: 12.8)
+#   ENABLE_CUTE_DSL   CuTe DSL selection (default: fmha)
+#   CUTE_DSL_ARTIFACT_TAG  Required artifact tag when selection is ambiguous
 #
 # After a successful run the build directory will contain:
 #   - sonarqube-coverage.xml  (SonarQube generic coverage format)
@@ -44,6 +46,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build_coverage"
 TRT_PACKAGE_DIR="${TRT_PACKAGE_DIR:-}"
 CUDA_VERSION="${CUDA_VERSION:-12.8}"
+ENABLE_CUTE_DSL="${ENABLE_CUTE_DSL:-fmha}"
+CUTE_DSL_ARTIFACT_TAG="${CUTE_DSL_ARTIFACT_TAG:-}"
 GTEST_FILTER="${GTEST_FILTER:-*}"
 JOBS="$(nproc 2>/dev/null || echo 8)"
 
@@ -85,6 +89,8 @@ cmake -S "${PROJECT_ROOT}" -B "${BUILD_DIR}" \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DBUILD_UNIT_TESTS=ON \
     -DENABLE_COVERAGE=ON \
+    -DENABLE_CUTE_DSL="${ENABLE_CUTE_DSL}" \
+    -DCUTE_DSL_ARTIFACT_TAG="${CUTE_DSL_ARTIFACT_TAG}" \
     -DTRT_PACKAGE_DIR="${TRT_PACKAGE_DIR}" \
     -DCUDA_CTK_VERSION="${CUDA_VERSION}"
 

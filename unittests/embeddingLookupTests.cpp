@@ -140,57 +140,7 @@ std::vector<half> embeddingLookupFP8Ref(std::vector<int32_t> const& inputIds,
     return result;
 }
 
-// CPU reference implementation for FP8 embedding lookup with image insertion (legacy multimodal)
-std::vector<half> embeddingLookupWithImageInsertionFP8Ref(std::vector<int32_t> const& inputIds,
-    std::vector<__nv_fp8_e4m3> const& embeddingTableFp8, std::vector<float> const& scales,
-    std::vector<half> const& imageEmbeds, int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
-    int64_t blockSize, int64_t imageTokenLen)
-{
-    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
-    int64_t const nGroups = hiddenSize / blockSize;
-
-    for (int64_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
-    {
-        for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
-        {
-            int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
-            int64_t const outBase = (batchIdx * seqLen + tokenIdx) * hiddenSize;
-
-            bool const isImageToken = tokenId > (vocabSize - 1);
-
-            if (isImageToken)
-            {
-                // Image token: lookup from imageEmbeds (FP16)
-                int32_t const visualTokenId = tokenId - vocabSize;
-                if (visualTokenId >= 0 && visualTokenId < imageTokenLen)
-                {
-                    int64_t const imgBase = static_cast<int64_t>(visualTokenId) * hiddenSize;
-                    for (int64_t col = 0; col < hiddenSize; ++col)
-                    {
-                        result[outBase + col] = imageEmbeds[imgBase + col];
-                    }
-                }
-                // Out-of-bounds image token: zero embedding (already initialized)
-            }
-            else if (tokenId >= 0 && tokenId < vocabSize)
-            {
-                // Valid text token: lookup from FP8 table with dequantization
-                int64_t const inBase = static_cast<int64_t>(tokenId) * hiddenSize;
-                for (int64_t col = 0; col < hiddenSize; ++col)
-                {
-                    int64_t const group = col / blockSize;
-                    float const scale = scales[static_cast<int64_t>(tokenId) * nGroups + group];
-                    float const value = static_cast<float>(embeddingTableFp8[inBase + col]) * scale;
-                    result[outBase + col] = __float2half(value);
-                }
-            }
-            // Out-of-bounds text token: zero embedding (already initialized)
-        }
-    }
-
-    return result;
-}
-
+// CPU reference implementation for FP8 embedding lookup with image/audio insertion
 // CPU reference implementation for FP8 multimodal embedding lookup (Qwen3-Omni style)
 std::vector<half> embeddingLookupMultimodalFP8Ref(std::vector<int32_t> const& inputIds,
     std::vector<__nv_fp8_e4m3> const& embeddingTableFp8, std::vector<float> const& scales,
@@ -527,168 +477,8 @@ TEST_F(EmbeddingLookupTest, FP8UnevenBlockSizeError)
         << "FP8 kernel should error out when hiddenSize is not divisible by nGroups";
 }
 
-// Test FP8 embedding lookup with image insertion (legacy multimodal path)
-TEST_F(EmbeddingLookupTest, FP8WithImageInsertionAccuracy)
-{
-    // Test cases: {batchSize, seqLen, vocabSize, hiddenSize, blockSize, imageTokenLen}
-    // All use production block size 128
-    std::vector<std::tuple<int64_t, int64_t, int32_t, int64_t, int64_t, int64_t>> testCases = {
-        {1, 16, 32, 128, 128, 8},   // Small test
-        {2, 32, 64, 256, 128, 16},  // Medium test
-        {2, 24, 100, 256, 128, 32}, // Large test
-    };
-
-    for (auto const& [batchSize, seqLen, vocabSize, hiddenSize, blockSize, imageTokenLen] : testCases)
-    {
-        int64_t const nGroups = hiddenSize / blockSize;
-
-        SCOPED_TRACE("Testing FP8 + Image: batchSize=" + std::to_string(batchSize)
-            + ", seqLen=" + std::to_string(seqLen) + ", vocabSize=" + std::to_string(vocabSize)
-            + ", hiddenSize=" + std::to_string(hiddenSize) + ", imageTokenLen=" + std::to_string(imageTokenLen));
-
-        // Generate input IDs: mix of text tokens, image tokens, and out-of-bounds
-        std::vector<int32_t> inputIds(batchSize * seqLen);
-        for (size_t i = 0; i < inputIds.size(); ++i)
-        {
-            int32_t choice = i % 5;
-            if (choice == 0)
-            {
-                inputIds[i] = -1; // Out-of-bounds text
-            }
-            else if (choice == 1)
-            {
-                inputIds[i] = i % vocabSize; // Valid text token
-            }
-            else if (choice == 2)
-            {
-                inputIds[i] = vocabSize + (i % imageTokenLen); // Valid image token
-            }
-            else if (choice == 3)
-            {
-                inputIds[i] = vocabSize + imageTokenLen + 10; // Out-of-bounds image token
-            }
-            else
-            {
-                inputIds[i] = (i * 7) % vocabSize; // Another valid text token
-            }
-        }
-
-        // Generate FP16 embedding table and quantize to FP8
-        std::vector<half> embeddingTableFp16(vocabSize * hiddenSize);
-        uniformFloatInitialization<half>(embeddingTableFp16, -1.0f, 1.0f);
-
-        std::vector<__nv_fp8_e4m3> embeddingTableFp8;
-        std::vector<float> scales;
-        quantizeToFP8PerGroup(embeddingTableFp16, embeddingTableFp8, scales, vocabSize, hiddenSize, blockSize);
-
-        // Generate image embeddings (FP16)
-        std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-        uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
-
-        // Create GPU tensors
-        rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-        rt::Tensor tableFp8Tensor({vocabSize, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
-        rt::Tensor scalesTensor({vocabSize, nGroups}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        rt::Tensor imageEmbedsTensor({imageTokenLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-        rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        // Copy data to GPU
-        copyHostToDevice(inputIdsTensor, inputIds);
-        CUDA_CHECK(cudaMemcpy(tableFp8Tensor.rawPointer(), embeddingTableFp8.data(),
-            embeddingTableFp8.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(
-            scalesTensor.rawPointer(), scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice));
-        copyHostToDevice(imageEmbedsTensor, imageEmbeds);
-
-        // Run GPU kernel (unified interface)
-        kernel::embeddingLookupWithImageInsertion(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor},
-            imageEmbedsTensor, outputTensor, stream);
-
-        // Get result from GPU
-        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-        // Compute CPU reference
-        auto const cpuResult = embeddingLookupWithImageInsertionFP8Ref(inputIds, embeddingTableFp8, scales, imageEmbeds,
-            batchSize, seqLen, vocabSize, hiddenSize, blockSize, imageTokenLen);
-
-        // Compare results
-        EXPECT_TRUE(compareResults(cpuResult, gpuResult, "FP8 Embedding Lookup with Image Insertion Accuracy Test"))
-            << "GPU and CPU results don't match for FP8 + image test case";
-    }
-}
-
+// Test FP8 embedding lookup with image insertion
 // Test FP8 embedding lookup with image insertion handles out-of-bounds correctly
-TEST_F(EmbeddingLookupTest, FP8WithImageInsertionOutOfBounds)
-{
-    int64_t const batchSize = 1;
-    int64_t const seqLen = 8;
-    int32_t const vocabSize = 10;
-    int64_t const hiddenSize = 128;
-    int64_t const blockSize = 128;
-    int64_t const nGroups = hiddenSize / blockSize;
-    int64_t const imageTokenLen = 4;
-
-    // Input IDs with specific patterns:
-    // -1: out-of-bounds text, 0: valid text, 9: valid text (boundary),
-    // 10: valid image (vocabSize+0), 13: valid image (vocabSize+3),
-    // 14: out-of-bounds image (vocabSize+4), 100: out-of-bounds text, 5: valid text
-    std::vector<int32_t> inputIds = {-1, 0, 9, 10, 13, 14, 100, 5};
-
-    // Generate FP16 embedding table and quantize to FP8
-    std::vector<half> embeddingTableFp16(vocabSize * hiddenSize);
-    uniformFloatInitialization<half>(embeddingTableFp16, -1.0f, 1.0f);
-
-    std::vector<__nv_fp8_e4m3> embeddingTableFp8;
-    std::vector<float> scales;
-    quantizeToFP8PerGroup(embeddingTableFp16, embeddingTableFp8, scales, vocabSize, hiddenSize, blockSize);
-
-    // Generate image embeddings (FP16)
-    std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-    uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
-
-    // Create GPU tensors
-    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor tableFp8Tensor({vocabSize, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
-    rt::Tensor scalesTensor({vocabSize, nGroups}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    rt::Tensor imageEmbedsTensor({imageTokenLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    // Copy data to GPU
-    copyHostToDevice(inputIdsTensor, inputIds);
-    CUDA_CHECK(cudaMemcpy(tableFp8Tensor.rawPointer(), embeddingTableFp8.data(),
-        embeddingTableFp8.size() * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
-    CUDA_CHECK(
-        cudaMemcpy(scalesTensor.rawPointer(), scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice));
-    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
-
-    // Run GPU kernel (unified interface)
-    kernel::embeddingLookupWithImageInsertion(
-        inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor}, imageEmbedsTensor, outputTensor, stream);
-
-    // Get result from GPU
-    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-    // Compute CPU reference
-    auto const cpuResult = embeddingLookupWithImageInsertionFP8Ref(inputIds, embeddingTableFp8, scales, imageEmbeds,
-        batchSize, seqLen, vocabSize, hiddenSize, blockSize, imageTokenLen);
-
-    // Compare results
-    EXPECT_TRUE(compareResults(cpuResult, gpuResult, "FP8 With Image Insertion Out-of-Bounds Test"));
-
-    // Verify specific out-of-bounds tokens produce zero embeddings
-    std::vector<size_t> outOfBoundsIndices = {0, 5, 6}; // -1, 14 (oob image), 100 are out-of-bounds
-    for (auto const tokenIdx : outOfBoundsIndices)
-    {
-        for (int64_t elem = 0; elem < hiddenSize; ++elem)
-        {
-            size_t const idx = tokenIdx * hiddenSize + elem;
-            EXPECT_TRUE(isclose(gpuResult[idx], __float2half(0.0f), 1e-6, 1e-6))
-                << "Out-of-bounds token at position " << tokenIdx << " (tokenId=" << inputIds[tokenIdx] << ") element "
-                << elem << " should produce zero embedding";
-        }
-    }
-}
-
 // Test FP8 multimodal embedding lookup (Qwen3-Omni style with audio + image)
 TEST_F(EmbeddingLookupTest, FP8MultimodalAccuracy)
 {
@@ -781,9 +571,8 @@ TEST_F(EmbeddingLookupTest, FP8MultimodalAccuracy)
         copyHostToDevice(audioEmbedsTensor, audioEmbeds);
 
         // Run GPU kernel (unified interface)
-        kernel::embeddingLookupMultimodal(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor},
-            multimodalIndicesTensor, imageTokenId, imageEmbedsTensor, audioTokenId, audioEmbedsTensor, outputTensor,
-            stream);
+        kernel::embeddingLookup(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor}, outputTensor,
+            stream, multimodalIndicesTensor, imageTokenId, imageEmbedsTensor, audioTokenId, audioEmbedsTensor);
 
         // Get result from GPU
         auto const gpuResult = copyDeviceToHost<half>(outputTensor);
@@ -858,8 +647,8 @@ TEST_F(EmbeddingLookupTest, FP8MultimodalImageOnly)
     copyHostToDevice(imageEmbedsTensor, imageEmbeds);
 
     // Run GPU kernel with image only (no audio) - unified interface
-    kernel::embeddingLookupMultimodal(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor},
-        multimodalIndicesTensor, imageTokenId, imageEmbedsTensor, std::nullopt, std::nullopt, outputTensor, stream);
+    kernel::embeddingLookup(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor}, outputTensor, stream,
+        multimodalIndicesTensor, imageTokenId, imageEmbedsTensor, std::nullopt, std::nullopt);
 
     auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
@@ -908,8 +697,8 @@ TEST_F(EmbeddingLookupTest, FP8MultimodalTextOnly)
         cudaMemcpy(scalesTensor.rawPointer(), scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     // Run GPU kernel with no image/audio - unified interface
-    kernel::embeddingLookupMultimodal(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor},
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, outputTensor, stream);
+    kernel::embeddingLookup(inputIdsTensor, tableFp8Tensor, rt::OptionalInputTensor{scalesTensor}, outputTensor, stream,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
 
     auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
@@ -959,53 +748,6 @@ TEST_F(EmbeddingLookupTest, UnevenHiddenSizeError)
 }
 
 // Test that image insertion kernel properly errors out for uneven hiddenSize
-TEST_F(EmbeddingLookupTest, UnevenHiddenSizeErrorWithImageInsertion)
-{
-    // Test case with hiddenSize = 15 (not a multiple of 8)
-    int64_t const batchSize = 1;
-    int64_t const seqLen = 5;
-    int32_t const vocabSize = 10;
-    int64_t const hiddenSize = 15; // Not a multiple of 8
-    int64_t const imageTokenLen = 8;
-
-    // Generate test data
-    std::vector<int32_t> inputIds(batchSize * seqLen);
-    uniformIntInitialization<int32_t>(inputIds, 0, vocabSize + imageTokenLen - 1);
-
-    std::vector<half> embeddingTable(vocabSize * hiddenSize);
-    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
-
-    std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-    uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
-
-    // Create tensors
-    rt::Coords inputShape{batchSize, seqLen};
-    rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-    rt::Coords embeddingShape{vocabSize, hiddenSize};
-    rt::Tensor embeddingTableTensor(embeddingShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    rt::Coords imageShape{imageTokenLen, hiddenSize};
-    rt::Tensor imageEmbedsTensor(imageShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    rt::Coords outputShape{batchSize, seqLen, hiddenSize};
-    rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    // Copy data to GPU
-    copyHostToDevice(inputIdsTensor, inputIds);
-    copyHostToDevice(embeddingTableTensor, embeddingTable);
-    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
-
-    // Expect the kernel to throw an error due to uneven hiddenSize
-    EXPECT_THROW(
-        {
-            kernel::embeddingLookupWithImageInsertion(
-                inputIdsTensor, embeddingTableTensor, std::nullopt, imageEmbedsTensor, outputTensor, stream);
-        },
-        std::runtime_error)
-        << "Image insertion kernel should error out when hiddenSize is not a multiple of 8";
-}
-
 // Test out-of-bounds token handling (should use zero embeddings)
 TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
 {
@@ -1067,297 +809,6 @@ TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandling)
     }
 }
 
-// Test out-of-bounds token handling with image insertion
-TEST_F(EmbeddingLookupTest, OutOfBoundsTokenHandlingWithImageInsertion)
-{
-    // Test case with out-of-bounds tokens and image tokens
-    int64_t const batchSize = 1;
-    int64_t const seqLen = 7;
-    int32_t const vocabSize = 10;
-    int64_t const hiddenSize = 16;
-    int64_t const imageTokenLen = 8;
-
-    // Generate test data with mixed tokens: [-1, 0, 9, 10, 15, 20]
-    // -1: out-of-bounds normal token (should be zero)
-    // 0, 9: valid normal tokens
-    // 10: out-of-bounds normal token (should be zero)
-    // 15: valid image token (10 + 5)
-    // 20: out-of-bounds image token (10 + 10, but imageTokenLen = 8)
-    std::vector<int32_t> inputIds = {0, 9, 10, -1, 15, 20, -1};
-
-    std::vector<half> embeddingTable(vocabSize * hiddenSize);
-    uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
-
-    std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-    uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
-
-    // Create tensors
-    rt::Coords inputShape{batchSize, seqLen};
-    rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-    rt::Coords embeddingShape{vocabSize, hiddenSize};
-    rt::Tensor embeddingTableTensor(embeddingShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    rt::Coords imageShape{imageTokenLen, hiddenSize};
-    rt::Tensor imageEmbedsTensor(imageShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    rt::Coords outputShape{batchSize, seqLen, hiddenSize};
-    rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    // Copy data to GPU
-    copyHostToDevice(inputIdsTensor, inputIds);
-    copyHostToDevice(embeddingTableTensor, embeddingTable);
-    copyHostToDevice(imageEmbedsTensor, imageEmbeds);
-
-    // Run GPU kernel
-    kernel::embeddingLookupWithImageInsertion(
-        inputIdsTensor, embeddingTableTensor, std::nullopt, imageEmbedsTensor, outputTensor, stream);
-
-    // Get result from GPU
-    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-    // Run CPU reference
-    auto cpuResult = embeddingLookupRef(
-        inputIds, embeddingTable, batchSize, seqLen, vocabSize, hiddenSize, imageEmbeds, imageTokenLen);
-
-    // Compare results
-    EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Out-of-Bounds Token Handling with Image Insertion Test"))
-        << "GPU and CPU results don't match for out-of-bounds token handling with image insertion";
-
-    // Verify specific token behaviors
-    for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
-    {
-        int32_t const tokenId = inputIds[tokenIdx];
-        bool const isImageToken = tokenId > (vocabSize - 1);
-        bool isOutOfBounds = false; // Will be determined per token type
-
-        if (isImageToken)
-        {
-            int32_t const visualTokenId = tokenId - vocabSize;
-            isOutOfBounds = (visualTokenId < 0 || visualTokenId >= imageTokenLen);
-        }
-        else
-        {
-            isOutOfBounds = (tokenId < 0 || tokenId >= vocabSize);
-        }
-
-        if (isOutOfBounds)
-        {
-            // Check that all elements for this token are zero
-            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
-            {
-                int64_t const resultIdx = tokenIdx * hiddenSize + elementIdx;
-                EXPECT_TRUE(isclose(gpuResult[resultIdx], __float2half(0.0f), 1e-6, 1e-6))
-                    << "Out-of-bounds token " << tokenId << " should produce zero embedding at element " << elementIdx;
-            }
-        }
-    }
-}
-
-// Test embedding lookup with image insertion accuracy
-TEST_F(EmbeddingLookupTest, EmbeddingLookupWithImageInsertionAccuracy)
-{
-    // Simple test cases for accuracy
-    std::vector<std::tuple<int64_t, int64_t, int32_t, int64_t, int64_t>> testCases = {
-        {1, 10, 10, 128, 64},  // Small test
-        {2, 20, 50, 256, 128}, // Medium test
-        {4, 50, 100, 128, 64}, // Large test
-    };
-
-    for (auto const& [batchSize, seqLen, vocabSize, hiddenSize, imageTokenLen] : testCases)
-    {
-        SCOPED_TRACE("Testing: batchSize=" + std::to_string(batchSize) + ", seqLen=" + std::to_string(seqLen)
-            + ", vocabSize=" + std::to_string(vocabSize) + ", hiddenSize=" + std::to_string(hiddenSize)
-            + ", imageTokenLen=" + std::to_string(imageTokenLen));
-
-        // Generate test data using testUtils
-        std::vector<int32_t> inputIds(batchSize * seqLen);
-        uniformIntInitialization<int32_t>(inputIds, 0, vocabSize + imageTokenLen - 1);
-
-        std::vector<half> embeddingTable(vocabSize * hiddenSize);
-        uniformFloatInitialization<half>(embeddingTable, -1.0f, 1.0f);
-
-        std::vector<half> imageEmbeds(imageTokenLen * hiddenSize);
-        uniformFloatInitialization<half>(imageEmbeds, -1.0f, 1.0f);
-
-        // Create tensors
-        rt::Coords inputShape{batchSize, seqLen};
-        rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-        rt::Coords embeddingShape{vocabSize, hiddenSize};
-        rt::Tensor embeddingTableTensor(embeddingShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        rt::Coords imageShape{imageTokenLen, hiddenSize};
-        rt::Tensor imageEmbedsTensor(imageShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        rt::Coords outputShape{batchSize, seqLen, hiddenSize};
-        rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        // Copy data to GPU
-        copyHostToDevice(inputIdsTensor, inputIds);
-        copyHostToDevice(embeddingTableTensor, embeddingTable);
-        copyHostToDevice(imageEmbedsTensor, imageEmbeds);
-
-        // Run GPU kernel
-        kernel::embeddingLookupWithImageInsertion(
-            inputIdsTensor, embeddingTableTensor, std::nullopt, imageEmbedsTensor, outputTensor, stream);
-
-        // Get result from GPU
-        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-        // Run CPU reference
-        auto cpuResult = embeddingLookupRef(
-            inputIds, embeddingTable, batchSize, seqLen, vocabSize, hiddenSize, imageEmbeds, imageTokenLen);
-
-        // Compare results
-        EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Embedding Lookup with Image Insertion Accuracy Test"))
-            << "GPU and CPU results don't match for test case: batchSize=" << batchSize << ", seqLen=" << seqLen
-            << ", vocabSize=" << vocabSize << ", hiddenSize=" << hiddenSize << ", imageTokenLen=" << imageTokenLen;
-    }
-}
-
-// Test deepstack embedding lookup accuracy
-TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLookupAccuracy)
-{
-    // Simple test cases for accuracy
-    std::vector<std::tuple<int64_t, int64_t, int32_t, int64_t, int64_t>> testCases = {
-        {1, 10, 100, 128, 64},  // Small test
-        {2, 20, 200, 256, 128}, // Medium test
-        {4, 50, 500, 128, 256}, // Large test
-    };
-
-    for (auto const& [batchSize, seqLen, vocabSize, hiddenSize, numImageTokens] : testCases)
-    {
-        SCOPED_TRACE("Testing: batchSize=" + std::to_string(batchSize) + ", seqLen=" + std::to_string(seqLen)
-            + ", vocabSize=" + std::to_string(vocabSize) + ", hiddenSize=" + std::to_string(hiddenSize)
-            + ", numImageTokens=" + std::to_string(numImageTokens));
-
-        // Generate test data - mix of tokens < vocabSize and >= vocabSize
-        std::vector<int32_t> inputIds(batchSize * seqLen);
-        uniformIntInitialization<int32_t>(inputIds, vocabSize, vocabSize + numImageTokens - 1);
-
-        std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
-        uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
-
-        // Create tensors
-        rt::Coords inputShape{batchSize, seqLen};
-        rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-        rt::Coords featuresShape{numImageTokens, hiddenSize};
-        rt::Tensor deepstackFeaturesTensor(featuresShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        rt::Coords outputShape{batchSize, seqLen, hiddenSize};
-        rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-        // Copy data to GPU
-        copyHostToDevice(inputIdsTensor, inputIds);
-        copyHostToDevice(deepstackFeaturesTensor, deepstackFeatures);
-
-        // Run GPU kernel
-        kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
-
-        // Get result from GPU
-        auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-        // Run CPU reference
-        auto cpuResult = assembleDeepstackEmbeddingRef(
-            inputIds, deepstackFeatures, batchSize, seqLen, vocabSize, hiddenSize, numImageTokens);
-
-        // Compare results
-        EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Deepstack Embedding Lookup Accuracy Test"))
-            << "GPU and CPU results don't match for test case: batchSize=" << batchSize << ", seqLen=" << seqLen
-            << ", vocabSize=" << vocabSize << ", hiddenSize=" << hiddenSize << ", numImageTokens=" << numImageTokens;
-    }
-}
-
-// Test deepstack embedding lookup with out-of-bounds handling
-TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLookupOutOfBounds)
-{
-    // Test case with mixed tokens
-    int64_t const batchSize = 1;
-    int64_t const seqLen = 6;
-    int32_t const vocabSize = 100;
-    int64_t const hiddenSize = 128;
-    int64_t const numImageTokens = 10;
-
-    // Generate test data with specific tokens:
-    // - Tokens < vocabSize (should be zero)
-    // - Tokens >= vocabSize and < vocabSize + numImageTokens (should use deepstack features)
-    // - Tokens >= vocabSize + numImageTokens (should be zero - out of bounds)
-    std::vector<int32_t> inputIds = {50, 100, 105, 110, 115, 200};
-    // 50: < vocabSize -> zero
-    // 100: = vocabSize -> deepstack[0]
-    // 105: = vocabSize + 5 -> deepstack[5]
-    // 110: = vocabSize + 10 -> out of bounds -> zero
-    // 115: = vocabSize + 15 -> out of bounds -> zero
-    // 200: >> vocabSize + numImageTokens -> out of bounds -> zero
-
-    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
-    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
-
-    // Create tensors
-    rt::Coords inputShape{batchSize, seqLen};
-    rt::Tensor inputIdsTensor(inputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-
-    rt::Coords featuresShape{numImageTokens, hiddenSize};
-    rt::Tensor deepstackFeaturesTensor(featuresShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    rt::Coords outputShape{batchSize, seqLen, hiddenSize};
-    rt::Tensor outputTensor(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    // Copy data to GPU
-    copyHostToDevice(inputIdsTensor, inputIds);
-    copyHostToDevice(deepstackFeaturesTensor, deepstackFeatures);
-
-    // Run GPU kernel
-    kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
-
-    // Get result from GPU
-    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-    // Run CPU reference
-    auto cpuResult = assembleDeepstackEmbeddingRef(
-        inputIds, deepstackFeatures, batchSize, seqLen, vocabSize, hiddenSize, numImageTokens);
-
-    // Compare results
-    EXPECT_TRUE(compareResults(cpuResult, gpuResult, "Deepstack Embedding Lookup Out-of-Bounds Test"))
-        << "GPU and CPU results don't match for deepstack out-of-bounds handling";
-
-    // Verify specific token behaviors
-    for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
-    {
-        int32_t const tokenId = inputIds[tokenIdx];
-        bool shouldBeZero = false;
-
-        if (tokenId < vocabSize)
-        {
-            // Tokens below vocabSize should be zero
-            shouldBeZero = true;
-        }
-        else
-        {
-            int32_t const deepstackIdx = tokenId - vocabSize;
-            if (deepstackIdx < 0 || deepstackIdx >= numImageTokens)
-            {
-                // Out-of-bounds image tokens should be zero
-                shouldBeZero = true;
-            }
-        }
-
-        if (shouldBeZero)
-        {
-            // Check that all elements for this token are zero
-            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
-            {
-                int64_t const resultIdx = tokenIdx * hiddenSize + elementIdx;
-                EXPECT_TRUE(isclose(gpuResult[resultIdx], __float2half(0.0f), 1e-6, 1e-6))
-                    << "Token " << tokenId << " at position " << tokenIdx
-                    << " should produce zero embedding at element " << elementIdx;
-            }
-        }
-    }
-}
-
 // Test that deepstack kernel properly errors out for uneven hiddenSize
 TEST_F(EmbeddingLookupTest, DeepstackUnevenHiddenSizeError)
 {
@@ -1391,10 +842,7 @@ TEST_F(EmbeddingLookupTest, DeepstackUnevenHiddenSizeError)
 
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
-        {
-            kernel::assembleDeepstackEmbedding(
-                inputIdsTensor, deepstackFeaturesTensor, vocabSize, outputTensor, stream);
-        },
+        { kernel::assembleDeepstackEmbedding(inputIdsTensor, deepstackFeaturesTensor, outputTensor, stream); },
         std::runtime_error)
         << "Deepstack kernel should error out when hiddenSize is not a multiple of 8";
 }
@@ -1404,7 +852,6 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitImageTokenId)
 {
     int64_t const batchSize = 1;
     int64_t const seqLen = 8;
-    int32_t const vocabSize = 100;
     int64_t const hiddenSize = 128;
     int64_t const numImageTokens = 4;
     int32_t const imageTokenId = 42;
@@ -1425,7 +872,7 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitImageTokenId)
     copyHostToDevice(featuresTensor, deepstackFeatures);
 
     kernel::assembleDeepstackEmbedding(
-        inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream, imageTokenId, std::ref(indicesTensor));
+        inputIdsTensor, featuresTensor, outputTensor, stream, imageTokenId, std::ref(indicesTensor));
 
     auto const gpuResult = copyDeviceToHost<half>(outputTensor);
 
@@ -1448,102 +895,6 @@ TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitImageTokenId)
                     << "Text token at position " << tokenIdx << " element " << elem << " should be zero";
             }
         }
-    }
-}
-
-// Test deepstack embedding legacy path still works after isImageToken refactor
-// (imageTokenId=0, no multimodalIndices → uses tokenId >= vocabSize)
-TEST_F(EmbeddingLookupTest, DeepstackEmbeddingLegacyPath)
-{
-    int64_t const batchSize = 1;
-    int64_t const seqLen = 6;
-    int32_t const vocabSize = 100;
-    int64_t const hiddenSize = 128;
-    int64_t const numImageTokens = 3;
-
-    // Mix of text tokens (< vocabSize) and image tokens (>= vocabSize)
-    std::vector<int32_t> inputIds = {50, 100, 20, 101, 80, 102};
-    // 50: text → zero
-    // 100: = vocabSize → deepstack[0]
-    // 20: text → zero
-    // 101: = vocabSize + 1 → deepstack[1]
-    // 80: text → zero
-    // 102: = vocabSize + 2 → deepstack[2]
-
-    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
-    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
-
-    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    copyHostToDevice(inputIdsTensor, inputIds);
-    copyHostToDevice(featuresTensor, deepstackFeatures);
-
-    // imageTokenId=0 → legacy mode, no multimodalIndices
-    kernel::assembleDeepstackEmbedding(inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream);
-
-    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-    for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
-    {
-        int32_t const tokenId = inputIds[tokenIdx];
-        bool const isImage = (tokenId >= vocabSize);
-        for (int64_t elem = 0; elem < hiddenSize; ++elem)
-        {
-            int64_t const idx = tokenIdx * hiddenSize + elem;
-            if (isImage)
-            {
-                int32_t const featureIdx = tokenId - vocabSize;
-                half const expected = deepstackFeatures[featureIdx * hiddenSize + elem];
-                EXPECT_TRUE(isclose(gpuResult[idx], expected, 1e-6, 1e-6))
-                    << "Legacy image token " << tokenId << " at position " << tokenIdx << " element " << elem
-                    << " mismatch";
-            }
-            else
-            {
-                EXPECT_TRUE(isclose(gpuResult[idx], __float2half(0.0f), 1e-6, 1e-6))
-                    << "Text token at position " << tokenIdx << " element " << elem << " should be zero";
-            }
-        }
-    }
-}
-
-// Test deepstack embedding with explicit imageTokenId but no multimodalIndices (fallback to tokenId - vocabSize)
-TEST_F(EmbeddingLookupTest, DeepstackEmbeddingExplicitIdNoIndices)
-{
-    int64_t const batchSize = 1;
-    int64_t const seqLen = 4;
-    int32_t const vocabSize = 100;
-    int64_t const hiddenSize = 128;
-    int64_t const numImageTokens = 2;
-    int32_t const imageTokenId = 42;
-
-    // imageTokenId=42 is within vocab, but no multimodalIndices → kernel falls back to tokenId - vocabSize
-    // tokenId=42 < vocabSize=100 → deepstackIdx = 42-100 = -58 → out of bounds → zero
-    std::vector<int32_t> inputIds = {imageTokenId, 10, imageTokenId, 50};
-
-    std::vector<half> deepstackFeatures(numImageTokens * hiddenSize);
-    uniformFloatInitialization<half>(deepstackFeatures, -1.0f, 1.0f);
-
-    rt::Tensor inputIdsTensor({batchSize, seqLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
-    rt::Tensor featuresTensor({numImageTokens, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-    rt::Tensor outputTensor({batchSize, seqLen, hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
-
-    copyHostToDevice(inputIdsTensor, inputIds);
-    copyHostToDevice(featuresTensor, deepstackFeatures);
-
-    // Explicit imageTokenId but no multimodalIndices
-    kernel::assembleDeepstackEmbedding(inputIdsTensor, featuresTensor, vocabSize, outputTensor, stream, imageTokenId);
-
-    auto const gpuResult = copyDeviceToHost<half>(outputTensor);
-
-    // All outputs should be zero: image tokens detected but tokenId - vocabSize is negative → out of bounds
-    // Text tokens are < vocabSize and != imageTokenId → zero
-    for (int64_t i = 0; i < seqLen * hiddenSize; ++i)
-    {
-        EXPECT_TRUE(isclose(gpuResult[i], __float2half(0.0f), 1e-6, 1e-6))
-            << "All outputs should be zero when imageTokenId is within vocab and no multimodalIndices";
     }
 }
 
@@ -1633,9 +984,9 @@ TEST_F(EmbeddingLookupTest, MultimodalAccuracy)
         copyHostToDevice(audioEmbedsTensor, audioEmbeds);
 
         // Run GPU kernel
-        kernel::embeddingLookupMultimodal(inputIdsTensor, embeddingTableTensor, std::nullopt,
+        kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, std::nullopt, outputTensor, stream,
             std::optional{std::ref(multimodalIndicesTensor)}, imageTokenId, std::optional{std::ref(imageEmbedsTensor)},
-            audioTokenId, std::optional{std::ref(audioEmbedsTensor)}, outputTensor, stream);
+            audioTokenId, std::optional{std::ref(audioEmbedsTensor)});
 
         // Get result from GPU
         auto const gpuResult = copyDeviceToHost<half>(outputTensor);
@@ -1732,9 +1083,9 @@ TEST_F(EmbeddingLookupTest, MultimodalOutOfBounds)
     copyHostToDevice(audioEmbedsTensor, audioEmbeds);
 
     // Run GPU kernel
-    kernel::embeddingLookupMultimodal(inputIdsTensor, embeddingTableTensor, std::nullopt,
+    kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, std::nullopt, outputTensor, stream,
         std::optional{std::ref(multimodalIndicesTensor)}, imageTokenId, std::optional{std::ref(imageEmbedsTensor)},
-        audioTokenId, std::optional{std::ref(audioEmbedsTensor)}, outputTensor, stream);
+        audioTokenId, std::optional{std::ref(audioEmbedsTensor)});
 
     // Get result from GPU
     auto const gpuResult = copyDeviceToHost<half>(outputTensor);
@@ -1834,10 +1185,9 @@ TEST_F(EmbeddingLookupTest, MultimodalUnevenHiddenSizeError)
     // Expect the kernel to throw an error due to uneven hiddenSize
     EXPECT_THROW(
         {
-            kernel::embeddingLookupMultimodal(inputIdsTensor, embeddingTableTensor, std::nullopt,
+            kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, std::nullopt, outputTensor, stream,
                 std::optional{std::ref(multimodalIndicesTensor)}, imageTokenId,
-                std::optional{std::ref(imageEmbedsTensor)}, audioTokenId, std::optional{std::ref(audioEmbedsTensor)},
-                outputTensor, stream);
+                std::optional{std::ref(imageEmbedsTensor)}, audioTokenId, std::optional{std::ref(audioEmbedsTensor)});
         },
         std::runtime_error)
         << "Qwen3-Omni kernel should error out when hiddenSize is not a multiple of 8";
@@ -1954,8 +1304,8 @@ TEST_F(EmbeddingLookupTest, MultimodalOptionalInputs)
             = tc.hasAudio ? rt::OptionalInputTensor(audioEmbedsTensor) : std::nullopt;
 
         // Run GPU kernel
-        kernel::embeddingLookupMultimodal(inputIdsTensor, embeddingTableTensor, std::nullopt, multimodalIndicesOpt,
-            imageTokenIdOpt, imageEmbedsOpt, audioTokenIdOpt, audioEmbedsOpt, outputTensor, stream);
+        kernel::embeddingLookup(inputIdsTensor, embeddingTableTensor, std::nullopt, outputTensor, stream,
+            multimodalIndicesOpt, imageTokenIdOpt, imageEmbedsOpt, audioTokenIdOpt, audioEmbedsOpt);
 
         // Get result from GPU
         auto const gpuResult = copyDeviceToHost<half>(outputTensor);

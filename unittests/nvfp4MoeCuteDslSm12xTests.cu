@@ -44,8 +44,8 @@ namespace
 // SM12x NVFP4 fused MoE runner constants. The geometry (FP4 levels, FP8 SF
 // vector size, 6D MMA swizzle, alpha-with-scale dequant) is shared with the
 // SM110 plugin; the GeForce kernel differs in the FC1 SwiGLU output layout
-// (plain [up_all, gate_all] concat -- see _concat_qwen3_swiglu_fc1 in
-// tensorrt_edgellm/checkpoint/repacking.py).
+// (plain [up_all, gate_all] concat -- see repack_nvfp4_gated_moe_experts with
+// fc1_layout="concat" in tensorrt_edgellm/checkpoint/repacking.py).
 // ---------------------------------------------------------------------------
 constexpr int32_t kSfVecSize = 16;
 constexpr int32_t kRowTile = 128;
@@ -637,7 +637,7 @@ bool isSupportedSm()
     return sm == 120 || sm == 121;
 }
 
-bool checkRequirementsAndLoad()
+bool checkRequirements()
 {
     if (!isSupportedSm())
     {
@@ -649,7 +649,7 @@ bool checkRequirementsAndLoad()
     {
         return false;
     }
-    return CuteDslNvfp4MoeRunner::loadKernelModules();
+    return true;
 }
 
 std::vector<MoeCase> defaultCases()
@@ -691,9 +691,9 @@ TEST(CuteDslNvfp4MoeSm12xTest, smoke)
     {
         GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL runner test requires Spark/GB10 (SM120/SM121), got SM=" << sm;
     }
-    if (!checkRequirementsAndLoad())
+    if (!checkRequirements())
     {
-        GTEST_SKIP() << "Failed to load SM12x NVFP4 fused MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL canImplement returned false";
     }
 
     for (auto const& cfg : defaultCases())
@@ -723,9 +723,9 @@ TEST(CuteDslNvfp4MoeSm12xTest, accuracy)
     {
         GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL runner test requires Spark/GB10 (SM120/SM121), got SM=" << sm;
     }
-    if (!checkRequirementsAndLoad())
+    if (!checkRequirements())
     {
-        GTEST_SKIP() << "Failed to load SM12x NVFP4 fused MoE CuTeDSL kernel modules or canImplement returned false";
+        GTEST_SKIP() << "SM12x NVFP4 fused MoE CuTeDSL canImplement returned false";
     }
 
     // Median cosine is the correctness gate (validated == 1.0 on real GB10):

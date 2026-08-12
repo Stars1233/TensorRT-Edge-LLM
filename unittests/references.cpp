@@ -559,8 +559,7 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
 }
 
 std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::vector<half> const& embeddingTable,
-    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize,
-    std::optional<std::vector<half>> const& imageEmbeds, int64_t imageTokenLen)
+    int64_t batchSize, int64_t seqLen, int32_t vocabSize, int64_t hiddenSize)
 {
     std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
 
@@ -569,41 +568,17 @@ std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::
         for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
         {
             int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
-            bool const isImageToken = imageEmbeds.has_value() && tokenId > (vocabSize - 1);
 
             for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
             {
                 int64_t const resultIdx = batchIdx * seqLen * hiddenSize + tokenIdx * hiddenSize + elementIdx;
 
-                half embeddingValue;
-                if (isImageToken)
+                // Out-of-vocab tokens map to a zero embedding.
+                if (tokenId >= 0 && tokenId < vocabSize)
                 {
-                    int32_t const visualTokenId = tokenId - vocabSize;
-                    if (visualTokenId >= 0 && visualTokenId < imageTokenLen)
-                    {
-                        int64_t const imageEmbedIdx = visualTokenId * hiddenSize + elementIdx;
-                        embeddingValue = imageEmbeds.value()[imageEmbedIdx];
-                    }
-                    else
-                    {
-                        embeddingValue = __float2half(0.0f);
-                    }
+                    int64_t const embeddingIdx = tokenId * hiddenSize + elementIdx;
+                    result[resultIdx] = embeddingTable[embeddingIdx];
                 }
-                else
-                {
-                    // For normal tokens, check bounds and use zero embedding for out-of-bounds
-                    if (tokenId >= 0 && tokenId < vocabSize)
-                    {
-                        int64_t const embeddingIdx = tokenId * hiddenSize + elementIdx;
-                        embeddingValue = embeddingTable[embeddingIdx];
-                    }
-                    else
-                    {
-                        embeddingValue = __float2half(0.0f);
-                    }
-                }
-
-                result[resultIdx] = embeddingValue;
             }
         }
     }
@@ -670,53 +645,6 @@ std::vector<half> embeddingLookupMultimodalRef(std::vector<int32_t> const& input
                     {
                         embeddingValue = __float2half(0.0f);
                     }
-                }
-
-                result[resultIdx] = embeddingValue;
-            }
-        }
-    }
-
-    return result;
-}
-
-std::vector<half> assembleDeepstackEmbeddingRef(std::vector<int32_t> const& inputIds,
-    std::vector<half> const& deepstackFeatures, int64_t batchSize, int64_t seqLen, int32_t vocabSize,
-    int64_t hiddenSize, int64_t numImageTokens)
-{
-    std::vector<half> result(batchSize * seqLen * hiddenSize, __float2half(0.0f));
-
-    for (int64_t batchIdx = 0; batchIdx < batchSize; ++batchIdx)
-    {
-        for (int64_t tokenIdx = 0; tokenIdx < seqLen; ++tokenIdx)
-        {
-            int32_t const tokenId = inputIds[batchIdx * seqLen + tokenIdx];
-            bool const isImageToken = tokenId >= vocabSize;
-
-            for (int64_t elementIdx = 0; elementIdx < hiddenSize; ++elementIdx)
-            {
-                int64_t const resultIdx = batchIdx * seqLen * hiddenSize + tokenIdx * hiddenSize + elementIdx;
-
-                half embeddingValue;
-                if (isImageToken)
-                {
-                    // For image tokens (tokenId >= vocabSize), use deepstack features
-                    int32_t const deepstackIdx = tokenId - vocabSize;
-                    if (deepstackIdx >= 0 && deepstackIdx < numImageTokens)
-                    {
-                        int64_t const featuresIdx = deepstackIdx * hiddenSize + elementIdx;
-                        embeddingValue = deepstackFeatures[featuresIdx];
-                    }
-                    else
-                    {
-                        // Out-of-bounds image token, use zero embedding
-                        embeddingValue = __float2half(0.0f);
-                    }
-                }
-                else
-                {
-                    // Token ID < vocabSize, use zero embedding
-                    embeddingValue = __float2half(0.0f);
                 }
 
                 result[resultIdx] = embeddingValue;

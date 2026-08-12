@@ -324,14 +324,129 @@ def _find_lm_head_weight_initializer(onnx_model, model) -> "str | None":
     return None
 
 
-def _write_external_weight_file(out_dir: str, external_weight_file: str,
+def _external_data_value(init, key: str) -> "str | None":
+    for entry in init.external_data:
+        if entry.key == key:
+            return entry.value
+    return None
+
+
+def _external_data_ref(init, base_dir: str) -> "tuple[str, int, int] | None":
+    location = _external_data_value(init, "location")
+    length = _external_data_value(init, "length")
+    if location is None or length is None:
+        return None
+    offset = _external_data_value(init, "offset")
+    try:
+        offset_value = int(offset) if offset is not None else 0
+        length_value = int(length)
+    except ValueError:
+        return None
+    return os.path.join(base_dir, location), offset_value, length_value
+
+
+def _safetensors_dtype(init) -> str:
+    import onnx
+
+    dtype_map = {
+        onnx.TensorProto.BOOL: "BOOL",
+        onnx.TensorProto.UINT8: "U8",
+        onnx.TensorProto.INT8: "I8",
+        onnx.TensorProto.UINT16: "U16",
+        onnx.TensorProto.INT16: "I16",
+        onnx.TensorProto.UINT32: "U32",
+        onnx.TensorProto.INT32: "I32",
+        onnx.TensorProto.UINT64: "U64",
+        onnx.TensorProto.INT64: "I64",
+        onnx.TensorProto.FLOAT16: "F16",
+        onnx.TensorProto.BFLOAT16: "BF16",
+        onnx.TensorProto.FLOAT: "F32",
+        onnx.TensorProto.DOUBLE: "F64",
+    }
+    return dtype_map.get(init.data_type, "")
+
+
+def _can_stream_external_weight_file(onnx_path: str, tensor_names: "list[str]",
+                                     initializers: dict) -> bool:
+    if not onnx_path:
+        return False
+    base_dir = os.path.dirname(os.path.abspath(onnx_path))
+    for tensor_name in tensor_names:
+        init = initializers[tensor_name]
+        if init.raw_data or not init.external_data:
+            return False
+        if not _safetensors_dtype(init):
+            return False
+        external_ref = _external_data_ref(init, base_dir)
+        if external_ref is None:
+            return False
+    return True
+
+
+def _write_external_weight_file_from_external_data(
+    out_dir: str,
+    external_weight_file: str,
+    tensor_names: "list[str]",
+    initializers: dict,
+    onnx_path: str,
+) -> str:
+    base_dir = os.path.dirname(os.path.abspath(onnx_path))
+    external_weight_path = os.path.join(out_dir, external_weight_file)
+    tensor_data_ranges: list[tuple[str, int, int]] = []
+    header = {}
+    data_offset = 0
+    for tensor_name in tensor_names:
+        init = initializers[tensor_name]
+        external_ref = _external_data_ref(init, base_dir)
+        if external_ref is None:
+            raise ValueError(f"Missing external data for {tensor_name}")
+        source_path, source_offset, length = external_ref
+        header[tensor_name] = {
+            "dtype": _safetensors_dtype(init),
+            "shape": [int(dim) for dim in init.dims],
+            "data_offsets": [data_offset, data_offset + length],
+        }
+        tensor_data_ranges.append((source_path, source_offset, length))
+        data_offset += length
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    padding = (8 - (len(header_bytes) % 8)) % 8
+    header_bytes += b" " * padding
+
+    chunk_size = 64 * 1024 * 1024
+    with open(external_weight_path, "wb") as out_file:
+        out_file.write(len(header_bytes).to_bytes(8, byteorder="little"))
+        out_file.write(header_bytes)
+        for source_path, source_offset, length in tensor_data_ranges:
+            remaining = length
+            with open(source_path, "rb") as source_file:
+                source_file.seek(source_offset)
+                while remaining:
+                    chunk = source_file.read(min(chunk_size, remaining))
+                    if not chunk:
+                        raise IOError(
+                            f"Unexpected EOF while reading {source_path}")
+                    out_file.write(chunk)
+                    remaining -= len(chunk)
+    return external_weight_path
+
+
+def _write_external_weight_file(out_dir: str,
+                                external_weight_file: str,
                                 tensor_names: "list[str]",
-                                initializers: dict) -> str:
+                                initializers: dict,
+                                onnx_path: str = "") -> str:
     """Write selected ONNX initializers to a safetensors external weight file."""
+    if _can_stream_external_weight_file(onnx_path, tensor_names, initializers):
+        return _write_external_weight_file_from_external_data(
+            out_dir, external_weight_file, tensor_names, initializers,
+            onnx_path)
+
     import numpy as np
     import onnx
     import torch
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
 
     external_weight_tensors = {}
     for tensor_name in tensor_names:
@@ -378,6 +493,14 @@ def _save_externalized_onnx_model(onnx_path: str, onnx_model) -> None:
     """Save ONNX after all requested externalization passes are complete."""
     import onnx
 
+    if any(init.external_data and not init.raw_data
+           for init in onnx_model.graph.initializer):
+        onnx.save_model(onnx_model, onnx_path)
+        logger.info(
+            "Saved ONNX metadata update while preserving existing external "
+            "data file")
+        return
+
     out_dir = os.path.dirname(os.path.abspath(onnx_path))
     ext_path = os.path.join(out_dir, "model.onnx.data")
     if os.path.isfile(ext_path):
@@ -406,7 +529,7 @@ def externalize_model_weights(
     if not requested:
         return []
 
-    onnx_model = onnx.load(onnx_path)
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
     initializers = {init.name: init for init in onnx_model.graph.initializer}
     out_dir = os.path.dirname(os.path.abspath(onnx_path))
 
@@ -423,7 +546,7 @@ def externalize_model_weights(
         if not new_names:
             return
         external_weight_path = _write_external_weight_file(
-            out_dir, external_weight_file, new_names, initializers)
+            out_dir, external_weight_file, new_names, initializers, onnx_path)
         external_names.extend(new_names)
         external_name_set.update(new_names)
         manifest.append({

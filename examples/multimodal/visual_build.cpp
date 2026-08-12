@@ -20,6 +20,7 @@
 #include "common/logger.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
@@ -189,7 +190,19 @@ int main(int argc, char** argv)
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
     config.profilingDetailed = args.profilingDetailed;
 
-    std::string actualEngineDir = args.engineDir + "/visual";
+    // The server loads <engineDir>/visual.engine, so land the engine under a
+    // single "visual" segment whether the caller passes the base dir or the
+    // visual subdir itself (avoids a visual/visual double nest).
+    std::filesystem::path enginePath(args.engineDir);
+    if (enginePath.filename().empty())
+    {
+        enginePath = enginePath.parent_path();
+    }
+    if (enginePath.filename() != "visual")
+    {
+        enginePath /= "visual";
+    }
+    std::string actualEngineDir = enginePath.string();
 
     // Create and run the builder
     builder::VisualBuilder visualBuilder(args.onnxDir, actualEngineDir, config);

@@ -26,7 +26,7 @@
  * - Dequantization: weight_fp16 = (weight_int4 - 8) * scale
  *
  * Note: Weight repacking (AWQ -> Marlin format) should be done in Python
- * using the awq_marlin_repack utility. This interface expects pre-swizzled
+ * using the awq_marlin_repack utility. This interface expects Marlin-packed
  * weights in Marlin format.
  */
 
@@ -49,7 +49,7 @@ namespace kernel
  *
  * Dequantization: weight_fp16 = (weight_int4 - 8) * scale
  *
- * Note: Weights must be pre-swizzled into Marlin format using awq_marlin_repack.
+ * Note: Weights must be transformed into Marlin format using awq_marlin_repack.
  *
  * Internally uses FP32 reduction for numerical accuracy. The workspace buffer
  * must be sized using getMoeMarlinWorkspaceSize() which includes space for both
@@ -73,6 +73,33 @@ void moeAwqW4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tens
     rt::Tensor const& scales, rt::Tensor const& sortedTokenIds, rt::Tensor const& expertIds,
     rt::Tensor const& numTokensPostPadded, rt::Tensor const& topkWeights, rt::Tensor& workspace, int64_t moeBlockSize,
     int64_t topK, bool mulTopkWeights, cudaStream_t stream);
+
+/*!
+ * @brief MoE FP16/BF16-A, E2M1-W, FP16/BF16-C GEMM using Marlin.
+ *
+ * The block scales are raw E4M3 bytes in Marlin order with a fixed K-group
+ * size of 16. The per-expert global scales use the activation data type and
+ * must already include its exponent adjustment for Marlin's skip-flop E2M1 conversion.
+ *
+ * @param input Input activations [numTokens, hiddenDim] (FP16 or BF16)
+ * @param output Output tensor [numTokens * topK, outDim] (same type as input)
+ * @param weights Marlin-packed E2M1 codes [numExperts, K/16, 2*outDim] (INT32 view)
+ * @param blockScales Marlin-permuted E4M3 bytes [numExperts, K/16, outDim] (INT8)
+ * @param globalScales Per-expert adjusted global scales [numExperts] (same type as input)
+ * @param sortedTokenIds Sorted slot indices [maxRoutedRows] (INT32)
+ * @param expertIds Expert assignment per routed block (INT32)
+ * @param numTokensPostPadded Actual padded routed-row count [1] (INT32)
+ * @param topkWeights Routing weights indexed by unpadded slot id (FP32)
+ * @param workspace Workspace buffer sized by getMoeMarlinWorkspaceSize() (INT32)
+ * @param moeBlockSize MoE processing block size (8, 16, 32, 48, or 64)
+ * @param topK Number of experts per input row
+ * @param mulTopkWeights Whether to multiply each output slot by its routing weight
+ * @param stream CUDA stream
+ */
+void moeNvfp4A16MarlinGemm(rt::Tensor const& input, rt::Tensor& output, rt::Tensor const& weights,
+    rt::Tensor const& blockScales, rt::Tensor const& globalScales, rt::Tensor const& sortedTokenIds,
+    rt::Tensor const& expertIds, rt::Tensor const& numTokensPostPadded, rt::Tensor const& topkWeights,
+    rt::Tensor& workspace, int64_t moeBlockSize, int64_t topK, bool mulTopkWeights, cudaStream_t stream);
 
 /*!
  * @brief Get required workspace size for MoE Marlin GEMM

@@ -3812,6 +3812,7 @@ class GDN:
         cum_seqlen_q: Optional[cute.Tensor] = None,
         cu_seqlens: Optional[cute.Tensor] = None,
         use_qk_l2norm: cutlass.Constexpr[cutlass.Boolean] = True,
+        sm_count: Optional[cutlass.Int32] = None,
         stream: cuda.CUstream = None,
     ):
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
@@ -3904,6 +3905,7 @@ class GDN:
             cute.shape((s_q, d, ((h_r, h_q), b))),
             self.cta_tiler,
             self.is_persistent,
+            sm_count,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -4493,6 +4495,7 @@ class GDN:
         o_shape: cute.Shape,
         cta_tiler: Tuple[int, int, int],
         is_persistent: bool,
+        sm_count=None,
     ) -> Tuple[GdnStaticTileSchedulerParams, Tuple[int, int, int]]:
         tile_sched_params = create_gdn_static_tile_scheduler_params(
             is_persistent,
@@ -4502,7 +4505,7 @@ class GDN:
                 cute.size(o_shape[2][1]),
             ),
         )
-        grid = GdnStaticTileScheduler.get_grid_shape(tile_sched_params)
+        grid = GdnStaticTileScheduler.get_grid_shape(tile_sched_params, sm_count)
         return tile_sched_params, grid
 
 
@@ -4539,8 +4542,9 @@ def _get_compiled_gdn_prefill_kernel(
     is_varlen: bool,
     is_initial_state: bool,
     is_output_state: bool,
+    device_id: int,
 ):
-    """Cache compiled kernel for given configuration (returns mutable dict)."""
+    """Cache compiled kernel and device properties for given configuration."""
     return {}
 
 
@@ -4675,6 +4679,7 @@ def chunk_gated_delta_rule(
         is_varlen,
         is_initial_state,
         output_final_state,
+        q.device.id,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 
@@ -4682,6 +4687,9 @@ def chunk_gated_delta_rule(
 
     t_trace = _to_cute_tensors_bw(ph)
     if "compiled_gdn" not in cache:
+        cache["sm_count"] = cutlass.Int32(
+            cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
+        )
         cache["compiled_gdn"] = cute.compile(
             _get_jit_blackwell(),
             t_trace["q"],
@@ -4695,6 +4703,7 @@ def chunk_gated_delta_rule(
             t_trace["h0_out"],
             t_trace["o"],
             t_trace["cu_seqlens"],
+            cache["sm_count"],
             stream=current_stream,
         )
 
@@ -4711,6 +4720,7 @@ def chunk_gated_delta_rule(
         t_run["h0_out"],
         t_run["o"],
         t_run["cu_seqlens"],
+        cache["sm_count"],
         stream=current_stream,
     )
 
@@ -5072,6 +5082,7 @@ def _create_jit_blackwell():
         h0_out: cute.Tensor,     # (n, h_v, d, d) f32     — output final state
         o: cute.Tensor,          # (n, seq_len, h_v, d) fp16 — output
         cu_seqlens: cute.Tensor, # (n+1,) int32 — prefix-sum for padding masking
+        sm_count: cutlass.Int32, # runtime persistent-grid size (SM count of launch GPU)
         stream: cuda.CUstream,
     ):
         n = q.layout.shape[0]
@@ -5101,6 +5112,7 @@ def _create_jit_blackwell():
             None,             # cum_seqlen_q=None → non-varlen padded layout
             cu_seqlens,       # cu_seqlens for padding masking
             True,             # use_qk_l2norm=True
+            sm_count,
             stream,
         )
 
@@ -5199,6 +5211,9 @@ def _compile_prefill_bw(n, h, hv, k, v, seq_len, stream, gpu_arch=""):
         t["h0_in"], t["h0_out"],
         t["o"],
         t["cu_seqlens"],   # cu_seqlens for padding masking (non-varlen padded layout)
+        # Runtime persistent-grid size: AOT callers pass the launch GPU's SM
+        # count; the trace value is a placeholder.
+        cutlass.Int32(cutlass.utils.HardwareInfo().get_device_multiprocessor_count()),
         stream,
         **(dict(options=compile_opts) if compile_opts else {}),
     )

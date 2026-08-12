@@ -22,8 +22,9 @@ import os
 import sys
 import traceback
 
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
+from tensorrt_edgellm._safetensors_io import save_file
 from tensorrt_edgellm.vocab_reduction.constants import (VOCAB_INFO_NAME,
                                                         VOCAB_MAP_NAME)
 from tensorrt_edgellm.vocab_reduction.selection import (get_vocab_size,

@@ -76,7 +76,6 @@ size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens);
  * @param workspace Workspace buffer for temporary allocations
  * @param workspaceSize Size of workspace buffer in bytes
  * @param stream CUDA stream for execution
- *
  * @note All tensor parameters must be allocated on GPU device
  * @note Workspace must be at least getEagleAcceptWorkspaceSize(batchSize, numTokens) bytes
  * @note Shared memory usage: Stage 1: CUB temp storage (~1KB), Stage 2: numTokens * sizeof(int32_t) + small overhead

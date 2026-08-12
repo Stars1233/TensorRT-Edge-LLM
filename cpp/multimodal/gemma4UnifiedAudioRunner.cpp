@@ -251,7 +251,8 @@ void Gemma4UnifiedAudioRunner::textPreprocess(rt::LLMGenerationRequest const& re
             int32_t const token = ids[tokenIndex];
             if (token == mConfig.audioTokenId)
             {
-                ELLM_CHECK(audioIndex < expectedEnd, "Too many audio placeholders in Gemma4 Unified prompt");
+                ELLM_CHECK(audioIndex < expectedEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: too many audio placeholders in Gemma4 Unified prompt");
                 bool const alreadyHasBegin = tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginAudioTokenId;
                 bool const alreadyHasEnd
                     = tokenIndex + 1 < ids.size() && ids[tokenIndex + 1] == mConfig.endAudioTokenId;
@@ -271,7 +272,8 @@ void Gemma4UnifiedAudioRunner::textPreprocess(rt::LLMGenerationRequest const& re
                 expanded.push_back(token);
             }
         }
-        ELLM_CHECK(audioIndex == expectedEnd, "Audio placeholder count does not match Gemma4 Unified clip count");
+        ELLM_CHECK(audioIndex == expectedEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: audio placeholder count does not match Gemma4 Unified clip count");
         if (requestIndex < batchedInputIds.size())
         {
             batchedInputIds[requestIndex] = std::move(expanded);
@@ -286,7 +288,7 @@ void Gemma4UnifiedAudioRunner::textPreprocess(rt::LLMGenerationRequest const& re
 
 bool Gemma4UnifiedAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     try
     {
@@ -302,7 +304,18 @@ bool Gemma4UnifiedAudioRunner::preprocess(rt::LLMGenerationRequest const& reques
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Gemma4 Unified audio preprocessing failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Gemma4 Unified audio preprocessing failed: %s", e.what());
+        }
+        // Drain the async H2D copy still reading the framing staging buffer, so the next request
+        // cannot overwrite it mid-flight -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 }

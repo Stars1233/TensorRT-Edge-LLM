@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
+#include <optional>
 #include <vector>
 
 namespace trt_edgellm
@@ -40,7 +41,8 @@ class Gemma4EmbeddingPreprocessor
 {
 public:
     Gemma4EmbeddingPreprocessor(std::filesystem::path const& engineDir, LLMEngineConfig const& config,
-        int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream);
+        int32_t maxBatchSize, int32_t maxSeqLen, TensorMap& tensorMap, cudaStream_t stream,
+        std::optional<Tensor> checkpointTable = std::nullopt);
 
     //! Gather PLE tensors for the current token-id tensor shape.
     void embed(Tensor const& tokenIds, cudaStream_t stream);

@@ -902,7 +902,7 @@ void melLinearGemmFp16TC(
         melFilterFp16Kmajor.rawPointer(), magFp16.rawPointer(), melPowerFp16.rawPointer(), M, N, K, stream);
     check::check(ok, "melLinearGemmFp16TC: CuteDslGemmRunner::run dispatch failed.");
 #else
-    // GEMM variant not compiled (ENABLE_CUTE_DSL=OFF); signature kept so audioUtils.cpp links.
+    // GEMM variant not compiled; signature kept so audioUtils.cpp links.
     check::check(
         false, "melLinearGemmFp16TC: CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
 #endif
@@ -1072,7 +1072,7 @@ void melLinearGemmFp16inFp32out(
         melFilterFp16Kmajor.rawPointer(), magFp16.rawPointer(), melPowerF32.rawPointer(), M, N, K, stream);
     check::check(ok, "melLinearGemmFp16inFp32out: CuteDslGemmRunner::runFp16inFp32out dispatch failed.");
 #else
-    // GEMM variant not compiled (ENABLE_CUTE_DSL=OFF); signature kept so audioUtils.cpp links.
+    // GEMM variant not compiled; signature kept so audioUtils.cpp links.
     check::check(
         false, "melLinearGemmFp16inFp32out: CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
 #endif

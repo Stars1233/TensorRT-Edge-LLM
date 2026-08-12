@@ -45,7 +45,24 @@ def resolve_lora_model_name(model_name: str) -> Optional[str]:
 
 
 def _uses_spec_decode(config: TestConfig) -> bool:
-    return bool(config.is_eagle or config.is_mtp or config.is_dflash)
+    return bool(config.is_eagle or config.is_mtp or config.is_dflash
+                or config.is_dspark)
+
+
+def _append_context_reuse_options(cmd: List[str], config: TestConfig) -> None:
+    if not config.context_reuse:
+        return
+
+    cmd.extend([
+        "--enableContextReuse",
+        f"--profileOutputFile={config.get_profile_json_file()}",
+    ])
+    if config.context_cache_recurrent_snapshot_pool_bytes is not None:
+        cmd.append("--contextCacheRecurrentSnapshotPoolBytes="
+                   f"{config.context_cache_recurrent_snapshot_pool_bytes}")
+    if config.context_cache_partial_kv_snapshot_pool_bytes is not None:
+        cmd.append("--contextCachePartialKVSnapshotPoolBytes="
+                   f"{config.context_cache_partial_kv_snapshot_pool_bytes}")
 
 
 def _tensorrt_edgellm_module_shell(module: str, args: List[str]) -> str:
@@ -413,6 +430,9 @@ def generate_build_commands(
             f"--maxBatchSize={config.max_batch_size}"
         ])
 
+        if config.max_kv_pool_pages is not None:
+            cmd.append(f"--maxKVPoolPages={config.max_kv_pool_pages}")
+
         if _uses_spec_decode(config):
             cmd.append("--specBase")
             cmd.append(f"--maxVerifyTreeSize={config.max_verify_tree_size}")
@@ -669,13 +689,16 @@ def generate_inference_commands(
         f"--inputFile={config.get_test_case_file()}",
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
+    _append_context_reuse_options(cmd, config)
 
     # Add speculative decoding parameters.
     if _uses_spec_decode(config):
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")
-        cmd.append(f"--specVerifyTreeSize={config.max_verify_tree_size}")
+        cmd.append(f"--specVerifySize={config.max_verify_tree_size}")
+        if config.is_dspark:
+            cmd.append(f"--dsparkMaxProposalLen={config.max_draft_tree_size}")
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
@@ -685,9 +708,11 @@ def generate_inference_commands(
         cmd.append(
             f"--multimodalEngineDir={config.get_multimodal_engine_dir()}")
 
-    # Add batch size override if specified
+    # Add batch size and generation length overrides if specified.
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
+    if config.output_seq_len is not None:
+        cmd.append(f"--maxGenerateLength={config.output_seq_len}")
 
     if config.debug:
         cmd.append("--debug")
@@ -741,13 +766,16 @@ def generate_e2e_bench_commands(
         f"--inputFile={config.get_test_case_file()}",
         f"--outputFile={config.get_output_json_file()}", f"--dumpProfile"
     ])
+    _append_context_reuse_options(cmd, config)
 
     # Add speculative decoding parameters.
     if _uses_spec_decode(config):
         cmd.append("--specDecode")
         cmd.append(f"--specDraftTopK={config.eagle_draft_top_k}")
         cmd.append(f"--specDraftStep={config.eagle_draft_step}")
-        cmd.append(f"--specVerifyTreeSize={config.max_verify_tree_size}")
+        cmd.append(f"--specVerifySize={config.max_verify_tree_size}")
+        if config.is_dspark:
+            cmd.append(f"--dsparkMaxProposalLen={config.max_draft_tree_size}")
 
     if config.model_type == ModelType.VLM:
         cmd.append(f"--multimodalEngineDir={config.get_visual_engine_dir()}")
@@ -757,9 +785,11 @@ def generate_e2e_bench_commands(
         cmd.append(
             f"--multimodalEngineDir={config.get_multimodal_engine_dir()}")
 
-    # Add batch size override if specified
+    # Add batch size and generation length overrides if specified.
     if config.batch_size is not None:
         cmd.append(f"--batchSize={config.batch_size}")
+    if config.output_seq_len is not None:
+        cmd.append(f"--maxGenerateLength={config.output_seq_len}")
 
     # Add warmup if specified
     cmd.append(f"--warmup={config.warmup or 10}")

@@ -23,6 +23,10 @@ from typing import Optional
 tests_dir = Path(__file__).parent
 if str(tests_dir) not in sys.path:
     sys.path.insert(0, str(tests_dir))
+# Repo root: test modules import in-tree packages (experimental.*) directly.
+repo_root = tests_dir.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 import pytest
 import yaml
@@ -296,6 +300,15 @@ def test_logger(request, env_config):
         logger.removeHandler(handler)
 
 
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Replay library size reports so they reach the CI job log."""
+    del exitstatus, config
+    from pytest_helpers import library_size_reports
+
+    for report in library_size_reports:
+        terminalreporter.write_line(report)
+
+
 def pytest_addoption(parser):
     """Add custom command line options"""
     parser.addoption("--priority",
@@ -459,9 +472,12 @@ def pytest_generate_tests(metafunc):
                     yaml_class, yaml_func = test_function_part.split('::', 1)
                     if metafunc.cls and metafunc.cls.__name__ != yaml_class:
                         continue
-                    if current_test_name not in yaml_func:
+                    # Exact function-name match: substring matching leaked
+                    # params across prefix-sharing tests (test_hlapi_generate
+                    # vs test_hlapi_generate_with_audio).
+                    if yaml_func.split('[')[0] != current_test_name:
                         continue
-                elif current_test_name not in test_function_part:
+                elif test_function_part.split('[')[0] != current_test_name:
                     continue
 
                 if '[' in test_case and ']' in test_case:

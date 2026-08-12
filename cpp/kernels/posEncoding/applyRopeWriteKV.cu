@@ -18,6 +18,7 @@
 #include "applyRopeWriteKV.h"
 #include "common/checkMacros.h"
 #include "common/cudaMacros.h"
+#include "common/pagedKvTypes.h"
 #include "kernels/common/vectorizedTypes.cuh"
 
 #include <cstdint>
@@ -71,8 +72,166 @@ __device__ __forceinline__ DVec<T> vecApplyRopeNonInterleave(
     }
 }
 
+//! Round @p x up to the next power of two — pads lanesPerHead so the warp-shuffle
+//! butterfly reduction is well-defined for any headDim.
+__host__ __device__ __forceinline__ constexpr uint32_t nextPowerOf2(uint32_t x)
+{
+    if (x <= 1)
+    {
+        return 1;
+    }
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
+
+//! Warp-shuffle butterfly reduction over @p paddedLanesPerHead lanes (power of two <= 32)
+//! cooperating on one head. Ghost lanes must pass partial = 0 but still participate so the
+//! warp converges. Returns the headDim sum-of-squares replicated to every lane.
+__device__ __forceinline__ float warpReduceHeadSumOfSquares(float partial, uint32_t const paddedLanesPerHead)
+{
+    // Defensive check on debug builds: butterfly requires a power-of-two participating-lane count.
+    assert((paddedLanesPerHead & (paddedLanesPerHead - 1)) == 0 && paddedLanesPerHead <= 32u);
+    // Explicit __syncwarp() around the shfl sequence for robustness under Volta+
+    // independent thread scheduling.
+    __syncwarp();
+    for (uint32_t offset = paddedLanesPerHead / 2; offset > 0; offset >>= 1)
+    {
+        partial += __shfl_xor_sync(0xffffffff, partial, offset);
+    }
+    __syncwarp();
+    return partial;
+}
+
+//! Load this thread's slice of one head, compute the head-wide RMSNorm scale via warp
+//! shuffle, multiply by gamma, and return the scaled slice (caller follows up with RoPE).
+//! invRmsOut returns 1/sqrt(mean(x^2)+eps). Ghost lanes (isActiveLane == false) contribute
+//! partial = 0, skip the (OOB) gamma/input loads, and return an uninitialized DVec — the
+//! caller must gate stores on isActiveLane.
+template <typename T>
+__device__ __forceinline__ DVec<T> loadAndApplyRmsNorm(T const* dataPtr, T const* gammaPtr, uint32_t const headDim,
+    uint32_t const paddedLanesPerHead, float const rmsEps, float& invRmsOut, bool const isActiveLane)
+{
+    uint32_t const vecOffset = threadIdx.x * DVec<T>::vec_size;
+    DVec<T> input;
+    DVec<T> gamma;
+    float partial = 0.f;
+
+    // Replicates the compiler backend's standalone-RMSNorm arithmetic so the fused path
+    // stays bit-identical to the unfused graph; the _rn intrinsics keep each op correctly
+    // rounded under --use_fast_math. Do not fold 1/sqrt back into rsqrtf (approximate).
+    // The FMA accumulation is exact: a half squared fits fp32, so only the add rounds.
+    if (isActiveLane)
+    {
+        input.load(dataPtr + vecOffset);
+        gamma.load(gammaPtr + vecOffset);
+
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            float const v = __half2float(input[i]);
+            partial = __fmaf_rn(v, v, partial);
+        }
+    }
+    // Ghost lanes: partial stays 0; still participate in the warp-wide reduction below.
+
+    float const headSumSq = warpReduceHeadSumOfSquares(partial, paddedLanesPerHead);
+    float const meanSq = __fdiv_rn(headSumSq, static_cast<float>(headDim));
+    invRmsOut = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(meanSq, rmsEps)));
+
+    if (isActiveLane)
+    {
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            input[i] = __hmul(__float2half(__fmul_rn(__half2float(input[i]), invRmsOut)), gamma[i]);
+        }
+    }
+    return input;
+}
+
+//! Fused RMSNorm + non-interleaved RoPE on one head. The local and the RoPE-permuted slices
+//! are normalized by the same invRms, each with its own gamma slice. Ghost lanes participate
+//! only in the reduction and return data the caller must NOT store.
+template <typename T>
+__device__ __forceinline__ DVec<T> vecApplyRmsNormAndRopeNonInterleave(T const* dataPtr, T const* gammaPtr,
+    DVec<float> const& cosVec, DVec<float> const& sinVec, uint32_t const rotaryDim, uint32_t const headDim,
+    uint32_t const paddedLanesPerHead, float const rmsEps)
+{
+    uint32_t const vecOffset = threadIdx.x * DVec<T>::vec_size;
+    bool const isActiveLane = (vecOffset < headDim);
+
+    // Compute invRms (shared by both halves of the rotary permute), get the normed local slice.
+    // All lanes (including ghosts) must call this — it contains the warp-wide butterfly shfl.
+    float invRms;
+    DVec<T> input = loadAndApplyRmsNorm(dataPtr, gammaPtr, headDim, paddedLanesPerHead, rmsEps, invRms, isActiveLane);
+
+    // Fetch the RoPE permute-partner's already-normed slice:
+    //   (A) shfl-partner (fast): full rotation + power-of-2 lanes — the partner is lane
+    //       (X XOR actualLanes/2); grab its register via __shfl_xor_sync.
+    //   (B) gmem reload (fallback): otherwise re-load the partner slice and re-norm.
+    uint32_t const actualLanesPerHead = headDim / DVec<T>::vec_size;
+    bool const canShflPartner = (rotaryDim == headDim) && ((actualLanesPerHead & (actualLanesPerHead - 1)) == 0);
+    DVec<T> permuteInput;
+
+    if (canShflPartner)
+    {
+        // All lanes participate uniformly here (canShflPartner forbids ghost lanes).
+        // Pack two 16-bit elements per uint32 shfl word to halve the shfl count.
+        static_assert(sizeof(T) == 2, "shfl-partner pack-into-uint32 assumes 16-bit element type");
+        int const pairOffset = static_cast<int>(actualLanesPerHead / 2);
+        __syncwarp();
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; i += 2)
+        {
+            uint32_t packed;
+            T* const packedAsT = reinterpret_cast<T*>(&packed);
+            packedAsT[0] = input[i];
+            packedAsT[1] = input[i + 1];
+            uint32_t const shuffled = __shfl_xor_sync(0xffffffff, packed, pairOffset);
+            T const* const shuffledAsT = reinterpret_cast<T const*>(&shuffled);
+            permuteInput[i] = shuffledAsT[0];
+            permuteInput[i + 1] = shuffledAsT[1];
+        }
+        __syncwarp();
+    }
+    else
+    {
+        // Strategy (B): gmem reload fallback. Early return for ghost/tail lanes — they
+        // don't own real elements to RoPE.
+        if (!isActiveLane || vecOffset >= rotaryDim)
+        {
+            return input;
+        }
+        uint32_t const permuteOffset
+            = (vecOffset < rotaryDim / 2) ? vecOffset + rotaryDim / 2 : vecOffset - rotaryDim / 2;
+        DVec<T> permuteGamma;
+        permuteInput.load(dataPtr + permuteOffset);
+        permuteGamma.load(gammaPtr + permuteOffset);
+#pragma unroll
+        for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+        {
+            // Same backend-matching order as loadAndApplyRmsNorm: fp32 scale, cast to
+            // half, then half-precision gamma multiply.
+            permuteInput[i] = __hmul(__float2half(__fmul_rn(__half2float(permuteInput[i]), invRms)), permuteGamma[i]);
+        }
+    }
+
+    DVec<T> result;
+#pragma unroll
+    for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+    {
+        result[i] = applyRope(input[i], permuteInput[i], cosVec[i], sinVec[i], (vecOffset < rotaryDim / 2));
+    }
+    return result;
+}
+
 template <typename TCache>
-__device__ __forceinline__ void storeVec(TCache* dst, int base, DVec<half> const& vec, float scaleQuantOrig)
+__device__ __forceinline__ void storeVec(TCache* dst, int64_t base, DVec<half> const& vec, float scaleQuantOrig)
 {
     if constexpr (std::is_same_v<TCache, half>)
     {
@@ -99,7 +258,8 @@ template <typename T, typename TCache>
 __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float const* cosSinCache,
     int32_t const* kvCacheEndLens, int32_t const* tokenPosIds, float kScaleQuantOrig, float vScaleQuantOrig,
     int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead,
-    uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, bool writeKInPlace)
+    uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen, bool writeKInPlace,
+    int32_t const* pageTable, int32_t maxPagesPerSeq)
 {
     // Each CTA will process multiple tokens of a single head which each thread handles 16 / sizeof(T) elements.
     // blockDim.x: number of threads to process each token, blockDim.y: number of tokens processed by each CTA.
@@ -202,7 +362,6 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
 
         int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
         int32_t const tokenIdxInCache = kvCacheStartIdx + tokenIdx % qSeqLen;
-        int32_t const cacheOffsetSequence = batchIdx * 2 * numKVHead * kvCacheCapacity * headDim;
 
         // Load V before writing roped K in-place: when K and V share the same
         // buffer (e.g. Gemma4 global layers where K=V projection), the in-place
@@ -222,20 +381,54 @@ __global__ void applyRopeWriteKV(T* q, T* k, T const* v, TCache* kvCache, float 
         // This ensures padding tokens don't corrupt valid cache entries
         if (!isPaddingToken)
         {
-            // Save to KVCache which assume to have layout of [B, Hk + Hv, S, D]
-            int32_t cacheOffsetK = cacheOffsetSequence + kvHeadIdx * kvCacheCapacity * headDim
-                + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
-            int32_t cacheOffsetV = cacheOffsetSequence + (numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
-                + tokenIdxInCache * headDim + DVec<T>::vec_size * tIdx;
-            storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
-            storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
+            int32_t const vecBase = DVec<T>::vec_size * tIdx;
+            if (pageTable != nullptr)
+            {
+                // Paged addressing: pageTable[b][0|1][j] carries K/V page ids into the SAME flat
+                // pool, reshaped as [nPages, kTOKENS_PER_PAGE, Hkv, D]. A negative entry skips the
+                // write for that half.
+                int32_t const pageRow = tokenIdxInCache / rt::kTOKENS_PER_PAGE;
+                int32_t const inPage = tokenIdxInCache % rt::kTOKENS_PER_PAGE;
+                int32_t const kPage = pageTable[(batchIdx * 2 + 0) * maxPagesPerSeq + pageRow];
+                int32_t const vPage = pageTable[(batchIdx * 2 + 1) * maxPagesPerSeq + pageRow];
+                if (kPage >= 0)
+                {
+                    int64_t const kOffset
+                        = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
+                        + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                    storeVec(kvCache, kOffset, kRoped, kScaleQuantOrig);
+                }
+                // else: unmapped page for a non-padding position -- skip the write (the runtime
+                // guarantees mapped coverage for live positions; see the header's bad-page note).
+                if (vPage >= 0)
+                {
+                    int64_t const vOffset
+                        = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
+                        + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                    storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+                }
+            }
+            else
+            {
+                // Legacy KVCache with layout [B, Hk + Hv, S, D].
+                int64_t const cacheOffsetSequence
+                    = static_cast<int64_t>(batchIdx) * 2 * numKVHead * kvCacheCapacity * headDim;
+                int64_t const cacheOffsetK = cacheOffsetSequence
+                    + static_cast<int64_t>(kvHeadIdx) * kvCacheCapacity * headDim + tokenIdxInCache * headDim + vecBase;
+                int64_t const cacheOffsetV = cacheOffsetSequence
+                    + static_cast<int64_t>(numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
+                    + tokenIdxInCache * headDim + vecBase;
+                storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
+                storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
+            }
         }
     }
 }
 
 static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache,
     rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::OptionalInputTensor tokenPosIds,
-    float kScale, float vScale, cudaStream_t stream, bool writeKInPlace)
+    float kScale, float vScale, cudaStream_t stream, bool writeKInPlace, int32_t const* pageTable,
+    int32_t maxPagesPerSeq)
 {
     auto const dt = kvCache.getDataType();
     constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
@@ -277,7 +470,8 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
         half* kvCachePtr = kvCache.dataPointer<half>();
         applyRopeWriteKV<half, half><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
             kvCacheEndLensPtr, tokenPosIdsPtr, kScale, vScale, runtimeSeqLen, totalNumTokens, kvCacheCapacity,
-            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace);
+            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace,
+            pageTable, maxPagesPerSeq);
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -285,7 +479,8 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
         applyRopeWriteKV<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, cosSinCachePtr,
             kvCacheEndLensPtr, tokenPosIdsPtr, kScale, vScale, runtimeSeqLen, totalNumTokens, kvCacheCapacity,
-            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace);
+            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, writeKInPlace,
+            pageTable, maxPagesPerSeq);
     }
 #endif
     else
@@ -296,7 +491,7 @@ static void launchApplyRopeWriteKVKernel(rt::Tensor& q, rt::Tensor& k, rt::Tenso
 
 void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens, rt::Tensor& q,
     rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    bool writeKInPlace)
+    bool writeKInPlace, int32_t const* pageTable, int32_t maxPagesPerSeq)
 {
     rt::OptionalInputTensor tokenPosIds{std::nullopt};
 
@@ -318,13 +513,13 @@ void launchApplyRopeWriteKV(rt::Tensor const& cosSinCache, rt::OptionalInputTens
         check::check(kvCache.getShape()[2] == numKVHeads, "KVCache shall have consistent number of K/V heads.");
     }
 
-    launchApplyRopeWriteKVKernel(
-        q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, kScale, vScale, stream, writeKInPlace);
+    launchApplyRopeWriteKVKernel(q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, kScale, vScale, stream,
+        writeKInPlace, pageTable, maxPagesPerSeq);
 }
 
 void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens,
     rt::Tensor const& tokenPosIds, rt::Tensor& q, rt::Tensor& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale,
-    float vScale, cudaStream_t stream)
+    float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq)
 {
     int64_t const batchSize = q.getShape()[0];
     int64_t const headDim = q.getShape()[3];
@@ -344,8 +539,8 @@ void launchApplyRopeWriteKVTreeDecoding(rt::Tensor const& cosSinCache, rt::Tenso
     check::check(cosSinCache.getShape()[0] == 1 || cosSinCache.getShape()[0] == batchSize,
         "CosSinCache shall have batch size 1 or equal to runtime batch size");
 
-    launchApplyRopeWriteKVKernel(
-        q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, kScale, vScale, stream, false);
+    launchApplyRopeWriteKVKernel(q, k, v, kvCache, cosSinCache, kvCacheEndLens, tokenPosIds, kScale, vScale, stream,
+        false, pageTable, maxPagesPerSeq);
 }
 
 // =============================================================================
@@ -357,7 +552,8 @@ __global__ void applyRopeWriteKVSplitQKVKernel(T* __restrict__ q, T const* __res
     TCache* __restrict__ kvCache, void* __restrict__ fp8QOut, float const* __restrict__ cosSinCache,
     int32_t const* __restrict__ kvCacheEndLens, float qScaleQuantOrig, float kScaleQuantOrig, float vScaleQuantOrig,
     int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead, uint32_t numKVHead,
-    uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen)
+    uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
+    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq)
 {
     // Thread mapping (same as existing kernel for proven memory coalescing):
     //   blockDim.x = headDim / vec_size  (threads per token)
@@ -425,25 +621,54 @@ __global__ void applyRopeWriteKVSplitQKVKernel(T* __restrict__ q, T const* __res
         DVec<T> vSrc;
         vSrc.load(vPtr + DVec<T>::vec_size * tIdx);
 
-        // KV cache layout: [B, 2, H_kv, S, D]
-        //   K at [b, 0, h, s, :] = b*2*H*S*D + 0*H*S*D + h*S*D + s*D
-        //   V at [b, 1, h, s, :] = b*2*H*S*D + 1*H*S*D + h*S*D + s*D
         int32_t const tokenIdxInCache = kvCacheEndLens[batchIdx] - qSeqLen + tokenIdx % qSeqLen;
-        int64_t const cacheBase = static_cast<int64_t>(batchIdx) * 2 * numKVHead * kvCacheCapacity * headDim;
         int32_t const vecBase = DVec<T>::vec_size * tIdx;
-        int64_t const cacheOffsetK = cacheBase + static_cast<int64_t>(kvHeadIdx) * kvCacheCapacity * headDim
-            + tokenIdxInCache * headDim + vecBase;
-        int64_t const cacheOffsetV = cacheBase + static_cast<int64_t>(numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
-            + tokenIdxInCache * headDim + vecBase;
-
-        storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
-        storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
+        if (pageTable != nullptr)
+        {
+            // Paged addressing: pageTable[b][0|1][j] carries K/V page ids into the SAME flat pool,
+            // reshaped as [nPages, kTOKENS_PER_PAGE, Hkv, D]. A negative entry skips the write for
+            // that half.
+            int32_t const pageRow = tokenIdxInCache / rt::kTOKENS_PER_PAGE;
+            int32_t const inPage = tokenIdxInCache % rt::kTOKENS_PER_PAGE;
+            int32_t const kPage = pageTable[(batchIdx * 2 + 0) * maxPagesPerSeq + pageRow];
+            int32_t const vPage = pageTable[(batchIdx * 2 + 1) * maxPagesPerSeq + pageRow];
+            if (kPage >= 0)
+            {
+                int64_t const kOffset
+                    = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
+                    + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                storeVec(kvCache, kOffset, kRoped, kScaleQuantOrig);
+            }
+            // else: unmapped page -- skip the write (runtime guarantees mapped coverage for
+            // live positions; see the header's bad-page note).
+            if (vPage >= 0)
+            {
+                int64_t const vOffset
+                    = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
+                    + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+            }
+        }
+        else
+        {
+            // Legacy KV cache layout: [B, 2, H_kv, S, D]
+            //   K at [b, 0, h, s, :] = b*2*H*S*D + 0*H*S*D + h*S*D + s*D
+            //   V at [b, 1, h, s, :] = b*2*H*S*D + 1*H*S*D + h*S*D + s*D
+            int64_t const cacheBase = static_cast<int64_t>(batchIdx) * 2 * numKVHead * kvCacheCapacity * headDim;
+            int64_t const cacheOffsetK = cacheBase + static_cast<int64_t>(kvHeadIdx) * kvCacheCapacity * headDim
+                + tokenIdxInCache * headDim + vecBase;
+            int64_t const cacheOffsetV = cacheBase
+                + static_cast<int64_t>(numKVHead + kvHeadIdx) * kvCacheCapacity * headDim + tokenIdxInCache * headDim
+                + vecBase;
+            storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
+            storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
+        }
     }
 }
 
 void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor const& kvCacheEndLens, rt::Tensor& q,
     rt::Tensor const& k, rt::Tensor const& v, rt::Tensor& kvCache, float kScale, float vScale, cudaStream_t stream,
-    void* fp8QOut, float qScale)
+    int32_t const* pageTable, int32_t maxPagesPerSeq, void* fp8QOut, float qScale)
 {
     auto const dt = kvCache.getDataType();
 
@@ -482,7 +707,8 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
         half* kvCachePtr = kvCache.dataPointer<half>();
         applyRopeWriteKVSplitQKVKernel<half, half><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr, nullptr,
             cosSinCachePtr, kvCacheEndLensPtr, 1.0f, kScale, vScale, runtimeSeqLen, totalNumTokens, kvCacheCapacity,
-            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
+            numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen, pageTable,
+            maxPagesPerSeq);
     }
 #if SUPPORTS_FP8
     else if (dt == nvinfer1::DataType::kFP8)
@@ -490,7 +716,354 @@ void launchApplyRopeWriteKVSplitQKV(rt::Tensor const& cosSinCache, rt::Tensor co
         __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
         applyRopeWriteKVSplitQKVKernel<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(qPtr, kPtr, vPtr, kvCachePtr,
             fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, qScale, kScale, vScale, runtimeSeqLen, totalNumTokens,
-            kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen);
+            kvCacheCapacity, numQHeads, numKVHeads, headDim, rotaryDim, cosSinCacheBatchSize, cosSinCacheSeqLen,
+            pageTable, maxPagesPerSeq);
+    }
+#endif
+    else
+    {
+        check::check(false, "Unsupported KV cache dtype");
+    }
+}
+
+// =============================================================================
+// Packed QKV [B, S, Hq+2*Hkv, D] → RoPE Q/K → split outputs:
+//   - roped Q to qScratch (or FP8 Q to fp8QOut), always
+//   - roped K + V to kvCache, always
+//   - roped K + V to kScratch/vScratch when SEPARATE_Q_K_V FMHA needs them
+// Tree decoding via optional tokenPosIds (-1 = padding token).
+// =============================================================================
+
+template <typename T, typename TCache>
+__global__ void applyRopeFromPackedToSplitKernel(T const* __restrict__ packedQKV, T* __restrict__ qScratch,
+    T* __restrict__ kScratch, T* __restrict__ vScratch, TCache* __restrict__ kvCache, void* __restrict__ fp8QOut,
+    float const* __restrict__ cosSinCache, int32_t const* __restrict__ kvCacheEndLens,
+    int32_t const* __restrict__ tokenPosIds, int32_t const* __restrict__ cuQSeqLens, T const* __restrict__ qNormGamma,
+    T const* __restrict__ kNormGamma, float rmsNormEps, float qScaleQuantOrig, float kScaleQuantOrig,
+    float vScaleQuantOrig, int32_t qSeqLen, int32_t totalNumTokens, int32_t kvCacheCapacity, uint32_t numQHead,
+    uint32_t numKVHead, uint32_t headDim, uint32_t rotaryDim, int32_t cosSinCacheBatchSize, int32_t cosSinCacheSeqLen,
+    int32_t const* __restrict__ pageTable, int32_t maxPagesPerSeq)
+{
+    // Thread mapping (same as existing kernels for proven memory coalescing):
+    //   blockDim.x = headDim / vec_size  (threads per token, cover head vector)
+    //   blockDim.y = tokens per CTA
+    //   gridDim.x  = ceil(totalNumTokens / blockDim.y)
+    //   gridDim.y  = numQHead + numKVHead  (each CTA processes one head-type)
+    //
+    // Packed QKV stride per token = (numQHead + 2*numKVHead) * headDim.
+    // Within a token: Q at offset [0, Hq), K at [Hq, Hq+Hkv), V at [Hq+Hkv, Hq+2*Hkv).
+
+    uint32_t const tIdx = threadIdx.x;
+    uint32_t const tIdy = threadIdx.y;
+    uint32_t const tokenIdx = blockIdx.x * blockDim.y + tIdy;
+
+    // Tail-token lanes must not early-return: a warp can span multiple token rows and the
+    // fused-norm path runs full-mask warp collectives. They run on a clamped valid token
+    // instead, and every global store below is gated on !isTailToken.
+    bool const isTailToken = (tokenIdx >= static_cast<uint32_t>(totalNumTokens));
+    uint32_t const clampedTokenIdx = isTailToken ? static_cast<uint32_t>(totalNumTokens - 1) : tokenIdx;
+
+    int32_t const batchIdx = clampedTokenIdx / qSeqLen;
+    int64_t const combinedHeads = static_cast<int64_t>(numQHead) + 2 * static_cast<int64_t>(numKVHead);
+
+    // RoPE position: prefill (kvCacheEndLens - qSeqLen + offset), decode
+    // (kvCacheEndLens[b] - 1), or tree (tokenPosIds; -1 = padding token, zeroed).
+    // Ragged prefill padding must be identified before page-table or RoPE-cache
+    // indexing. It cannot early-return because fused qk_norm uses warp collectives.
+    int32_t const rowInBatch = static_cast<int32_t>(clampedTokenIdx % qSeqLen);
+    int32_t actualQSeqLen = qSeqLen;
+    if (cuQSeqLens != nullptr)
+    {
+        actualQSeqLen = cuQSeqLens[batchIdx + 1] - cuQSeqLens[batchIdx];
+    }
+    int32_t sinCosCachePos{};
+    bool const isPaddingToken = (tokenPosIds != nullptr && tokenPosIds[clampedTokenIdx] == -1)
+        || (cuQSeqLens != nullptr && rowInBatch >= actualQSeqLen);
+    if (tokenPosIds != nullptr)
+    {
+        sinCosCachePos = tokenPosIds[clampedTokenIdx];
+        if (sinCosCachePos < 0)
+        {
+            sinCosCachePos = 0;
+        }
+    }
+    else
+    {
+        int32_t const posStartId = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
+        int32_t const maxActualRow = actualQSeqLen > 0 ? actualQSeqLen - 1 : 0;
+        int32_t const ropeRow = isPaddingToken && rowInBatch > maxActualRow ? maxActualRow : rowInBatch;
+        sinCosCachePos = posStartId + ropeRow;
+    }
+
+    // Vectorized load cos/sin for this token's RoPE position.
+    uint32_t const sinOffset = rotaryDim / 2;
+    uint32_t const cosOffset = (tIdx * DVec<float>::vec_size) % (rotaryDim / 2);
+    int32_t const cosSinCacheBatchIdx = (cosSinCacheBatchSize == 1) ? 0 : batchIdx;
+    int32_t const cosSinCacheOffset = cosSinCacheBatchIdx * cosSinCacheSeqLen * rotaryDim + sinCosCachePos * rotaryDim;
+    DVec<float> cosVec;
+    DVec<float> sinVec;
+    cosVec.load(cosSinCache + cosSinCacheOffset + cosOffset);
+    sinVec.load(cosSinCache + cosSinCacheOffset + cosOffset + sinOffset);
+
+    uint32_t const headIdx = blockIdx.y;
+    int64_t const tokenBaseInPacked = static_cast<int64_t>(clampedTokenIdx) * combinedHeads * headDim;
+    int32_t const vecBase = DVec<T>::vec_size * tIdx;
+
+    // Ghost lanes (tIdx >= actualLanesPerHead) exist only to make blockDim.x a power of 2
+    // for the warp-shuffle reduction (e.g. headDim=96: 12 -> 16).
+    uint32_t const paddedLanesPerHead = blockDim.x;
+    uint32_t const actualLanesPerHead = static_cast<uint32_t>(headDim) / DVec<T>::vec_size;
+    bool const isActiveLane = (tIdx < actualLanesPerHead);
+
+    if (headIdx < numQHead)
+    {
+        // --- Q head: read from packed QKV, optionally apply RMSNorm, apply RoPE,
+        //     write to qScratch (or fp8QOut) ---
+        uint32_t const qHeadIdx = headIdx;
+        int64_t const packedQOffset = tokenBaseInPacked + static_cast<int64_t>(qHeadIdx) * headDim;
+        int32_t const scratchQOffset = clampedTokenIdx * numQHead * headDim + qHeadIdx * headDim;
+
+        DVec<T> qRoped;
+        if (qNormGamma != nullptr)
+        {
+            // ALL lanes (ghosts and padding tokens included) must enter uniformly — the
+            // call contains a warp-wide shfl. Padding tokens' qRoped is zeroed below.
+            qRoped = vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedQOffset, qNormGamma, cosVec, sinVec,
+                rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
+            if (isPaddingToken && isActiveLane)
+            {
+#pragma unroll
+                for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+                {
+                    qRoped[i] = T(0);
+                }
+            }
+        }
+        else if (isActiveLane)
+        {
+            // No norm path: ghost lanes skip (would OOB at vecBase >= headDim).
+            if (isPaddingToken)
+            {
+                // Zero out Q for padding tokens (tree decoding).
+#pragma unroll
+                for (uint32_t i = 0; i < DVec<T>::vec_size; ++i)
+                {
+                    qRoped[i] = T(0);
+                }
+            }
+            else
+            {
+                qRoped = vecApplyRopeNonInterleave(packedQKV + packedQOffset, cosVec, sinVec, rotaryDim);
+            }
+        }
+
+        if (isActiveLane && !isTailToken)
+        {
+#if SUPPORTS_FP8
+            if (fp8QOut != nullptr)
+            {
+                // CuTeDSL FP8 path: quantize roped Q to FP8 and store in separate buffer.
+                storeVec(reinterpret_cast<__nv_fp8_e4m3*>(fp8QOut), scratchQOffset + vecBase, qRoped, qScaleQuantOrig);
+            }
+            else
+#endif
+            {
+                qRoped.store(qScratch + scratchQOffset + vecBase);
+            }
+        }
+    }
+    else
+    {
+        // --- KV head: read K and V from packed, optionally RMSNorm(K), RoPE(K), write to scratch + cache ---
+        uint32_t const kvHeadIdx = headIdx - numQHead;
+        int64_t const packedKOffset = tokenBaseInPacked + static_cast<int64_t>(numQHead + kvHeadIdx) * headDim;
+        int64_t const packedVOffset
+            = tokenBaseInPacked + static_cast<int64_t>(numQHead + numKVHead + kvHeadIdx) * headDim;
+
+        DVec<T> kRoped;
+        if (kNormGamma != nullptr)
+        {
+            // All lanes (including ghosts) participate in the fused-norm shfl reduction.
+            kRoped = vecApplyRmsNormAndRopeNonInterleave(packedQKV + packedKOffset, kNormGamma, cosVec, sinVec,
+                rotaryDim, headDim, paddedLanesPerHead, rmsNormEps);
+        }
+        else if (isActiveLane)
+        {
+            // RoPE-only path: ghost lanes skip — vecBase would be OOB.
+            kRoped = vecApplyRopeNonInterleave(packedQKV + packedKOffset, cosVec, sinVec, rotaryDim);
+        }
+        DVec<T> vSrc;
+        if (isActiveLane)
+        {
+            vSrc.load(packedQKV + packedVOffset + vecBase);
+        }
+
+        // Skip all K/V writes for padding tokens (tree decoding), tail tokens, and ghost lanes.
+        if (!isPaddingToken && isActiveLane && !isTailToken)
+        {
+            int32_t const scratchKVOffset = clampedTokenIdx * numKVHead * headDim + kvHeadIdx * headDim;
+
+            // Optionally write to scratch K/V (for SEPARATE_Q_K_V FMHA to read directly).
+            if (kScratch != nullptr)
+            {
+                kRoped.store(kScratch + scratchKVOffset + vecBase);
+            }
+            if (vScratch != nullptr)
+            {
+                vSrc.store(vScratch + scratchKVOffset + vecBase);
+            }
+
+            // Always write K and V to the KV cache.
+            int32_t const kvCacheStartIdx = kvCacheEndLens != nullptr ? kvCacheEndLens[batchIdx] - qSeqLen : 0;
+            int32_t const tokenIdxInCache = kvCacheStartIdx + clampedTokenIdx % qSeqLen;
+            if (pageTable != nullptr)
+            {
+                // Paged addressing: pageTable[b][0|1][j] carries K/V page ids into the SAME flat
+                // pool, reshaped as [nPages, kTOKENS_PER_PAGE, Hkv, D]. A negative entry skips the
+                // write for that half (see the header's bad-page note).
+                int32_t const pageRow = tokenIdxInCache / rt::kTOKENS_PER_PAGE;
+                int32_t const inPage = tokenIdxInCache % rt::kTOKENS_PER_PAGE;
+                int32_t const kPage = pageTable[(batchIdx * 2 + 0) * maxPagesPerSeq + pageRow];
+                int32_t const vPage = pageTable[(batchIdx * 2 + 1) * maxPagesPerSeq + pageRow];
+                if (kPage >= 0)
+                {
+                    int64_t const kOffset
+                        = (static_cast<int64_t>(kPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
+                        + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                    storeVec(kvCache, kOffset, kRoped, kScaleQuantOrig);
+                }
+                if (vPage >= 0)
+                {
+                    int64_t const vOffset
+                        = (static_cast<int64_t>(vPage) * rt::kTOKENS_PER_PAGE + inPage) * numKVHead * headDim
+                        + static_cast<int64_t>(kvHeadIdx) * headDim + vecBase;
+                    storeVec(kvCache, vOffset, vSrc, vScaleQuantOrig);
+                }
+            }
+            else
+            {
+                // Legacy KV cache layout: [B, 2, Hkv, kvCacheCapacity, D].
+                int64_t const cacheBase = static_cast<int64_t>(batchIdx) * 2 * numKVHead * kvCacheCapacity * headDim;
+                int64_t const cacheOffsetK = cacheBase + static_cast<int64_t>(kvHeadIdx) * kvCacheCapacity * headDim
+                    + tokenIdxInCache * headDim + vecBase;
+                int64_t const cacheOffsetV = cacheBase
+                    + static_cast<int64_t>(numKVHead + kvHeadIdx) * kvCacheCapacity * headDim
+                    + tokenIdxInCache * headDim + vecBase;
+                storeVec(kvCache, cacheOffsetK, kRoped, kScaleQuantOrig);
+                storeVec(kvCache, cacheOffsetV, vSrc, vScaleQuantOrig);
+            }
+        }
+    }
+}
+
+void launchApplyRopeFromPackedToSplit(rt::Tensor const& cosSinCache, rt::OptionalInputTensor kvCacheEndLens,
+    rt::OptionalInputTensor tokenPosIds, rt::Tensor const& packedQKV, rt::Tensor& qScratch, rt::Tensor& kvCache,
+    float kScale, float vScale, cudaStream_t stream, int32_t const* pageTable, int32_t maxPagesPerSeq,
+    void* kScratchOut, void* vScratchOut, void* fp8QOut, float qScale, half const* qNormGamma, half const* kNormGamma,
+    float rmsNormEps, rt::OptionalInputTensor cuQSeqLens)
+{
+    auto const dt = kvCache.getDataType();
+    constexpr uint32_t kVEC_SIZE = DVec<half>::vec_size;
+    constexpr uint32_t kTHREADS_PER_CTA = 128;
+
+    // packedQKV: [B, S, Hq+2*Hkv, D]
+    int64_t const batchSize = packedQKV.getShape()[0];
+    int64_t const runtimeSeqLen = packedQKV.getShape()[1];
+    int64_t const combinedHeads = packedQKV.getShape()[2];
+    int64_t const headDim = packedQKV.getShape()[3];
+    int64_t const numKVHeads = kvCache.getShape()[2];
+    int64_t const numQHeads = combinedHeads - 2 * numKVHeads;
+    int64_t const kvCacheCapacity = kvCache.getShape()[3];
+    int64_t const totalNumTokens = batchSize * runtimeSeqLen;
+
+    check::check(numQHeads > 0, "Packed QKV combined heads must exceed 2x KV heads.");
+    check::check(qScratch.getShape()[0] == batchSize && qScratch.getShape()[1] == runtimeSeqLen
+            && qScratch.getShape()[2] == numQHeads && qScratch.getShape()[3] == headDim,
+        "qScratch shape shall be [B, S, Hq, D].");
+    check::check(kvCache.getShape()[0] == batchSize, "KVCache shall have the same batch size as packed QKV.");
+    check::check(
+        kvCache.getShape()[4] == headDim, "Head dimension shall be consistent between packed QKV and KVCache.");
+
+    int64_t const cosSinCacheBatchSize = cosSinCache.getShape()[0];
+    int64_t const cosSinCacheSeqLen = cosSinCache.getShape()[1];
+    int64_t const rotaryDim = cosSinCache.getShape()[2];
+    check::check(cosSinCacheBatchSize == 1 || cosSinCacheBatchSize == batchSize,
+        "CosSinCache shall have batch size 1 or equal to runtime batch size");
+
+    if (kvCacheEndLens.has_value())
+    {
+        check::check(kvCacheEndLens.value().get().getShape()[0] == batchSize,
+            "kvCacheEndLens shall have consistent batch size.");
+    }
+    if (tokenPosIds.has_value())
+    {
+        check::check(tokenPosIds.value().get().getShape()[0] == batchSize
+                && tokenPosIds.value().get().getShape()[1] == runtimeSeqLen,
+            "tokenPosIds shape shall be [B, S].");
+    }
+    if (cuQSeqLens.has_value())
+    {
+        check::check(cuQSeqLens.value().get().getShape()[0] == batchSize + 1, "cuQSeqLens shape shall be [B + 1].");
+        check::check(cuQSeqLens.value().get().getDataType() == nvinfer1::DataType::kINT32,
+            "cuQSeqLens shall have INT32 data type.");
+    }
+
+    half const* packedPtr = packedQKV.dataPointer<half>();
+    half* qScratchPtr = qScratch.dataPointer<half>();
+    half* kScratchPtr = reinterpret_cast<half*>(kScratchOut);
+    half* vScratchPtr = reinterpret_cast<half*>(vScratchOut);
+    float const* cosSinCachePtr = cosSinCache.dataPointer<float>();
+    int32_t const* kvCacheEndLensPtr
+        = kvCacheEndLens.has_value() ? kvCacheEndLens.value().get().dataPointer<int32_t>() : nullptr;
+    int32_t const* tokenPosIdsPtr
+        = tokenPosIds.has_value() ? tokenPosIds.value().get().dataPointer<int32_t>() : nullptr;
+    int32_t const* cuQSeqLensPtr = cuQSeqLens.has_value() ? cuQSeqLens.value().get().dataPointer<int32_t>() : nullptr;
+
+    // Fused RMSNorm needs a power-of-2 lane count for the warp-shuffle butterfly: pad
+    // blockDim.x to nextPowerOf2(headDim / vec_size); ghost lanes only join the shfl.
+    // Power-of-2 lane counts (e.g. headDim=128 -> 16) get no padding and no overhead.
+    uint32_t const actualBDimX = static_cast<uint32_t>(headDim) / kVEC_SIZE;
+    bool const fusedNormEnabled = (qNormGamma != nullptr || kNormGamma != nullptr);
+    uint32_t const bDimX = fusedNormEnabled ? nextPowerOf2(actualBDimX) : actualBDimX;
+    // The <= 32 lane constraint only applies with fused norm; without qk_norm larger heads
+    // (e.g. headDim=512 => 64 lanes) take the plain RoPE path (no cross-lane reduction).
+    check::check(!fusedNormEnabled || bDimX <= 32u,
+        "Fused qk_norm in attention plugin requires paddedLanesPerHead <= 32 (i.e. headDim/vec_size <= 32). "
+        "Disable qk_norm fusion for this model (or extend the warp-shuffle reduction to span multiple warps).");
+    // Tokens per CTA computed from the (possibly padded) bDimX so that total threads ≤ kTHREADS_PER_CTA.
+    // Floor-divide to match the original formula (kTHREADS_PER_CTA * vec_size / headDim) when no padding.
+    uint32_t const tokenPerCTA = kTHREADS_PER_CTA / bDimX;
+    uint32_t const bDimY = tokenPerCTA;
+    uint32_t const gDimX = (static_cast<uint32_t>(totalNumTokens) + tokenPerCTA - 1) / tokenPerCTA;
+    uint32_t const gDimY = static_cast<uint32_t>(numQHeads + numKVHeads);
+
+    dim3 grid(gDimX, gDimY);
+    dim3 block(bDimX, bDimY);
+
+    if (dt == nvinfer1::DataType::kHALF)
+    {
+        half* kvCachePtr = kvCache.dataPointer<half>();
+        applyRopeFromPackedToSplitKernel<half, half><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr, kScratchPtr,
+            vScratchPtr, kvCachePtr, nullptr /* fp8QOut */, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, 1.0f /* qScaleQuantOrig */, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
+            static_cast<int32_t>(kvCacheCapacity), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
+            static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
+            static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
+            maxPagesPerSeq);
+    }
+#if SUPPORTS_FP8
+    else if (dt == nvinfer1::DataType::kFP8)
+    {
+        __nv_fp8_e4m3* kvCachePtr = kvCache.dataPointer<__nv_fp8_e4m3>();
+        applyRopeFromPackedToSplitKernel<half, __nv_fp8_e4m3><<<grid, block, 0, stream>>>(packedPtr, qScratchPtr,
+            kScratchPtr, vScratchPtr, kvCachePtr, fp8QOut, cosSinCachePtr, kvCacheEndLensPtr, tokenPosIdsPtr,
+            cuQSeqLensPtr, qNormGamma, kNormGamma, rmsNormEps, qScale, kScale, vScale,
+            static_cast<int32_t>(runtimeSeqLen), static_cast<int32_t>(totalNumTokens),
+            static_cast<int32_t>(kvCacheCapacity), static_cast<uint32_t>(numQHeads), static_cast<uint32_t>(numKVHeads),
+            static_cast<uint32_t>(headDim), static_cast<uint32_t>(rotaryDim),
+            static_cast<int32_t>(cosSinCacheBatchSize), static_cast<int32_t>(cosSinCacheSeqLen), pageTable,
+            maxPagesPerSeq);
     }
 #endif
     else

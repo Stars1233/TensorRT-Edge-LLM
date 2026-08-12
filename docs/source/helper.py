@@ -28,13 +28,11 @@ CPP_API_DIR = 'cpp_api'
 #
 # By default, filenames are automatically converted from camelCase to Title Case:
 #   - fileUtils.h -> "File Utils"
-#   - contextFMHARunner.h -> "Context FMHA Runner"
 #   - llmEngineRunner.h -> "LLM Engine Runner"
 #
 # Use this dictionary to override the automatic conversion for specific files:
 HEADING_OVERRIDES = {
     # Example overrides:
-    # 'fmhaParams_v2': 'FMHA Parameters V2',
     # 'int4GroupwiseGemm': 'INT4 Groupwise GEMM',
 }
 
@@ -46,10 +44,8 @@ def camel_case_to_title(name):
     
     Examples:
         fileUtils -> File Utils
-        contextFMHARunner -> Context FMHA Runner
         int4GroupwiseGemm -> Int4 Groupwise Gemm
         llmEngineRunner -> LLM Engine Runner
-        fmhaParams_v2 -> FMHA Params V2
         internViTRunner -> Intern ViT Runner
     """
     import re
@@ -139,7 +135,7 @@ def get_cpp_directory_structure():
 def sanitize_filename(name):
     """
     Convert a header path to a safe RST filename.
-    Example: kernels/contextAttentionKernels/contextFMHARunner.h -> contextFMHARunner.rst
+    Example: runtime/llmEngineRunner.h -> llmEngineRunner.rst
     """
     return Path(name).stem + '.rst'
 

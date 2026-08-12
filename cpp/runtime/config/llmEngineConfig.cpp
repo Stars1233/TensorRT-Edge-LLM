@@ -21,6 +21,7 @@
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
+#include "common/pagedKvTypes.h"
 #include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
@@ -32,6 +33,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace trt_edgellm
@@ -128,29 +130,46 @@ SpecDecodeMode parseSpecDecodeMode(Json const& configJson)
     {
         return SpecDecodeMode::kGemma4MTP;
     }
+    if (specDecodeType == "dspark")
+    {
+        return SpecDecodeMode::kDSpark;
+    }
     throw std::runtime_error("parseEngineConfig: invalid spec_decode_type '" + specDecodeType
-        + "'. Allowed values: none, mtp, eagle3, dflash, gemma4_mtp.");
+        + "'. Allowed values: none, mtp, eagle3, dflash, dspark, gemma4_mtp.");
 }
 
 std::string parseEngineRole(Json const& configJson)
 {
     std::string const engineRole = configJson.value("engine_role", "llm");
-    if (engineRole == "llm" || engineRole == "base" || engineRole == "draft")
+    if (engineRole == "llm" || engineRole == "base" || engineRole == "draft" || engineRole == "dllm")
     {
         return engineRole;
     }
     throw std::runtime_error(
-        "parseEngineConfig: invalid engine_role '" + engineRole + "'. Allowed values: llm, base, draft.");
+        "parseEngineConfig: invalid engine_role '" + engineRole + "'. Allowed values: llm, base, draft, dllm.");
 }
 
-void validateDFlashTargetLayerIds(
-    std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers, char const* layerCountOwner)
+void validateSpecTargetLayerIds(std::vector<int32_t> const& targetLayerIds, int32_t numDecoderLayers,
+    char const* modeName, char const* layerCountOwner)
 {
     for (int32_t layerId : targetLayerIds)
     {
         ELLM_CHECK(layerId >= 0 && layerId < numDecoderLayers,
-            "parseEngineConfig: DFlash target layer id " + std::to_string(layerId) + " is outside [0, "
-                + layerCountOwner + ".num_hidden_layers).");
+            "parseEngineConfig: " + std::string(modeName) + " target layer id " + std::to_string(layerId)
+                + " is outside [0, " + layerCountOwner + ".num_hidden_layers).");
+    }
+}
+
+void parseSpecTargetLayerIds(Json const& modeConfig, char const* modeConfigName, LLMEngineConfig& cfg)
+{
+    if (modeConfig.contains("target_layer_ids"))
+    {
+        ELLM_CHECK(modeConfig["target_layer_ids"].is_array(),
+            "parseEngineConfig: " + std::string(modeConfigName) + ".target_layer_ids must be an array");
+        for (auto const& id : modeConfig["target_layer_ids"])
+        {
+            cfg.specTargetLayerIds.push_back(id.get<int32_t>());
+        }
     }
 }
 
@@ -165,36 +184,21 @@ void parseDFlashFields(
     Json const empty = Json::object();
     Json const& dflashConfig = configJson.contains("dflash_config") ? configJson["dflash_config"] : empty;
 
-    cfg.dflashBlockSize = dflashConfig.value("block_size", configJson.value("block_size", 16));
-    cfg.dflashMaskTokenId = dflashConfig.value("mask_token_id", configJson.value("dflash_mask_token_id", 248070));
-    ELLM_CHECK(cfg.dflashBlockSize > 0,
-        "parseEngineConfig: invalid DFlash block_size: " + std::to_string(cfg.dflashBlockSize) + " (must be positive)");
-    ELLM_CHECK(cfg.dflashMaskTokenId >= 0,
-        "parseEngineConfig: invalid DFlash mask_token_id: " + std::to_string(cfg.dflashMaskTokenId)
+    cfg.specDraftBlockSize = dflashConfig.value("block_size", 16);
+    cfg.specDraftMaskTokenId = dflashConfig.value("mask_token_id", 248070);
+    ELLM_CHECK(cfg.specDraftBlockSize > 0,
+        "parseEngineConfig: invalid DFlash block_size: " + std::to_string(cfg.specDraftBlockSize)
+            + " (must be positive)");
+    ELLM_CHECK(cfg.specDraftMaskTokenId >= 0,
+        "parseEngineConfig: invalid DFlash mask_token_id: " + std::to_string(cfg.specDraftMaskTokenId)
             + " (must be non-negative)");
 
-    if (dflashConfig.contains("target_layer_ids"))
-    {
-        ELLM_CHECK(dflashConfig["target_layer_ids"].is_array(),
-            "parseEngineConfig: dflash_config.target_layer_ids must be an array");
-        for (auto const& id : dflashConfig["target_layer_ids"])
-        {
-            cfg.dflashTargetLayerIds.push_back(id.get<int32_t>());
-        }
-    }
-    else if (configJson.contains("dflash_target_layer_ids"))
-    {
-        ELLM_CHECK(configJson["dflash_target_layer_ids"].is_array(),
-            "parseEngineConfig: dflash_target_layer_ids must be an array");
-        for (auto const& id : configJson["dflash_target_layer_ids"])
-        {
-            cfg.dflashTargetLayerIds.push_back(id.get<int32_t>());
-        }
-    }
-
+    parseSpecTargetLayerIds(dflashConfig, "dflash_config", cfg);
+    ELLM_CHECK(
+        !cfg.specTargetLayerIds.empty(), "parseEngineConfig: DFlash requires non-empty dflash_config.target_layer_ids");
     if (targetLayerValidationUpperBound.has_value())
     {
-        validateDFlashTargetLayerIds(cfg.dflashTargetLayerIds, *targetLayerValidationUpperBound, "base");
+        validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DFlash", "base");
     }
 }
 
@@ -238,6 +242,46 @@ void parseGemma4MTPFields(Json const& configJson, LLMEngineConfig& cfg)
     }
 }
 
+void parseDSparkFields(
+    Json const& configJson, LLMEngineConfig& cfg, std::optional<int32_t> targetLayerValidationUpperBound = std::nullopt)
+{
+    if (cfg.specDecodeType != SpecDecodeMode::kDSpark)
+    {
+        return;
+    }
+
+    Json const empty = Json::object();
+    Json const& dsparkConfig = configJson.contains("dspark_config") ? configJson["dspark_config"] : empty;
+
+    cfg.specDraftBlockSize = dsparkConfig.value("block_size", 7);
+    cfg.specDraftMaskTokenId = dsparkConfig.value("mask_token_id", 151669);
+    cfg.dsparkEnableConfidenceHead = dsparkConfig.value("enable_confidence_head", false);
+    cfg.dsparkConfidenceHeadWithMarkov = dsparkConfig.value("confidence_head_with_markov", false);
+    cfg.dsparkMarkovHeadType = dsparkConfig.value("markov_head_type", std::string{});
+    cfg.dsparkMarkovRank = dsparkConfig.value("markov_rank", 0);
+    cfg.dsparkHeadsFile = dsparkConfig.value("heads_file", std::string(binding_names::kDSparkHeadsFileName));
+    cfg.dsparkHeadsInfoFile
+        = dsparkConfig.value("heads_info_file", std::string(binding_names::kDSparkHeadsInfoFileName));
+
+    ELLM_CHECK(cfg.specDraftBlockSize > 0,
+        "parseEngineConfig: invalid DSpark block_size: " + std::to_string(cfg.specDraftBlockSize)
+            + " (must be positive)");
+    ELLM_CHECK(cfg.specDraftMaskTokenId >= 0,
+        "parseEngineConfig: invalid DSpark mask_token_id: " + std::to_string(cfg.specDraftMaskTokenId)
+            + " (must be non-negative)");
+    ELLM_CHECK(cfg.dsparkMarkovRank >= 0,
+        "parseEngineConfig: invalid DSpark markov_rank: " + std::to_string(cfg.dsparkMarkovRank)
+            + " (must be non-negative)");
+
+    parseSpecTargetLayerIds(dsparkConfig, "dspark_config", cfg);
+    ELLM_CHECK(
+        !cfg.specTargetLayerIds.empty(), "parseEngineConfig: DSpark requires non-empty dspark_config.target_layer_ids");
+    if (targetLayerValidationUpperBound.has_value())
+    {
+        validateSpecTargetLayerIds(cfg.specTargetLayerIds, *targetLayerValidationUpperBound, "DSpark", "base");
+    }
+}
+
 bool isDFlashDraftConfig(LLMEngineConfig const& config)
 {
     return config.specDecodeType == SpecDecodeMode::kDFlash && !config.isSpecDecodeBase;
@@ -246,6 +290,11 @@ bool isDFlashDraftConfig(LLMEngineConfig const& config)
 bool isGemma4MTPDraftConfig(LLMEngineConfig const& config)
 {
     return config.specDecodeType == SpecDecodeMode::kGemma4MTP && !config.isSpecDecodeBase;
+}
+
+bool isDSparkDraftConfig(LLMEngineConfig const& config)
+{
+    return config.specDecodeType == SpecDecodeMode::kDSpark && !config.isSpecDecodeBase;
 }
 
 //! Helper: parse explicit sliding/full RoPE config blocks when present.
@@ -329,6 +378,7 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     cfg.maxSupportedBatchSize = getRequired<int32_t>(bc, "max_batch_size");
     cfg.maxSupportedInputLength = getRequired<int32_t>(bc, "max_input_len");
     cfg.maxKVCacheCapacity = getRequired<int32_t>(bc, "max_kv_cache_capacity");
+    cfg.skipSoftmaxScaleOverride = configJson.value("skip_softmax_scale_override", int64_t{0});
 
     // RoPE configuration (top-level, derived from full config).
     cfg.ropeConfig = collectRopeConfig(configJson);
@@ -341,6 +391,22 @@ void parseCoreFields(Json const& configJson, LLMEngineConfig& cfg)
     requirePositive(cfg.maxSupportedBatchSize, "max_batch_size");
     requirePositive(cfg.maxSupportedInputLength, "max_input_len");
     requirePositive(cfg.maxKVCacheCapacity, "max_kv_cache_capacity");
+    ELLM_CHECK(cfg.maxKVCacheCapacity <= kMAX_KV_CACHE_CAPACITY,
+        "parseEngineConfig: max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity)
+            + ") exceeds the largest value that remains int32 after page alignment ("
+            + std::to_string(kMAX_KV_CACHE_CAPACITY) + ")");
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    int64_t const serializedKvPoolPages = getRequired<int64_t>(bc, "max_kv_pool_pages");
+    ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES,
+        "parseEngineConfig: minimum active pages (" + std::to_string(minimumActivePages) + ")"
+            + " exceeds the largest int32-addressable paged-KV pool " + std::to_string(kMAX_KV_POOL_PAGES) + ".");
+    ELLM_CHECK(serializedKvPoolPages >= minimumActivePages,
+        "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
+            + ") cannot be smaller than the minimum active pages (" + std::to_string(minimumActivePages) + ")");
+    ELLM_CHECK(serializedKvPoolPages <= kMAX_KV_POOL_PAGES,
+        "parseEngineConfig: max_kv_pool_pages (" + std::to_string(serializedKvPoolPages)
+            + ") exceeds the largest int32-addressable paged-KV pool (" + std::to_string(kMAX_KV_POOL_PAGES) + ")");
+    cfg.kvPoolPages = static_cast<int32_t>(serializedKvPoolPages);
     ELLM_CHECK(cfg.maxSupportedInputLength <= cfg.maxKVCacheCapacity,
         "parseEngineConfig: max_input_len (" + std::to_string(cfg.maxSupportedInputLength)
             + ") cannot be greater than max_kv_cache_capacity (" + std::to_string(cfg.maxKVCacheCapacity) + ")");
@@ -485,15 +551,45 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole != "draft", "parseEngineConfig: use parseDraftEngineConfig for engine_role=draft.");
     cfg.isSpecDecodeBase = (engineRole == "base");
+    cfg.isDiffusionBackbone = (engineRole == "dllm");
     if (cfg.isSpecDecodeBase)
     {
         ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, or gemma4_mtp.");
+            "parseEngineConfig: engine_role=base requires spec_decode_type to be mtp, eagle3, dflash, dspark, or "
+            "gemma4_mtp.");
     }
     else
     {
         ELLM_CHECK(cfg.specDecodeType == SpecDecodeMode::kNONE,
-            "parseEngineConfig: engine_role=llm requires spec_decode_type=none.");
+            "parseEngineConfig: non-speculative engine roles require spec_decode_type=none.");
+    }
+
+    if (cfg.isDiffusionBackbone)
+    {
+        Json const empty = Json::object();
+        Json const& diffusionConfig = configJson.contains("diffusion_config") ? configJson["diffusion_config"] : empty;
+        cfg.contextMaskSelectorEnabled = configJson.value("context_mask_selector_enabled", true);
+        cfg.diffusionUnifiedConditioning = configJson.value("diffusion_unified_conditioning", false);
+        cfg.diffusionCanvasLength = diffusionConfig.value("canvas_length", configJson.value("canvas_length", 256));
+        cfg.diffusionMaxDenoisingSteps
+            = diffusionConfig.value("max_denoising_steps", configJson.value("max_denoising_steps", 48));
+        cfg.diffusionSelfConditioningSize = configJson.value("self_conditioning_size", 0);
+        cfg.diffusionTMax = diffusionConfig.value("t_max", 0.8F);
+        cfg.diffusionTMin = diffusionConfig.value("t_min", 0.4F);
+        cfg.diffusionEntropyBound = diffusionConfig.value("entropy_bound", 0.1F);
+        cfg.diffusionEntropyThreshold = diffusionConfig.value("entropy_threshold", 0.005F);
+        cfg.rmsNormEps = configJson.value("rms_norm_eps", 1.0e-6F);
+        cfg.diffusionStabilityWindow = diffusionConfig.value("stability_window", 2);
+        requirePositive(cfg.diffusionCanvasLength, "diffusion canvas_length");
+        requirePositive(cfg.diffusionMaxDenoisingSteps, "diffusion max_denoising_steps");
+        requirePositive(cfg.diffusionStabilityWindow, "diffusion stability_window");
+        ELLM_CHECK(cfg.diffusionUnifiedConditioning,
+            "parseEngineConfig: DiffusionGemma dllm engines require diffusion_unified_conditioning=true. Re-export the "
+            "model with the latest DiffusionGemma exporter and rebuild the engine.");
+        ELLM_CHECK(cfg.diffusionTMax > 0.0F && cfg.diffusionTMin > 0.0F,
+            "parseEngineConfig: diffusion t_min/t_max must be positive");
+        ELLM_CHECK(cfg.diffusionEntropyBound >= 0.0F && cfg.diffusionEntropyThreshold >= 0.0F,
+            "parseEngineConfig: diffusion entropy thresholds must be non-negative");
     }
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
@@ -508,7 +604,7 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
 
-    cfg.numDeepstackFeatures = configJson.value("num_deepstack_features", 0);
+    cfg.numDeepstackFeatures = cfg.isDiffusionBackbone ? 0 : configJson.value("num_deepstack_features", 0);
     cfg.pleEnabled = configJson.value("ple_enabled", false);
     cfg.numPleInputs = configJson.value("num_ple_inputs", 0);
     cfg.pleHiddenSize = configJson.value("ple_hidden_size", 0);
@@ -521,11 +617,29 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
     cfg.numLinearAttnLayers = configJson.value("num_linear_attn_layers", 0);
     cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     cfg.recurrentStateNumHeads = configJson.value("recurrent_state_num_heads", 0);
+    cfg.recurrentStateNumGroups = configJson.value("recurrent_state_num_groups", 0);
+    // Explicit MTP spec-verify commit mode: "replay" (Mamba SSM) vs "snapshot" (GDN/DDTree).
+    std::string const recurrentSpecVerifyMode = configJson.value("recurrent_spec_verify_mode", std::string{"snapshot"});
+    ELLM_CHECK(recurrentSpecVerifyMode == "replay" || recurrentSpecVerifyMode == "snapshot",
+        "parseEngineConfig: invalid recurrent_spec_verify_mode '" + recurrentSpecVerifyMode
+            + "'; expected \"replay\" or \"snapshot\".");
+    cfg.recurrentSpecVerifyUsesReplay = (recurrentSpecVerifyMode == "replay");
     cfg.recurrentStateHeadDim = configJson.value("recurrent_state_head_dim", 0);
     cfg.recurrentStateSize = configJson.value("recurrent_state_size", 0);
     cfg.convDim = configJson.value("conv_dim", 0);
     cfg.convKernel = configJson.value("conv_kernel", 0);
     parseDFlashFields(configJson, cfg, cfg.numDecoderLayers);
+    parseDSparkFields(configJson, cfg, cfg.numDecoderLayers);
+    if (cfg.isSpecDecodeBase && cfg.specDecodeType == SpecDecodeMode::kEAGLE
+        && configJson.contains("eagle_hidden_state_layers"))
+    {
+        Json const& layerIds = configJson["eagle_hidden_state_layers"];
+        ELLM_CHECK(layerIds.is_array(), "parseEngineConfig: eagle_hidden_state_layers must be an array when present.");
+        for (auto const& layerId : layerIds)
+        {
+            cfg.specTargetLayerIds.push_back(layerId.get<int32_t>());
+        }
+    }
 
     auto const& bc = configJson["builder_config"];
     cfg.maxSupportedLoraRank = bc.value("max_lora_rank", 0);
@@ -580,8 +694,9 @@ LLMEngineConfig parseEngineConfig(std::filesystem::path const& configPath)
         requirePositive(cfg.maxVerifyTreeSize, "max_verify_tree_size");
         if (cfg.specDecodeType == SpecDecodeMode::kGemma4MTP)
         {
-            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text",
-                "parseEngineConfig: gemma4_mtp base config must set model to gemma4 or gemma4_text.");
+            ELLM_CHECK(cfg.modelType == "gemma4" || cfg.modelType == "gemma4_text" || cfg.modelType == "gemma4_unified"
+                    || cfg.modelType == "gemma4_unified_text",
+                "parseEngineConfig: gemma4_mtp base config must identify a Gemma4 target model.");
             ELLM_CHECK(cfg.baseModelHiddenSize == 0 || cfg.baseModelHiddenSize == cfg.hiddenSize,
                 "parseEngineConfig: gemma4_mtp base_model_hidden_size must match hidden_size.");
         }
@@ -652,7 +767,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     std::string const engineRole = parseEngineRole(configJson);
     ELLM_CHECK(engineRole == "draft", "parseDraftEngineConfig: draft config must set engine_role=draft.");
     ELLM_CHECK(cfg.specDecodeType != SpecDecodeMode::kNONE,
-        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, or "
+        "parseDraftEngineConfig: engine_role=draft requires spec_decode_type to be mtp, eagle3, dflash, dspark, or "
         "gemma4_mtp.");
 
     // Shared core fields (layers, kv heads, head_dim, hidden_size, kv_cache_dtype,
@@ -661,7 +776,11 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     parseGemma4MTPFields(configJson, cfg);
 
     // --- Draft-specific ---
-    cfg.numAttentionLayers = cfg.numDecoderLayers;
+    // A hybrid draft (e.g. Nemotron-H MTP: attention + MoE) has fewer KV-bearing
+    // attention layers than total layers, so honor an explicit
+    // ``num_attention_layers`` (matches parseEngineConfig); default to the
+    // decoder-layer count for single-type drafts that omit it.
+    cfg.numAttentionLayers = configJson.value("num_attention_layers", cfg.numDecoderLayers);
     // Match the engine's `rope_rotary_cos_sin` binding shape. Most partial
     // rotary models expose a smaller binding via `partial_rotary_factor`, while
     // proportional RoPE keeps a headDim-sized binding and treats the non-rotated
@@ -671,6 +790,7 @@ LLMEngineConfig parseDraftEngineConfig(std::filesystem::path const& configPath)
     cfg.reducedVocabSize = configJson.value(binding_names::kReducedVocabSizeKey, 0);
     cfg.outputVocabSize = (cfg.reducedVocabSize > 0) ? cfg.reducedVocabSize : cfg.vocabSize;
     parseDFlashFields(configJson, cfg);
+    parseDSparkFields(configJson, cfg);
 
     // Draft engines do not own speculative base verification bindings.
     cfg.isSpecDecodeBase = false;
@@ -733,7 +853,7 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
        << " numAttentionLayers=" << cfg.numAttentionLayers << " numKVHeads=" << cfg.numKVHeads
        << " headDim=" << cfg.headDim << " rotaryDim=" << cfg.rotaryDim << " maxBatch=" << cfg.maxSupportedBatchSize
        << " maxInputLen=" << cfg.maxSupportedInputLength << " maxKVCapacity=" << cfg.maxKVCacheCapacity
-       << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
+       << " kvPoolPages=" << cfg.kvPoolPages << " pleEnabled=" << cfg.pleEnabled << " numPleInputs=" << cfg.numPleInputs
        << " pleHiddenSize=" << cfg.pleHiddenSize << " isSpecDecodeBase=" << cfg.isSpecDecodeBase
        << " specDecodeType=" << static_cast<int>(cfg.specDecodeType) << " loraRank=" << cfg.maxSupportedLoraRank;
     if (cfg.useDualRope)
@@ -758,10 +878,15 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
     {
         ss << " maxDraftTreeSize=" << cfg.maxDraftTreeSize;
     }
-    if (cfg.specDecodeType == SpecDecodeMode::kDFlash)
+    if (cfg.specDecodeType == SpecDecodeMode::kDFlash || cfg.specDecodeType == SpecDecodeMode::kDSpark)
     {
-        ss << " dflashBlockSize=" << cfg.dflashBlockSize << " dflashMaskTokenId=" << cfg.dflashMaskTokenId
-           << " dflashTargetLayerIds=" << cfg.dflashTargetLayerIds.size();
+        ss << " specDraftBlockSize=" << cfg.specDraftBlockSize << " specDraftMaskTokenId=" << cfg.specDraftMaskTokenId
+           << " specTargetLayerIds=" << cfg.specTargetLayerIds.size();
+    }
+    if (cfg.specDecodeType == SpecDecodeMode::kDSpark)
+    {
+        ss << " dsparkMarkovHeadType=" << cfg.dsparkMarkovHeadType << " dsparkMarkovRank=" << cfg.dsparkMarkovRank
+           << " dsparkConfidence=" << cfg.dsparkEnableConfidenceHead;
     }
     if (!cfg.eosTokenIds.empty())
     {
@@ -769,7 +894,9 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
         for (size_t i = 0; i < cfg.eosTokenIds.size(); ++i)
         {
             if (i > 0)
+            {
                 ss << ",";
+            }
             ss << cfg.eosTokenIds[i];
         }
         ss << "]";
@@ -779,6 +906,15 @@ std::string formatEngineConfig(LLMEngineConfig const& cfg)
         ss << " modelType=" << cfg.modelType << " sharesTargetKV=" << cfg.sharesTargetKV
            << " hasOwnKVCache=" << cfg.hasOwnKVCache << " assistantHiddenSize=" << cfg.assistantHiddenSize
            << " kvSharingMap=" << cfg.gemma4MTPKVSharingMap.size();
+    }
+    if (cfg.isDiffusionBackbone)
+    {
+        ss << " diffusionCanvasLength=" << cfg.diffusionCanvasLength
+           << " diffusionMaxDenoisingSteps=" << cfg.diffusionMaxDenoisingSteps << " diffusionTMin=" << cfg.diffusionTMin
+           << " diffusionTMax=" << cfg.diffusionTMax << " diffusionEntropyBound=" << cfg.diffusionEntropyBound
+           << " diffusionEntropyThreshold=" << cfg.diffusionEntropyThreshold << " rmsNormEps=" << cfg.rmsNormEps
+           << " diffusionStabilityWindow=" << cfg.diffusionStabilityWindow
+           << " diffusionUnifiedConditioning=" << cfg.diffusionUnifiedConditioning;
     }
     ss << " }";
     return ss.str();
@@ -804,19 +940,26 @@ InferenceDims LLMEngineConfig::prefillDims(int64_t batch, int64_t seqLen, bool k
     // larger attention shape would be interpreted as a proposal-attention mask
     // and read uninitialized buffer bits, producing garbage outputs.
     //
-    // startIndexLen=0 is the plugin-path sentinel for "initial prefill of an
-    // empty KV cache"; chunked prefill uses [batch].
-    int64_t const startIndexLen = kvCacheAllEmpty ? 0 : batch;
+    // startIndexLen=0 is the autoregressive plugin-path sentinel for "initial
+    // prefill of an empty KV cache"; chunked prefill uses [batch].
+    // DiffusionGemma keeps kvcache_start_index materialized and uses
+    // context_mask_selector's shape sentinel to switch attention mask modes.
+    int64_t const startIndexLen = (kvCacheAllEmpty && !isDiffusionBackbone) ? 0 : batch;
+    // Keep KV cache binding shape at physical capacity for CUDA graph stability.
+    // Logical work length is carried by context_lengths + kvcache_start_index.
+    int64_t const kvLen = maxKVCacheCapacity;
     return InferenceDims{
         /*.batch=*/batch,
         /*.seqLen=*/seqLen,
-        /*.kvLen=*/maxKVCacheCapacity,
+        /*.kvLen=*/kvLen,
         /*.selectLen=*/1,
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/startIndexLen,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -830,8 +973,44 @@ InferenceDims LLMEngineConfig::decodeDims(int64_t batch) const
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
+    };
+}
+
+InferenceDims LLMEngineConfig::denoiseDims(int64_t batch, int64_t canvasLen) const
+{
+    return InferenceDims{
+        /*.batch=*/batch,
+        /*.seqLen=*/canvasLen,
+        /*.kvLen=*/maxKVCacheCapacity,
+        /*.selectLen=*/canvasLen,
+        /*.attnMaskSeqLen=*/1,
+        /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
+        /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/batch,
+        /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
+    };
+}
+
+InferenceDims LLMEngineConfig::diffusionCommitDims(int64_t batch, int64_t commitLen) const
+{
+    return InferenceDims{
+        /*.batch=*/batch,
+        /*.seqLen=*/commitLen,
+        /*.kvLen=*/maxKVCacheCapacity,
+        /*.selectLen=*/commitLen,
+        /*.attnMaskSeqLen=*/1,
+        /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
+        /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
+        /*.startIndexLen=*/batch,
+        /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -848,8 +1027,10 @@ InferenceDims LLMEngineConfig::specVerifyDims(int64_t batch, int64_t verifySize)
         /*.attnMaskSeqLen=*/verifySize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(verifySize, 32)),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/1,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -868,8 +1049,10 @@ InferenceDims LLMEngineConfig::proposalDims(int64_t batch, int64_t proposalSize,
         /*.attnMaskSeqLen=*/proposalSize,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(proposalSize, 32)),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
@@ -887,13 +1070,104 @@ InferenceDims LLMEngineConfig::acceptDims(int64_t batch, int64_t acceptLen) cons
         /*.attnMaskSeqLen=*/acceptLen,
         /*.ropeBatch=*/(ropeConfig.type == RopeType::kMRope) ? batch : 1,
         /*.packedMaskLen=*/static_cast<int64_t>(divUp(acceptLen, 32)),
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/batch,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 
+void validatePagedKVBindings(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
+{
+    if (config.numAttentionLayers == 0)
+    {
+        return;
+    }
+
+    ELLM_CHECK(static_cast<int32_t>(config.kvLayerConfigs.size()) == config.numAttentionLayers,
+        std::string("KV layer metadata mismatch (") + engineLabel + "): expected "
+            + std::to_string(config.numAttentionLayers) + " entries, got "
+            + std::to_string(config.kvLayerConfigs.size()) + ".");
+    int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(numProfiles > 0, std::string("Engine has no optimization profiles (") + engineLabel + ").");
+
+    for (int32_t layerIdx = 0; layerIdx < config.numAttentionLayers; ++layerIdx)
+    {
+        std::string const bindingName = binding_names::formatKVCacheName(layerIdx, /*isPast=*/true);
+        ELLM_CHECK(executor.hasIOTensor(bindingName.c_str()),
+            std::string("Missing KV cache binding (") + engineLabel + "): expected '" + bindingName + "'.");
+        nvinfer1::DataType const engineDtype = executor.getBindingDataType(bindingName.c_str());
+        ELLM_CHECK(engineDtype == config.kvCacheDtype,
+            std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
+                + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                + " for binding '" + bindingName + "'.");
+
+        KVLayerConfig const& layer = config.kvLayerConfigs[layerIdx];
+        for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+        {
+            for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
+                     nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
+            {
+                nvinfer1::Dims const shape = executor.getProfileShape(bindingName.c_str(), profileIdx, selector);
+                ELLM_CHECK(shape.nbDims == 5 && shape.d[0] == 2 && shape.d[1] == config.kvPoolPages
+                        && shape.d[2] == kTOKENS_PER_PAGE && shape.d[3] == layer.numKVHeads
+                        && shape.d[4] == layer.headDim,
+                    std::string("Paged KV profile mismatch (") + engineLabel + ") for binding '" + bindingName
+                        + "': expected [2," + std::to_string(config.kvPoolPages) + ","
+                        + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(layer.numKVHeads) + ","
+                        + std::to_string(layer.headDim) + "] for every profile selector.");
+            }
+        }
+    }
+}
+
+namespace
+{
+
+//! Validate the current mutable page-table engine ABI.
+void validatePageTableBinding(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
+{
+    if (config.numAttentionLayers == 0)
+    {
+        return;
+    }
+
+    char const* const bindingName = binding_names::kKVPageTable;
+    ELLM_CHECK(executor.hasIOTensor(bindingName),
+        std::string("Missing page-table binding (") + engineLabel + "): expected '" + bindingName
+            + "' from the current engine toolchain.");
+    ELLM_CHECK(executor.getEngine().getTensorIOMode(bindingName) == nvinfer1::TensorIOMode::kINPUT,
+        std::string("Page-table binding (") + engineLabel + ") must be an input.");
+    ELLM_CHECK(executor.getBindingDataType(bindingName) == nvinfer1::DataType::kINT32,
+        std::string("Page-table binding (") + engineLabel + ") must have INT32 dtype.");
+
+    int32_t const numProfiles = executor.getEngine().getNbOptimizationProfiles();
+    ELLM_CHECK(numProfiles > 0, std::string("Engine has no optimization profiles (") + engineLabel + ").");
+    int32_t const maxPagesPerSequence = computeMaxPagesPerSeq(config.maxKVCacheCapacity);
+    for (int32_t profileIdx = 0; profileIdx < numProfiles; ++profileIdx)
+    {
+        for (nvinfer1::OptProfileSelector const selector : {nvinfer1::OptProfileSelector::kMIN,
+                 nvinfer1::OptProfileSelector::kOPT, nvinfer1::OptProfileSelector::kMAX})
+        {
+            int32_t const expectedBatch
+                = selector == nvinfer1::OptProfileSelector::kMIN ? 1 : config.maxSupportedBatchSize;
+            nvinfer1::Dims const shape = executor.getProfileShape(bindingName, profileIdx, selector);
+            ELLM_CHECK(shape.nbDims == 3 && shape.d[0] == expectedBatch && shape.d[1] == 2
+                    && shape.d[2] == maxPagesPerSequence,
+                std::string("Page-table profile mismatch (") + engineLabel + ") for binding '" + bindingName
+                    + "': expected [" + std::to_string(expectedBatch) + ",2," + std::to_string(maxPagesPerSequence)
+                    + "]. Re-export and rebuild the engine.");
+        }
+    }
+}
+
+} // namespace
+
 void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& executor, char const* engineLabel)
 {
+    validatePagedKVBindings(config, executor, engineLabel);
+    validatePageTableBinding(config, executor, engineLabel);
+
     if (isDFlashDraftConfig(config))
     {
         // DFlash cached draft engines require KV cache bindings (cached-KV path).
@@ -1009,12 +1283,62 @@ void validateAgainstEngine(LLMEngineConfig const& config, EngineExecutor const& 
                     auto const shape = executor.getProfileShape(kvPastName.c_str(), profileIdx, selector);
                     ELLM_CHECK(shape.nbDims == 5,
                         std::string("Gemma4 MTP shared KV binding '") + kvPastName + "' must be rank-5.");
-                    ELLM_CHECK(shape.d[1] == 2 && shape.d[2] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
+                    // Paged pool binding [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim];
+                    // numPages (dim 1) is engine-specific.
+                    ELLM_CHECK(shape.d[0] == 2 && shape.d[1] == config.kvPoolPages && shape.d[2] == kTOKENS_PER_PAGE
+                            && shape.d[3] == kvConfig.numKVHeads && shape.d[4] == kvConfig.headDim,
                         std::string("Gemma4 MTP shared KV profile shape mismatch for binding '") + kvPastName
-                            + "': expected static dims [*,2," + std::to_string(kvConfig.numKVHeads) + ",*,"
+                            + "': expected static dims [2," + std::to_string(config.kvPoolPages) + ","
+                            + std::to_string(kTOKENS_PER_PAGE) + "," + std::to_string(kvConfig.numKVHeads) + ","
                             + std::to_string(kvConfig.headDim) + "].");
                 }
             }
+        }
+
+        return;
+    }
+
+    if (isDSparkDraftConfig(config))
+    {
+        // DSpark cached draft engines reuse the DFlash cached-draft target-hidden
+        // and delta-length binding names, plus a DSpark-specific hidden-state output.
+        LOG_INFO("DSpark draft engine (%s): validating cached-path bindings.", engineLabel);
+
+        static char const* const kRequiredBindings[] = {
+            binding_names::kInputsEmbeds,
+            binding_names::kDFlashTargetHiddenConcat,
+            binding_names::kLogits,
+            binding_names::kDSparkHiddenStates,
+            binding_names::kContextLengths,
+            binding_names::kKVCacheStartIndex,
+            binding_names::kDFlashDeltaLengths,
+            binding_names::kRopeCosSin,
+            binding_names::kAttentionMask,
+            binding_names::kAttentionPosId,
+        };
+        for (auto const* name : kRequiredBindings)
+        {
+            ELLM_CHECK(executor.hasIOTensor(name),
+                std::string("DSpark cached draft engine (") + engineLabel + ") is missing required binding '" + name
+                    + "'. Re-export and rebuild the DSpark draft engine.");
+        }
+
+        if (config.numAttentionLayers > 0)
+        {
+            std::string const kvPastName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+            std::string const kvPresentName = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/false);
+            ELLM_CHECK(executor.hasIOTensor(kvPastName.c_str()),
+                std::string("DSpark cached draft engine (") + engineLabel + ") missing KV cache binding '" + kvPastName
+                    + "'. Re-export and rebuild.");
+            ELLM_CHECK(executor.hasIOTensor(kvPresentName.c_str()),
+                std::string("DSpark cached draft engine (") + engineLabel + ") missing KV cache binding '"
+                    + kvPresentName + "'.");
+
+            auto const engineDtype = executor.getBindingDataType(kvPastName.c_str());
+            ELLM_CHECK(engineDtype == config.kvCacheDtype,
+                std::string("KV cache dtype mismatch (") + engineLabel + "): config says "
+                    + getDataTypeString(config.kvCacheDtype) + ", engine reports " + getDataTypeString(engineDtype)
+                    + " for binding '" + kvPastName + "'.");
         }
 
         return;
@@ -1086,8 +1410,10 @@ InferenceDims LLMEngineConfig::resetDims() const
         /*.attnMaskSeqLen=*/1,
         /*.ropeBatch=*/1,
         /*.packedMaskLen=*/1,
+        /*.contextMaskSelectorLen=*/0,
         /*.startIndexLen=*/1,
         /*.specVerifyPhaseLen=*/0,
+        /*.skipSoftmaxScaleLen=*/skipSoftmaxScaleOverride,
     };
 }
 

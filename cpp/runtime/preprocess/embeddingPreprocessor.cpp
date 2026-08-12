@@ -38,48 +38,31 @@ EmbeddingPreprocessor::EmbeddingPreprocessor(EmbeddingData const& embedding, LLM
 void EmbeddingPreprocessor::embed(Tensor const& tokenIds, OptionalInputTensor visionEmbeds,
     OptionalInputTensor audioEmbeds, PipelineIO& io, cudaStream_t stream)
 {
-    // Use the explicit-token-id multimodal path when audio is present, or for
-    // image-only inference on audio-capable model families (Nemotron-Omni /
-    // Qwen3-Omni) — these keep <image> in-stream and identify themselves via
-    // audioTokenId >= 0. Legacy vision-only families (Qwen2.5-VL, InternVL)
-    // leave audioTokenId unset (-1) and fall through to the remap path below.
-    bool const useExplicitId = audioEmbeds.has_value() || (visionEmbeds.has_value() && mConfig.audioTokenId >= 0);
-    if (useExplicitId)
+    // Prefill embeds every modality through the single embeddingLookup kernel:
+    // image/audio embeddings are inserted at the imageTokenId / audioTokenId
+    // positions using multimodalIndices, and text tokens use the embedding table.
+    if (visionEmbeds.has_value() || audioEmbeds.has_value())
     {
-        auto const inputShape = tokenIds.getShape();
-        size_t const inputSizeBytes = inputShape.volume() * sizeof(int32_t);
-        Tensor inputIdsCPU(inputShape, DeviceType::kCPU, tokenIds.getDataType());
-        CUDA_CHECK(cudaMemcpyAsync(
-            inputIdsCPU.rawPointer(), tokenIds.rawPointer(), inputSizeBytes, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         std::optional<int32_t> audioTokenOpt
             = (mConfig.audioTokenId >= 0) ? std::optional{mConfig.audioTokenId} : std::nullopt;
         std::optional<int32_t> imageTokenOpt
             = (mConfig.imageTokenId >= 0) ? std::optional{mConfig.imageTokenId} : std::nullopt;
-        Tensor multimodalIndicesCPU
-            = generateMultimodalIndices(inputIdsCPU, audioTokenOpt, imageTokenOpt, mConfig.vocabSize);
 
-        auto const indicesShape = multimodalIndicesCPU.getShape();
-        size_t const indicesSizeBytes = indicesShape.volume() * sizeof(int32_t);
-        mMultimodalIndices = Tensor(indicesShape, DeviceType::kGPU, multimodalIndicesCPU.getDataType());
-        CUDA_CHECK(cudaMemcpy(mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesSizeBytes,
-            cudaMemcpyHostToDevice));
+        // Generate the multimodal indices on-device, directly from the GPU token IDs, entirely on
+        // `stream`. No device-to-host or host-to-device copy is involved: the kernel is ordered after
+        // the caller's async token upload (same stream), so it always sees the current tokens, and the
+        // result stays on-device for embeddingLookup. Cached in `mMultimodalIndices` and reused by a
+        // following assembleDeepstack() for these same tokens (no recomputation).
+        mMultimodalIndices = Tensor(tokenIds.getShape(), DeviceType::kGPU, tokenIds.getDataType());
+        kernel::generateMultimodalIndices(tokenIds, mMultimodalIndices, imageTokenOpt, audioTokenOpt, stream);
 
-        kernel::embeddingLookupMultimodal(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(),
-            std::optional{std::ref(mMultimodalIndices)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds,
-            io.inputsEmbeds, stream);
-    }
-    else if (visionEmbeds.has_value())
-    {
-        // Legacy vision path (Qwen2.5-VL, InternVL: imageTokenId >= vocabSize or not set)
-        Tensor const& imageEmbedsTensor = visionEmbeds.value().get();
-        kernel::embeddingLookupWithImageInsertion(
-            tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), imageEmbedsTensor, io.inputsEmbeds, stream);
+        kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream,
+            std::optional{std::ref(mMultimodalIndices)}, imageTokenOpt, visionEmbeds, audioTokenOpt, audioEmbeds);
     }
     else
     {
-        // Standard embedding lookup (pure text)
+        // Text-only request: the same kernel with no image/audio inputs.
         kernel::embeddingLookup(tokenIds, mEmbedding.table, mEmbedding.scalesAsOptional(), io.inputsEmbeds, stream);
     }
 }
@@ -98,12 +81,13 @@ OptionalInputTensors EmbeddingPreprocessor::assembleDeepstack(
     int64_t const activeBatchSize = inputShape[0];
     int64_t const seqLen = inputShape[1];
 
-    // Prepare multimodal indices for deepstack assembly (needed when imageTokenId < vocabSize)
-    OptionalInputTensor deepstackMultimodalIndices{std::nullopt};
-    if (mMultimodalIndices.getShape().volume() > 0)
-    {
-        deepstackMultimodalIndices = std::ref(mMultimodalIndices);
-    }
+    // Reuse the multimodal indices already computed by embed() for these exact tokens. Deepstack is
+    // only ever assembled in the base prefill immediately after embed() ran on the same tokenIds, so
+    // there is nothing to recompute and no device round-trip. Each image position maps to its own
+    // deepstack feature row via these indices.
+    check::check(mMultimodalIndices.getShape().volume() == inputShape.volume(),
+        "assembleDeepstack requires embed() to have computed multimodal indices for the same tokens first");
+    OptionalInputTensor deepstackMultimodalIndices{std::ref(mMultimodalIndices)};
 
     for (int32_t idx = 0; idx < static_cast<int32_t>(features.size()); ++idx)
     {
@@ -112,8 +96,8 @@ OptionalInputTensors EmbeddingPreprocessor::assembleDeepstack(
         // Reshape the output slot to match the current batch/sequence dimensions
         check::check(
             io.deepstackEmbeds[idx].reshape({activeBatchSize, seqLen, mConfig.hiddenSize}), "Tensor reshape failed");
-        kernel::assembleDeepstackEmbedding(tokenIds, featureTensor, mConfig.vocabSize, io.deepstackEmbeds[idx], stream,
-            mConfig.imageTokenId, deepstackMultimodalIndices);
+        kernel::assembleDeepstackEmbedding(
+            tokenIds, featureTensor, io.deepstackEmbeds[idx], stream, mConfig.imageTokenId, deepstackMultimodalIndices);
 
         deepstackEmbeds.push_back(std::ref(io.deepstackEmbeds[idx]));
     }

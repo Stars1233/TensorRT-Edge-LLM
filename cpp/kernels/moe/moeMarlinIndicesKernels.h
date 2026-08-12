@@ -34,10 +34,38 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
     int32_t moeBlockSize, cudaStream_t stream);
 
 /**
+ * @brief Build the trivial Marlin routing arrays for a dense (single-expert, topK=1) GEMM.
+ *
+ * The dense case degenerates the MoE routing: every one of the @p numTokens rows maps to expert 0 in order, so
+ * sortedTokenIds is the identity 0..numTokens-1 with padded tail slots set to the out-of-range sentinel numTokens
+ * (== numTokens*topK, matching marlin_template.h's `idx < prob_m*top_k` masking), expertIds is all zeros, and
+ * numTokensPostPadded is the block-aligned row count. topkWeights is filled with 1.0f purely to keep the shared
+ * Marlin call signature valid; it is unused because the dense wrapper passes mulTopkWeights=false.
+ *
+ * @param sortedTokenIds      [paddedRows] (INT32) output slot ids
+ * @param expertIds           [paddedRows/moeBlockSize] (INT32) output, all zeros
+ * @param numTokensPostPadded [1] (INT32) output, set to paddedRows
+ * @param topkWeights         [paddedRows] (FP32) output, all 1.0f (unused by dense path)
+ * @param numTokens           Number of real rows M
+ * @param paddedRows          Block-aligned row count ceilDiv(M, moeBlockSize)*moeBlockSize
+ * @param moeBlockSize        Marlin block size (8 for decode, 32 for prefill)
+ */
+void launchBuildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize, cudaStream_t stream);
+
+/**
  * @brief Launch kernel to aggregate slot outputs back to tokens (sum over topK in slot order).
  */
 void launchAggregateSlotOutputsKernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens, int32_t topK,
     int32_t outDim, cudaStream_t stream);
+
+/**
+ * @brief Launch the BF16 slot-output aggregation kernel.
+ *
+ * Each output element is accumulated over topK slots in FP32 and converted to BF16 once at the final store.
+ */
+void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens,
+    int32_t topK, int32_t outDim, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

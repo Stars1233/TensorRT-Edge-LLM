@@ -1,0 +1,7 @@
+# Context = kernelSrcs/ for Dockerfile.cutedsl. Exclude local build products
+# so the image and build context stay small and deterministic.
+cuteDSLPrebuilt/
+__pycache__/
+*.pyc
+Dockerfile.cutedsl
+.dockerignore

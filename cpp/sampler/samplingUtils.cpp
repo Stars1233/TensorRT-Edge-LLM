@@ -24,6 +24,12 @@ namespace trt_edgellm
 
 bool shouldUseNonGreedySampling(float temperature, int64_t topK, float topP) noexcept
 {
+    // SamplingParams normalizes near-zero temperatures to greedy top-1 sampling.
+    if (temperature >= 0.0F && temperature < 1e-3F)
+    {
+        return false;
+    }
+
     // topK == 1 forces greedy regardless of other params (only one candidate token)
     if (topK == 1)
     {

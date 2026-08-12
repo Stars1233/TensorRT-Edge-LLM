@@ -400,7 +400,7 @@ void Gemma4AudioRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     tokenizer::Tokenizer const* tokenizer)
 {
     bool const alreadyTokenized = batchInputIds.size() == request.requests.size();
-    int audioIndex = 0;
+    int64_t audioIndex = 0;
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -412,13 +412,18 @@ void Gemma4AudioRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         check::check(!ids.empty(), "Failed to encode text");
 
         bool const wrapAudio = mConfig.beginAudioTokenId >= 0 && mConfig.endAudioTokenId >= 0;
+        // Per-request media window (one entry per clip): a placeholder may only consume this request's own clips (batch
+        // isolation).
+        int64_t const mediaEnd = audioIndex + static_cast<int64_t>(request.requests[i].audioBuffers.size());
+
         std::vector<int32_t> newIds;
         size_t expandedSize = 0;
-        size_t tmpAudioIdx = audioIndex;
+        int64_t tmpAudioIdx = audioIndex;
         for (auto const& id : ids)
         {
-            expandedSize
-                += (id == mConfig.audioTokenId) ? audioTokenLengths.at(tmpAudioIdx++) + (wrapAudio ? 2 : 0) : 1;
+            expandedSize += (id == mConfig.audioTokenId && tmpAudioIdx < mediaEnd)
+                ? audioTokenLengths.at(tmpAudioIdx++) + (wrapAudio ? 2 : 0)
+                : 1;
         }
         newIds.reserve(expandedSize);
         for (size_t tokenIndex = 0; tokenIndex < ids.size(); ++tokenIndex)
@@ -426,6 +431,9 @@ void Gemma4AudioRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             int32_t const id = ids[tokenIndex];
             if (id == mConfig.audioTokenId)
             {
+                ELLM_CHECK(audioIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Gemma4AudioRunner::textPreprocess() placeholder count exceeds this "
+                    "request's clip count");
                 bool const alreadyHasBegin
                     = wrapAudio && tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginAudioTokenId;
                 bool const alreadyHasEnd
@@ -458,6 +466,9 @@ void Gemma4AudioRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         {
             batchInputIds.emplace_back(std::move(newIds));
         }
+        ELLM_CHECK(audioIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Gemma4AudioRunner::textPreprocess() placeholder count is smaller than this "
+            "request's clip count");
     }
 }
 
@@ -478,7 +489,18 @@ bool Gemma4AudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Gemma4AudioRunner::preprocess failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Gemma4AudioRunner::preprocess failed: %s", e.what());
+        }
+        // Drain in-flight encoder work still reading the request's PCM, so the caller can safely
+        // release it -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

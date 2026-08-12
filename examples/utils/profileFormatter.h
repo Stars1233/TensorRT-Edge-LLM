@@ -24,6 +24,14 @@
 #include <string>
 #include <vector>
 
+namespace trt_edgellm
+{
+namespace rt
+{
+struct ContextCacheMetrics;
+} // namespace rt
+} // namespace trt_edgellm
+
 //! Statistical analysis results for performance data.
 struct StatisticalAnalysis
 {
@@ -41,6 +49,9 @@ struct StatisticalAnalysis
 
 //! Output prefill stage summary to ostream
 void outputPrefillProfile(std::ostream& output, trt_edgellm::metrics::LLMPrefillMetrics const& prefillMetrics);
+
+//! Output context-cache summary to ostream.
+void outputContextCacheProfile(std::ostream& output, trt_edgellm::rt::ContextCacheMetrics const& cacheMetrics);
 
 //! Output generation stage summary (naive decoding) to ostream
 void outputGenerationProfile(std::ostream& output, trt_edgellm::metrics::LLMGenerationMetrics const& generationMetrics);
@@ -64,6 +75,9 @@ void outputLayerProfiles(std::ostream& output, bool detailed = false);
 
 //! Add JSON for prefill stage to existing json object
 void addJsonPrefillSummary(nlohmann::json& summary, trt_edgellm::metrics::LLMPrefillMetrics const& prefillMetrics);
+
+//! Add context-cache metrics under the stable context_cache object.
+void addJsonContextCacheSummary(nlohmann::json& summary, trt_edgellm::rt::ContextCacheMetrics const& cacheMetrics);
 
 //! Add JSON for generation stage (naive decoding) to existing json object
 void addJsonGenerationSummary(

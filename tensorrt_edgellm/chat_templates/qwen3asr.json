@@ -16,7 +16,7 @@
     },
     "content_types": {
       "audio": {
-        "format": "<|audio_pad|>"
+        "format": "<|audio_start|><|audio_pad|><|audio_end|>"
       },
       "image": {
         "format": "<|image_pad|>"

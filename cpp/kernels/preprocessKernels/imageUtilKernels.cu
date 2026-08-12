@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <string>
 
 using namespace nvinfer1;
 
@@ -722,6 +723,361 @@ void initFastPosEmbedQwenViT(rt::Tensor& fastPosEmbedIdx, rt::Tensor& fastPosEmb
             fastPosEmbedWeight.dataPointer<half>(), llmGridH, llmGridW, mergeSize, numGridPerSide, lineSpaceH,
             lineSpaceW, startIdx + t * H * W, totalSeqLength);
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU bicubic (Catmull-Rom) image resize, anti-aliased for downscaling. For
+// downscaling the filter is widened by the scale factor (fscale) so it
+// low-passes instead of applying a fixed 4-tap cubic.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float catmullRomWeight(float x)
+{
+    x = fabsf(x);
+    if (x < 1.0f)
+        return 1.5f * x * x * x - 2.5f * x * x + 1.0f;
+    if (x < 2.0f)
+        return -0.5f * x * x * x + 2.5f * x * x - 4.0f * x + 2.0f;
+    return 0.0f;
+}
+
+__global__ void resizeCatmullRomHorizKernel(
+    unsigned char const* in, float* out, int const Hin, int const Win, int const Wout, int const C)
+{
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const total = static_cast<int64_t>(Hin) * Wout * C;
+    if (tid >= total)
+        return;
+    int const c = static_cast<int>(tid % C);
+    int const xo = static_cast<int>((tid / C) % Wout);
+    int const h = static_cast<int>(tid / (static_cast<int64_t>(Wout) * C));
+
+    float const scale = static_cast<float>(Win) / static_cast<float>(Wout);
+    float const fscale = scale > 1.0f ? scale : 1.0f;
+    float const center = (xo + 0.5f) * scale;
+    int const xs = static_cast<int>(ceilf(center - 2.0f * fscale - 0.5f));
+    int const xe = static_cast<int>(floorf(center + 2.0f * fscale - 0.5f));
+
+    float acc = 0.0f;
+    float wsum = 0.0f;
+    int64_t const rowOff = static_cast<int64_t>(h) * Win * C;
+    for (int xin = xs; xin <= xe; ++xin)
+    {
+        float const w = catmullRomWeight((xin + 0.5f - center) / fscale);
+        int const xc = xin < 0 ? 0 : (xin >= Win ? Win - 1 : xin);
+        acc += w * static_cast<float>(in[rowOff + static_cast<int64_t>(xc) * C + c]);
+        wsum += w;
+    }
+    out[tid] = wsum > 0.0f ? acc / wsum : 0.0f;
+}
+
+__global__ void resizeCatmullRomVertKernel(
+    float const* in, unsigned char* out, int const Hin, int const Hout, int const Wout, int const C)
+{
+    int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t const total = static_cast<int64_t>(Hout) * Wout * C;
+    if (tid >= total)
+        return;
+    int const c = static_cast<int>(tid % C);
+    int const x = static_cast<int>((tid / C) % Wout);
+    int const yo = static_cast<int>(tid / (static_cast<int64_t>(Wout) * C));
+
+    float const scale = static_cast<float>(Hin) / static_cast<float>(Hout);
+    float const fscale = scale > 1.0f ? scale : 1.0f;
+    float const center = (yo + 0.5f) * scale;
+    int const ys = static_cast<int>(ceilf(center - 2.0f * fscale - 0.5f));
+    int const ye = static_cast<int>(floorf(center + 2.0f * fscale - 0.5f));
+
+    float acc = 0.0f;
+    float wsum = 0.0f;
+    int64_t const colOff = static_cast<int64_t>(x) * C + c;
+    int64_t const stride = static_cast<int64_t>(Wout) * C;
+    for (int yin = ys; yin <= ye; ++yin)
+    {
+        float const w = catmullRomWeight((yin + 0.5f - center) / fscale);
+        int const yc = yin < 0 ? 0 : (yin >= Hin ? Hin - 1 : yin);
+        acc += w * in[static_cast<int64_t>(yc) * stride + colOff];
+        wsum += w;
+    }
+    float v = wsum > 0.0f ? acc / wsum : 0.0f;
+    v = v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v);
+    out[tid] = static_cast<unsigned char>(v + 0.5f);
+}
+
+void resizeImage(rt::Tensor const& rawImage, rt::Tensor& tmp, rt::Tensor& resizedImage, int64_t const outHeight,
+    int64_t const outWidth, InterpolationMode const mode, cudaStream_t stream)
+{
+    ELLM_CHECK(mode == InterpolationMode::kBICUBIC,
+        "GPU resizeImage supports only InterpolationMode::kBICUBIC (Catmull-Rom) for now.");
+    ELLM_CHECK(rawImage.getDeviceType() == rt::DeviceType::kGPU && tmp.getDeviceType() == rt::DeviceType::kGPU
+            && resizedImage.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for resize tensors.");
+    ELLM_CHECK(rawImage.getDataType() == DataType::kUINT8 && tmp.getDataType() == DataType::kFLOAT
+            && resizedImage.getDataType() == DataType::kUINT8,
+        "Data type check failed for resize tensors (raw u8, tmp f32, out u8).");
+    ELLM_CHECK(rawImage.getShape().getNumDims() == 3 && resizedImage.getShape().getNumDims() == 3,
+        "rawImage and resizedImage shall be [H, W, C].");
+
+    int const Hin = static_cast<int>(rawImage.getShape()[0]);
+    int const Win = static_cast<int>(rawImage.getShape()[1]);
+    int const C = static_cast<int>(rawImage.getShape()[2]);
+    int const Hout = static_cast<int>(outHeight);
+    int const Wout = static_cast<int>(outWidth);
+
+    ELLM_CHECK(tmp.getShape().volume() >= static_cast<int64_t>(Hin) * Wout * C,
+        "tmp scratch smaller than Hin * outWidth * C for resize tensors.");
+    ELLM_CHECK(resizedImage.getShape().volume() >= static_cast<int64_t>(Hout) * Wout * C,
+        "resizedImage smaller than outHeight * outWidth * C for resize tensors.");
+
+    uint32_t const blockSize = 256;
+    int64_t const totalH = static_cast<int64_t>(Hin) * Wout * C;
+    resizeCatmullRomHorizKernel<<<static_cast<uint32_t>((totalH + blockSize - 1) / blockSize), blockSize, 0, stream>>>(
+        rawImage.dataPointer<unsigned char>(), tmp.dataPointer<float>(), Hin, Win, Wout, C);
+    int64_t const totalV = static_cast<int64_t>(Hout) * Wout * C;
+    resizeCatmullRomVertKernel<<<static_cast<uint32_t>((totalV + blockSize - 1) / blockSize), blockSize, 0, stream>>>(
+        tmp.dataPointer<float>(), resizedImage.dataPointer<unsigned char>(), Hin, Hout, Wout, C);
+}
+
+void copyImageToDeviceAndResize(unsigned char const* rawHostImage, int64_t const numFrames, int64_t const rawHeight,
+    int64_t const rawWidth, int64_t const channels, rt::Tensor& rawScratch, rt::Tensor& tmp, rt::Tensor& dstImage,
+    int64_t const outHeight, int64_t const outWidth, cudaStream_t stream)
+{
+    ELLM_CHECK(rawHostImage != nullptr, "copyImageToDeviceAndResize: raw host image pointer is null.");
+    ELLM_CHECK(rawHeight > 0 && rawWidth > 0 && outHeight > 0 && outWidth > 0,
+        "copyImageToDeviceAndResize: raw and output dimensions shall be positive.");
+    ELLM_CHECK(dstImage.getDeviceType() == rt::DeviceType::kGPU,
+        "copyImageToDeviceAndResize: destination image shall be on the GPU.");
+    ELLM_CHECK(
+        dstImage.getDataType() == DataType::kUINT8, "copyImageToDeviceAndResize: destination image shall be UINT8.");
+    ELLM_CHECK(dstImage.reshape({numFrames, outHeight, outWidth, channels}),
+        "copyImageToDeviceAndResize destination too small for " + std::to_string(numFrames) + " frames of "
+            + std::to_string(outHeight) + "x" + std::to_string(outWidth) + "x" + std::to_string(channels) + ".");
+
+    int64_t const rawFrameBytes = rawHeight * rawWidth * channels;
+    int64_t const outFrameBytes = outHeight * outWidth * channels;
+    bool const identity = (rawHeight == outHeight && rawWidth == outWidth);
+
+    if (!identity)
+    {
+        // Each raw side carries its own cap (the engine budget bounds only the resized size); this also
+        // bounds the horizontal-pass scratch [rawHeight, outWidth, channels].
+        ELLM_CHECK(rawHeight <= kGpuResizeMaxRawDim && rawWidth <= kGpuResizeMaxRawDim,
+            "Raw image " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth)
+                + " exceeds the GPU-resize budget of " + std::to_string(kGpuResizeMaxRawDim) + "x"
+                + std::to_string(kGpuResizeMaxRawDim) + " pixels; downscale the input image.");
+        ELLM_CHECK(rawScratch.reshape({rawHeight, rawWidth, channels}),
+            "GPU-resize raw scratch too small for a " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth) + "x"
+                + std::to_string(channels) + " raw image.");
+        ELLM_CHECK(tmp.reshape({rawHeight, outWidth, channels}),
+            "GPU-resize horizontal-pass scratch for raw " + std::to_string(rawHeight) + "x" + std::to_string(rawWidth)
+                + " resized to " + std::to_string(outHeight) + "x" + std::to_string(outWidth) + " exceeds its budget.");
+    }
+
+    auto* const dstBase = static_cast<unsigned char*>(dstImage.rawPointer());
+    for (int64_t t = 0; t < numFrames; ++t)
+    {
+        unsigned char const* srcFrame = rawHostImage + t * rawFrameBytes;
+        unsigned char* dstFrame = dstBase + t * outFrameBytes;
+        if (identity)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(dstFrame, srcFrame, rawFrameBytes, cudaMemcpyHostToDevice, stream));
+            continue;
+        }
+        // rawScratch and tmp are reused per frame on the same stream, so the upload-then-resize chain
+        // serializes safely; the 3-D view aliases this frame's slot of the 4-D dst.
+        CUDA_CHECK(cudaMemcpyAsync(rawScratch.rawPointer(), srcFrame, rawFrameBytes, cudaMemcpyHostToDevice, stream));
+        rt::Tensor dstView(dstFrame, {outHeight, outWidth, channels}, rt::DeviceType::kGPU, DataType::kUINT8,
+            "kernel::copyImageToDeviceAndResize.dstView");
+        resizeImage(rawScratch, tmp, dstView, outHeight, outWidth, InterpolationMode::kBICUBIC, stream);
+    }
+}
+
+void allocateResizeScratch(int64_t const channels, int64_t const tmpElems, rt::Tensor& rawScratch, rt::Tensor& tmp)
+{
+    int64_t const rawElems = kGpuResizeMaxRawDim * kGpuResizeMaxRawDim * channels;
+    rawScratch = rt::Tensor({rawElems}, rt::DeviceType::kGPU, DataType::kUINT8, "kernel::resizeScratch.rawImage");
+    tmp = rt::Tensor({tmpElems}, rt::DeviceType::kGPU, DataType::kFLOAT, "kernel::resizeScratch.tmp");
+}
+
+__global__ void transposeToPatchNemotronKernel(half const* blockPixels, half* inputPatches, int64_t const T,
+    int64_t const C, int64_t const H, int64_t const W, int64_t const P, int64_t const totalElements)
+{
+    // Row layout: [group * numPatches + (pi * (W/P) + pj), ((t*C + c)*P + py)*P + px]
+    // Source layout: [group*T + t, c, pi*P + py, pj*P + px]
+    auto const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= totalElements)
+    {
+        return;
+    }
+
+    int64_t const rowWidth = T * C * P * P;
+    int64_t const gridW = W / P;
+    int64_t const numPatches = (H / P) * gridW;
+
+    int64_t const row = tid / rowWidth;
+    int64_t const col = tid % rowWidth;
+
+    int64_t const group = row / numPatches;
+    int64_t const patch = row % numPatches;
+    int64_t const pi = patch / gridW;
+    int64_t const pj = patch % gridW;
+
+    int64_t const t = col / (C * P * P);
+    int64_t const c = (col % (C * P * P)) / (P * P);
+    int64_t const py = (col % (P * P)) / P;
+    int64_t const px = col % P;
+
+    int64_t const srcIdx = (((group * T + t) * C + c) * H + pi * P + py) * W + pj * P + px;
+    inputPatches[tid] = blockPixels[srcIdx];
+}
+
+void transposeToPatchNemotronViT(rt::Tensor const& blockPixels, rt::Tensor& inputPatches,
+    int64_t const temporalPatchSize, int64_t const patchSize, cudaStream_t stream)
+{
+    check::check(
+        blockPixels.getDeviceType() == rt::DeviceType::kGPU && inputPatches.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(blockPixels.getDataType() == DataType::kHALF && inputPatches.getDataType() == DataType::kHALF,
+        "Data type check failed for the input tensors.");
+    check::check(blockPixels.getShape().getNumDims() == 4, "blockPixels shape shall be [frames, channels, H, W].");
+    check::check(temporalPatchSize > 0, "temporalPatchSize must be positive.");
+    check::check(patchSize > 0, "patchSize must be positive.");
+
+    int64_t const frames = blockPixels.getShape()[0];
+    int64_t const channels = blockPixels.getShape()[1];
+    int64_t const height = blockPixels.getShape()[2];
+    int64_t const width = blockPixels.getShape()[3];
+    check::check(frames % temporalPatchSize == 0, "Frame count must be a multiple of temporalPatchSize.");
+    check::check(height % patchSize == 0 && width % patchSize == 0, "Image dims must be multiples of patchSize.");
+
+    int64_t const totalElements = frames * channels * height * width;
+    check::check(
+        inputPatches.getShape().volume() >= totalElements, "inputPatches tensor too small for the patch output.");
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
+
+    transposeToPatchNemotronKernel<<<gridSize, blockSize, 0, stream>>>(blockPixels.dataPointer<half>(),
+        inputPatches.dataPointer<half>(), temporalPatchSize, channels, height, width, patchSize, totalElements);
+}
+
+__global__ void addPosEmbedNemotronKernel(
+    half* patchEmbeds, half const* posEmbed, int64_t const perBlockElements, int64_t const totalElements)
+{
+    auto const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= totalElements)
+    {
+        return;
+    }
+    patchEmbeds[tid] = __hadd(patchEmbeds[tid], posEmbed[tid % perBlockElements]);
+}
+
+void addPosEmbedNemotronViT(rt::Tensor& patchEmbeds, rt::Tensor const& posEmbed, cudaStream_t stream)
+{
+    check::check(
+        patchEmbeds.getDeviceType() == rt::DeviceType::kGPU && posEmbed.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(patchEmbeds.getDataType() == DataType::kHALF && posEmbed.getDataType() == DataType::kHALF,
+        "Data type check failed for the input tensors.");
+    check::check(patchEmbeds.getShape().getNumDims() == 3 && posEmbed.getShape().getNumDims() == 2,
+        "patchEmbeds shape shall be [numBlocks, numPatches, hidden] and posEmbed [numPatches, hidden].");
+    check::check(
+        patchEmbeds.getShape()[1] == posEmbed.getShape()[0] && patchEmbeds.getShape()[2] == posEmbed.getShape()[1],
+        "posEmbed dims must match patchEmbeds per-block dims.");
+
+    int64_t const perBlockElements = posEmbed.getShape().volume();
+    check::check(perBlockElements > 0, "posEmbed must be non-empty.");
+    int64_t const totalElements = patchEmbeds.getShape().volume();
+    uint32_t const blockSize = 256;
+    uint32_t const gridSize = (totalElements + blockSize - 1) / blockSize;
+
+    addPosEmbedNemotronKernel<<<gridSize, blockSize, 0, stream>>>(
+        patchEmbeds.dataPointer<half>(), posEmbed.dataPointer<half>(), perBlockElements, totalElements);
+}
+
+__global__ void evsScoresNemotronKernel(
+    half const* embeds, float* scores, int64_t const tokensPerGroup, int64_t const hidden)
+{
+    // One CTA per token (g, s). Cosine dissimilarity vs the same spatial slot in the previous
+    // temporal group; group 0 gets the keep-always sentinel 255 (matches HF EVS).
+    int64_t const token = blockIdx.x;
+    int64_t const group = token / tokensPerGroup;
+
+    if (group == 0)
+    {
+        if (threadIdx.x == 0)
+        {
+            scores[token] = 255.0F;
+        }
+        return;
+    }
+
+    half const* cur = embeds + token * hidden;
+    half const* prev = embeds + (token - tokensPerGroup) * hidden;
+
+    float dot = 0.0F;
+    float normCur = 0.0F;
+    float normPrev = 0.0F;
+    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x)
+    {
+        float const a = __half2float(cur[i]);
+        float const b = __half2float(prev[i]);
+        dot += a * b;
+        normCur += a * a;
+        normPrev += b * b;
+    }
+
+    __shared__ float sDot[32];
+    __shared__ float sCur[32];
+    __shared__ float sPrev[32];
+    int const lane = threadIdx.x % 32;
+    int const warp = threadIdx.x / 32;
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
+        dot += __shfl_down_sync(0xFFFFFFFF, dot, offset);
+        normCur += __shfl_down_sync(0xFFFFFFFF, normCur, offset);
+        normPrev += __shfl_down_sync(0xFFFFFFFF, normPrev, offset);
+    }
+    if (lane == 0)
+    {
+        sDot[warp] = dot;
+        sCur[warp] = normCur;
+        sPrev[warp] = normPrev;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float d = 0.0F;
+        float nc = 0.0F;
+        float np = 0.0F;
+        int const numWarps = (blockDim.x + 31) / 32;
+        for (int w = 0; w < numWarps; ++w)
+        {
+            d += sDot[w];
+            nc += sCur[w];
+            np += sPrev[w];
+        }
+        // torch cosine_similarity clamps each norm to eps before dividing.
+        float const eps = 1e-8F;
+        float const cos = d / (fmaxf(sqrtf(nc), eps) * fmaxf(sqrtf(np), eps));
+        scores[token] = 1.0F - cos;
+    }
+}
+
+void evsScoresNemotronViT(
+    rt::Tensor const& embeds, rt::Tensor& scores, int64_t const tokensPerGroup, cudaStream_t stream)
+{
+    check::check(embeds.getDeviceType() == rt::DeviceType::kGPU && scores.getDeviceType() == rt::DeviceType::kGPU,
+        "Device type shall all be GPU for these tensors.");
+    check::check(embeds.getDataType() == DataType::kHALF && scores.getDataType() == DataType::kFLOAT,
+        "Data type check failed for the input tensors.");
+    check::check(embeds.getShape().getNumDims() == 2, "embeds shape shall be [numTokens, hidden].");
+    check::check(tokensPerGroup > 0, "tokensPerGroup must be positive.");
+    int64_t const numTokens = embeds.getShape()[0];
+    check::check(numTokens % tokensPerGroup == 0, "numTokens must be a multiple of tokensPerGroup.");
+    check::check(scores.getShape().volume() >= numTokens, "scores tensor too small.");
+
+    int64_t const hidden = embeds.getShape()[1];
+    evsScoresNemotronKernel<<<static_cast<uint32_t>(numTokens), 256, 0, stream>>>(
+        embeds.dataPointer<half>(), scores.dataPointer<float>(), tokensPerGroup, hidden);
 }
 
 } // namespace kernel

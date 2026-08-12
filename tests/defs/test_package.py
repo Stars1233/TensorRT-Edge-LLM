@@ -64,6 +64,7 @@ class PackageTester:
         tools = [
             "tensorrt-edgellm-quantize",
             "tensorrt-edgellm-export",
+            "tensorrt-edgellm-build",
             "tensorrt-edgellm-insert-lora",
             "tensorrt-edgellm-process-lora",
             "tensorrt-edgellm-merge-lora",

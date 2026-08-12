@@ -78,6 +78,59 @@ def _sync_remote_output_file(filepath: str,
     return filepath
 
 
+def _read_context_reuse_profile(
+        config: TestConfig,
+        logger,
+        remote_config: Optional[RemoteConfig] = None) -> int:
+    """Return reused prefill tokens and fail when an enabled cache never hits."""
+    profile_path = _sync_remote_output_file(config.get_profile_json_file(),
+                                            remote_config, logger)
+    with open(profile_path, encoding='utf-8') as profile_file:
+        profile = json.load(profile_file)
+
+    reused_tokens = profile.get('prefill', {}).get('reused_tokens')
+    if not isinstance(reused_tokens, int) or reused_tokens <= 0:
+        raise RuntimeError(
+            "Context reuse was enabled but the profile did not report a "
+            f"positive prefill.reused_tokens value: {reused_tokens!r}")
+    return reused_tokens
+
+
+def _check_context_reuse_cold_hit_equivalence(config: TestConfig) -> None:
+    """Require the cold full prompt and prefix-reused full prompt to match."""
+    with open(config.get_output_json_file(), encoding='utf-8') as output_file:
+        responses = json.load(output_file).get('responses', [])
+    if len(responses) != 3:
+        raise RuntimeError(
+            "The context-reuse parity fixture must produce exactly three responses, "
+            f"got {len(responses)}.")
+
+    producer, _, consumer = responses
+    if producer.get('output_text') != consumer.get('output_text'):
+        raise RuntimeError(
+            "The reused response text differs from the cold producer response."
+        )
+    if producer.get('finish_reason') != consumer.get('finish_reason'):
+        raise RuntimeError(
+            "The reused response finish reason differs from the cold producer response."
+        )
+
+    def generated_token_ids(response: Dict[str, Any]) -> list[int]:
+        logprobs = response.get('logprobs')
+        if not isinstance(logprobs, list) or any(
+                not isinstance(step, list) or not step
+                or not isinstance(step[0].get('token_id'), int)
+                for step in logprobs):
+            raise RuntimeError(
+                "The context-reuse parity fixture requires num_logprobs >= 1.")
+        return [step[0]['token_id'] for step in logprobs]
+
+    if generated_token_ids(producer) != generated_token_ids(consumer):
+        raise RuntimeError(
+            "The reused response token IDs differ from the cold producer response."
+        )
+
+
 def _source_test_case_file(config: TestConfig) -> Optional[str]:
     """Return the canonical (un-rewritten) test case JSON path, ignoring any
     per-config preprocessed override that this module may have already set.
@@ -426,6 +479,11 @@ def execute_e2e_bench_test(
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
+        if config.context_reuse:
+            if config.test_case == 'llm_context_reuse':
+                _check_context_reuse_cold_hit_equivalence(config)
+            final_result['context_reuse_reused_tokens'] = (
+                _read_context_reuse_profile(config, logger, remote_config))
 
     except Exception as e:
         final_result['error'] = f"Failed to calculate metrics: {str(e)}"
@@ -508,6 +566,11 @@ def execute_inference_test(
 
         # Merge metrics result into final result
         final_result.update(metrics_result)
+        if config.context_reuse:
+            if config.test_case == 'llm_context_reuse':
+                _check_context_reuse_cold_hit_equivalence(config)
+            final_result['context_reuse_reused_tokens'] = (
+                _read_context_reuse_profile(config, logger, remote_config))
 
     except Exception as e:
         final_result['error'] = f"Failed to calculate metrics: {str(e)}"

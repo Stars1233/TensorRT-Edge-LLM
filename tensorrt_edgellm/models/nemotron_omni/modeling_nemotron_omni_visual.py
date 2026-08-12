@@ -15,15 +15,26 @@
 """
 From-scratch Nemotron-Omni RADIO vision encoder.
 
-Architecture:
-    RADIOEmbeddings
-        register tokens [10, H] (position-free)
-        Conv2d patch embedding  +  pos_embed [1, N, H] (bilinear interpolated)
+The patch embedder is NOT part of the exported graph.  Nemotron-Omni uses a
+different embedder for images (``Linear(3·P² → H)``) and videos
+(``Linear(T·3·P² → H)``) while sharing every other weight, so the embedder
+GEMM (plus the grid-dependent position-embedding add) is executed by the C++
+runtime and the single exported model serves both paths.  The embedder /
+video_embedder / raw pos_embed weights ship in a safetensors sidecar written
+by :meth:`NemotronOmniVisualModel.save_onnx_sidecar`.
+
+Exported graph:
+    inputs: ``patch_embeds`` [B, N, H]  (embedder GEMM output + pos_embed)
+            ``shuffle_indices`` [M, 4]  (pixel-shuffle gather indices for the
+            B×N patch grid; grid-dependent, computed by the runtime)
+    → prepend register tokens [10, H] (position-free)
     → 32 × RADIOBlock
         norm1 → attn(fused qkv, proj) → residual
         norm2 → mlp(fc1, GELU, fc2) → residual
     → remove register tokens
-    → pixel_shuffle downsampling (downsample_ratio=0.5)
+    → pixel_shuffle downsampling (downsample_ratio=0.5) as a Gather over
+      ``shuffle_indices`` (supports the non-square patch grids produced by
+      aspect-preserving video frame resize)
     → mlp1 projector: RMSNorm → Linear → SquaredReLU → Linear
 
 Checkpoint weight key prefixes:
@@ -33,7 +44,6 @@ Checkpoint weight key prefixes:
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -72,24 +82,27 @@ class _RMSNorm(nn.Module):
 
 
 class RADIOEmbeddings(nn.Module):
-    """Register tokens + Conv2d patch embedding + learnable position embedding.
+    """Weight container for the RADIO patch embedder and register tokens.
 
-    RADIO uses 10 register tokens (not a single CLS). The patch embedder stores
-    weight as flat [hidden_size, 3*patch_size*patch_size] and is reshaped to
-    Conv2d format during weight loading. Position embedding is stored at max
-    resolution and sliced to match the actual image size.
+    Holds checkpoint weights only — no forward: the patch-embedder GEMM and the
+    per-grid pos_embed interpolation run in the C++ runtime. The image embedder
+    weight is flat [hidden_size, 3*patch_size*patch_size] (reshaped to Conv2d on
+    load); ``video_embedder`` (when the checkpoint carries it) is a Linear over
+    T stacked frames; the raw max-resolution pos_embed is kept for the runtime.
 
     Checkpoint keys (under ``patch_generator.``):
-        ``cls_token.token``   [num_registers, hidden_size]
-        ``embedder.weight``   [hidden_size, 3*patch_size*patch_size]
-        ``pos_embed``         [1, max_patches, hidden_size]
+        ``cls_token.token``       [num_registers, hidden_size]
+        ``embedder.weight``       [hidden_size, 3*patch_size*patch_size]
+        ``video_embedder.weight`` [hidden_size, T*3*patch_size*patch_size]
+        ``pos_embed``             [1, max_patches, hidden_size]
     """
 
     def __init__(self,
                  hidden_size: int,
                  patch_size: int,
                  image_size: int,
-                 num_registers: int = 10) -> None:
+                 num_registers: int = 10,
+                 video_temporal_patch_size: int = 0) -> None:
         super().__init__()
         self.num_patches = (image_size // patch_size)**2
         self.num_registers = num_registers
@@ -101,20 +114,20 @@ class RADIOEmbeddings(nn.Module):
                                   kernel_size=patch_size,
                                   stride=patch_size,
                                   bias=False)
-        # pos_embed covers patches only (no registers). Interpolated at load time.
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_patches, hidden_size))
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        B = pixel_values.size(0)
-        patch_embeds = self.embedder(
-            pixel_values.to(self.embedder.weight.dtype)).flatten(2).transpose(
-                1, 2)
-        # Add position embedding to patches only (registers are position-free)
-        patch_embeds = patch_embeds + self.pos_embed
-        reg_tokens = self.cls_token.token.unsqueeze(0).expand(B, -1, -1)
-        x = torch.cat((reg_tokens, patch_embeds), dim=1)
-        return x
+        # Video patch embedder: T temporally-stacked frames per patch.
+        # Present only when the checkpoint carries video_embedder weights.
+        self.video_temporal_patch_size = video_temporal_patch_size
+        if video_temporal_patch_size > 0:
+            self.video_embedder = nn.Linear(video_temporal_patch_size * 3 *
+                                            patch_size * patch_size,
+                                            hidden_size,
+                                            bias=False)
+        # Raw checkpoint pos_embed (max resolution) for the sidecar; the C++
+        # runtime interpolates it per patch grid. forward() gets pos_embed
+        # already added into patch_embeds, so no pos_embed parameter is kept.
+        self.register_buffer("pos_embed_orig",
+                             torch.zeros(1, 0, hidden_size),
+                             persistent=False)
 
 
 # ---------------------------------------------------------------------------
@@ -284,26 +297,6 @@ class RADIOEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Pixel shuffle
-# ---------------------------------------------------------------------------
-
-
-def _pixel_shuffle(x: torch.Tensor, scale_factor: float) -> torch.Tensor:
-    """Spatial downsampling via pixel shuffle (merge spatial → channel).
-
-    Matches the ps_version='v2' logic from the HF model.
-    """
-    B, H, W, C = x.shape
-    scale = int(1.0 / scale_factor)
-    new_H = H // scale
-    new_W = W // scale
-    x = x.view(B, new_H, scale, new_W, scale, C)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-    x = x.view(B, new_H, new_W, scale * scale * C)
-    return x
-
-
-# ---------------------------------------------------------------------------
 # Squared ReLU (used in mlp1 projector)
 # ---------------------------------------------------------------------------
 
@@ -325,10 +318,17 @@ class NemotronOmniVisualModel(nn.Module):
     Expects the full ``config.json`` dict (needs ``vision_config``,
     ``llm_config``, ``vit_hidden_size``, ``downsample_ratio``, etc.).
 
-    Output: ``[total_patches * tokens_per_patch, llm_hidden_size]``
+    The exported graph consumes runtime-computed ``patch_embeds`` (embedder
+    GEMM + pos_embed, see module docstring) and grid-dependent
+    ``shuffle_indices``; it serves both the image and the video path.
+
+    Output: ``[num_blocks, tokens_per_block, llm_hidden_size]``
     """
 
-    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
+    def __init__(self,
+                 config: dict,
+                 model_config: "ModelConfig",
+                 video_temporal_patch_size: int = 0) -> None:
         super().__init__()
         llm_cfg = config.get("llm_config", config.get("text_config", {}))
         llm_hidden_size: int = llm_cfg["hidden_size"]
@@ -349,8 +349,11 @@ class NemotronOmniVisualModel(nn.Module):
         attention_scale = config_module._get_attention_scaling(
             vc, head_dim, 1.0 / (float(head_dim)**0.5))
 
-        self.patch_generator = RADIOEmbeddings(hidden_size, patch_size,
-                                               image_size)
+        self.patch_generator = RADIOEmbeddings(
+            hidden_size,
+            patch_size,
+            image_size,
+            video_temporal_patch_size=video_temporal_patch_size)
         # Vision blocks live under ``vision_model.radio_model.model.blocks.N.*``
         # in the HF checkpoint; thread that prefix so MIXED_PRECISION
         # ``layer_overrides`` resolve and ``*vision_model*`` wildcards match.
@@ -383,51 +386,117 @@ class NemotronOmniVisualModel(nn.Module):
                         module_name="mlp1.3"),
         )
         self._llm_hidden_size = llm_hidden_size
-        self._feat_side: int = image_size // patch_size
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def forward(self, patch_embeds: torch.Tensor,
+                shuffle_indices: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pixel_values: [num_images, 3, image_size, image_size]
+            patch_embeds: [num_blocks, num_patches, vit_hidden] — embedder
+                GEMM output with pos_embed already added (runtime-computed).
+            shuffle_indices: [num_out_tokens, scale²] int64 — pixel-shuffle
+                gather indices into the num_patches axis for this grid.
 
         Returns:
-            image_features: [num_images, tokens_per_image, llm_hidden_size]
+            image_features: [num_blocks, num_out_tokens, llm_hidden_size]
         """
-        x = self.patch_generator(pixel_values)
+        B = patch_embeds.shape[0]
+        reg_tokens = self.patch_generator.cls_token.token.unsqueeze(0).expand(
+            B, -1, -1).to(patch_embeds.dtype)
+        x = torch.cat((reg_tokens, patch_embeds), dim=1)
         x = self.encoder(x)
 
         # Remove register tokens (RADIO uses 10 registers, not a single CLS)
         num_reg = self.patch_generator.num_registers
         x = x[:, num_reg:, :]
 
-        B = x.shape[0]
+        # Pixel shuffle as a gather: index_select exports as a single ONNX
+        # Gather and keeps the graph valid for non-square (h, w) patch grids.
         C = x.shape[2]
-        feat_side = self._feat_side
-        x = x.reshape(B, feat_side, feat_side, C)
-        x = _pixel_shuffle(x, self.downsample_ratio)
-        x = x.reshape(B, -1, x.shape[-1])
+        x = torch.index_select(x, 1, shuffle_indices.reshape(-1))
+        x = x.reshape(B, shuffle_indices.shape[0],
+                      shuffle_indices.shape[1] * C)
         x = self.mlp1(x)
         return x
+
+    def build_shuffle_indices(self, grid_h: int, grid_w: int) -> torch.Tensor:
+        """Pixel-shuffle gather indices for a (grid_h, grid_w) patch grid.
+
+        Row m = output cell (i, j) with m = i·(grid_w/s) + j; its s² entries
+        are the input patch indices (s·i+di)·grid_w + (s·j+dj) in (di, dj)
+        row-major order — matching the HF pixel-shuffle (v2) token order.
+        The C++ runtime computes the same table.
+        """
+        s = int(1.0 / self.downsample_ratio)
+        oh, ow = grid_h // s, grid_w // s
+        i = torch.arange(oh).view(oh, 1, 1, 1)
+        j = torch.arange(ow).view(1, ow, 1, 1)
+        di = torch.arange(s).view(1, 1, s, 1)
+        dj = torch.arange(s).view(1, 1, 1, s)
+        idx = (s * i + di) * grid_w + (s * j + dj)
+        return idx.reshape(oh * ow, s * s).to(torch.int64)
 
     def get_onnx_export_args(self, config: dict, device: str):
         """Return (args, input_names, output_names, dynamic_shapes)."""
         image_size = config["force_image_size"]
-        pixel_values = torch.zeros(2,
-                                   3,
-                                   image_size,
-                                   image_size,
+        patch_size = config["patch_size"]
+        hidden_size = config["vit_hidden_size"]
+        grid_side = image_size // patch_size
+        patch_embeds = torch.zeros(2,
+                                   grid_side * grid_side,
+                                   hidden_size,
                                    dtype=torch.float16,
                                    device=device)
-        args = (pixel_values, )
-        input_names = ["input"]
+        shuffle_indices = self.build_shuffle_indices(grid_side,
+                                                     grid_side).to(device)
+        args = (patch_embeds, shuffle_indices)
+        input_names = ["input", "shuffle_indices"]
         output_names = ["output"]
-        N = torch.export.Dim("num_images", min=1)
-        dynamic_shapes = {"pixel_values": {0: N}}
+        B = torch.export.Dim("num_blocks", min=1)
+        N = torch.export.Dim("num_patches", min=4)
+        M = torch.export.Dim("num_out_tokens", min=1)
+        dynamic_shapes = {
+            "patch_embeds": {
+                0: B,
+                1: N
+            },
+            "shuffle_indices": {
+                0: M
+            },
+        }
         return args, input_names, output_names, dynamic_shapes
+
+    def save_onnx_sidecar(self, output_dir: str) -> str:
+        """Save the runtime-executed embedder weights next to the ONNX model.
+
+        Tensors (all FP16):
+            ``embedder.weight``        [vit_hidden, 3·P²]     (flat GEMM layout)
+            ``video_embedder.weight``  [vit_hidden, T·3·P²]   (if present)
+            ``pos_embed``              [1, S², vit_hidden]    (raw checkpoint
+                resolution; the runtime interpolates it per patch grid)
+        """
+        import os
+
+        from ..._safetensors_io import save_file
+
+        pg = self.patch_generator
+        tensors = {
+            "embedder.weight":
+            pg.embedder.weight.reshape(pg.embedder.weight.shape[0], -1).to(
+                torch.float16).cpu().contiguous(),
+            "pos_embed":
+            pg.pos_embed_orig.to(torch.float16).cpu().contiguous(),
+        }
+        if pg.video_temporal_patch_size > 0:
+            tensors["video_embedder.weight"] = pg.video_embedder.weight.to(
+                torch.float16).cpu().contiguous()
+        sidecar_path = os.path.join(output_dir,
+                                    "nemotron_omni_embedder.safetensors")
+        save_file(tensors, sidecar_path)
+        return sidecar_path
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +528,10 @@ def _load_weights(model: NemotronOmniVisualModel, weights: dict) -> None:
     def _remap(k: str) -> "str | None":
         if k.startswith(vt_prefix):
             inner = k[len(vt_prefix):]
+            if inner == "patch_generator.pos_embed":
+                # forward() gets pos_embed pre-added; keep only the raw tensor
+                # for the sidecar (the runtime interpolates it per grid).
+                return "patch_generator.pos_embed_orig"
             if inner.startswith("patch_generator.") or inner.startswith(
                     "blocks."):
                 # blocks.* lives under encoder.* in our module tree.
@@ -473,24 +546,6 @@ def _load_weights(model: NemotronOmniVisualModel, weights: dict) -> None:
         if remapped_key == "patch_generator.embedder.weight" and v.dim() == 2:
             ps = model.patch_generator.embedder.kernel_size[0]
             return v.reshape(v.shape[0], 3, ps, ps)
-        if remapped_key == "patch_generator.pos_embed":
-            full_pos = v  # [1, max_patches, hidden]
-            target_patches = model.patch_generator.num_patches
-            stored_patches = full_pos.shape[1]
-            if stored_patches != target_patches:
-                hidden = full_pos.shape[2]
-                stored_side = int(math.sqrt(stored_patches))
-                target_side = int(math.sqrt(target_patches))
-                patch_pos = full_pos.reshape(1, stored_side, stored_side,
-                                             hidden)
-                patch_pos = patch_pos.permute(0, 3, 1, 2).float()
-                patch_pos = F.interpolate(patch_pos,
-                                          size=(target_side, target_side),
-                                          mode="bilinear",
-                                          align_corners=True).to(
-                                              full_pos.dtype)
-                patch_pos = patch_pos.permute(0, 2, 3, 1)
-                return patch_pos.reshape(1, target_patches, hidden)
         return v
 
     load_submodule_weights(model,
@@ -503,6 +558,16 @@ def _load_weights(model: NemotronOmniVisualModel, weights: dict) -> None:
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
+
+def resolve_video_cfg(config: dict, key: str, default):
+    """Read a video sizing field, preferring ``vision_config`` (where the
+    official checkpoint and vLLM place it) over the top level (older artifacts),
+    then the default. Shared with the exporter so both agree on the value."""
+    vision_cfg = config.get("vision_config") or {}
+    if key in vision_cfg:
+        return vision_cfg[key]
+    return config.get(key, default)
 
 
 def build_nemotron_omni_visual(
@@ -518,7 +583,14 @@ def build_nemotron_omni_visual(
         model_config: Top-level ``ModelConfig`` for quantized Linear dispatch.
         dtype:        Target dtype (default ``float16``).
     """
-    model = NemotronOmniVisualModel(config, model_config=model_config)
+    has_video = ("vision_model.radio_model.model.patch_generator."
+                 "video_embedder.weight") in weights
+    # Must match export.py so the video_embedder shape agrees with runtime T.
+    video_t = ((resolve_video_cfg(config, "video_temporal_patch_size", None)
+                or 2) if has_video else 0)
+    model = NemotronOmniVisualModel(config,
+                                    model_config=model_config,
+                                    video_temporal_patch_size=video_t)
     model.to(dtype)
     _load_weights(model, weights)
     model.eval()

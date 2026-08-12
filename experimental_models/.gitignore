@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local build / engine / export artifacts (never commit these)
+build*/
+# ...but keep the cosmos3 C++ "builder/" source dir, which build*/ would otherwise match
+!builder/
+engines/
+*.onnx
+*.engine
+*.plan
+*.safetensors

@@ -24,7 +24,9 @@ from . import first_present, load_hf_split, register
 @register("text", "cnn_dailymail")
 def cnn_dailymail():
     """CNN/DailyMail news articles -- the default text dataset."""
-    ds = load_hf_split("cnn_dailymail",
+    # Use the canonical namespaced Hub id: recent huggingface_hub rejects the
+    # bare "cnn_dailymail" ("Repository id must be 'namespace/name'").
+    ds = load_hf_split("abisee/cnn_dailymail",
                        name="cnn_dailymail",
                        config="3.0.0",
                        split="train")
@@ -32,6 +34,40 @@ def cnn_dailymail():
         text = example.get("article")
         if text:
             yield text
+
+
+@register("text", "zh_en_mixed")
+def zh_en_mixed():
+    """Alternating zh-Wikipedia / CNN-DailyMail passages.
+
+    TTS/Talker calibration on the multilingual Qwen3-Omni Next family needs
+    Chinese activation coverage — English-only calibration leaves zh
+    activations outside the calibrated amax envelope.
+    """
+    # Single-shard parquet fetch: dataset streaming of wikimedia/wikipedia
+    # stalls on slow links resolving the shard manifest; one shard is enough
+    # for calibration-sized sampling.
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    shard = hf_hub_download("wikimedia/wikipedia",
+                            "20231101.zh/train-00000-of-00006.parquet",
+                            repo_type="dataset")
+    zh_texts = pq.read_table(shard, columns=["text"]).column("text")
+    en = load_hf_split("cnn_dailymail",
+                       name="cnn_dailymail",
+                       config="3.0.0",
+                       split="train")
+    en_iter = iter(en)
+    for zh_val in zh_texts:
+        zh_text = zh_val.as_py()
+        if zh_text:
+            yield zh_text
+        en_ex = next(en_iter, None)
+        if en_ex is None:
+            return
+        en_text = en_ex.get("article")
+        if en_text:
+            yield en_text
 
 
 @register("text", "wikitext")

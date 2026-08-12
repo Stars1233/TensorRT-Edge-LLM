@@ -700,6 +700,35 @@ MelExtractor makeParakeetExtractor()
     return MelExtractor(std::move(cfg));
 }
 
+MelExtractor makeNemotronAsrExtractor()
+{
+    // Same front-end as Parakeet except the model consumes raw log-mel:
+    // HF NemotronAsrStreamingFeatureExtractor never normalizes.
+    MelExtractorConfig cfg;
+    cfg.name = "nemotron_asr";
+    cfg.sampleRate = 16000;
+    cfg.nFFT = 512;
+    cfg.hopLength = 160;
+    cfg.winLength = 400;
+    cfg.nMel = 128;
+    cfg.minFrequencyHz = 0.0f;
+    cfg.maxFrequencyHz = 8000.0f;
+    cfg.windowType = WindowType::kHannSymmetric;
+    cfg.melScale = MelScale::kSlaney;
+    cfg.melNorm = MelNorm::kSlaney;
+    cfg.preemphCoeff = 0.97f;
+    cfg.preemphPostScale = 0.0f;
+    cfg.logType = LogType::kLn;
+    cfg.logFloorMode = LogFloorMode::kAdd;
+    cfg.logFloor = 5.96046447754e-08f; // 2^-24
+    cfg.framePadding = FramePadding::kCenterZero;
+    cfg.layout = MelLayout::kTimeMel;
+    cfg.postNormalize = PostNormalize::kNone;
+    cfg.timePadding = TimePadding::kNone;
+    cfg.dropLastStftFrame = true; // valid frames = audio_len // hop
+    return MelExtractor(std::move(cfg));
+}
+
 MelExtractor makeExtractorByName(std::string const& feType)
 {
     if (feType == "whisper")
@@ -709,6 +738,10 @@ MelExtractor makeExtractorByName(std::string const& feType)
     if (feType == "parakeet")
     {
         return makeParakeetExtractor();
+    }
+    if (feType == "nemotron_asr")
+    {
+        return makeNemotronAsrExtractor();
     }
     throw std::invalid_argument("Unknown feature extractor type: " + feType);
 }

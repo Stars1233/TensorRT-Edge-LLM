@@ -32,7 +32,14 @@ static inline cudaError_t cudaLibraryUnload(cudaLibrary_t lib)
 #endif // CUDA_VERSION >= 12000 && CUDA_VERSION < 12080
 #endif // TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT
 
+#include "kernels/cuteDslModuleLoader.h"
+
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -51,23 +58,17 @@ struct GDNParams
     void* A_log{};
     void* dt_bias{};
     void* h0_source{};
-    void* context_lengths{}; ///< [N] int32 — valid length per batch (decode / prefill; unused in MTP)
-    void* cu_seqlens{};      ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
-    void* h0_scratch{};      ///< [N, hv, k, v] f32 — pre-allocated scratch for h0_out (Blackwell prefill);
-                             ///<   must be provided by caller (e.g. plugin workspace).
+    void* context_lengths{};   ///< [N] int32 — valid length per batch (decode / prefill; unused in MTP)
+    void* cu_seqlens{};        ///< [N+1] int32 — prefix-sum of context_lengths (Blackwell prefill)
+    void* h0_scratch{};        ///< [N, hv, k, v] f32 — pre-allocated scratch for h0_out (Blackwell prefill);
+                               ///<   must be provided by caller (e.g. plugin workspace).
+    void* tensormap_scratch{}; ///< Tail-store TMA descriptors (Blackwell GeForce prefill).
     void* o{};
 
     // MTP (multi-token) decode fields — used only when use_mtp == true.
     void* intermediate_states{}; ///< [N, seq_len, HV, K, V] FP32 — per-step h cache for rollback.
                                  ///<   Must be non-null when use_mtp == true.
     bool use_mtp{false};         ///< true → MTP decode path (any seq_len).
-
-    // DDTree decode fields — used only when use_ddtree == true.
-    void* tree_parent_ids{};    ///< [N, seq_len] int32 — parent node index per verify token.
-    void* tree_depths{};        ///< [N, seq_len] int32 — depth per verify token.
-    bool use_ddtree{false};     ///< true → DDTree decode path; never falls back to linear MTP.
-    void* ddtree_qk_scales{};   ///< [N, seq_len, H, 2] FP32 — split-v precomputed q/k scales.
-    void* ddtree_gate_values{}; ///< [N, seq_len, HV, 2] FP32 — split-v precomputed g/beta.
 
     int32_t n{};
     int32_t seq_len{};
@@ -78,13 +79,13 @@ struct GDNParams
     int32_t smVersion{}; // GPU SM version for dispatch (e.g. 87, 110)
 };
 
-/** Loads AOT .o, fills tensor structs from GDNParams, calls generated wrapper.
+/** Lazily loads the selected AOT module, fills tensor structs from GDNParams, and calls its generated wrapper.
  *
  *  Dispatch table (evaluated in order):
- *    use_ddtree == true           → runDecodeTree()      (DDTree: parent/depth-driven tree state)
  *    use_mtp == true              → runDecodeMTP()       (MTP: any seq_len)
  *    seq_len == 1                 → runDecode()          (single-token decode)
- *    seq_len > 1 && SM >= 100     → runPrefillBlackwell() (Blackwell prefill)
+ *    seq_len > 1 && SM120/121     → runPrefillBlackwellGeforce() (Blackwell GeForce warp-MMA prefill)
+ *    seq_len > 1 && SM100/101/110  → runPrefillBlackwell() (Blackwell prefill)
  *    seq_len > 1                  → runPrefill()          (sequential prefill)
  *
  *  MTP note: all batch items process seq_len (T) draft tokens uniformly.
@@ -93,6 +94,10 @@ struct GDNParams
 class CuteDslGDNRunner
 {
 public:
+    // Blackwell GeForce only; must match TENSOR_MAP_DESCRIPTOR_BYTES in gdn_prefill_sm12x_helpers.py.
+    static constexpr int32_t kBlackwellGeforceTensorMapDescriptorBytes = 128;
+    static constexpr int32_t kBlackwellGeforceMaxSMCount = 256;
+
     CuteDslGDNRunner() = default;
     ~CuteDslGDNRunner() = default;
     CuteDslGDNRunner(CuteDslGDNRunner const&) = delete;
@@ -100,30 +105,29 @@ public:
 
     static bool canImplement(int32_t kDim, int32_t vDim, int32_t smVersion);
 
-    static bool loadKernelModules();
-    static void unloadKernelModules();
+    //! Load only the module selected by \p params. This is exposed so the plugin can
+    //! fail before enqueue-side preprocessing mutates device buffers.
+    static bool ensureKernelModules(GDNParams const& params, cudaStream_t stream);
 
     /** Run GDN kernel. See class-level dispatch table. */
     int run(GDNParams const& params, cudaStream_t stream);
 
-    /** Run DDTree decode with parent/depth-driven recurrent state checkpoints. */
-    int runDecodeTree(GDNParams const& params, cudaStream_t stream);
-
 private:
-    int runDecodeTreeSplitVPrecomputed(GDNParams const& params, cudaStream_t stream);
     int runDecode(GDNParams const& params, cudaStream_t stream);
     int runPrefill(GDNParams const& params, cudaStream_t stream);
     int runPrefillBlackwell(GDNParams const& params, cudaStream_t stream);
+    int runPrefillBlackwellGeforce(GDNParams const& params, cudaStream_t stream);
     int runDecodeMTP(GDNParams const& params, cudaStream_t stream);
 
-    static gdn_decode_Kernel_Module_t sDecodeModule;
-    static gdn_prefill_Kernel_Module_t sPrefillModule;
+    static detail::LazyKernelModule<gdn_decode_Kernel_Module_t> sDecodeModule;
+    static detail::LazyKernelModule<gdn_prefill_Kernel_Module_t> sPrefillModule;
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
-    static gdn_prefill_blackwell_Kernel_Module_t sBlackwellPrefillModule;
+    static detail::LazyKernelModule<gdn_prefill_blackwell_Kernel_Module_t> sBlackwellPrefillModule;
 #endif
-    static gdn_decode_mtp_cache_Kernel_Module_t sMTPDecodeCacheModule;
-    static gdn_decode_tree_split_v_precomputed_Kernel_Module_t sDecodeTreeSplitVPrecomputedModule;
-    static bool sLoaded;
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    static detail::LazyKernelModule<gdn_prefill_blackwell_geforce_Kernel_Module_t> sBlackwellGeforcePrefillModule;
+#endif
+    static detail::LazyKernelModule<gdn_decode_mtp_cache_Kernel_Module_t> sMTPDecodeCacheModule;
 };
 
 } // namespace trt_edgellm

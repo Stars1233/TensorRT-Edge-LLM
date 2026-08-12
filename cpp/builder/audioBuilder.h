@@ -67,7 +67,8 @@ enum class AudioBuildType
 {
     UNKNOWN,       //!< Not yet determined
     AUDIO_ENCODER, //!< Audio encoder (speech-to-embeddings)
-    CODE2WAV       //!< Code2Wav vocoder (codes-to-waveform)
+    CODE2WAV,      //!< Code2Wav vocoder (codes-to-waveform)
+    RNNT_DECODER   //!< Nemotron-3.5-ASR RNN-T step engine (static shapes, no profile)
 };
 
 //! Builder class for audio-related TensorRT engines.
@@ -127,6 +128,11 @@ private:
     //! @return true if parsing was successful, false otherwise
     bool parseNemotronOmniAudioConfig();
 
+    //! Parse Nemotron-3.5-ASR FastConformer encoder configuration from
+    //! encoder_config (reads num_mel_bins).
+    //! @return true if parsing was successful, false otherwise
+    bool parseNemotron35AsrAudioConfig();
+
     //! Parse encoder-free Gemma4 Unified framed-PCM audio configuration.
     bool parseGemma4UnifiedAudioConfig();
 
@@ -149,6 +155,13 @@ private:
     //! @param profile Optimization profile to configure
     //! @return true if setup was successful, false otherwise
     bool setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
+
+    //! Set up Nemotron-3.5-ASR FastConformer encoder profile.
+    //! Configures inputs: input_features [1, seq_len, mel_bins] (dynamic seq) and
+    //! prompt_ids [1] (static language-prompt index).
+    //! @param profile Optimization profile to configure
+    //! @return true if setup was successful, false otherwise
+    bool setupNemotron35AsrEncoderProfile(nvinfer1::IOptimizationProfile& profile);
 
     //! Set up Gemma4 audio encoder profile.
     //! Configures input: input_features [1, seq_len, mel_bins] with subsamplingFactor=4.

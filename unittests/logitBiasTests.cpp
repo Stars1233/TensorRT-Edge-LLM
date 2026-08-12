@@ -97,17 +97,13 @@ TEST(LogitBiasPolicyTest, DetectsBiasInAnyRequestSlot)
     EXPECT_FALSE(rt::hasLogitBias(rt::LLMGenerationRequest{}));
 }
 
-TEST(LogitBiasPolicyTest, RejectsOnlyWhenSpecDecodeWouldBeActive)
+TEST(LogitBiasPolicyTest, RejectsOnlyWhenSpecDecodeIsSelected)
 {
     auto request = makeRequest({{}, {{17, 1.0F}}});
 
     EXPECT_FALSE(rt::shouldRejectLogitBiasWithSpecDecode(request, false));
     EXPECT_TRUE(rt::shouldRejectLogitBiasWithSpecDecode(request, true));
 
-    request.disableSpecDecode = true;
-    EXPECT_FALSE(rt::shouldRejectLogitBiasWithSpecDecode(request, true));
-
-    request.disableSpecDecode = false;
     request.requests[1].logitBias.clear();
     EXPECT_FALSE(rt::shouldRejectLogitBiasWithSpecDecode(request, true));
 }

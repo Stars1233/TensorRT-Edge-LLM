@@ -16,10 +16,12 @@
  */
 
 #include "builderUtils.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/trtUtils.h"
 
 #include <NvOnnxParser.h>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -28,6 +30,60 @@ namespace trt_edgellm
 {
 namespace builder
 {
+
+namespace
+{
+
+[[maybe_unused]] void appendLunowudFlag(std::string& flags, std::string const& flag)
+{
+    if (flags.find(flag) != std::string::npos)
+    {
+        return;
+    }
+    if (!flags.empty())
+    {
+        flags += ' ';
+    }
+    flags += flag;
+}
+
+} // namespace
+
+std::string applyCompileWorkarounds([[maybe_unused]] int32_t maxBatchSize)
+{
+    std::string lunowudFlags;
+    char const* existingLunowud = std::getenv("__LUNOWUD");
+    if (existingLunowud)
+    {
+        lunowudFlags = existingLunowud;
+    }
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
+#endif
+#if NV_TENSORRT_MAJOR >= 11
+    // TRT dual-GEMM fusion miscompiles NVFP4 graphs; no known-good 11.x on sm12x
+    if (getSMVersion() / 10 == 12)
+    {
+        appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
+    }
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
+    appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
+    appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
+    appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
+#endif
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
+    if (maxBatchSize == 1)
+    {
+        appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
+    }
+#endif
+    if (existingLunowud || !lunowudFlags.empty())
+    {
+        setenv("__LUNOWUD", lunowudFlags.c_str(), 1);
+    }
+    return lunowudFlags;
+}
 
 //! Create TensorRT dimensions from a vector of shape values.
 //! @param shape Vector of dimension sizes
@@ -256,7 +312,7 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
 #if (NV_TENSORRT_MAJOR >= 10 && NV_TENSORRT_MINOR >= 6) || NV_TENSORRT_MAJOR >= 11
     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
 #endif
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 3)
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 3)
     config->setPreviewFeature(nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03, true);
 #endif
 

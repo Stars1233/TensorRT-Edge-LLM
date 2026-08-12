@@ -70,8 +70,11 @@ if TYPE_CHECKING:
     from ..config import ModelConfig
 
 from ..checkpoint.checkpoint_utils import normalize_rope_scaling_for_runtime
+from ..config import _is_diffusion_gemma_model_type
 from ..external_weights import (EXTERNAL_WEIGHT_CHOICES,
+                                EXTERNAL_WEIGHT_NVFP4_MOE,
                                 resolve_externalize_weights)
+from ..models.ops import set_int4_gemm_plugin_version
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,10 +99,16 @@ _GEMMA4_MODEL_TYPES = frozenset([
     "gemma4_unified_text",
 ])
 
+_GEMMA4_ASSISTANT_MODEL_TYPES = frozenset([
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+])
+
 _VLM_MODEL_TYPES = frozenset([
     "qwen3_vl",
     "qwen3_omni",
     "qwen3_omni_moe",
+    "qwen3_omni_next",
     "qwen3_5",
     "qwen3_5_moe",
     "qwen2_5_vl",
@@ -114,12 +123,15 @@ _VLM_MODEL_TYPES = frozenset([
 ])
 
 _AUDIO_MODEL_TYPES = frozenset([
+    "nemotron3_5_asr",
     "gemma4",
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
+    "qwen3_omni_next",
+    "qwen3_omni_next_thinker",
     "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
@@ -131,12 +143,16 @@ _AUDIO_MODEL_TYPES = frozenset([
 # Excludes Nemotron-Omni, which has its own field names
 # (``img_context_token_id`` / ``sound_context_token_id``) at the source-config
 # root and is handled by ``_collect_tokens_from_nemotron_root``.
+# ``nemotron3_5_asr`` is subtracted too: it is a pure RNN-T ASR model with no
+# LLM decoder at all (no ``thinker_config``, no ``user_token_id``), so the
+# Qwen-style multimodal-token patching does not apply.
 _ASR_LLM_MODEL_TYPES = (_AUDIO_MODEL_TYPES - _NEMOTRON_OMNI_MODEL_TYPES -
-                        {"gemma4_unified"})
+                        {"gemma4_unified", "nemotron3_5_asr"})
 
 _CODE2WAV_MODEL_TYPES = frozenset([
     "qwen3_omni",
     "qwen3_omni_moe",
+    "qwen3_omni_next",
     "qwen3_tts",
 ])
 
@@ -150,6 +166,12 @@ _LLM_COMPONENTS: dict[str, frozenset[str]] = {
     "qwen3_tts": frozenset(["talker", "code_predictor"]),  # no thinker
     "qwen3_omni": frozenset(["thinker", "talker", "code_predictor"]),
     "qwen3_omni_moe": frozenset(["thinker", "talker", "code_predictor"]),
+    "qwen3_omni_next": frozenset(["thinker", "talker", "code_predictor"]),
+    # Talker-root checkpoint from the CP-FP8 quantization pass
+    # (``--cp_quantization fp8``); only the CodePredictor is re-exported
+    # from it — thinker/talker/encoders come from the original HF root.
+    "qwen3_omni_next_talker": frozenset(["code_predictor"]),
+    "nemotron3_5_asr": frozenset(),  # pure RNN-T transducer
 }
 _DEFAULT_LLM_COMPONENTS = frozenset(["thinker"])
 
@@ -162,17 +184,24 @@ def _has_audio(model_type: str) -> bool:
     return model_type in _AUDIO_MODEL_TYPES
 
 
+def _has_rnnt_decoder(model_type: str) -> bool:
+    """Whether ``model_type`` has an RNN-T (transducer) decoder-step engine
+    exported alongside its encoder — currently only Nemotron-3.5-ASR."""
+    return model_type == "nemotron3_5_asr"
+
+
 def _checkpoint_audio_config(config: dict) -> "dict | None":
     """Locate the audio-encoder config wherever the checkpoint stores it.
 
     Gemma4 / Gemma4-Unified keep ``audio_config`` at the root; Qwen3-ASR /
     Qwen3-Omni nest it under ``thinker_config``; Nemotron-Omni names it
-    ``sound_config``. Returns ``None`` when the checkpoint genuinely has no
-    audio encoder (e.g. Gemma4 dense with ``"audio_config": null``).
+    ``sound_config``; Nemotron-3.5-ASR names it ``encoder_config``. Returns
+    ``None`` when the checkpoint genuinely has no audio encoder (e.g. Gemma4
+    dense with ``"audio_config": null``).
     """
     return (config.get("audio_config")
             or (config.get("thinker_config") or {}).get("audio_config")
-            or config.get("sound_config"))
+            or config.get("sound_config") or config.get("encoder_config"))
 
 
 def _has_action(model_type: str) -> bool:
@@ -196,6 +225,12 @@ def _is_alpamayo(model_type: str) -> bool:
     return model_type == "alpamayo_r1"
 
 
+def _is_diffusion_gemma(model_type: str, config: dict) -> bool:
+    architectures = [str(a).lower() for a in config.get("architectures", [])]
+    return (_is_diffusion_gemma_model_type(model_type)
+            or any("diffusiongemma" in arch for arch in architectures))
+
+
 # Default output sub-path for every component.  Model types that need a
 # non-default path only list the components that differ in ``_LAYOUT_OVERRIDES``.
 _DEFAULT_LAYOUT: dict[str, str] = {
@@ -203,11 +238,13 @@ _DEFAULT_LAYOUT: dict[str, str] = {
     "talker": "talker",
     "code_predictor": "code_predictor",
     "audio": "audio",
+    "rnnt_decoder": "rnnt_decoder",
     "code2wav": "code2wav",
     "visual": "visual",
     "action": "action",
     "mtp_draft": "mtp_draft",
     "dflash_draft": "dflash_draft",
+    "dspark_draft": "dspark_draft",
 }
 
 # Per-model overrides on top of ``_DEFAULT_LAYOUT``.
@@ -219,6 +256,29 @@ _LAYOUT_OVERRIDES: dict[str, dict[str, str]] = {
         "audio": "audio/audio_encoder",
         "code2wav": "audio/code2wav",
         "visual": "vision",
+    },
+    # Qwen3-Next Omni reuses the same on-disk layout as Qwen3-Omni so existing
+    # engine-build / runtime scripts that expect ``llm/thinker``,
+    # ``llm/talker``, ``audio/audio_encoder``, etc. keep working unchanged.
+    "qwen3_omni_next": {
+        "thinker": "llm/thinker",
+        "talker": "llm/talker",
+        "code_predictor": "llm/code_predictor",
+        "audio": "audio/audio_encoder",
+        "code2wav": "audio/code2wav",
+        "visual": "vision",
+    },
+    # ``qwen3_omni_moe`` shares the Omni ONNX layout.
+    "qwen3_omni_moe": {
+        "thinker": "llm/thinker",
+        "talker": "llm/talker",
+        "code_predictor": "llm/code_predictor",
+        "audio": "audio/audio_encoder",
+        "code2wav": "audio/code2wav",
+        "visual": "vision",
+    },
+    "qwen3_omni_next_talker": {
+        "code_predictor": "llm/code_predictor",
     },
     "qwen3_tts": {
         # Qwen3-TTS has no thinker; the Talker is written under ``llm/`` so
@@ -270,6 +330,19 @@ def _load_config(model_dir: str) -> dict:
         return json.load(f)
 
 
+def _is_cosmos3_checkpoint(model_dir: str) -> bool:
+    """Detect a Cosmos3 diffusers checkpoint via ``model_index.json``."""
+    index_path = os.path.join(model_dir, "model_index.json")
+    if not os.path.exists(index_path):
+        return False
+    try:
+        with open(index_path) as f:
+            class_name = json.load(f).get("_class_name", "")
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(class_name, str) and class_name.startswith("Cosmos3")
+
+
 def _get_llm_text_config(config: dict) -> dict:
     """Return the promoted text/LLM config dict when present."""
     for key in ("text_config", "llm_config", "language_config"):
@@ -281,8 +354,24 @@ def _get_llm_text_config(config: dict) -> dict:
 
 def _has_mtp(config: dict) -> bool:
     """Return True when the checkpoint exposes the MTP branch."""
+    # Omni checkpoints nest the LLM config one level deeper
+    # (thinker_config.text_config).
+    thinker = config.get("thinker_config")
+    if isinstance(thinker, dict):
+        sub = thinker.get("text_config")
+        if isinstance(sub,
+                      dict) and sub.get("mtp_num_hidden_layers") is not None:
+            return True
     text_cfg = _get_llm_text_config(config)
-    return bool(text_cfg.get("mtp_num_hidden_layers") is not None)
+    if text_cfg.get("mtp_num_hidden_layers") is not None:
+        return True
+    # Nemotron-H (DeepSeek-V3 naming): one or more MTP prediction modules whose
+    # layer stack is given by ``mtp_hybrid_override_pattern`` or, on newer
+    # checkpoints, the ``mtp_layers_block_type`` list.
+    return bool(
+        int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0
+        and (text_cfg.get("mtp_hybrid_override_pattern")
+             or text_cfg.get("mtp_layers_block_type")))
 
 
 def _normalize_gemma4_layer_type(layer_type: str) -> str:
@@ -466,13 +555,13 @@ def _validate_gemma4_mtp_pair(target_dir: str,
     target_text = _get_llm_text_config(target_config)
     assistant_text = _get_llm_text_config(assistant_config)
 
-    if target_text.get("model_type") not in ("gemma4", "gemma4_text"):
+    if target_text.get("model_type") not in _GEMMA4_MODEL_TYPES:
         raise ValueError(
-            "Gemma4 MTP target must have model_type gemma4/gemma4_text in text_config."
+            "Gemma4 MTP target must have a Gemma4 model_type in text_config.")
+    if assistant_config.get("model_type") not in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        raise ValueError(
+            "Gemma4 MTP assistant must have a Gemma4 assistant root model_type."
         )
-    if assistant_config.get("model_type") != "gemma4_assistant":
-        raise ValueError(
-            "Gemma4 MTP assistant must have root model_type gemma4_assistant.")
     if int(target_text.get("hidden_size", 0)) != int(
             assistant_config.get("backbone_hidden_size", 0)):
         raise ValueError(
@@ -719,6 +808,19 @@ def _patch_multimodal_token_ids(model_dir: str, llm_out_dir: str,
             collected.update(
                 _collect_tokens_from_tokenizer_fallback(llm_out_dir))
 
+    # Phi-4 Multimodal names its image placeholder ``<|endoftext10|>`` (id
+    # 200010) rather than ``<|image_pad|>``, so the generic fallback above does
+    # not find it. The runtime needs image_token_id in the LLM config to insert
+    # visual embeddings at those positions (there is no image_token_id field in
+    # the source config), so resolve it from the tokenizer here.
+    if "image_token_id" not in collected and model_type in ("phi4mm",
+                                                            "phi4_multimodal"):
+        image_id = _find_token_id(model_dir, "<|endoftext10|>")
+        if image_id is None:
+            image_id = _find_token_id(llm_out_dir, "<|endoftext10|>")
+        if image_id is not None:
+            collected["image_token_id"] = image_id
+
     # Gemma4 PLE needs multimodal placeholder IDs for zero-filling PLE token
     # identity at image/audio positions.
     if model_type in _GEMMA4_MODEL_TYPES:
@@ -781,6 +883,19 @@ def _is_nvfp4_checkpoint(model_dir: str) -> bool:
     return False
 
 
+def _diffusion_gemma_backbone_externalize_weights(
+        model_dir: str,
+        externalize_weights: "list[str] | None") -> "list[str]":
+    """Return externalized weight kinds required by DiffusionGemma backbone."""
+    backbone_externalize_weights = list(externalize_weights or [])
+    if (_is_nvfp4_checkpoint(model_dir)
+            and EXTERNAL_WEIGHT_NVFP4_MOE not in backbone_externalize_weights):
+        backbone_externalize_weights.append(EXTERNAL_WEIGHT_NVFP4_MOE)
+        logger.info("[DiffusionGemma] Auto-enabling NVFP4 MoE external "
+                    "weights for the backbone export")
+    return backbone_externalize_weights
+
+
 def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
     """Remap ``vlm.lm_head.*`` → ``lm_head.*`` (not covered by prefix detection)."""
     if key.startswith("vlm.lm_head."):
@@ -788,20 +903,49 @@ def _alpamayo_llm_key_remap(key: str) -> "Optional[str]":
     return key
 
 
+def _cosmos3_edge_llm_key_remap(key: str) -> "Optional[str]":
+    """Map the Cosmos3-Edge native reasoner schema onto the default ``CausalLM``.
+
+    The root ``model.safetensors`` stores the text tower flat (``layers.N.*``,
+    ``embed_tokens.weight``, ``norm.weight``, ``lm_head.weight``) with Qwen-VL
+    style attention names (``to_q/to_k/to_v/to_out``); the vision tower
+    (``model.visual.*`` / ``model.projector.*``) is exported separately, and the
+    per-layer ``k_norm_und_for_gen`` belongs only to the GEN diffusion tower.
+    """
+    if "visual." in key or "projector." in key or "k_norm_und_for_gen" in key:
+        return None
+    for src, dst in ((".self_attn.to_q.", ".self_attn.q_proj."),
+                     (".self_attn.to_k.", ".self_attn.k_proj."),
+                     (".self_attn.to_v.", ".self_attn.v_proj."),
+                     (".self_attn.to_out.", ".self_attn.o_proj.")):
+        key = key.replace(src, dst)
+    # The native schema stores the text tower unprefixed; the CausalLM module
+    # tree lives under ``model.`` (except lm_head).
+    if key.startswith(("layers.", "embed_tokens.", "norm.")):
+        return "model." + key
+    return key
+
+
 def _export_llm(model_dir: str,
                 llm_out_dir: str,
                 model_type: str = "",
                 eagle_base: bool = False,
+                eagle_draft_dir: str = "",
                 fp8_embedding: bool = False,
                 reduced_vocab_dir: str = "",
                 mtp_base: bool = False,
+                mtp_tree_base: bool = False,
                 dflash_base: bool = False,
                 dflash_tree_base: bool = False,
                 dflash_draft_dir: str = "",
+                dspark_base: bool = False,
+                dspark_draft_dir: str = "",
                 gemma4_mtp_base: bool = False,
                 externalize_weights: "list[str] | None" = None,
                 tp_size: int = 1,
-                num_decoder_layers: "int | None" = None) -> None:
+                num_decoder_layers: "int | None" = None,
+                skip_softmax_scale_factor: "float | None" = None,
+                quantization_override: "str | None" = None) -> None:
     """Export LLM backbone via the standard tensorrt_edgellm pipeline.
 
     When ``tp_size > 1``, exports ``tp_size`` per-rank ONNX files named
@@ -811,8 +955,11 @@ def _export_llm(model_dir: str,
     """
     os.makedirs(llm_out_dir, exist_ok=True)
 
-    key_remap = (_alpamayo_llm_key_remap
-                 if model_type == "alpamayo_r1" else None)
+    key_remap = None
+    if model_type == "alpamayo_r1":
+        key_remap = _alpamayo_llm_key_remap
+    elif model_type == "cosmos3_edge":
+        key_remap = _cosmos3_edge_llm_key_remap
 
     # ModelOpt-quantized Qwen3-MoE / Qwen3-Omni-MoE checkpoints store per-expert
     # weights under ``mlp.experts.{j}.`` (modelopt's fused-expert export, for
@@ -828,20 +975,27 @@ def _export_llm(model_dir: str,
         from ..models.qwen3_moe import MODELOPT_KEY_REMAP
         key_remap = MODELOPT_KEY_REMAP
 
-    # Gemma4 NVFP4 MoE: checkpoint stores router/experts at layer level but
+    # Gemma4 MoE: checkpoint stores router/experts at layer level but
     # model tree nests them under moe_block with _experts indirection.
-    # Only activate when the checkpoint is NVFP4-quantized (otherwise the
-    # FP16 dense path uses router/experts directly on the layer).
+    # Activate when the checkpoint has MoE (quantized or BF16 QAT).
+    _needs_moe_quantization = False
     if key_remap is None and model_type in _GEMMA4_MODEL_TYPES:
-        if _is_nvfp4_checkpoint(model_dir):
-            config_path = os.path.join(model_dir, "config.json")
-            with open(config_path) as f:
-                _cfg = json.load(f)
-            _llm = _cfg.get("text_config", _cfg)
-            # Only MoE checkpoints (e.g. 26B-A4B) nest router/experts under
-            # moe_block and need the remap; dense NVFP4 checkpoints (E2B/E4B/
-            # 31B) have enable_moe_block=False and export directly.
-            if _llm.get("enable_moe_block", False):
+        config_path = os.path.join(model_dir, "config.json")
+        with open(config_path) as f:
+            _cfg = json.load(f)
+        _llm = _cfg.get("text_config", _cfg)
+        if _llm.get("enable_moe_block", False):
+            _is_nvfp4 = _is_nvfp4_checkpoint(model_dir)
+            _has_int4_cfg = os.path.isfile(
+                os.path.join(model_dir, "hf_quant_config.json"))
+            _needs_moe_quantization = (not _is_nvfp4 and not _has_int4_cfg)
+            if _needs_moe_quantization:
+                # BF16 QAT-unquantized: fused expert tensors
+                from ..models.gemma4.modeling_gemma4_text import \
+                    GEMMA4_FUSED_BF16_KEY_REMAP
+                key_remap = GEMMA4_FUSED_BF16_KEY_REMAP
+            else:
+                # NVFP4 or INT4 AWQ: per-expert quantized weights
                 from ..models.gemma4.modeling_gemma4_text import \
                     GEMMA4_NVFP4_KEY_REMAP
                 key_remap = GEMMA4_NVFP4_KEY_REMAP
@@ -863,24 +1017,58 @@ def _export_llm(model_dir: str,
         logger.info("[LLM] Loading checkpoint from %s", model_dir)
         try:
             from ..model import AutoModel
+
+            # Build config overrides for on-the-fly quantization of BF16 MoE
+            # checkpoints (e.g. --quantization int4_awq on a QAT-unquantized ckpt).
+            _extra_configs = None
+            if quantization_override == "int4_awq" and _needs_moe_quantization:
+                _extra_configs = {
+                    "_needs_moe_quantization": True,
+                    "_use_int4_moe_plugin": True,
+                }
+
             model = AutoModel.from_pretrained(
                 model_dir,
                 device="cpu",
                 eagle_base=eagle_base,
+                eagle_draft_dir=eagle_draft_dir or None,
                 key_remap=key_remap,
                 reduced_vocab_dir=reduced_vocab_dir or None,
                 mtp_base=mtp_base,
+                mtp_tree_base=mtp_tree_base,
                 dflash_base=dflash_base,
                 dflash_tree_base=dflash_tree_base,
                 dflash_draft_dir=dflash_draft_dir or None,
+                dspark_base=dspark_base,
+                dspark_draft_dir=dspark_draft_dir or None,
                 gemma4_mtp_base=gemma4_mtp_base,
                 tp_size=world,
                 tp_rank=rank,
                 num_decoder_layers=num_decoder_layers,
+                extra_configs=_extra_configs,
             )
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[LLM] Failed to load checkpoint")
             raise SystemExit(1) from exc
+
+        # CLI override of the skip-softmax (BLASST) scale factor: None = flag not given (keep the config value); an explicit 0.0
+        # disables skip-softmax even when config.json carries a positive S.
+        if skip_softmax_scale_factor is not None:
+            n_patched = 0
+            for module in model.modules():
+                if hasattr(module, "skip_softmax_scale_factor"):
+                    module.skip_softmax_scale_factor = skip_softmax_scale_factor
+                    n_patched += 1
+            if n_patched:
+                logger.info(
+                    "[LLM] skip_softmax_scale_factor=%.6f applied to %d "
+                    "attention modules", skip_softmax_scale_factor, n_patched)
+            else:
+                logger.warning(
+                    "[LLM] --skip-softmax-scale-factor=%.6f had NO effect: no "
+                    "attention module carries the attribute (this model's "
+                    "attention variant is not wired for skip-softmax yet)",
+                    skip_softmax_scale_factor)
 
         # Per-rank runtime config so each rank artifact is self-describing.
         # Single-device exports keep the conventional "config.json".
@@ -900,6 +1088,16 @@ def _export_llm(model_dir: str,
         except (OSError, ValueError, RuntimeError) as exc:
             logger.exception("[LLM] ONNX export failed")
             raise SystemExit(1) from exc
+
+        # DFlash: the draft's proposal query embeds the mask token via this base
+        # engine's shared embedding table, so fold the draft's trained mask row
+        # into it (no-op when the row is shared with the base).
+        if dflash_draft_dir and world == 1:
+            from ..checkpoint.checkpoint_utils import _runtime_embedding_scale
+            _patch_dflash_mask_embedding(
+                llm_out_dir,
+                dflash_draft_dir,
+                embedding_scale=_runtime_embedding_scale(model))
 
         # Free this rank's model before building the next one
         del model
@@ -925,6 +1123,146 @@ def _export_llm(model_dir: str,
         _patch_tts_config(model_dir, llm_out_dir)
 
     logger.info("[LLM] Done: %s", output_path)
+
+
+def _patch_diffusion_export_config(model_dir: str, output_dir: str) -> None:
+    """Patch DiffusionGemma runtime metadata that is not present in HF config.json."""
+    root = _load_config(model_dir)
+    token_ids = {}
+    for key in ("image_token_id", "audio_token_id"):
+        value = root.get(key)
+        if isinstance(value, int):
+            token_ids[key] = value
+    if "image_token_id" not in token_ids:
+        image_token_id = _find_token_id(model_dir, "<|image_pad|>")
+        if image_token_id is not None:
+            token_ids["image_token_id"] = image_token_id
+    if not token_ids:
+        return
+
+    cfg_patch_path = os.path.join(output_dir, "dllm", "config.json")
+    if not os.path.exists(cfg_patch_path):
+        return
+    with open(cfg_patch_path) as f:
+        cfg = json.load(f)
+    cfg.update(token_ids)
+    with open(cfg_patch_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    logger.info("[DiffusionGemma] Patched multimodal token IDs into %s",
+                cfg_patch_path)
+
+
+def _diffusion_gemma_has_visual(config: dict) -> bool:
+    return isinstance(config.get("vision_config"), dict)
+
+
+def _remap_diffusion_gemma_visual_weights(weights: dict) -> dict:
+    """Return a Gemma4-visual-compatible view of DiffusionGemma visual weights."""
+    remapped = {}
+    prefix_map = (
+        ("model.encoder.vision_tower.", "model.vision_tower."),
+        ("model.encoder.embed_vision.", "model.embed_vision."),
+        ("model.encoder.multimodal_embedder.", "model.embed_vision."),
+        ("model.encoder.mm_soft_embedding_projection.",
+         "model.embed_vision.embedding_projection."),
+        ("model.encoder.mm_soft_embedding_norm.",
+         "model.embed_vision.embedding_pre_projection_norm."),
+    )
+    for key, tensor in weights.items():
+        for src, dst in prefix_map:
+            if key.startswith(src):
+                remapped[dst + key[len(src):]] = tensor
+                break
+    if not remapped:
+        raise ValueError("DiffusionGemma checkpoint has vision_config but no "
+                         "model.encoder visual weights were found.")
+    return remapped
+
+
+def _export_diffusion_gemma_visual(model_dir: str, visual_out_dir: str,
+                                   weights: dict, config: dict,
+                                   dtype: "torch.dtype",
+                                   model_config: "ModelConfig") -> None:
+    """Export DiffusionGemma vision tower via the Gemma4 visual exporter."""
+    if not _diffusion_gemma_has_visual(config):
+        raise ValueError("DiffusionGemma checkpoint has no vision_config.")
+    visual_weights = _remap_diffusion_gemma_visual_weights(weights)
+    _export_visual(model_dir,
+                   visual_out_dir,
+                   visual_weights,
+                   config,
+                   "gemma4",
+                   dtype,
+                   model_config=model_config)
+
+
+def _export_diffusion_gemma(model_dir: str,
+                            output_dir: str,
+                            fp8_embedding: bool = False,
+                            reduced_vocab_dir: str = "",
+                            externalize_weights: "list[str] | None" = None,
+                            tp_size: int = 1) -> None:
+    """Export DiffusionGemma as one unified backbone graph."""
+    if tp_size != 1:
+        raise SystemExit(
+            "DiffusionGemma export currently supports only --tp-size 1.")
+
+    backbone_out_dir = os.path.join(output_dir, "dllm")
+    os.makedirs(backbone_out_dir, exist_ok=True)
+    backbone_externalize_weights = _diffusion_gemma_backbone_externalize_weights(
+        model_dir, externalize_weights)
+    use_nvfp4_moe = _is_nvfp4_checkpoint(model_dir)
+
+    try:
+        from ..model import AutoModel
+        from ..models.diffusion_gemma import make_diffusion_gemma_key_remap
+        from ..models.linear import FP16Linear
+        from ..onnx.export import export_onnx
+    except ImportError as exc:
+        logger.exception("[DiffusionGemma] Failed to import export helpers")
+        raise SystemExit(1) from exc
+
+    logger.info("[DiffusionGemma] Loading backbone checkpoint from %s",
+                model_dir)
+    try:
+        backbone = AutoModel.from_pretrained(
+            model_dir,
+            device="cpu",
+            key_remap=make_diffusion_gemma_key_remap(
+                include_backbone=True,
+                include_self_conditioning=True,
+                nvfp4_moe=use_nvfp4_moe),
+            reduced_vocab_dir=reduced_vocab_dir or None,
+        )
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            module = getattr(backbone.self_conditioning, name)
+            if not isinstance(module, FP16Linear):
+                raise ValueError(
+                    "DiffusionGemma unified self-conditioning requires "
+                    f"self_conditioning.{name} to export as FP16Linear; "
+                    f"got {type(module).__name__}. Add this module to "
+                    "the checkpoint quantization exclude list.")
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[DiffusionGemma] Failed to load backbone")
+        raise SystemExit(1) from exc
+
+    backbone_path = os.path.join(backbone_out_dir, "model.onnx")
+    logger.info("[DiffusionGemma] Exporting backbone to %s", backbone_path)
+    try:
+        export_onnx(backbone,
+                    backbone_path,
+                    model_dir=model_dir,
+                    fp8_embedding=fp8_embedding,
+                    reduced_vocab_dir=reduced_vocab_dir,
+                    externalize_weights=backbone_externalize_weights)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[DiffusionGemma] Backbone ONNX export failed")
+        raise SystemExit(1) from exc
+
+    del backbone
+
+    _patch_diffusion_export_config(model_dir, output_dir)
+    logger.info("[DiffusionGemma] Done: %s", output_dir)
 
 
 def _export_mtp_draft(model_dir: str,
@@ -1046,7 +1384,8 @@ def _export_dflash_draft(model_dir: str,
 
     # --- Save draft vocab map sidecar for C++ runtime ---
     if draft_reduced_vocab_dir:
-        from safetensors.torch import save_file as _save_safetensors
+        from tensorrt_edgellm._safetensors_io import \
+            save_file as _save_safetensors
 
         from ..vocab_reduction.constants import (DRAFT_VOCAB_INFO_NAME,
                                                  DRAFT_VOCAB_MAP_NAME)
@@ -1072,6 +1411,251 @@ def _export_dflash_draft(model_dir: str,
     logger.info("[DFlash Draft] Done: %s", output_path)
 
 
+def _patch_dflash_mask_embedding(llm_out_dir: str,
+                                 dflash_draft_dir: str,
+                                 embedding_scale: float = 1.0) -> None:
+    """Fold the DFlash draft's trained mask-token embedding into the base sidecar.
+
+    The runtime embeds the draft proposal query ``[anchor, mask, ...]`` by
+    looking ``mask_token_id`` up in the base engine's shared
+    ``embedding.safetensors`` (``dflashDecoder.cpp`` ``runDraftForward``). Some
+    DFlash checkpoints (e.g. Nemotron-3.5) ship a distinct trained embedding for
+    that reserved token in the draft's own ``embed_tokens`` — typically the only
+    row that differs from the base table. Patch only that single row; when the
+    draft's mask row is shared with the base (the common Qwen-style case) this is
+    a no-op.
+    """
+    import glob
+
+    from safetensors import safe_open
+
+    from tensorrt_edgellm._safetensors_io import save_file
+
+    emb_path = os.path.join(llm_out_dir, "embedding.safetensors")
+    if not os.path.exists(emb_path):
+        logger.warning("[DFlash] %s missing; cannot fold draft mask embedding",
+                       emb_path)
+        return
+
+    draft_cfg = _load_config(dflash_draft_dir)
+    dcfg = draft_cfg.get("dflash_config", {}) or {}
+    mask_id = dcfg.get("mask_token_id", draft_cfg.get("mask_token_id"))
+    if mask_id is None:
+        logger.warning("[DFlash] draft config has no mask_token_id; skipping "
+                       "mask embedding fold")
+        return
+    mask_id = int(mask_id)
+
+    # embed_tokens is excluded from draft quantization, so the row is dense.
+    draft_vec = None
+    for shard in sorted(
+            glob.glob(os.path.join(dflash_draft_dir, "*.safetensors"))):
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for key in ("embed_tokens.weight", "model.embed_tokens.weight"):
+                if key in keys:
+                    draft_vec = f.get_slice(key)[mask_id:mask_id +
+                                                 1].squeeze(0).to(
+                                                     torch.float32)
+                    break
+        if draft_vec is not None:
+            break
+    if draft_vec is None:
+        logger.info("[DFlash] draft checkpoint has no embed_tokens; mask "
+                    "embedding is shared with the base (no fold needed)")
+        return
+
+    with safe_open(emb_path, framework="pt", device="cpu") as f:
+        if "embedding_scale" in set(f.keys()):
+            raise ValueError(
+                "DFlash mask-embedding fold does not support FP8 "
+                "embedding.safetensors; re-export the base without "
+                "--fp8-embedding.")
+        weight = f.get_tensor("embedding")
+
+    patched_row = (draft_vec * embedding_scale).to(weight.dtype)
+    if torch.allclose(weight[mask_id].to(torch.float32),
+                      patched_row.to(torch.float32),
+                      atol=1e-3,
+                      rtol=0.0):
+        logger.info(
+            "[DFlash] draft mask embedding (id=%d) matches base; no fold needed",
+            mask_id)
+        return
+
+    weight[mask_id] = patched_row
+    # Write to a temp file and atomically rename so an interrupted patch never
+    # leaves the base engine's embedding sidecar half-written; a re-run then
+    # recovers without re-exporting the base.
+    tmp_path = emb_path + ".tmp"
+    save_file({"embedding": weight.contiguous()}, tmp_path)
+    os.replace(tmp_path, emb_path)
+    logger.info(
+        "[DFlash] Folded draft mask embedding (id=%d) into base "
+        "embedding.safetensors", mask_id)
+
+
+_DSPARK_HEAD_TENSOR_KEYS = {
+    "markov_w1": "markov_head.markov_w1.weight",
+    "markov_w2": "markov_head.markov_w2.weight",
+    "confidence_weight": "confidence_head.proj.weight",
+    "confidence_bias": "confidence_head.proj.bias",
+}
+
+
+def _load_dspark_head_tensors(draft_dir: str, required_keys: set[str]) -> dict:
+    """Load DSpark Markov/confidence sidecar tensors from safetensors shards."""
+    import glob
+
+    from safetensors import safe_open
+
+    shards = sorted(glob.glob(os.path.join(draft_dir, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(f"No safetensors files found in {draft_dir}")
+
+    remaining = dict(_DSPARK_HEAD_TENSOR_KEYS)
+    loaded: dict = {}
+    source: dict = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+            for save_name, ckpt_key in list(remaining.items()):
+                if ckpt_key in keys:
+                    tensor = f.get_tensor(ckpt_key).cpu()
+                    if save_name == "confidence_weight" and tensor.ndim == 2 and tensor.shape[
+                            0] == 1:
+                        tensor = tensor.squeeze(0)
+                    loaded[save_name] = tensor
+                    source[save_name] = {
+                        "checkpoint_key": ckpt_key,
+                        "shard": os.path.basename(shard),
+                        "shape": list(tensor.shape),
+                        "dtype": str(tensor.dtype).replace("torch.", ""),
+                    }
+                    del remaining[save_name]
+
+    missing_required = sorted(required_keys - loaded.keys())
+    if missing_required:
+        details = ", ".join(f"{name}<-{_DSPARK_HEAD_TENSOR_KEYS[name]}"
+                            for name in missing_required)
+        raise KeyError(
+            f"DSpark draft checkpoint is missing required head tensors: {details}"
+        )
+    return loaded, source
+
+
+def _export_dspark_sidecars(dspark_draft_dir: str, draft_out_dir: str) -> None:
+    """Export DSpark Markov and confidence heads as runtime sidecars.
+
+    The draft ONNX engine contains the parallel DSpark backbone only. The
+    sequential Markov head and confidence scheduler are intentionally kept as
+    sidecar tensors so the runtime can execute token-by-token scheduling
+    without inflating the TensorRT graph with dynamic control flow.
+    """
+    from tensorrt_edgellm._safetensors_io import save_file
+
+    cfg = _load_config(dspark_draft_dir)
+    dspark_cfg = cfg.get("dspark_config", {}) or {}
+    markov_type = str(
+        dspark_cfg.get("markov_head_type", cfg.get("markov_head_type", "")))
+    enable_confidence = bool(
+        dspark_cfg.get("enable_confidence_head",
+                       cfg.get("enable_confidence_head", False)))
+    confidence_with_markov = bool(
+        dspark_cfg.get("confidence_head_with_markov",
+                       cfg.get("confidence_head_with_markov", False)))
+    required = {"markov_w1", "markov_w2"}
+    if enable_confidence:
+        required.update({"confidence_weight", "confidence_bias"})
+
+    tensors, source = _load_dspark_head_tensors(dspark_draft_dir, required)
+    out_tensors = _to_fp16(tensors)
+    heads_path = os.path.join(draft_out_dir, "dspark_heads.safetensors")
+    save_file(out_tensors, heads_path)
+
+    info = {
+        "format":
+        "tensorrt-edgellm-dspark-heads-v1",
+        "source":
+        dspark_draft_dir,
+        "markov_head_type":
+        markov_type,
+        "markov_rank":
+        int(dspark_cfg.get("markov_rank", cfg.get("markov_rank", 0)) or 0),
+        "enable_confidence_head":
+        enable_confidence,
+        "confidence_head_with_markov":
+        confidence_with_markov,
+        "tensor_keys":
+        sorted(out_tensors.keys()),
+        "source_tensors":
+        source,
+        "notes": [
+            "markov_w2 is saved in checkpoint Linear weight layout [vocab_size, markov_rank].",
+            "confidence_weight is squeezed to [input_dim] when the checkpoint stores [1, input_dim].",
+        ],
+    }
+    info_path = os.path.join(draft_out_dir, "dspark_heads_info.json")
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2)
+    logger.info("[DSpark Draft] Wrote head sidecars: %s, %s", heads_path,
+                info_path)
+
+
+def _export_dspark_draft(model_dir: str, draft_out_dir: str,
+                         dspark_draft_dir: str) -> None:
+    """Export the DSpark draft backbone plus Markov/confidence sidecars."""
+    os.makedirs(draft_out_dir, exist_ok=True)
+    output_path = os.path.join(draft_out_dir, "model.onnx")
+
+    logger.info("[DSpark Draft] Loading checkpoint from %s", dspark_draft_dir)
+    try:
+        from ..model import AutoModel
+        model = AutoModel.from_pretrained(model_dir,
+                                          device="cpu",
+                                          dspark_draft=True,
+                                          dspark_draft_dir=dspark_draft_dir)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[DSpark Draft] Failed to load checkpoint")
+        raise SystemExit(1) from exc
+
+    logger.info("[DSpark Draft] Exporting backbone ONNX to %s", output_path)
+    try:
+        from ..onnx.export import export_onnx
+        export_onnx(model, output_path, model_dir=dspark_draft_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[DSpark Draft] ONNX export failed")
+        raise SystemExit(1) from exc
+
+    try:
+        _export_dspark_sidecars(dspark_draft_dir, draft_out_dir)
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+        logger.exception("[DSpark Draft] Sidecar export failed")
+        raise SystemExit(1) from exc
+
+    logger.info("[DSpark Draft] Done: %s", output_path)
+
+
+def _tower_model_config(model_config: "ModelConfig", weights: dict,
+                        prefixes: tuple) -> "ModelConfig":
+    """Return *model_config* with quant reset to fp16 when the tower under
+    *prefixes* ships no ``.weight_scale`` tensors (i.e. it was left
+    unquantized in an otherwise-quantized consolidated checkpoint).
+
+    Detects per-tower quantization from the checkpoint instead of assuming
+    the backbone quant_type applies (same pattern as the CodePredictor).
+    """
+    import dataclasses
+
+    from ..config import QuantConfig
+    tower_quantized = any(
+        k.endswith(".weight_scale") and k.startswith(prefixes)
+        for k in weights)
+    if tower_quantized:
+        return model_config
+    return dataclasses.replace(model_config, quant=QuantConfig())
+
+
 def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                    config: dict, model_type: str, dtype: "torch.dtype",
                    model_config: "ModelConfig") -> None:
@@ -1084,6 +1668,9 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
     ``qwen3_omni`` / ``qwen3_omni_moe`` model_types and runs the
     remap inside its own ``build_qwen3_omni_visual``.
     """
+    model_config = _tower_model_config(
+        model_config, weights,
+        ("visual.", "thinker.visual.", "model.visual.", "vision_tower."))
     os.makedirs(visual_out_dir, exist_ok=True)
     output_path = os.path.join(visual_out_dir, "model.onnx")
 
@@ -1129,7 +1716,11 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         # same C++ runner enum the dense Qwen3-Omni visual engine registers.
         "qwen3_omni_moe": "qwen3_omni_vision_encoder",
         "gemma4": "gemma4_vision",
+        "qwen3_omni_next": "qwen3_omni_next_vision_encoder",
         "gemma4_unified": "gemma4_unified_vision",
+        # Cosmos3-Edge reasoner SigLIP2 ViT (the bare "cosmos3_edge" maps to
+        # the text decoder in C++; the visual engine registers its own enum).
+        "cosmos3_edge": "cosmos3_edge_vision",
     }
     top_level_model_type = _VISUAL_MODEL_TYPE_MAP.get(model_type, model_type)
     vis_cfg_out: dict = {
@@ -1152,7 +1743,8 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         vis_cfg_out["vision_config"][
             "model_type"] = "qwen3_omni_vision_encoder"
     if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_omni", "qwen3_omni_moe",
-                      "qwen3_5", "qwen3_5_moe"):
+                      "qwen3_omni_next", "qwen3_5", "qwen3_5_moe",
+                      "cosmos3_edge"):
         # C++ QwenViTRunner reads these token IDs and rope_theta from config.json.
         # For Qwen3-VL the token IDs are at the root level, but vocab_size and
         # rope_theta live inside text_config.  Fall back to text_config for any
@@ -1248,29 +1840,16 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
                 vc_out = dict(vc_out)
                 vc_out["num_position_embeddings"] = _grid * _grid
                 vis_cfg_out["vision_config"] = vc_out
-        if model_type == "qwen3_omni":
-            # Qwen3-Omni video temporal MRoPE scale. HF keeps it at thinker_config
-            # level (not vision_config), so copy it into vision_config where the C++
-            # Qwen3OmniViTRunner reads it.
-            _pips = _thinker_cfg.get("position_id_per_seconds",
-                                     config.get("position_id_per_seconds"))
-            if _pips is not None:
-                vis_cfg_out["vision_config"] = dict(
-                    vis_cfg_out["vision_config"])
-                vis_cfg_out["vision_config"]["position_id_per_seconds"] = _pips
-
-    if model_type == "gemma4":
-        vis_cfg_out["vision_config"] = dict(vis_cfg_out["vision_config"])
-        vis_cfg_out["vision_config"]["model_type"] = "gemma4_vision"
-        text_cfg = config.get("text_config") or {}
-        if text_cfg:
-            vis_cfg_out["text_config"] = text_cfg
-        if "image_token_id" in config:
-            vis_cfg_out["image_token_id"] = config["image_token_id"]
-        else:
-            image_token_id = _find_token_id(model_dir, "<|image_pad|>")
-            if image_token_id is not None:
-                vis_cfg_out["image_token_id"] = image_token_id
+    if model_type in ("qwen3_omni", "qwen3_omni_moe", "qwen3_omni_next"):
+        # Qwen3OmniViTRunner reads position_id_per_seconds from vision_config;
+        # HF stores it one level up. Copy it in.
+        _pips = _thinker_cfg.get("position_id_per_seconds",
+                                 config.get("position_id_per_seconds"))
+        if _pips is not None and isinstance(vis_cfg_out.get("vision_config"),
+                                            dict):
+            vc_out = dict(vis_cfg_out["vision_config"])
+            vc_out["position_id_per_seconds"] = _pips
+            vis_cfg_out["vision_config"] = vc_out
     # Copy preprocessor_config.json to the visual output dir so the C++
     # runtime can find patch_size, image_mean, image_std, etc.  Applies to
     # every visual family (Qwen VL, InternVL, Phi-4mm) — the C++ visual
@@ -1357,12 +1936,25 @@ def _export_visual(model_dir: str, visual_out_dir: str, weights: dict,
         vis_cfg_out["vision_config"][
             "model_type"] = "nemotron_omni_vision_encoder"
         # NemotronOmniViTRunner reads these top-level fields; visualBuilder
-        # additionally reads patch_size and downsample_ratio.
+        # additionally reads patch_size, downsample_ratio and vit_hidden_size.
         for key in ("llm_config", "img_context_token_id", "img_start_token_id",
                     "img_end_token_id", "force_image_size", "norm_mean",
-                    "norm_std", "patch_size", "downsample_ratio"):
+                    "norm_std", "patch_size", "downsample_ratio",
+                    "vit_hidden_size", "video_pruning_rate"):
             if key in config:
                 vis_cfg_out[key] = config[key]
+        # Video sizing lives under vision_config in the official checkpoint (and
+        # in vLLM); resolve_video_cfg falls back to top level for older
+        # artifacts, then the HF defaults (temporal_patch_size omitted -> 2).
+        # Shared with the runtime model build so both agree on T.
+        from ..models.nemotron_omni.modeling_nemotron_omni_visual import \
+            resolve_video_cfg
+        vis_cfg_out["video_temporal_patch_size"] = (resolve_video_cfg(
+            config, "video_temporal_patch_size", None) or 2)
+        vis_cfg_out["video_target_num_patches"] = resolve_video_cfg(
+            config, "video_target_num_patches", 1024)
+        vis_cfg_out["video_maintain_aspect_ratio"] = resolve_video_cfg(
+            config, "video_maintain_aspect_ratio", True)
     if os.environ.get("USE_TRT_NATIVE_ATTN") == "1":
         vis_cfg_out["use_trt_native_vit_attn"] = True
     cfg_out_path = os.path.join(visual_out_dir, "config.json")
@@ -1394,6 +1986,10 @@ def _export_audio(model_dir: str,
                   dtype: "torch.dtype",
                   model_config: "ModelConfig | None" = None) -> None:
     """Export audio encoder via from-scratch tensorrt_edgellm pipeline."""
+    if model_config is not None:
+        model_config = _tower_model_config(
+            model_config, weights,
+            ("audio_tower.", "thinker.audio_tower.", "audio_embed."))
     os.makedirs(audio_out_dir, exist_ok=True)
     output_path = os.path.join(audio_out_dir, "model.onnx")
 
@@ -1416,6 +2012,19 @@ def _export_audio(model_dir: str,
     logger.info("[Audio] Done: %s", output_path)
 
     # Write config.json for the C++ runtime
+    if model_type == "nemotron3_5_asr":
+        # Nemotron-3.5-ASR keeps everything the encoder builder AND the RNN-T
+        # runtime need (``encoder_config``, ``decoder_hidden_size``,
+        # ``blank_token_id``, ``vocab_size``, ``num_decoder_layers``,
+        # ``default_prompt_id``, ...) at the config root, so pass it through
+        # verbatim. Both the encoder and the RNN-T step share this one file.
+        audio_cfg_out = dict(config)
+        cfg_out_path = os.path.join(audio_out_dir, "config.json")
+        with open(cfg_out_path, "w") as f:
+            json.dump(audio_cfg_out, f, indent=2)
+        logger.info("[Audio] Wrote config.json: %s", cfg_out_path)
+        _copy_asr_tokenizer(model_dir, audio_out_dir)
+        return
     if model_type == "gemma4_unified":
         audio_cfg = dict(config.get("audio_config") or {})
         audio_cfg["model_type"] = "gemma4_unified_audio"
@@ -1504,6 +2113,8 @@ def _export_audio(model_dir: str,
             "qwen3_asr": "qwen3_asr_thinker",
             "qwen3_omni": "qwen3_omni_audio_encoder",
             "qwen3_omni_moe": "qwen3_omni_audio_encoder",
+            "qwen3_omni_next": "qwen3_omni_next_audio_encoder",
+            "qwen3_omni_next_thinker": "qwen3_omni_next_audio_encoder",
         }
         audio_model_type = _AUDIO_MODEL_TYPE_MAP.get(model_type, model_type)
         audio_cfg_out = {
@@ -1538,6 +2149,75 @@ def _export_audio(model_dir: str,
     logger.info("[Audio] Wrote config.json: %s", cfg_out_path)
 
 
+def _copy_asr_tokenizer(model_dir: str, out_dir: str) -> None:
+    """Copy the RNN-T tokenizer sidecar into the engine dir.
+
+    ``NemotronAsrRuntime`` detokenizes emitted RNN-T tokens with
+    ``tokenizer.json`` (``tokenizer_config.json`` is optional — special-token
+    config). Copying them here keeps the exported engine dir self-contained.
+    """
+    import shutil
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        src = os.path.join(model_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(out_dir, name))
+            logger.info("[Audio] Copied %s", name)
+        elif name == "tokenizer.json":
+            logger.warning(
+                "[Audio] %s not found in checkpoint — the RNN-T runtime "
+                "needs it to detokenize.", name)
+
+
+# ---------------------------------------------------------------------------
+# RNN-T decoder-step export (Nemotron-3.5-ASR)
+# ---------------------------------------------------------------------------
+
+
+def _export_rnnt_decoder(model_dir: str, out_dir: str, weights: dict,
+                         config: dict, dtype: "torch.dtype") -> None:
+    """Export the fused RNN-T step (LSTM prediction network + joint) to ONNX.
+
+    One decode step: ``(decoder_input_ids, hidden_state, cell_state,
+    encoder_frame) -> (logits, present_hidden_state, present_cell_state)``.
+    All-static shapes (the greedy loop lives in the C++ runtime).
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "model.onnx")
+    logger.info("[RNN-T] Exporting decoder step to %s", output_path)
+    try:
+        from ..models.nemotron3_5_asr import build_nemotron3_5_asr_decoder
+        from ..onnx.export_encoder import _run_dynamo_export
+        step = build_nemotron3_5_asr_decoder(config, weights, dtype=dtype)
+        step = step.to("cpu").eval()
+        args_, input_names, output_names, dynamic_shapes = (
+            step.get_onnx_export_args(config, "cpu"))
+        _run_dynamo_export(step, args_, output_path, input_names, output_names,
+                           dynamic_shapes)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[RNN-T] ONNX export failed")
+        raise SystemExit(1) from exc
+    logger.info("[RNN-T] Done: %s", output_path)
+
+    # Build-type marker sidecar: the C++ audioBuilder auto-detects the RNN-T
+    # step build from the ``rnnt_decoder_config`` key (the engine itself is
+    # fully static-shape). The runtime reads the full config from the encoder
+    # dir; the fields here are informational.
+    step_cfg = {
+        "model_type": "nemotron3_5_asr",
+        "rnnt_decoder_config": {
+            "blank_token_id": config.get("blank_token_id"),
+            "vocab_size": config.get("vocab_size"),
+            "decoder_hidden_size": config.get("decoder_hidden_size"),
+            "num_decoder_layers": config.get("num_decoder_layers", 2),
+            "max_symbols_per_step": config.get("max_symbols_per_step", 10),
+        },
+    }
+    cfg_out_path = os.path.join(out_dir, "config.json")
+    with open(cfg_out_path, "w") as f:
+        json.dump(step_cfg, f, indent=2)
+    logger.info("[RNN-T] Wrote config.json: %s", cfg_out_path)
+
+
 # ---------------------------------------------------------------------------
 # Code2Wav export
 # ---------------------------------------------------------------------------
@@ -1567,6 +2247,87 @@ def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
         except (OSError, ValueError, RuntimeError, ImportError) as exc:
             logger.exception("[Code2Wav] Qwen3-TTS export failed")
             raise SystemExit(1) from exc
+        logger.info("[Code2Wav] Done: %s", output_path)
+        if config.get("tts_model_type") == "base":
+            # Base checkpoints clone voices from reference audio: export the
+            # reference encoders (ECAPA x-vector + Mimi codec encoder) too.
+            logger.info(
+                "[CloneEncoders] Exporting voice-clone reference encoders")
+            try:
+                from ..models.qwen3_tts import export_qwen3_tts_clone_encoders
+                clone_out_dir = os.path.join(os.path.dirname(c2w_out_dir),
+                                             "clone_encoders")
+                export_qwen3_tts_clone_encoders(model_dir, clone_out_dir)
+            except (OSError, ValueError, RuntimeError, ImportError) as exc:
+                logger.exception("[CloneEncoders] export failed")
+                raise SystemExit(1) from exc
+        return
+
+    if model_type == "qwen3_omni_next":
+        # Qwen3-Next Omni Code2Wav config + weights live in a separate directory
+        # (release name ``codec_decode_online/`` shipped alongside the HF
+        # checkpoint), containing ``config.yaml`` + ``model_weights.pt``.
+        # Its architecture (SplitResidualVectorQuantizer + Llama-style
+        # WindowLimitedTransformer) is incompatible with Qwen3-Omni's vocoder.
+        c2w_dir = os.environ.get(
+            "QWEN3_OMNI_NEXT_CODE2WAV_DIR") or os.path.join(
+                model_dir, "codec_decode_online")
+        if not (os.path.isfile(os.path.join(c2w_dir, "config.yaml"))
+                and os.path.isfile(os.path.join(c2w_dir, "model_weights.pt"))):
+            logger.error(
+                "[Code2Wav] Qwen3-Next Omni vocoder expected config.yaml + "
+                "model_weights.pt under %r (override with the "
+                "QWEN3_OMNI_NEXT_CODE2WAV_DIR env var). Skip with "
+                "--skip-code2wav.", c2w_dir)
+            sys.exit(1)
+        logger.info("[Code2Wav] Building Qwen3-Next Omni model from %s",
+                    c2w_dir)
+        try:
+            from ..models.qwen3_omni_next import (
+                build_qwen3_omni_next_code2wav,
+                export_qwen3_omni_next_code2wav_onnx)
+            model = build_qwen3_omni_next_code2wav(c2w_dir,
+                                                   dtype=dtype).to("cuda")
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            logger.exception("[Code2Wav] Failed to build model")
+            raise SystemExit(1) from exc
+
+        logger.info("[Code2Wav] Exporting ONNX to %s", output_path)
+        try:
+            export_qwen3_omni_next_code2wav_onnx(model, output_path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            logger.exception("[Code2Wav] ONNX export failed")
+            raise SystemExit(1) from exc
+
+        # Write a config.json the C++ runtime can consume.  ``code2wav_config``
+        # mirrors the dataclass defaults in ``Code2WavConfig`` (n_q=16,
+        # codebook_size=2048, decoder_dim=1536) and exposes the two upsample
+        # lists that the runtime multiplies to compute samples-per-code
+        # (product([2, 2]) * product([8, 5, 4, 3]) = 1920 samples / code).
+        c2w_cfg_out = {
+            "num_quantizers": 16,
+            "codebook_size": 2048,
+            "hidden_size": 1024,
+            "decoder_dim": 1536,
+            "upsample_rates": [2, 2],
+            "upsampling_ratios": [8, 5, 4, 3],
+            "sample_rate": 24000,
+        }
+        cfg_out_path = os.path.join(c2w_out_dir, "config.json")
+        with open(cfg_out_path, "w") as f:
+            json.dump(
+                {
+                    "model_type": "qwen3_omni_next_code2wav",
+                    "code2wav_config": c2w_cfg_out,
+                    "builder_config": {
+                        "max_code_len": 2000,
+                        "min_code_len": 1,
+                        "opt_code_len": 300,
+                    },
+                },
+                f,
+                indent=2)
+        logger.info("[Code2Wav] Wrote config.json: %s", cfg_out_path)
         logger.info("[Code2Wav] Done: %s", output_path)
         return
 
@@ -1616,150 +2377,209 @@ def _export_code2wav(model_dir: str, c2w_out_dir: str, weights: dict,
 # ---------------------------------------------------------------------------
 
 
-def _extract_tts_weights(model_dir: str, out_dir: str) -> None:
-    """Extract TTS-specific weight files from the full checkpoint.
-
-    Saves:
-    - ``text_embedding.safetensors``  — thinker text embedding [text_vocab_size, hidden]
-    - ``text_projection.safetensors`` — MLP weights (fc1/fc2 weight+bias)
+def _projection_mlp_specs(ckpt_prefix: str) -> list:
+    """Return ``[(save_name, ckpt_key), ...]`` for the shared 2-layer MLP
+    projection layout (``linear_fc1`` + ``linear_fc2``, weight + bias).
     """
-    from safetensors.torch import save_file
+    return [(f"{fc}.{a}", f"{ckpt_prefix}.{fc}.{a}")
+            for fc in ("linear_fc1", "linear_fc2") for a in ("weight", "bias")]
 
-    weights = _load_all_weights(model_dir)
 
-    # text_embedding: talker.model.text_embedding.weight [151936, 2048]
-    text_emb_key = "talker.model.text_embedding.weight"
-    if text_emb_key not in weights:
-        logger.error("Key %r not found in checkpoint", text_emb_key)
-        sys.exit(1)
-    text_emb = weights[text_emb_key].cpu()
-    save_file(_to_fp16({"text_embedding": text_emb}),
-              os.path.join(out_dir, "text_embedding.safetensors"))
-    logger.info("[TTS] Wrote text_embedding.safetensors %s",
-                list(text_emb.shape))
-
-    # text_projection: talker.text_projection.linear_fc1/fc2 weight/bias
-    proj_keys = {
-        "linear_fc1.weight": "talker.text_projection.linear_fc1.weight",
-        "linear_fc1.bias": "talker.text_projection.linear_fc1.bias",
-        "linear_fc2.weight": "talker.text_projection.linear_fc2.weight",
-        "linear_fc2.bias": "talker.text_projection.linear_fc2.bias",
-    }
-    proj_tensors = {}
-    for save_name, ckpt_key in proj_keys.items():
-        if ckpt_key not in weights:
-            logger.error("Key %r not found in checkpoint", ckpt_key)
-            sys.exit(1)
-        proj_tensors[save_name] = weights[ckpt_key].cpu()
-    save_file(_to_fp16(proj_tensors),
-              os.path.join(out_dir, "text_projection.safetensors"))
-    logger.info("[TTS] Wrote text_projection.safetensors (4 tensors)")
+def _extract_tts_weights(model_dir: str, out_dir: str) -> None:
+    """Extract Qwen3-TTS talker sidecars (``text_embedding`` + ``text_projection``)."""
+    _extract_sidecars(
+        model_dir,
+        out_dir,
+        [
+            ("text_embedding.safetensors", [
+                ("text_embedding", "talker.model.text_embedding.weight")
+            ], True),
+            ("text_projection.safetensors",
+             _projection_mlp_specs("talker.text_projection"), True),
+        ],
+        strict=True,
+    )
 
 
 def _extract_omni_talker_sidecars(model_dir: str, out_dir: str) -> None:
-    """Qwen3-Omni Talker weight extractor.
+    """Extract Qwen3-Omni Talker sidecars.
 
-    Qwen3-Omni Talker consumes the thinker's ``hidden_states`` directly
-    (instead of a separate text-token embedding lookup like Qwen3-TTS),
-    so the sidecars are:
-
-    - ``embedding.safetensors``          — codec token embedding
-    - ``hidden_projection.safetensors``  — Omni-only projection from
-                                           thinker's hidden_states space
-                                           (``2560``) into talker space
-                                           (``1024``).
-    - ``text_projection.safetensors``    — projection for text tokens
-                                           (shared with Qwen3-TTS).
+    Qwen3-Omni Talker consumes the thinker's ``hidden_states`` directly, so
+    ships three sidecars: ``embedding`` (codec token embedding),
+    ``hidden_projection`` (thinker hidden space → talker space; Omni-only),
+    ``text_projection`` (shared with Qwen3-TTS).
     """
-    from safetensors.torch import save_file
-
-    weights = _load_all_weights(model_dir)
-
-    # 1. embedding.safetensors — codec embedding used by the C++ runtime.
-    ce_key = "talker.model.codec_embedding.weight"
-    if ce_key not in weights:
-        logger.error("Key %r not found in checkpoint", ce_key)
-        sys.exit(1)
-    ce_tensor = weights[ce_key].cpu()
-    save_file(_to_fp16({"embedding": ce_tensor}),
-              os.path.join(out_dir, "embedding.safetensors"))
-    logger.info("[Talker-Omni] Wrote embedding.safetensors %s",
-                list(ce_tensor.shape))
-
-    # 2. hidden_projection.safetensors — Omni-only.
-    hp_keys = {
-        "linear_fc1.weight": "talker.hidden_projection.linear_fc1.weight",
-        "linear_fc1.bias": "talker.hidden_projection.linear_fc1.bias",
-        "linear_fc2.weight": "talker.hidden_projection.linear_fc2.weight",
-        "linear_fc2.bias": "talker.hidden_projection.linear_fc2.bias",
-    }
-    hp_tensors = {}
-    for save_name, ckpt_key in hp_keys.items():
-        if ckpt_key not in weights:
-            logger.error("Key %r not found in checkpoint", ckpt_key)
-            sys.exit(1)
-        hp_tensors[save_name] = weights[ckpt_key].cpu()
-    save_file(_to_fp16(hp_tensors),
-              os.path.join(out_dir, "hidden_projection.safetensors"))
-    logger.info(
-        "[Talker-Omni] Wrote hidden_projection.safetensors (4 tensors)")
-
-    # 3. text_projection.safetensors — same keys as Qwen3-TTS.
-    tp_keys = {
-        "linear_fc1.weight": "talker.text_projection.linear_fc1.weight",
-        "linear_fc1.bias": "talker.text_projection.linear_fc1.bias",
-        "linear_fc2.weight": "talker.text_projection.linear_fc2.weight",
-        "linear_fc2.bias": "talker.text_projection.linear_fc2.bias",
-    }
-    tp_tensors = {}
-    for save_name, ckpt_key in tp_keys.items():
-        if ckpt_key not in weights:
-            logger.error("Key %r not found in checkpoint", ckpt_key)
-            sys.exit(1)
-        tp_tensors[save_name] = weights[ckpt_key].cpu()
-    save_file(_to_fp16(tp_tensors),
-              os.path.join(out_dir, "text_projection.safetensors"))
-    logger.info("[Talker-Omni] Wrote text_projection.safetensors (4 tensors)")
+    _extract_sidecars(
+        model_dir,
+        out_dir,
+        [
+            ("embedding.safetensors", [
+                ("embedding", "talker.model.codec_embedding.weight")
+            ], True),
+            ("hidden_projection.safetensors",
+             _projection_mlp_specs("talker.hidden_projection"), True),
+            ("text_projection.safetensors",
+             _projection_mlp_specs("talker.text_projection"), True),
+        ],
+        strict=True,
+    )
 
 
-def _make_talker_sub_config(model_dir: str, sub_path) -> "ModelConfig":
+def _make_talker_sub_config(model_dir: str,
+                            sub_path=None,
+                            *,
+                            sub_cfg: "Optional[dict]" = None,
+                            key_prefix: str = "",
+                            key_remap=None) -> "ModelConfig":
     """Build a :class:`ModelConfig` from a nested sub-config of ``config.json``.
 
-    Only used by multi-stage Talker/CodePredictor exports (Qwen3-Omni), where
-    the dense decoder's architecture config lives under ``talker_config.*``
-    in the shared root config.  Writes the nested sub-dict into a temp
-    ``config.json`` and symlinks the root's safetensors so quant detection
-    still works.
+    Multi-stage Talker/CodePredictor exports share this helper: the dense
+    decoder's architecture config lives under ``talker_config.*`` (or a caller
+    passes ``sub_cfg`` directly for families whose config is already extracted).
+    Writes the sub-dict into a temp ``config.json`` and symlinks the root's
+    safetensors so quant detection still works.
+
+    When ``key_prefix`` is provided the temp dir's ``hf_quant_config.json``
+    ``exclude_modules`` list is rewritten (prefix stripped, optional key_remap
+    applied) so exclusion globs match the sub-LLM's short module paths.  If the
+    entire sub-LLM is excluded (glob collapses to ``*``) the sidecar is dropped
+    so ``_parse_quant`` returns the default FP16 config.
 
     Args:
-        model_dir: Directory containing the checkpoint's root ``config.json``.
-        sub_path:  Sequence of keys to walk into the root config
-                   (e.g. ``["talker_config", "text_config"]``).
+        model_dir:  Directory containing the checkpoint's root ``config.json``.
+        sub_path:   Sequence of keys to walk into the root config, e.g.
+                    ``["talker_config", "text_config"]``.  Ignored when
+                    ``sub_cfg`` is passed.
+        sub_cfg:    Fully-formed sub-config dict (bypasses the ``sub_path`` walk).
+        key_prefix: Checkpoint-side prefix (e.g. ``"talker."``) to strip from
+                    quant exclusion patterns.
+        key_remap:  Optional ``str -> Optional[str]`` fn applied to each
+                    exclusion pattern after prefix stripping.
     """
     import tempfile
 
     from ..model import load_model_config
 
-    cfg = _load_config(model_dir)
-    for key in sub_path:
-        if not isinstance(cfg, dict) or key not in cfg:
-            logger.error("sub-config path %s not found in %s/config.json",
-                         ".".join(sub_path), model_dir)
-            sys.exit(1)
-        cfg = cfg[key]
+    root_cfg = _load_config(model_dir)
+    root_quant = root_cfg.get("quantization_config")
+    if sub_cfg is None:
+        cfg = root_cfg
+        for key in sub_path or ():
+            if not isinstance(cfg, dict) or key not in cfg:
+                logger.error("sub-config path %s not found in %s/config.json",
+                             ".".join(sub_path), model_dir)
+                sys.exit(1)
+            cfg = cfg[key]
+    else:
+        cfg = sub_cfg
+    # Quant metadata lives at the root config only; the sub-model inherits it.
+    if root_quant is not None and "quantization_config" not in cfg:
+        cfg = {**cfg, "quantization_config": root_quant}
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         for fname in os.listdir(model_dir):
-            if fname.endswith(".safetensors") or fname.endswith(
-                    ".safetensors.index.json"):
+            if (fname.endswith(".safetensors")
+                    or fname.endswith(".safetensors.index.json")):
+                if key_prefix and fname.endswith(".safetensors.index.json"):
+                    continue  # replaced by the filtered index below
                 src = os.path.join(model_dir, fname)
                 dst = os.path.join(tmp_dir, fname)
                 if not os.path.exists(dst):
                     os.symlink(src, dst)
-        tmp_cfg_path = os.path.join(tmp_dir, "config.json")
-        with open(tmp_cfg_path, "w") as f:
+        if key_prefix:
+            # Quant detection (``_detect_modelopt_unquantized_linears`` /
+            # ``_effective_excluded_modules``) scans checkpoint tensor names.
+            # On a multi-component root the OTHER components' unquantized
+            # modules would collide with this sub-LLM's short module names
+            # after normalization (e.g. the Talker body's bf16
+            # ``model.layers.3.self_attn.q_proj`` masks the CodePredictor's
+            # quantized layer 3) — stage an index restricted to this
+            # component, with the prefix stripped.
+            _stage_component_weight_index(model_dir, tmp_dir, key_prefix)
+        fully_excluded = _maybe_stage_hf_quant_config(model_dir, tmp_dir,
+                                                      key_prefix, key_remap)
+        if fully_excluded and "quantization_config" in cfg:
+            # The whole sub-LLM sits in the FP16 keep-set: the root-level
+            # quantization_config it inherited would rebuild every Linear
+            # as a quantized class over unquantized weights.
+            cfg = {k: v for k, v in cfg.items() if k != "quantization_config"}
+        with open(os.path.join(tmp_dir, "config.json"), "w") as f:
             json.dump(cfg, f)
         return load_model_config(tmp_dir)
+
+
+def _stage_component_weight_index(model_dir: str, tmp_dir: str,
+                                  key_prefix: str) -> None:
+    """Write a ``model.safetensors.index.json`` covering only *key_prefix*.
+
+    Keys are prefix-stripped so they match the sub-LLM's module paths; shard
+    filenames stay valid via the safetensors symlinks staged alongside. Also
+    handles single-file checkpoints (synthesizes an index over
+    ``model.safetensors``).
+    """
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    single_path = os.path.join(model_dir, "model.safetensors")
+    weight_map = {}
+    if os.path.isfile(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    elif os.path.isfile(single_path):
+        from safetensors import safe_open
+        with safe_open(single_path, framework="pt") as f:
+            weight_map = {k: "model.safetensors" for k in f.keys()}
+    filtered = {
+        k[len(key_prefix):]: shard
+        for k, shard in weight_map.items() if k.startswith(key_prefix)
+    }
+    if not filtered:
+        return
+    with open(os.path.join(tmp_dir, "model.safetensors.index.json"), "w") as f:
+        json.dump({"weight_map": filtered}, f)
+
+
+def _maybe_stage_hf_quant_config(model_dir: str, tmp_dir: str, key_prefix: str,
+                                 key_remap) -> bool:
+    """Rewrite ``hf_quant_config.json``'s ``exclude_modules`` for a sub-LLM.
+
+    Drops patterns that belong to other sub-LLMs (don't start with
+    *key_prefix*), strips the prefix from surviving patterns, applies
+    *key_remap*, and skips the file entirely when the whole sub-LLM is
+    excluded (glob becomes ``*``).
+    """
+    hf_qc_src = os.path.join(model_dir, "hf_quant_config.json")
+    if not os.path.isfile(hf_qc_src):
+        return False
+    if not key_prefix:
+        # No sub-LLM namespace: the exclusion patterns already match the
+        # checkpoint keys — stage the sidecar as-is (modelopt-quantized
+        # consolidated roots keep their quant metadata there).
+        dst = os.path.join(tmp_dir, "hf_quant_config.json")
+        if not os.path.exists(dst):
+            os.symlink(hf_qc_src, dst)
+        return False
+    with open(hf_qc_src) as f:
+        hf_qc = json.load(f)
+    stripped_prefix = key_prefix.rstrip(".")
+    excl = hf_qc.get("quantization", {}).get("exclude_modules", [])
+    new_excl = []
+    for pat in excl:
+        if pat.startswith(key_prefix):
+            pat = pat[len(key_prefix):]
+        elif pat.startswith(stripped_prefix):
+            pat = pat[len(stripped_prefix):]
+        elif not ("*" in pat or pat == ""):
+            continue  # belongs to a different sub-LLM
+        if key_remap is not None and pat:
+            remapped = key_remap(pat)
+            if remapped is not None:
+                pat = remapped
+        new_excl.append(pat)
+    if "*" in new_excl:
+        return True  # entire sub-LLM unquantized → skip sidecar entirely
+    hf_qc.setdefault("quantization", {})["exclude_modules"] = new_excl
+    with open(os.path.join(tmp_dir, "hf_quant_config.json"), "w") as f:
+        json.dump(hf_qc, f)
+    return False
 
 
 def _patch_tts_config(model_dir: str, out_dir: str) -> None:
@@ -1771,8 +2591,8 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
 
     Accepts two input layouts:
       * HF root config with nested ``talker_config`` (fields under sub-dict).
-      * Standalone Talker config from a prior quant export (fields at top
-        level, written by ``_write_standalone_talker_config``).
+      * Standalone Talker config from an older split-checkpoint export
+        (fields at top level).
     """
     root_config = _load_config(model_dir)
     # ``or {}`` guards against explicit ``"talker_config": null`` in a
@@ -1842,10 +2662,25 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
         if "default_speaker_id" not in cfg:
             cfg["default_speaker_id"] = next(iter(spk_map.values()))
     # Also propagate an explicit ``default_speaker_id`` if the input
-    # already had one (e.g. set by ``_write_standalone_talker_config``).
+    # already had one (e.g. from an older split-checkpoint export).
     dsi = pick("default_speaker_id")
     if dsi is not None and "default_speaker_id" not in cfg:
         cfg["default_speaker_id"] = dsi
+
+    # CustomVoice language conditioning. Qwen3-TTS stores the name→codec-id
+    # dict under ``talker_config.codec_language_id``; some checkpoints keep it
+    # at root level as ``talker_language_id`` (pick's root fallback covers both).
+    # Absent maps are not written (no ``null`` keys) — the runtime then keeps
+    # the no-language prefill.
+    lang_map = pick("codec_language_id", "talker_language_id")
+    if isinstance(lang_map, dict) and lang_map:
+        cfg["codec_language_id"] = lang_map
+    # Dialect speaker map: values are false (non-dialect) or a dialect name
+    # string; forwarded verbatim so the runtime can apply the PyTorch
+    # dialect-override rule for speakers like eric/dylan.
+    dialect_map = pick("spk_is_dialect")
+    if isinstance(dialect_map, dict) and dialect_map:
+        cfg["spk_is_dialect"] = dialect_map
 
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
@@ -1869,6 +2704,389 @@ def _talker_key_remap(key: str) -> "Optional[str]":
     return key
 
 
+# ---------------------------------------------------------------------------
+# Qwen3-Next Omni (qwen3_omni_next) Talker + CodePredictor helpers
+# ---------------------------------------------------------------------------
+#
+# Qwen3-Next Omni's Talker and CodePredictor are Qwen3.5-gated decoders (Talker is
+# hybrid GDN + gated full-attention; CP is a 5-layer dense gated decoder), so
+# the upstream qwen3_tts ``TalkerCausalLM`` / ``CodePredictorCausalLM`` cannot
+# be reused — they target plain Qwen3 attention.  The helpers below stage a
+# sub-LLM tmp dir from the nested ``talker_config.text_config`` /
+# ``talker_config.code_predictor_config`` so :class:`ModelConfig` can parse
+# them as standalone checkpoints, then build the Qwen3.5-specific model class
+# from ``models.qwen3_omni_next`` and load weights through the standard
+# checkpoint loader with a key_prefix + key_remap.
+
+
+def _export_sub_llm(
+    model_dir: str,
+    out_dir: str,
+    *,
+    model_class,
+    sub_path=None,
+    sub_config: "Optional[dict]" = None,
+    key_prefix: str = "",
+    key_remap=None,
+    model_type_override: "Optional[str]" = None,
+) -> None:
+    """Build a sub-LLM (Talker / CodePredictor), load its weights, and export.
+
+    Either ``sub_path`` (walk nested root config) or ``sub_config`` (already
+    extracted dict) selects the sub-LLM config; when both are ``None`` the
+    root ``config.json`` is used directly.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    from ..checkpoint.loader import load_weights
+    from ..model import load_model_config
+    from ..onnx.export import export_onnx
+
+    tag = os.path.basename(out_dir) or "SubLLM"
+    logger.info("[%s] Loading checkpoint from %s", tag, model_dir)
+    try:
+        if sub_path is None and sub_config is None:
+            config = load_model_config(model_dir)
+        else:
+            config = _make_talker_sub_config(model_dir,
+                                             sub_path,
+                                             sub_cfg=sub_config,
+                                             key_prefix=key_prefix,
+                                             key_remap=key_remap)
+
+        if model_type_override:
+            config.model_type = model_type_override
+
+        model = model_class(config)
+        load_weights(model,
+                     model_dir,
+                     device="cpu",
+                     key_prefix=key_prefix,
+                     key_remap=key_remap)
+    except (OSError, ValueError, RuntimeError, ImportError) as exc:
+        logger.exception("[%s] Failed to load checkpoint", tag)
+        raise SystemExit(1) from exc
+
+    output_path = os.path.join(out_dir, "model.onnx")
+    logger.info("[%s] Exporting ONNX to %s", tag, output_path)
+    try:
+        export_onnx(model, output_path, model_dir=model_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.exception("[%s] ONNX export failed", tag)
+        raise SystemExit(1) from exc
+    logger.info("[%s] Done: %s", tag, output_path)
+
+
+def _extract_sidecars(model_dir: str,
+                      out_dir: str,
+                      specs,
+                      *,
+                      strict: bool = False) -> None:
+    """Dump selected checkpoint tensors into sidecar safetensors files.
+
+    *specs*: iterable of ``(filename, [(save_name, ckpt_key), ...], fp16_cast)``.
+    ``fp16_cast=True`` casts bfloat16->float16 for C++ runtime compatibility.
+
+    With ``strict=True`` a missing checkpoint key is a fatal error (matches
+    the historic Qwen3-Omni / Qwen3-TTS extractors' behaviour); with the
+    default ``strict=False`` a missing key is logged as a warning and the
+    file is skipped if no tensors survive.
+    """
+    from tensorrt_edgellm._safetensors_io import save_file
+
+    weights = _load_all_weights(model_dir)
+    for filename, keys, fp16 in specs:
+        tensors: dict = {}
+        for save_name, ckpt_key in keys:
+            t = weights.get(ckpt_key)
+            if t is None:
+                if strict:
+                    logger.error("Key %r not found in checkpoint", ckpt_key)
+                    sys.exit(1)
+                logger.warning("[Sidecar] %r missing for %s", ckpt_key,
+                               filename)
+                continue
+            tensors[save_name] = t.cpu()
+        if not tensors:
+            continue
+        out = _to_fp16(tensors) if fp16 else tensors
+        save_file(out, os.path.join(out_dir, filename))
+        first_shape = list(next(iter(tensors.values())).shape)
+        logger.info("[Sidecar] Wrote %s (%d tensors, first shape %s)",
+                    filename, len(tensors), first_shape)
+
+
+def _write_downcast_fp16_sidecar(model_dir: str,
+                                 out_dir: str,
+                                 filename: str,
+                                 keys: list,
+                                 *,
+                                 strict: bool = False) -> None:
+    """Extract *keys* from the checkpoint and write them as fp16 safetensors.
+
+    Unlike :func:`_extract_sidecars`, downcasts ``float32`` (as well as
+    ``bfloat16``) source tensors so the C++ runtime's ``__half*`` reader
+    always sees fp16. Reserved for sidecars whose HF source is fp32 — the
+    shared ``_to_fp16`` helper stays bfloat16-only.
+
+    With ``strict=True`` a missing checkpoint key is a fatal error
+    (matches :func:`_extract_sidecars`).
+    """
+    import torch
+
+    from tensorrt_edgellm._safetensors_io import save_file
+    weights = _load_all_weights(model_dir)
+    out: dict = {}
+    for save_name, ckpt_key in keys:
+        t = weights.get(ckpt_key)
+        if t is None:
+            if strict:
+                logger.error("Key %r not found in checkpoint", ckpt_key)
+                sys.exit(1)
+            logger.warning("[Sidecar] %r missing for %s", ckpt_key, filename)
+            continue
+        if t.dtype == torch.float8_e4m3fn:
+            # CP-FP8 quantization also covers this projection; the C++
+            # runtime reads the sidecar as plain __half, so dequantize
+            # with the per-channel weight_scale instead of shipping raw
+            # FP8 bytes (and silently dropping the scale).
+            scale = weights.get(f"{ckpt_key}_scale")
+            if scale is None:
+                logger.error("FP8 tensor %r has no %s_scale in checkpoint",
+                             ckpt_key, ckpt_key)
+                sys.exit(1)
+            t = t.to(torch.float32) * scale.reshape(-1, *([1] * (t.dim() - 1)))
+        if t.dtype in (torch.bfloat16, torch.float32):
+            t = t.to(torch.float16)
+        out[save_name] = t.cpu()
+    if not out:
+        return
+    save_file(out, os.path.join(out_dir, filename))
+    first_shape = list(next(iter(out.values())).shape)
+    logger.info("[Sidecar] Wrote %s (%d tensors, first shape %s)", filename,
+                len(out), first_shape)
+
+
+def _patch_exported_config(
+        out_dir: str,
+        root_config: dict,
+        *,
+        copy_from_root=(),
+        copy_from_talker=(),
+        extra: "Optional[dict]" = None,
+) -> None:
+    """Merge extra fields into an already-written ``config.json``.
+
+    *copy_from_root* / *copy_from_talker* items are either a plain key string
+    (copy by same name) or a ``(src, dst)`` tuple (rename).  Also normalises
+    ``speaker_id`` / ``spk_id`` and sets ``default_speaker_id`` from the first
+    speaker, which is common to every TTS-style export.
+    """
+    cfg_path = os.path.join(out_dir, "config.json")
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    def _apply(src_dict, spec):
+        for item in spec:
+            src, dst = item if isinstance(item, tuple) else (item, item)
+            if src in src_dict:
+                cfg[dst] = src_dict[src]
+
+    _apply(root_config, copy_from_root)
+    talker = root_config.get("talker_config", {}) or {}
+    _apply(talker, copy_from_talker)
+
+    spk = talker.get("speaker_id") or talker.get("spk_id")
+    if isinstance(spk, dict) and spk:
+        cfg["speaker_id"] = spk
+        cfg.setdefault("default_speaker_id", next(iter(spk.values())))
+
+    if extra:
+        cfg.update(extra)
+
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    logger.info("[Config] Patched %s", cfg_path)
+
+
+def _export_omni_next_talker(model_dir: str, out_dir: str) -> None:
+    """Export Qwen3-Next Omni Talker (24-layer hybrid GDN + gated-attention
+    decoder that additionally emits hidden_states for the CP residual) +
+    text_embedding / hidden_projection / speaker_codec_embeddings sidecars.
+    """
+    from ..models.qwen3_omni_next import (Qwen3OmniNextMoeTalkerCausalLM,
+                                          Qwen3OmniNextTalkerCausalLM)
+
+    root = _load_config(model_dir)
+    t_cfg = dict((root.get("talker_config") or {}).get("text_config") or {})
+    if not t_cfg.get("hidden_size"):
+        logger.error("talker_config.text_config not found in config.json")
+        sys.exit(1)
+
+    # The Talker ships in both dense and sparse-MoE variants under the same
+    # talker_config. Select the MoE backbone when the checkpoint declares
+    # routed experts (Qwen3-Omni Next); otherwise the dense one.
+    talker_is_moe = int(t_cfg.get("num_experts", 0) or 0) > 0
+    if talker_is_moe:
+        talker_model_class = Qwen3OmniNextMoeTalkerCausalLM
+        talker_model_type = "qwen3_omni_next_talker_text"
+    else:
+        talker_model_class = Qwen3OmniNextTalkerCausalLM
+        talker_model_type = "qwen3_omni_next_talker"
+
+    # HF auto-generates layer_types when None: every 4th layer is
+    # full_attention, the rest are linear_attention (3:1 GDN/full interleave).
+    if t_cfg.get("layer_types") is None:
+        n = t_cfg["num_hidden_layers"]
+        t_cfg["layer_types"] = [
+            "linear_attention" if bool((i + 1) % 4) else "full_attention"
+            for i in range(n)
+        ]
+
+    _export_sub_llm(
+        model_dir,
+        out_dir,
+        model_class=talker_model_class,
+        sub_config=t_cfg,
+        key_prefix="talker.",
+        key_remap=_talker_key_remap,
+        model_type_override=talker_model_type,
+    )
+    _extract_sidecars(
+        model_dir,
+        out_dir,
+        [
+            ("text_embedding.safetensors", [
+                ("text_embedding", "talker.model.embed_tokens.weight")
+            ], True),
+            # Talker has TWO embedding tables: ``model.embed_tokens`` (text, 248320 vocab)
+            # and ``model.codec_embedding`` (codec, 5120 vocab). The HF ``_get_talker_*_parts``
+            # builders use the codec table for codec_bos/eos/think/pad token lookups, while
+            # the LLM model class only has a single ``embed_tokens`` slot (the key remap
+            # collapses codec_embedding -> embed_tokens for the dense backbone). So the codec
+            # table is dumped as a separate sidecar for the C++ runtime to load — without
+            # this file the runtime indexes codec tokens (0..5119) into the text embed and
+            # the Talker produces saturated noise instead of speech.
+            ("codec_embedding.safetensors", [
+                ("codec_embedding", "talker.model.codec_embedding.weight")
+            ], True),
+            ("speaker_codec_embeddings.safetensors", [
+                ("speaker_codec_embeddings", "talker.speaker_codec_embeddings")
+            ], False),  # int64 LUT, don't cast
+        ],
+        strict=True)
+    # hidden_projection ships in fp32 in HF; C++ TalkerRunner reads it as
+    # __half. Extract + downcast manually so the shared ``_to_fp16``
+    # helper keeps its bfloat16-only contract.
+    _write_downcast_fp16_sidecar(
+        model_dir,
+        out_dir,
+        "hidden_projection.safetensors", [
+            ("weight", "talker.hidden_projection.weight"),
+            ("bias", "talker.hidden_projection.bias"),
+        ],
+        strict=True)
+    _patch_exported_config(
+        out_dir,
+        root,
+        copy_from_root=("tts_pad_token_id", "tts_bos_token_id",
+                        "tts_eos_token_id", "max_thinker_to_talker_mm_tokens",
+                        "talker_language_id",
+                        "talker_assistant_prompt_id_mapping"),
+        copy_from_talker=(
+            "codec_nothink_id",
+            "codec_think_bos_id",
+            "codec_think_eos_id",
+            "codec_pad_id",
+            "codec_bos_id",
+            "codec_eos_token_id",
+            "codec_think_id",
+            "accept_hidden_layer",
+            "num_code_groups",
+            "thinker_hidden_size",
+            # Per-speaker system prompt rows (~13 tokens each):
+            # HF _get_talker_system_parts inserts them between the
+            # system role header and codec_bos; omitting them drops
+            # the speaker instruction from every Talker prompt.
+            "speaker_system_prompt_id"),
+    )
+    # Friendly speaker aliases ("Ryan" → "m36") consumed by the TTS runtime.
+    voice_map_src = os.path.join(model_dir, "voice_map.json")
+    if os.path.exists(voice_map_src):
+        import shutil
+        shutil.copy2(voice_map_src, os.path.join(out_dir, "voice_map.json"))
+        logger.info("[Sidecar] Copied voice_map.json")
+
+
+def _export_omni_next_code_predictor(model_dir: str, out_dir: str) -> None:
+    """Export Qwen3-Next Omni CodePredictor (5-layer gated-attention dense
+    decoder, head_dim 256, partial_rotary 0.25, MRope interleaved).
+
+    ``model_dir`` is either the full Omni HF root
+    (``talker_config.code_predictor_config``, keys
+    ``talker.code_predictor.*``) or a Talker-root checkpoint produced by the
+    CP-FP8 quantization pass (``code_predictor_config`` at root, keys
+    ``code_predictor.*``). Mirrors the Qwen3-Omni CP export's dual-layout
+    handling; the FP8 QDQ flows in via ``hf_quant_config.json``
+    (``_export_sub_llm`` re-namespaces it with ``key_prefix``).
+    """
+    from ..models.qwen3_omni_next import Qwen3OmniNextCodePredictorCausalLM
+
+    root = _load_config(model_dir)
+    talker = root.get("talker_config", {}) or {}
+    cp_cfg = dict(talker.get("code_predictor_config") or {})
+    talker_is_root = False
+    if not cp_cfg.get("hidden_size"):
+        cp_cfg = dict(root.get("code_predictor_config") or {})
+        talker = root
+        talker_is_root = bool(cp_cfg.get("hidden_size"))
+    if not cp_cfg.get("hidden_size"):
+        logger.error(
+            "code_predictor_config not found in %s/config.json (checked both "
+            "talker_config.code_predictor_config and top-level "
+            "code_predictor_config)", model_dir)
+        sys.exit(1)
+    key_prefix = ("code_predictor."
+                  if talker_is_root else "talker.code_predictor.")
+    cp_cfg["num_code_groups"] = talker.get("num_code_groups", 16)
+
+    _export_sub_llm(
+        model_dir,
+        out_dir,
+        model_class=Qwen3OmniNextCodePredictorCausalLM,
+        sub_config=cp_cfg,
+        key_prefix=key_prefix,
+        model_type_override="qwen3_omni_next_code_predictor",
+    )
+    # ``torch.onnx.export`` drops ``axis=0`` from per-channel DequantizeLinear
+    # nodes → TRT engine build fails with ``K == scaleSize``. Restore it.
+    # No-op for the unquantized (FP16) CP.
+    _patch_cp_dq_axis(os.path.join(out_dir, "model.onnx"))
+
+    _extract_sidecars(model_dir,
+                      out_dir,
+                      _cp_codec_embed_and_head_specs(
+                          key_prefix, talker.get("num_code_groups", 16)),
+                      strict=True)
+    # ``small_to_mtp_projection`` is fp32 in HF; C++ CodePredictor reads
+    # it as __half. Downcast manually so the shared ``_to_fp16`` helper
+    # keeps its bfloat16-only contract. Optional — some CP variants ship
+    # without this projection (silent skip is intended).
+    _write_downcast_fp16_sidecar(
+        model_dir, out_dir, "small_to_mtp_projection.safetensors", [
+            ("weight", f"{key_prefix}model.talker_projection.weight"),
+            ("bias", f"{key_prefix}model.talker_projection.bias"),
+        ])
+    _patch_exported_config(out_dir,
+                           root,
+                           extra={
+                               "use_embeddings_input":
+                               True,
+                               "num_code_groups":
+                               talker.get("num_code_groups", 16),
+                           })
+
+
 def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
     """Export Talker LLM backbone + sidecar weights.
 
@@ -1886,50 +3104,34 @@ def _export_talker(model_dir: str, llm_out_dir: str, model_type: str) -> None:
       + ``hidden_projection.safetensors`` + ``text_projection.safetensors``
       (it takes thinker hidden states as input instead of a text embedding).
     """
-    os.makedirs(llm_out_dir, exist_ok=True)
-    output_path = os.path.join(llm_out_dir, "model.onnx")
+    if model_type == "qwen3_omni_next":
+        _export_omni_next_talker(model_dir, llm_out_dir)
+        return
 
-    logger.info("[Talker] Loading checkpoint from %s (model_type=%s)",
-                model_dir, model_type)
-    try:
-        from ..checkpoint.loader import load_weights
-        from ..model import load_model_config
-        from ..models.qwen3_tts import TalkerCausalLM
+    from ..models.qwen3_tts import TalkerCausalLM
 
-        if model_type in ("qwen3_omni", "qwen3_omni_moe"):
-            config = _make_talker_sub_config(model_dir,
-                                             ["talker_config", "text_config"])
-            extract_sidecars = _extract_omni_talker_sidecars
-        else:  # qwen3_tts and any other future dense-talker variants
-            config = load_model_config(model_dir)
-            extract_sidecars = _extract_tts_weights
-
-        model = TalkerCausalLM(config)
-        model.to("cpu")
-        load_weights(model,
-                     model_dir,
-                     device="cpu",
-                     key_prefix="talker.",
-                     key_remap=_talker_key_remap)
-    except (OSError, ValueError, RuntimeError, ImportError) as exc:
-        logger.exception("[Talker] Failed to load checkpoint")
-        raise SystemExit(1) from exc
-
-    logger.info("[Talker] Exporting ONNX to %s", output_path)
-    try:
-        from ..onnx.export import export_onnx
-        export_onnx(model, output_path, model_dir=model_dir)
-    except (OSError, ValueError, RuntimeError) as exc:
-        logger.exception("[Talker] ONNX export failed")
-        raise SystemExit(1) from exc
+    is_omni = model_type in ("qwen3_omni", "qwen3_omni_moe")
+    talker_cls = TalkerCausalLM
+    if model_type == "qwen3_omni_moe":
+        # The MoE Talker is a 128-expert MoE decoder, not the dense
+        # CausalLM the TTS Talker class models.
+        from ..models.qwen3_omni import Qwen3OmniMoeTalkerCausalLM
+        talker_cls = Qwen3OmniMoeTalkerCausalLM
+    _export_sub_llm(
+        model_dir,
+        llm_out_dir,
+        model_class=talker_cls,
+        sub_path=["talker_config", "text_config"] if is_omni else None,
+        key_prefix="talker.",
+        key_remap=_talker_key_remap,
+    )
 
     logger.info("[Talker] Extracting weight sidecars ...")
-    extract_sidecars(model_dir, llm_out_dir)
+    (_extract_omni_talker_sidecars if is_omni else _extract_tts_weights)(
+        model_dir, llm_out_dir)
 
     logger.info("[Talker] Patching config.json with TTS fields ...")
     _patch_tts_config(model_dir, llm_out_dir)
-
-    logger.info("[Talker] Done: %s", output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1954,7 +3156,7 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     differs (used by the C++ runtime for identification).
 
     The CodePredictor has:
-    - ``lm_head_weight`` as an ONNX input (dynamic, 15 different heads)
+    - ``lm_heads`` + ``lm_head_idx`` as ONNX inputs (head gathered in-graph)
     - ``hidden_states`` as an additional output (for residual connection)
     - MLP FP16 overflow WAR applied to all layers
 
@@ -1965,8 +3167,9 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     - ``small_to_mtp_projection.safetensors`` — talker→CP projection
     - ``config.json`` — LLM config with ``use_embeddings_input: true``
     """
-    os.makedirs(cp_out_dir, exist_ok=True)
-    output_path = os.path.join(cp_out_dir, "model.onnx")
+    if model_type in ("qwen3_omni_next", "qwen3_omni_next_talker"):
+        _export_omni_next_code_predictor(model_dir, cp_out_dir)
+        return
 
     # ``code_predictor_config`` lives at either root.talker_config.* (full Omni
     # HF root) or root.* (Talker-only submodule export). Support both.
@@ -1988,90 +3191,34 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
     load_key_prefix = ("code_predictor."
                        if talker_is_root else "talker.code_predictor.")
 
-    # Write a temporary config.json for the CodePredictor so ModelConfig can
-    # parse it.  The CP sub-config is a valid standalone Qwen3 config.
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Copy safetensors index/files for has_qk_norm detection
-        for fname in os.listdir(model_dir):
-            if fname.endswith(".safetensors") or fname.endswith(
-                    ".safetensors.index.json"):
-                src = os.path.join(model_dir, fname)
-                dst = os.path.join(tmp_dir, fname)
-                if not os.path.exists(dst):
-                    os.symlink(src, dst)
-        # Rewrite ``hf_quant_config.json`` into the CP-relative namespace:
-        # strip the CP subtree prefix from exclude entries and drop everything
-        # outside CP so ``make_linear`` in the standalone graph resolves.
-        hf_quant_src = os.path.join(model_dir, "hf_quant_config.json")
-        cp_only_excludes: list = []
-        if os.path.exists(hf_quant_src):
-            with open(hf_quant_src) as f:
-                hf_q = json.load(f)
-            q = hf_q.get("quantization", {})
-            # Strip either the full-Omni CP prefix or the Talker-only CP
-            # prefix; drop entries outside the CP subtree (Talker body,
-            # Thinker, code2wav — none exist inside the standalone CP graph).
-            cp_prefix = load_key_prefix
-            for ex in q.get("exclude_modules", []):
-                if ex.startswith(cp_prefix):
-                    cp_only_excludes.append(ex[len(cp_prefix):])
-            q["exclude_modules"] = cp_only_excludes
-            hf_q["quantization"] = q
-            with open(os.path.join(tmp_dir, "hf_quant_config.json"), "w") as f:
-                json.dump(hf_q, f, indent=2)
-        # Write the CP config
-        tmp_cfg_path = os.path.join(tmp_dir, "config.json")
-        with open(tmp_cfg_path, "w") as f:
-            json.dump(cp_cfg, f)
-
-        from ..config import _normalize_module_name
-        from ..model import load_model_config
-        config = load_model_config(tmp_dir)
-
-    # ``_parse_quant`` auto-detects unquantized weights from the whole
-    # checkpoint. Post-normalization those thinker/encoder module names
-    # collide with CP paths and force every CP Linear to FP16. Overwrite
-    # ``excluded`` with only the CP-scoped entries.
-    if config.quant is not None:
-        config.quant.excluded = [
-            _normalize_module_name(ex) for ex in cp_only_excludes
-        ]
-
-    # Override model_type for runtime identification
-    config.model_type = _CP_RUNTIME_MODEL_TYPE.get(model_type,
-                                                   "qwen3_tts_code_predictor")
-
-    # CP's MLP path is the same for FP16 and FP8: FP32 silu*up + FP32
-    # down_proj matmul.  down_proj is always FP16Linear (excluded from FP8
-    # quant by ``FP8_CP``), so the FP32 matmul is safe in either mode.
     from ..models.qwen3_tts import CodePredictorCausalLM
-    model = CodePredictorCausalLM(config)
-    model.to("cpu")
 
-    from ..checkpoint.loader import load_weights
-    load_weights(model, model_dir, device="cpu", key_prefix=load_key_prefix)
+    # onnx_export_spec needs the head count for the stacked lm_heads input.
+    cp_cfg["num_code_groups"] = talker_cfg.get("num_code_groups", 16)
 
-    logger.info("[CodePredictor] Exporting ONNX to %s", output_path)
-    try:
-        from ..onnx.export import export_onnx
-        export_onnx(model, output_path, model_dir=model_dir)
-    except (OSError, ValueError, RuntimeError) as exc:
-        logger.exception("[CodePredictor] ONNX export failed")
-        raise SystemExit(1) from exc
+    _export_sub_llm(
+        model_dir,
+        cp_out_dir,
+        model_class=CodePredictorCausalLM,
+        sub_config=cp_cfg,
+        key_prefix=load_key_prefix,
+        model_type_override=_CP_RUNTIME_MODEL_TYPE.get(
+            model_type, "qwen3_tts_code_predictor"),
+    )
 
     # ``torch.onnx.export`` drops ``axis=0`` from per-channel DequantizeLinear
     # nodes → TRT engine build fails with ``K == scaleSize``. Restore it.
-    _patch_cp_dq_axis(output_path)
+    _patch_cp_dq_axis(os.path.join(cp_out_dir, "model.onnx"))
 
-    # Extract CodePredictor-specific weight files
     logger.info("[CodePredictor] Extracting weight files ...")
     _extract_code_predictor_weights(model_dir,
                                     cp_out_dir,
                                     talker_cfg,
                                     key_prefix=load_key_prefix)
 
-    # Patch config.json with use_embeddings_input and num_code_groups
+    # Patch config.json with CodePredictor-specific fields.  Inline (not
+    # ``_patch_exported_config``) to avoid the speaker_id normalisation, which
+    # is Talker-only.
     cfg_path = os.path.join(cp_out_dir, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -2079,14 +3226,25 @@ def _export_code_predictor(model_dir: str, cp_out_dir: str,
         cfg["use_embeddings_input"] = True
         cfg["num_code_groups"] = talker_cfg.get("num_code_groups", 16)
         # CodePredictor has no deepstack visual inputs; override the
-        # inherited value from ModelConfig (see note in _patch_tts_config).
+        # inherited value from ModelConfig.
         cfg["num_deepstack_features"] = 0
         with open(cfg_path, "w") as f:
             json.dump(cfg, f, indent=2)
-        logger.info("[CodePredictor] Patched config.json with "
-                    "use_embeddings_input and num_code_groups")
 
-    logger.info("[CodePredictor] Done: %s", output_path)
+
+def _cp_codec_embed_and_head_specs(prefix: str, num_code_groups: int) -> list:
+    """Per-codebook codec_embeddings + lm_heads spec pair (shared by
+    Qwen3-TTS, Qwen3-Omni, and Qwen3-Next Omni CodePredictors).
+    """
+    n = num_code_groups - 1  # first codebook lives in the Talker
+    return [
+        ("codec_embeddings.safetensors",
+         [(f"embedding_{i}", f"{prefix}model.codec_embedding.{i}.weight")
+          for i in range(n)], True),
+        ("lm_heads.safetensors", [(f"lm_head_{i}.weight",
+                                   f"{prefix}lm_head.{i}.weight")
+                                  for i in range(n)], True),
+    ]
 
 
 def _patch_cp_dq_axis(onnx_path: str) -> None:
@@ -2149,10 +3307,10 @@ def _extract_code_predictor_weights(model_dir: str, out_dir: str,
     """Extract codec_embeddings, lm_heads, and small_to_mtp_projection.
 
     ``key_prefix`` is either ``talker.code_predictor.`` (full-Omni HF root
-    layout) or ``code_predictor.`` (Talker-only submodule layout produced by
-    ``qwen3_omni._export_submodel`` for MoE CP-only exports).
+    layout) or ``code_predictor.`` (Talker-only layout from older split
+    exports).
     """
-    from safetensors.torch import save_file
+    from tensorrt_edgellm._safetensors_io import save_file
 
     weights = _load_all_weights(model_dir)
 
@@ -2426,14 +3584,100 @@ def main() -> None:
         ("Comma-separated allow-list of components to export. Default (empty) "
          "exports every component the checkpoint supports. Recognized values: "
          "thinker, mtp_draft, talker, code_predictor, visual, audio, "
-         "code2wav, action. Useful for re-running a single stage, e.g. "
+         "code2wav, action; for Cosmos3 checkpoints: und_prefill, gen, "
+         "vae_encoder. Useful for re-running a single stage, e.g. "
          "``--components code_predictor`` to refresh only the CodePredictor."),
+    )
+    p.add_argument(
+        "--task",
+        choices=("policy", "reasoning", "all"),
+        default="all",
+        help=
+        ("Cosmos3-Edge checkpoints only: which task's artifacts to export. "
+         "'policy' exports the und_prefill/gen/vae_encoder action-generation "
+         "components, 'reasoning' exports the llm/ + visual/ backbones for "
+         "the standard autoregressive VLM flow, 'all' (default) exports "
+         "both."),
+    )
+    p.add_argument(
+        "--action-chunk-size",
+        "--action_chunk_size",
+        dest="action_chunk_size",
+        type=int,
+        default=None,
+        help=("Cosmos3 policy only: number of future action timesteps the GEN "
+              "expert emits per request (action chunk length). Default "
+              "(None) uses the checkpoint's canonical value (16)."),
+    )
+    p.add_argument(
+        "--num-frames",
+        "--num_frames",
+        dest="num_frames",
+        type=int,
+        default=None,
+        help=("Cosmos3 policy only: number of rollout frames the GEN/VAE "
+              "components are shaped for (sets the VAE latent time axis). "
+              "Default (None) uses the checkpoint's canonical value (17)."),
+    )
+    p.add_argument(
+        "--fps",
+        dest="fps",
+        type=float,
+        default=None,
+        help=("Cosmos3 policy only: frames-per-second stamped into the GEN "
+              "runtime config (controls the diffusion time schedule). Default "
+              "(None) uses the checkpoint's canonical value (5)."),
+    )
+    p.add_argument(
+        "--max-video-subsample-factor",
+        "--max_video_subsample_factor",
+        dest="max_video_subsample_factor",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: largest video-subsample factor the GEN "
+            "engine's DYNAMIC video-token profile must admit. The profile "
+            "spans [latent_t(max_vsf) .. latent_t(1)]; a larger value widens "
+            "the flexible range (e.g. 8 for finer subsampling) at the cost of "
+            "a looser optimization profile. Default (None) uses 4."),
+    )
+    p.add_argument(
+        "--min-action-chunk",
+        "--min_action_chunk",
+        dest="min_action_chunk",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: smallest action-chunk length the GEN "
+            "engine's DYNAMIC action-token axis must admit. Default (None) = "
+            "the canonical chunk (action axis fixed). Set below the chunk to "
+            "serve shorter action requests from one engine (e.g. 16)."),
+    )
+    p.add_argument(
+        "--max-action-chunk",
+        "--max_action_chunk",
+        dest="max_action_chunk",
+        type=int,
+        default=None,
+        help=(
+            "Cosmos3 policy only: largest action-chunk length the GEN engine's "
+            "DYNAMIC action-token axis must admit. Default (None) = the "
+            "canonical chunk. Widen to serve longer action requests without a "
+            "rebuild (keep it sane, e.g. <= 48, to bound tactic search)."),
     )
     p.add_argument(
         "--eagle-base",
         action="store_true",
         help=
         "Export as EAGLE3 base model (adds tree-attention I/O and hidden_states output).",
+    )
+    p.add_argument(
+        "--eagle-draft-dir",
+        default="",
+        help=(
+            "Path to the EAGLE3 draft checkpoint directory. Required for "
+            "Gemma4 EAGLE3 base export so target hidden layers match the draft."
+        ),
     )
     p.add_argument(
         "--fp8-embedding",
@@ -2450,6 +3694,22 @@ def main() -> None:
         default="",
         help=
         "Directory containing vocab_map.safetensors for LLM vocabulary reduction.",
+    )
+    p.add_argument(
+        "--skip-softmax-scale-factor",
+        "--skip_softmax_scale_factor",
+        dest="skip_softmax_scale_factor",
+        type=float,
+        default=None,
+        metavar="S",
+        help=(
+            "Skip-softmax (BLASST) calibrated scale factor S (0 = disabled). "
+            "Baked into the AttentionPlugin nodes; at inference the runtime "
+            "derives lambda = S / context_length per request for the prefill "
+            "FMHA. Obtain S from calibrate_skip_softmax.py. Overrides the "
+            "checkpoint config.json key \"skip_softmax_scale_factor\" — an "
+            "explicit 0 disables skip-softmax even if the config enables it; "
+            "omit the flag to keep the config value."),
     )
     p.add_argument(
         "--draft-reduced-vocab-dir",
@@ -2490,6 +3750,12 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     p.add_argument(
+        "--mtp-tree-base",
+        action="store_true",
+        help="Export MTP base with DDTree hybrid state metadata inputs "
+        "(implies --mtp; required for MTP tree drafting).",
+    )
+    p.add_argument(
         "--dflash-base",
         action="store_true",
         help="Export as DFlash base model (adds DFlash hidden_states output).",
@@ -2508,6 +3774,22 @@ def main() -> None:
         "--dflash-draft-dir",
         default="",
         help="Path to the DFlash draft checkpoint directory.",
+    )
+    p.add_argument(
+        "--dspark-base",
+        action="store_true",
+        help="Export as DSpark base model (adds target hidden-state output).",
+    )
+    p.add_argument(
+        "--dspark-draft",
+        action="store_true",
+        help=
+        "Export DSpark draft backbone model plus Markov/confidence sidecars.",
+    )
+    p.add_argument(
+        "--dspark-draft-dir",
+        default="",
+        help="Path to the DSpark draft checkpoint directory.",
     )
     p.add_argument(
         "--externalize-weights",
@@ -2567,12 +3849,101 @@ def main() -> None:
             "Qwen3.5, Nemotron-H); not for eagle/mtp/dflash "
             "speculative-decoding variants."),
     )
+    p.add_argument(
+        "--int4-gemm-plugin-version",
+        "--int4_gemm_plugin_version",
+        dest="int4_gemm_plugin_version",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help=("INT4 groupwise GEMM plugin backend to export with. "
+              "2 (default) targets the cuteDSL Int4GroupwiseGemmPluginV2 with "
+              "fragment-layout weights; 1 targets the legacy "
+              "Int4GroupwiseGemmPlugin with AWQ-swizzled weights."),
+    )
+    p.add_argument(
+        "--quantization",
+        default=None,
+        choices=["int4_awq", "nvfp4"],
+        help=("Override quantization type for BF16/FP16 checkpoints. "
+              "Applies on-the-fly quantization during export (e.g. INT4 RTN "
+              "for QAT models stored in BF16)."),
+    )
     args = p.parse_args()
+
+    # Select the INT4 GEMM plugin backend before any weight repack / op emission.
+    set_int4_gemm_plugin_version(args.int4_gemm_plugin_version)
 
     model_dir = _resolve_model_dir(args.model)
     config = _load_config(model_dir)
     model_type: str = config.get("model_type", "unknown")
     dtype = _dtype_from_str(args.dtype)
+
+    # Cosmos3-Edge checkpoints carry two model families that run on DIFFERENT
+    # runtime paths; ``--task`` selects which artifact set this invocation
+    # exports (both by default):
+    #   * policy    -> und_prefill/gen/vae_encoder components for the
+    #     experimental component runtime, and
+    #   * reasoning -> a regular llm/ backbone + visual/ SigLIP2 encoder for
+    #     the standard llm_build + visual_build + llm_inference VLM flow.
+    # Both the root ``model_type`` and the diffusers ``model_index.json``
+    # identify them.
+    if model_type in ("cosmos3_edge",
+                      "cosmos3_omni") or _is_cosmos3_checkpoint(model_dir):
+        has_reasoner = model_type == "cosmos3_edge"
+        if args.task == "reasoning" and not has_reasoner:
+            p.error("--task reasoning requires a cosmos3_edge checkpoint "
+                    "(this checkpoint carries no reasoner tower)")
+
+        if args.task in ("policy", "all"):
+            from ..models.cosmos3.export import export_cosmos3_components
+            requested = [c for c in args.components.split(",") if c] or None
+            # Forward only the variables the user set; leaving one unset keeps
+            # the module's canonical default (chunk=16, num_frames=17, fps=5).
+            policy_overrides = {
+                k: v
+                for k, v in (("action_chunk_size", args.action_chunk_size),
+                             ("num_frames", args.num_frames), ("fps",
+                                                               args.fps),
+                             ("max_video_subsample_factor",
+                              args.max_video_subsample_factor),
+                             ("min_action_chunk", args.min_action_chunk),
+                             ("max_action_chunk", args.max_action_chunk))
+                if v is not None
+            }
+            export_cosmos3_components(model_dir,
+                                      args.output_dir,
+                                      components=requested,
+                                      dtype=dtype,
+                                      **policy_overrides)
+
+        if args.task in ("reasoning", "all") and has_reasoner:
+            # Text decoder -> regular llm/ backbone (KV-cache autoregressive
+            # decode via the standard runtime). Cosmos3ReasonerCausalLM is
+            # registered for "cosmos3_edge"/"cosmos3_edge_text" in the package
+            # __init__ like every other model family.
+            if not args.skip_llm:
+                _export_llm(model_dir,
+                            os.path.join(args.output_dir, "llm"),
+                            model_type="cosmos3_edge")
+            # SigLIP2 ViT + PatchMerger -> visual/ for the standard
+            # visual_build + multimodal runtime. The vision tower is read
+            # directly from its checkpoint shards (the root index maps it to
+            # per-component files, so there is no flat *.safetensors set).
+            if not args.skip_visual:
+                from ..model import load_model_config
+                from ..models.cosmos3_reasoner import \
+                    load_cosmos3_reasoner_visual_checkpoint
+                _export_visual(
+                    model_dir,
+                    os.path.join(args.output_dir, "visual"),
+                    load_cosmos3_reasoner_visual_checkpoint(model_dir),
+                    config,
+                    "cosmos3_edge",
+                    dtype,
+                    model_config=load_model_config(model_dir))
+        return
+
     has_mtp_draft = _has_mtp(config)
     is_gemma4_target = model_type in _GEMMA4_MODEL_TYPES
     mtp_draft_dir_arg = args.mtp_draft_dir or args.gemma4_mtp_assistant_dir
@@ -2581,36 +3952,62 @@ def main() -> None:
     gemma4_kv_sharing_map: list[dict] = []
     externalize_weights = resolve_externalize_weights(args.externalize_weights)
 
-    if (model_type == "qwen3_tts"
-            and config.get("tts_model_type") != "custom_voice"):
-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
+    if (model_type == "qwen3_tts" and config.get("tts_model_type")
+            not in ("custom_voice", "voice_design", "base")):
+        p.error(
+            "Only Qwen3-TTS CustomVoice / VoiceDesign / Base checkpoints are "
+            f"supported. Got tts_model_type={config.get('tts_model_type')!r}.")
 
+    if args.mtp_tree_base:
+        args.mtp = True
     if args.eagle_base and args.mtp:
         p.error("--eagle-base and --mtp cannot be enabled together")
+    if args.eagle_draft_dir and not args.eagle_base:
+        p.error("--eagle-draft-dir requires --eagle-base")
+    if args.eagle_base and is_gemma4_target and not args.eagle_draft_dir:
+        p.error("Gemma4 --eagle-base requires --eagle-draft-dir")
     if args.mtp_draft_dir and args.gemma4_mtp_assistant_dir:
         p.error("Use only one MTP draft checkpoint directory option")
     if mtp_draft_dir_arg and args.eagle_base:
         p.error("--mtp-draft-dir cannot be combined with --eagle-base")
-    if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft):
-        p.error("--mtp-draft-dir cannot be combined with DFlash export")
     if args.dflash_tree_base:
         args.dflash_base = True
+    if mtp_draft_dir_arg and (args.dflash_base or args.dflash_draft
+                              or args.dspark_base or args.dspark_draft):
+        p.error("--mtp-draft-dir cannot be combined with DFlash/DSpark export")
     if args.dflash_base and (args.eagle_base or args.mtp):
         p.error("--dflash-base cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and (args.eagle_base or args.mtp):
         p.error("--dflash-draft cannot be combined with --eagle-base or --mtp")
     if args.dflash_draft and not args.dflash_draft_dir:
         p.error("--dflash-draft requires --dflash-draft-dir")
+    if args.dspark_base and (args.eagle_base or args.mtp or args.dflash_base
+                             or args.dflash_draft):
+        p.error("--dspark-base cannot be combined with EAGLE/MTP/DFlash modes")
+    if args.dspark_draft and (args.eagle_base or args.mtp or args.dflash_base
+                              or args.dflash_draft):
+        p.error(
+            "--dspark-draft cannot be combined with EAGLE/MTP/DFlash modes")
+    if args.dspark_base and not args.dspark_draft_dir:
+        p.error(
+            "--dspark-base requires --dspark-draft-dir for target layer metadata"
+        )
+    if args.dspark_draft and not args.dspark_draft_dir:
+        p.error("--dspark-draft requires --dspark-draft-dir")
     if args.mtp and args.skip_llm:
         p.error("--mtp requires LLM export; remove --skip-llm")
     if mtp_draft_dir_arg and args.skip_llm:
         p.error("--mtp-draft-dir requires LLM export; remove --skip-llm")
     if args.dflash_base and args.skip_llm:
         p.error("--dflash-base requires LLM export; remove --skip-llm")
+    if args.dspark_base and args.skip_llm:
+        p.error("--dspark-base requires LLM export; remove --skip-llm")
     if args.dflash_draft and args.skip_llm:
         logger.info(
             "--dflash-draft implies --skip-llm (draft export is independent)")
+    if args.dspark_draft and args.skip_llm:
+        logger.info(
+            "--dspark-draft implies --skip-llm (draft export is independent)")
     if mtp_draft_dir_arg and not args.mtp:
         p.error("--mtp-draft-dir requires --mtp")
     if args.mtp and is_gemma4_target and not mtp_draft_dir_arg:
@@ -2634,13 +4031,15 @@ def main() -> None:
     if args.num_decoder_layer is not None:
         if args.num_decoder_layer < 1:
             p.error("--num-decoder-layer must be >= 1")
-        if args.eagle_base or args.mtp or args.dflash_base or args.dflash_draft:
+        if (args.eagle_base or args.mtp or args.dflash_base
+                or args.dflash_draft or args.dspark_base or args.dspark_draft):
             p.error("--num-decoder-layer cannot be combined with "
-                    "--eagle-base / --mtp / --dflash-base / --dflash-draft")
+                    "--eagle-base / --mtp / --dflash-base / --dflash-draft / "
+                    "--dspark-base / --dspark-draft")
 
     _VALID_COMPONENTS = {
         "thinker", "mtp_draft", "talker", "code_predictor", "visual", "audio",
-        "code2wav", "action"
+        "code2wav", "action", "dllm"
     }
     requested_components = {
         c.strip()
@@ -2650,6 +4049,92 @@ def main() -> None:
     if unknown:
         p.error(f"--components contains unknown values {sorted(unknown)}; "
                 f"valid choices: {sorted(_VALID_COMPONENTS)}")
+
+    if _is_diffusion_gemma(model_type, config):
+        has_diffusion_visual = _diffusion_gemma_has_visual(config)
+        allowed = {
+            "thinker",
+            "dllm",
+        }
+        if has_diffusion_visual:
+            allowed.add("visual")
+        disallowed = requested_components - allowed
+        if disallowed:
+            p.error("DiffusionGemma supports only components "
+                    f"{sorted(allowed)}; got {sorted(disallowed)}")
+        wants_diffusion_engines = (not args.skip_llm
+                                   and (not requested_components
+                                        or bool(requested_components & {
+                                            "thinker",
+                                            "dllm",
+                                        })))
+        wants_visual = (has_diffusion_visual and not args.skip_visual
+                        and (not requested_components
+                             or "visual" in requested_components))
+        if args.skip_llm and not wants_visual:
+            p.error("DiffusionGemma --skip-llm is only valid when exporting "
+                    "the visual component.")
+        if not wants_diffusion_engines and not wants_visual:
+            p.error("No DiffusionGemma components selected for export.")
+        if args.mtp or args.eagle_base or args.dflash_base or args.dflash_draft:
+            p.error("DiffusionGemma cannot be combined with speculative "
+                    "decode export flags")
+        if args.reduced_vocab_dir:
+            p.error("DiffusionGemma unified self-conditioning does not "
+                    "support --reduced-vocab-dir because hidden feedback "
+                    "must align with the full embedding table.")
+
+        logger.info("=" * 60)
+        logger.info("Model type    : diffusion_gemma_text")
+        logger.info("Checkpoint    : %s", model_dir)
+        logger.info("Output dir    : %s", args.output_dir)
+        logger.info("  %-15s: %s", "dllm",
+                    "yes" if wants_diffusion_engines else "no")
+        logger.info("  %-15s: %s", "visual", "yes" if wants_visual else "no")
+        logger.info("FP8 embedding : %s",
+                    "yes" if args.fp8_embedding else "no")
+        logger.info("TP size       : %d", args.tp_size)
+        logger.info("=" * 60)
+        if wants_diffusion_engines:
+            _export_diffusion_gemma(
+                model_dir,
+                args.output_dir,
+                fp8_embedding=args.fp8_embedding,
+                reduced_vocab_dir=args.reduced_vocab_dir,
+                externalize_weights=externalize_weights,
+                tp_size=args.tp_size,
+            )
+        if wants_visual:
+            from ..model import load_model_config
+            weights = _load_all_weights(model_dir)
+            model_config = load_model_config(model_dir)
+            _export_diffusion_gemma_visual(
+                model_dir,
+                os.path.join(args.output_dir, "visual"),
+                weights,
+                config,
+                dtype,
+                model_config=model_config,
+            )
+
+        print()
+        print("=" * 60)
+        print("Export complete")
+        print(f"  output dir: {args.output_dir}")
+        for component in ("dllm", "visual"):
+            p_sub = os.path.join(args.output_dir, component)
+            onnx = os.path.join(p_sub, "model.onnx")
+            mb = os.path.getsize(onnx) / 1e6 if os.path.exists(onnx) else 0
+            if os.path.exists(onnx):
+                print(f"  {component:27s}: {onnx}  ({mb:.1f} MB)")
+                for sidecar in ("external_nvfp4_moe_weights.safetensors", ):
+                    sc_path = os.path.join(p_sub, sidecar)
+                    if os.path.exists(sc_path):
+                        sc_mb = os.path.getsize(sc_path) / 1e6
+                        print(f"                             + {sidecar}  "
+                              f"({sc_mb:.1f} MB)")
+        print("=" * 60)
+        return
 
     # Load weights lazily — only needed when a weight-consuming exporter runs.
     _weights: dict = {}
@@ -2679,10 +4164,10 @@ def main() -> None:
             return {}
         return _get_weights()
 
-    # When --dflash-draft is set, only the dflash_draft stage runs.
-    # DFlash draft is a standalone export (like Eagle draft) — no base LLM,
-    # visual, audio, or other components needed.
-    _draft_only = args.dflash_draft
+    # When only a standalone draft flag is set, run just that draft stage.
+    # If a matching base flag is also set, export both base and draft artifacts.
+    _draft_only = ((args.dflash_draft and not args.dflash_base)
+                   or (args.dspark_draft and not args.dspark_base))
 
     def _export_visual_component(out: str) -> None:
         if _is_alpamayo(model_type):
@@ -2711,21 +4196,28 @@ def main() -> None:
     # drive both the pre-run log and the post-run summary below.
     stages = [
         (_has_llm_component(model_type, "thinker") and not args.skip_llm
-         and not _draft_only and _allow("thinker"), "thinker", lambda out:
-         _export_llm(model_dir,
-                     out,
-                     model_type=model_type,
-                     eagle_base=args.eagle_base,
-                     mtp_base=args.mtp and not gemma4_mtp_requested,
-                     dflash_base=args.dflash_base,
-                     dflash_tree_base=args.dflash_tree_base,
-                     dflash_draft_dir=args.dflash_draft_dir,
-                     gemma4_mtp_base=gemma4_mtp_requested,
-                     fp8_embedding=args.fp8_embedding,
-                     reduced_vocab_dir=args.reduced_vocab_dir,
-                     externalize_weights=externalize_weights,
-                     tp_size=args.tp_size,
-                     num_decoder_layers=args.num_decoder_layer)),
+         and not _draft_only
+         and _allow("thinker"), "thinker", lambda out: _export_llm(
+             model_dir,
+             out,
+             model_type=model_type,
+             eagle_base=args.eagle_base,
+             eagle_draft_dir=args.eagle_draft_dir,
+             mtp_base=args.mtp and not gemma4_mtp_requested,
+             mtp_tree_base=args.mtp_tree_base,
+             dflash_base=args.dflash_base,
+             dflash_tree_base=args.dflash_tree_base,
+             dflash_draft_dir=args.dflash_draft_dir,
+             dspark_base=args.dspark_base,
+             dspark_draft_dir=args.dspark_draft_dir,
+             gemma4_mtp_base=gemma4_mtp_requested,
+             fp8_embedding=args.fp8_embedding,
+             reduced_vocab_dir=args.reduced_vocab_dir,
+             externalize_weights=externalize_weights,
+             tp_size=args.tp_size,
+             num_decoder_layers=args.num_decoder_layer,
+             skip_softmax_scale_factor=args.skip_softmax_scale_factor,
+             quantization_override=getattr(args, 'quantization', None))),
         (args.mtp and not gemma4_mtp_requested
          and _allow("mtp_draft"), "mtp_draft", lambda out: _export_mtp_draft(
              model_dir, out, externalize_weights=externalize_weights)),
@@ -2737,6 +4229,8 @@ def main() -> None:
             out,
             args.dflash_draft_dir,
             draft_reduced_vocab_dir=args.draft_reduced_vocab_dir)),
+        (args.dspark_draft, "dspark_draft", lambda out: _export_dspark_draft(
+            model_dir, out, args.dspark_draft_dir)),
         (_has_llm_component(model_type, "talker") and not args.skip_llm
          and not _draft_only and _allow("talker"), "talker",
          lambda out: _export_talker(model_dir, out, model_type)),
@@ -2745,15 +4239,27 @@ def main() -> None:
          lambda out: _export_code_predictor(model_dir, out, model_type)),
         (_has_visual(model_type) and not args.skip_visual and not _draft_only
          and _allow("visual"), "visual", _export_visual_component),
-        (_has_audio(model_type) and not args.skip_audio and not _draft_only
-         and _checkpoint_audio_config(config) is not None and _allow("audio"),
-         "audio", lambda out: _export_audio(model_dir,
-                                            out,
-                                            _get_weights(),
-                                            config,
-                                            model_type,
-                                            dtype,
-                                            model_config=_get_model_config())),
+        (
+            _has_audio(model_type) and not args.skip_audio and not _draft_only
+            and _checkpoint_audio_config(config) is not None
+            and _allow("audio"),
+            "audio",
+            lambda out: _export_audio(
+                model_dir,
+                out,
+                _get_weights(),
+                config,
+                model_type,
+                dtype,
+                # Nemotron-3.5-ASR has no LLM backbone, so the LLM-oriented
+                # ModelConfig (which requires a top-level ``hidden_size``) does
+                # not apply; its fp16 encoder does not need it.
+                model_config=(None if model_type == "nemotron3_5_asr" else
+                              _get_model_config()))),
+        (_has_rnnt_decoder(model_type) and not args.skip_audio
+         and not _draft_only and _checkpoint_audio_config(config) is not None
+         and _allow("rnnt_decoder"), "rnnt_decoder", lambda out:
+         _export_rnnt_decoder(model_dir, out, _get_weights(), config, dtype)),
         (_has_code2wav(model_type) and not args.skip_code2wav
          and not _draft_only and _allow("code2wav"), "code2wav",
          lambda out: _export_code2wav(model_dir, out, _get_code2wav_weights(),
@@ -2782,6 +4288,8 @@ def main() -> None:
                 gemma4_mtp_assistant_dir if gemma4_mtp_assistant_dir else "no")
     logger.info("DFlash base   : %s", "yes" if args.dflash_base else "no")
     logger.info("DFlash draft  : %s", "yes" if args.dflash_draft else "no")
+    logger.info("DSpark base   : %s", "yes" if args.dspark_base else "no")
+    logger.info("DSpark draft  : %s", "yes" if args.dspark_draft else "no")
     logger.info("Reduced vocab : %s",
                 args.reduced_vocab_dir if args.reduced_vocab_dir else "no")
     logger.info(
@@ -2831,7 +4339,9 @@ def main() -> None:
     _SIDECARS = ("embedding.safetensors", "ple_embedding.safetensors",
                  "text_embedding.safetensors", "text_projection.safetensors",
                  "hidden_projection.safetensors",
-                 "codec_embeddings.safetensors", "lm_heads.safetensors",
+                 "codec_embedding.safetensors", "codec_embeddings.safetensors",
+                 "lm_heads.safetensors",
+                 "speaker_codec_embeddings.safetensors",
                  "small_to_mtp_projection.safetensors",
                  "external_int4_ffn_weights.safetensors",
                  "external_int4_moe_weights.safetensors",

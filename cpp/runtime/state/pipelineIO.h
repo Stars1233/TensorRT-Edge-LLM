@@ -64,10 +64,13 @@ struct PipelineIO
     Tensor inputsEmbeds;
     Tensor outputLogits;
     Tensor selectTokenIndices;
-    Tensor contextLengths;     //!< GPU
-    Tensor hostContextLengths; //!< CPU (pinned, [maxBatch] INT32)
+    Tensor phaseIsEncoder;      //!< DiffusionGemma phase selector, [batch] INT32
+    Tensor contextMaskSelector; //!< DiffusionGemma context-mask selector, [0] or [batch] INT32
+    Tensor contextLengths;      //!< GPU
+    Tensor hostContextLengths;  //!< CPU (pinned, [maxBatch] INT32)
     Tensor
         hostSelectTokenIndices; //!< CPU (pinned, [maxBatch, 1] INT64) — pairs with selectTokenIndices for H2D staging
+    Tensor hostPhaseIsEncoder;  //!< CPU (pinned, [maxBatch] INT32) — pairs with phaseIsEncoder for H2D staging
     //! Gemma4 Unified block IDs, [batch, seq_len] INT32; empty for other models.
     Tensor visionBlockIds;
 
@@ -104,6 +107,9 @@ struct PipelineIO
     //! this tensor at shape [0] for normal prefill/decode and [1] for spec
     //! verify; plugins branch on the shape, not the payload.
     Tensor specVerifyPhaseMarker;
+    //! Shape-only runtime skip-softmax override carrier (data never read); bound
+    //! with shape [S] where S comes from LLMEngineConfig::skipSoftmaxScaleOverride.
+    Tensor skipSoftmaxScale;
     //! DDTree parent node ids, [batch, proposalSize] INT32. Runtime-owned
     //! metadata for tree attention and hybrid state plugin bindings.
     Tensor specTreeParentIds;
@@ -144,6 +150,26 @@ void allocateMRope(PipelineIO& io, int32_t maxBatch, int32_t maxKVCacheCapacity,
 //! @param kvCacheIndex Index into res.cacheManagers for the target engine.
 void buildTensorMap(
     TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex);
+
+//! Populate a TensorMap for a DiffusionGemma unified-backbone engine.
+//!
+//! This keeps DiffusionGemma-only phase/canvas bindings out of the default
+//! autoregressive tensor-map path while still sharing the common KV/RoPE/state
+//! bindings with standard LLM engines.
+void buildTensorMapForDiffusionBackbone(
+    TensorMap& map, PipelineIO& io, SharedResources& res, LLMEngineConfig const& cfg, int32_t kvCacheIndex);
+
+//! Rebind DiffusionGemma unified-backbone tensors for the current denoise,
+//! prefill, or commit step. Self-conditioning feedback is hidden-size state
+//! ping-ponged by the block-diffusion decoder.
+void bindDiffusionUnifiedBackboneTensors(TensorMap& map, PipelineIO& io, Tensor& logits, Tensor& canvasIds,
+    Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds, Tensor& selfConditioningTemperature);
+
+//! Rebind only the DiffusionGemma self-conditioning tensors that ping-pong
+//! between denoise steps. Static unified-backbone bindings are established by
+//! bindDiffusionUnifiedBackboneTensors().
+void bindDiffusionUnifiedBackboneSelfConditioningTensors(
+    TensorMap& map, Tensor& prevSelfConditioningEmbeds, Tensor& nextSelfConditioningEmbeds);
 
 //! Populate a TensorMap for a SpecDecode draft engine. Delegates to `buildTensorMap`
 //! with `kvCacheIndex=1` for the common bindings, then patches in draft-engine-

@@ -50,12 +50,19 @@ def resolve_activation_type(name):
     return mapping[name]
 
 
-def get_max_active_clusters(cluster_shape_mn: tuple[int, int]) -> int:
+def get_max_active_clusters(cluster_shape_mn: tuple[int, int]):
+    """Trace-time seed for the runtime max_active_clusters wrapper argument.
+
+    max_active_clusters is now a RUNTIME kernel argument: the deployed caller
+    passes the launch GPU's value (SM count // cluster size). This seed uses
+    the pure multiprocessor-count attribute instead of HardwareInfo's
+    dummy-occupancy-kernel probe, which is invalid under foreign-arch compiles
+    (e.g. sm_110a exports on a non-Thor build GPU).
+    """
     import cutlass
 
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
+    sm_count = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
+    return cutlass.Int32(sm_count // (cluster_shape_mn[0] * cluster_shape_mn[1]))
 
 
 def make_ptr(dtype, value: int, assumed_align: int | None = None):

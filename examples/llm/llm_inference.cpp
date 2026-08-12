@@ -33,6 +33,8 @@
 #include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
 #include <algorithm>
+#include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
@@ -40,7 +42,9 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -73,7 +77,17 @@ enum LLMInferenceOptionId : int
     OUTPUT_AUDIO_DIR = 919,
     ENABLE_THINKER_TALKER_STREAMING = 920,
     DFLASH_BLOCK_SIZE = 921,
-    NUM_LOGPROBS = 922
+    NUM_LOGPROBS = 922,
+    DSPARK_SCHEDULER = 923,
+    DSPARK_CONFIDENCE_THRESHOLD = 924,
+    DSPARK_MIN_PROPOSAL_LEN = 925,
+    DSPARK_MAX_PROPOSAL_LEN = 926,
+    ENABLE_CONTEXT_REUSE = 927,
+    CONTEXT_CACHE_MAX_RECORDS = 928,
+    CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES = 929,
+    CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES = 930,
+    CHECKPOINT_DIR = 931,
+    DRAFT_CHECKPOINT_DIR = 932
 };
 
 // Struct to hold speculative decoding arguments (used by both EAGLE and MTP)
@@ -90,11 +104,16 @@ struct SpecDecodeArgs
     // Each step extends the current draft proposal.
     int32_t draftStep{6};
 
-    // Number of proposal tokens to select for base model verification.
+    // Number of tokens in the base verification input.
     int32_t verifySize{60};
 
     // DFlash-only draft horizon. 0 means infer from the engine config.
     int32_t dflashBlockSize{0};
+
+    rt::DSparkSchedulerMode dsparkSchedulerMode{rt::DSparkSchedulerMode::kOff};
+    float dsparkConfidenceThreshold{0.0F};
+    int32_t dsparkMinProposalLen{1};
+    int32_t dsparkMaxProposalLen{0};
 };
 
 struct LLMInferenceArgs
@@ -102,6 +121,8 @@ struct LLMInferenceArgs
     bool help{false};
     std::string engineDir;
     std::string multimodalEngineDir{""};
+    std::string checkpointDir{""};
+    std::string draftCheckpointDir{""};
     std::string inputFile;
     std::string outputFile{""};
     std::string profileOutputFile{""};
@@ -115,6 +136,7 @@ struct LLMInferenceArgs
     int64_t maxGenerateLength{-1}; // -1 means use value from input file
     int32_t numLogprobs{-1};       // -1 means use value from input file
     SpecDecodeArgs specDecodeArgs;
+    rt::ContextCacheConfig contextCacheConfig;
 
     // Qwen3-Omni audio output options
     bool enableAudioOutput{false};
@@ -146,13 +168,19 @@ void printUsage(char const* programName)
                  "[--dumpProfile] [--profileOutputFile=<path to profile output file>] [--warmup=<number>] [--debug] "
                  "[--dumpOutput] [--batchSize=<number>] [--maxGenerateLength=<number>] [--specDecode] "
                  "[--specDraftTopK=<number>] [--specDraftStep=<number>] "
-                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>]"
+                 "[--specVerifySize=<number>] [--dflashBlockSize=<number>] "
+                 "[--dsparkScheduler=off|threshold|sps] "
+                 "[--dsparkConfidenceThreshold=<float>] "
+                 "[--dsparkMinProposalLen=<number>] [--dsparkMaxProposalLen=<number>]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
     std::cerr << "  --inputFile               Path to input JSON file with requests" << std::endl;
     std::cerr << "  --engineDir               Path to engine directory" << std::endl;
     std::cerr << "  --multimodalEngineDir     Path to multimodal engine directory (optional)" << std::endl;
+    std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint dir (required for runtime weight loading)"
+              << std::endl;
+    std::cerr << "  --draftCheckpointDir      Separate checkpoint for paired speculative drafts" << std::endl;
     std::cerr << "  --outputFile              Path to output JSON file (optional)" << std::endl;
     std::cerr << "  --dumpProfile             Dump profiling summary to console" << std::endl;
     std::cerr << "  --profileOutputFile       Path to profile JSON output file (optional)" << std::endl;
@@ -171,12 +199,30 @@ void printUsage(char const* programName)
     std::cerr << "                            For DFlash: candidateTopK; 1 is linear, >1 enables branching DDTree"
               << std::endl;
     std::cerr << "  --specDraftStep           Number of drafting steps to perform (default: 6)" << std::endl;
-    std::cerr << "                            DFlash requires this to be 1; use dflashBlockSize for proposal horizon"
+    std::cerr
+        << "                            Each step extends the current draft proposal; DFlash requires this to be 1"
+        << std::endl;
+    std::cerr << "  --specVerifySize          Number of tokens in the base verification input (default: 60)"
               << std::endl;
-    std::cerr << "  --specVerifySize          Number of proposal tokens for base verification (default: 60)"
+    std::cerr << "  --dsparkScheduler         DSpark scheduler mode: off, threshold, or sps (default: off)"
+              << std::endl;
+    std::cerr << "  --dsparkConfidenceThreshold  DSpark threshold scheduler survival threshold in [0,1]" << std::endl;
+    std::cerr << "  --dsparkMinProposalLen    DSpark scheduler minimum proposal length (default: 1)" << std::endl;
+    std::cerr << "  --dsparkMaxProposalLen    DSpark scheduler maximum proposal length (default: full block)"
               << std::endl;
     std::cerr << "  --dflashBlockSize         DFlash proposal block size; 0 means infer from engine config"
               << std::endl;
+    std::cerr << "\nContext Reuse Options:" << std::endl;
+    std::cerr << "  --enableContextReuse      Enable process-local content-addressed context reuse" << std::endl;
+    std::cerr << "  --contextCacheMaxRecords  Maximum retained context records (default: 1024)" << std::endl;
+    std::cerr << "  --contextCacheRecurrentSnapshotPoolBytes" << std::endl;
+    std::cerr << "                            Device byte budget for recurrent/conv snapshots (default: 0;"
+              << " required for hybrid reuse)" << std::endl;
+    std::cerr << "  --contextCachePartialKVSnapshotPoolBytes" << std::endl;
+    std::cerr << "                            Device byte budget for partial-KV snapshots (default: 0;"
+              << " required for hybrid attention reuse)" << std::endl;
+    std::cerr << "                            KV retention capacity is configured at build time with"
+              << " --maxKVPoolPages" << std::endl;
     std::cerr << "\nQwen3-Omni Audio Output Options:" << std::endl;
     std::cerr << "  --enableAudioOutput       Enable audio output from Thinker hidden states" << std::endl;
     std::cerr << "  --talkerEngineDir         Path to Talker engine directory" << std::endl;
@@ -184,12 +230,35 @@ void printUsage(char const* programName)
     std::cerr << "  --outputAudioDir          Directory to save generated audio (.wav) files" << std::endl;
 }
 
+namespace
+{
+
+template <typename IntegerType>
+bool parseNonNegativeIntegerOption(char const* optionName, char const* value, IntegerType& output)
+{
+    static_assert(std::is_integral_v<IntegerType> && std::is_signed_v<IntegerType>);
+    std::string_view const text{value == nullptr ? "" : value};
+    IntegerType parsed{};
+    auto const [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (error != std::errc{} || end != text.data() + text.size() || parsed < 0)
+    {
+        LOG_ERROR("Invalid --%s value: %s (must be a non-negative integer)", optionName, text.data());
+        return false;
+    }
+    output = parsed;
+    return true;
+}
+
+} // namespace
+
 bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
 {
     static struct option inferenceOptions[] = {{"help", no_argument, 0, LLMInferenceOptionId::HELP},
         {"inputFile", required_argument, 0, LLMInferenceOptionId::INPUT_FILE},
         {"engineDir", required_argument, 0, LLMInferenceOptionId::ENGINE_DIR},
         {"multimodalEngineDir", required_argument, 0, LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR},
+        {"checkpointDir", required_argument, 0, LLMInferenceOptionId::CHECKPOINT_DIR},
+        {"draftCheckpointDir", required_argument, 0, LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR},
         {"outputFile", required_argument, 0, LLMInferenceOptionId::OUTPUT_FILE},
         {"debug", no_argument, 0, LLMInferenceOptionId::DEBUG},
         {"dumpProfile", no_argument, 0, LLMInferenceOptionId::DUMP_PROFILE},
@@ -214,6 +283,16 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         {"code2wavEngineDir", required_argument, 0, LLMInferenceOptionId::CODE2WAV_ENGINE_DIR},
         {"outputAudioDir", required_argument, 0, LLMInferenceOptionId::OUTPUT_AUDIO_DIR},
         {"enableThinkerTalkerStreaming", no_argument, 0, LLMInferenceOptionId::ENABLE_THINKER_TALKER_STREAMING},
+        {"dsparkScheduler", required_argument, 0, LLMInferenceOptionId::DSPARK_SCHEDULER},
+        {"dsparkConfidenceThreshold", required_argument, 0, LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD},
+        {"dsparkMinProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN},
+        {"dsparkMaxProposalLen", required_argument, 0, LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN},
+        {"enableContextReuse", no_argument, 0, LLMInferenceOptionId::ENABLE_CONTEXT_REUSE},
+        {"contextCacheMaxRecords", required_argument, 0, LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS},
+        {"contextCacheRecurrentSnapshotPoolBytes", required_argument, 0,
+            LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES},
+        {"contextCachePartialKVSnapshotPoolBytes", required_argument, 0,
+            LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES},
         {0, 0, 0, 0}};
 
     int opt;
@@ -225,6 +304,8 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         case LLMInferenceOptionId::INPUT_FILE: args.inputFile = optarg; break;
         case LLMInferenceOptionId::ENGINE_DIR: args.engineDir = optarg; break;
         case LLMInferenceOptionId::MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
+        case LLMInferenceOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
+        case LLMInferenceOptionId::DRAFT_CHECKPOINT_DIR: args.draftCheckpointDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_FILE: args.outputFile = optarg; break;
         case LLMInferenceOptionId::DEBUG: args.debug = true; break;
         case LLMInferenceOptionId::DUMP_PROFILE: args.dumpProfile = true; break;
@@ -344,6 +425,77 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             }
             break;
         case LLMInferenceOptionId::ENABLE_AUDIO_OUTPUT: args.enableAudioOutput = true; break;
+        case LLMInferenceOptionId::DSPARK_SCHEDULER:
+        {
+            std::string const mode{optarg};
+            if (mode == "off")
+            {
+                args.specDecodeArgs.dsparkSchedulerMode = rt::DSparkSchedulerMode::kOff;
+            }
+            else if (mode == "threshold")
+            {
+                args.specDecodeArgs.dsparkSchedulerMode = rt::DSparkSchedulerMode::kThreshold;
+            }
+            else if (mode == "sps")
+            {
+                args.specDecodeArgs.dsparkSchedulerMode = rt::DSparkSchedulerMode::kSPS;
+            }
+            else
+            {
+                LOG_ERROR("Invalid dsparkScheduler value: %s (expected off, threshold, or sps)", optarg);
+                return false;
+            }
+            break;
+        }
+        case LLMInferenceOptionId::DSPARK_CONFIDENCE_THRESHOLD:
+            try
+            {
+                args.specDecodeArgs.dsparkConfidenceThreshold = std::stof(optarg);
+                if (args.specDecodeArgs.dsparkConfidenceThreshold < 0.0F
+                    || args.specDecodeArgs.dsparkConfidenceThreshold > 1.0F)
+                {
+                    LOG_ERROR("Invalid dsparkConfidenceThreshold value: %s (must be in [0,1])", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dsparkConfidenceThreshold value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DSPARK_MIN_PROPOSAL_LEN:
+            try
+            {
+                args.specDecodeArgs.dsparkMinProposalLen = std::stoi(optarg);
+                if (args.specDecodeArgs.dsparkMinProposalLen <= 0)
+                {
+                    LOG_ERROR("Invalid dsparkMinProposalLen value: %s (must be positive)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dsparkMinProposalLen value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::DSPARK_MAX_PROPOSAL_LEN:
+            try
+            {
+                args.specDecodeArgs.dsparkMaxProposalLen = std::stoi(optarg);
+                if (args.specDecodeArgs.dsparkMaxProposalLen < 0)
+                {
+                    LOG_ERROR("Invalid dsparkMaxProposalLen value: %s (must be non-negative)", optarg);
+                    return false;
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Invalid dsparkMaxProposalLen value: %s", optarg);
+                return false;
+            }
+            break;
         case LLMInferenceOptionId::TALKER_ENGINE_DIR: args.talkerEngineDir = optarg; break;
         case LLMInferenceOptionId::CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
         case LLMInferenceOptionId::OUTPUT_AUDIO_DIR: args.outputAudioDir = optarg; break;
@@ -361,6 +513,27 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
             catch (std::exception const& e)
             {
                 LOG_ERROR("Invalid numLogprobs value: %s", optarg);
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::ENABLE_CONTEXT_REUSE: args.contextCacheConfig.enabled = true; break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_MAX_RECORDS:
+            if (!parseNonNegativeIntegerOption("contextCacheMaxRecords", optarg, args.contextCacheConfig.maxRecords))
+            {
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_RECURRENT_SNAPSHOT_POOL_BYTES:
+            if (!parseNonNegativeIntegerOption("contextCacheRecurrentSnapshotPoolBytes", optarg,
+                    args.contextCacheConfig.recurrentSnapshotPoolBytes))
+            {
+                return false;
+            }
+            break;
+        case LLMInferenceOptionId::CONTEXT_CACHE_PARTIAL_KV_SNAPSHOT_POOL_BYTES:
+            if (!parseNonNegativeIntegerOption("contextCachePartialKVSnapshotPoolBytes", optarg,
+                    args.contextCacheConfig.partialKvSnapshotPoolBytes))
+            {
                 return false;
             }
             break;
@@ -419,6 +592,24 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
         LOG_INFO("Spec draft step: %d", args.specDecodeArgs.draftStep);
         LOG_INFO("Spec verify size: %d", args.specDecodeArgs.verifySize);
         LOG_INFO("DFlash block size: %d", args.specDecodeArgs.dflashBlockSize);
+        LOG_INFO("DSpark scheduler mode: %d", static_cast<int32_t>(args.specDecodeArgs.dsparkSchedulerMode));
+        LOG_INFO("DSpark confidence threshold: %.4f", args.specDecodeArgs.dsparkConfidenceThreshold);
+        LOG_INFO("DSpark proposal length range: [%d, %d]", args.specDecodeArgs.dsparkMinProposalLen,
+            args.specDecodeArgs.dsparkMaxProposalLen);
+    }
+    else if (!args.draftCheckpointDir.empty())
+    {
+        LOG_ERROR("--draftCheckpointDir requires --specDecode");
+        return false;
+    }
+
+    if (args.contextCacheConfig.enabled)
+    {
+        LOG_INFO("Context reuse enabled");
+        LOG_INFO("Context cache config: maxRecords=%d recurrentSnapshotPoolBytes=%lld partialKVSnapshotPoolBytes=%lld",
+            args.contextCacheConfig.maxRecords,
+            static_cast<long long>(args.contextCacheConfig.recurrentSnapshotPoolBytes),
+            static_cast<long long>(args.contextCacheConfig.partialKvSnapshotPoolBytes));
     }
 
     if (args.enableAudioOutput)
@@ -568,10 +759,15 @@ int main(int argc, char* argv[])
         draftingConfig.draftingStep = args.specDecodeArgs.draftStep;
         draftingConfig.verifySize = args.specDecodeArgs.verifySize;
         draftingConfig.dflashBlockSize = args.specDecodeArgs.dflashBlockSize;
+        draftingConfig.dsparkSchedulerMode = args.specDecodeArgs.dsparkSchedulerMode;
+        draftingConfig.dsparkConfidenceThreshold = args.specDecodeArgs.dsparkConfidenceThreshold;
+        draftingConfig.dsparkMinProposalLen = args.specDecodeArgs.dsparkMinProposalLen;
+        draftingConfig.dsparkMaxProposalLen = args.specDecodeArgs.dsparkMaxProposalLen;
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
+            runtime
+                = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir, loraWeightsMap,
+                    draftingConfig, stream, args.contextCacheConfig, args.checkpointDir, args.draftCheckpointDir);
         }
         catch (std::exception const& e)
         {
@@ -584,8 +780,8 @@ int main(int argc, char* argv[])
         // Standard vanilla-only mode (no draft model)
         try
         {
-            runtime = std::make_unique<rt::LLMInferenceRuntime>(
-                args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
+            runtime = std::make_unique<rt::LLMInferenceRuntime>(args.engineDir, args.multimodalEngineDir,
+                loraWeightsMap, stream, args.contextCacheConfig, args.checkpointDir);
         }
         catch (std::exception const& e)
         {
@@ -608,8 +804,8 @@ int main(int argc, char* argv[])
         {
             std::filesystem::path const codePredictorDir
                 = std::filesystem::path(args.talkerEngineDir).parent_path() / "code_predictor";
-            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(
-                args.talkerEngineDir, codePredictorDir.string(), args.engineDir, stream);
+            ttsRuntime = std::make_unique<rt::Qwen3OmniTTSRuntime>(args.talkerEngineDir, codePredictorDir.string(),
+                args.engineDir, /*cloneEncoderDir=*/"", stream, args.checkpointDir);
             LOG_INFO("TTS runtime initialized for audio output");
         }
         catch (std::exception const& e)
@@ -626,7 +822,7 @@ int main(int argc, char* argv[])
         {
             try
             {
-                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream);
+                code2wavRunner = std::make_unique<rt::Code2WavRunner>(code2wavDir.string(), stream, args.checkpointDir);
                 LOG_INFO("Code2Wav runner initialized");
             }
             catch (std::exception const& e)
@@ -653,6 +849,11 @@ int main(int argc, char* argv[])
         setProfilingEnabled(false);
         LOG_INFO("Starting warmup with %d runs using the first request...", args.warmup);
         auto& firstRequest = batchedRequests[0];
+        rt::ContextCacheLookupPolicy const originalLookupPolicy = firstRequest.contextCacheLookupPolicy;
+        if (args.contextCacheConfig.enabled)
+        {
+            firstRequest.contextCacheLookupPolicy = rt::ContextCacheLookupPolicy::kBypass;
+        }
 
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
@@ -661,10 +862,12 @@ int main(int argc, char* argv[])
 
             if (!requestStatus)
             {
+                firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
                 LOG_ERROR("Warmup run %d/%d failed", warmupRun + 1, args.warmup);
                 return EXIT_FAILURE;
             }
         }
+        firstRequest.contextCacheLookupPolicy = originalLookupPolicy;
         LOG_INFO("Warmup of %d runs completed. Starting actual benchmark runs...", args.warmup);
     }
 
@@ -1084,6 +1287,10 @@ int main(int argc, char* argv[])
         auto prefillMetrics = runtime->getPrefillMetrics();
         auto multimodalMetrics = runtime->getMultimodalMetrics();
         outputPrefillProfile(profileOutput, prefillMetrics);
+        if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+        {
+            outputContextCacheProfile(profileOutput, *contextCacheMetrics);
+        }
         if (args.specDecodeArgs.enabled)
         {
             auto specDecodeGenerationMetrics = runtime->getSpecDecodeGenerationMetrics();
@@ -1114,6 +1321,10 @@ int main(int argc, char* argv[])
 
             // Add high-level metrics from unified runtime
             addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
+            if (auto const contextCacheMetrics = runtime->getContextCacheMetrics(); contextCacheMetrics.has_value())
+            {
+                addJsonContextCacheSummary(profileJson, *contextCacheMetrics);
+            }
             if (args.specDecodeArgs.enabled)
             {
                 addJsonSpecDecodeGenerationSummary(profileJson, runtime->getSpecDecodeGenerationMetrics(),

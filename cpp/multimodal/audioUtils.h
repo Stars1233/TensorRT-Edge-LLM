@@ -83,8 +83,8 @@ void makeFftTwiddleHost(int32_t nFft, std::vector<float>& twoChan);
 //! FFT); the caller ensures ``window.size() <= nFft``.
 void makeCentredWindowHost(std::vector<float> const& window, int32_t nFft, std::vector<float>& out);
 
-//! Compute CNN output length (three 2x downsampling layers)
-int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow);
+//! Compute CNN output length after ``numConvStages`` stride-2 2D convolutions.
+int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow, int32_t numConvStages = 3);
 
 //! Compute chunk split information for audio features
 ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow);
@@ -93,13 +93,13 @@ ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow);
 bool chunkAndPadFeatures(
     rt::Tensor const& melSpectrogram, ChunkInfo const& chunkInfo, rt::Tensor& paddedFeature, cudaStream_t stream);
 
-//! Create validity mask for tokens after CNN downsampling
+//! Create validity mask for tokens after CNN downsampling.
 bool createPaddedMask(ChunkInfo const& chunkInfo, int32_t nWindow, rt::Tensor& paddedMask,
-    std::vector<int64_t>& afterCNNLens, cudaStream_t stream);
+    std::vector<int64_t>& afterCNNLens, cudaStream_t stream, int32_t numConvStages = 3);
 
-//! Preprocess audio for Qwen3-Omni encoder: chunk, pad, and create masks
+//! Preprocess audio for Qwen3-Omni / Qwen3-Next Omni encoder: chunk, pad, and create masks.
 bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, rt::Tensor& paddedFeature,
-    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream);
+    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream, int32_t numConvStages = 3);
 
 //! Convert boolean mask to nonzero indices (equivalent to torch.nonzero)
 //! This function implements the NonZero operation that was removed from the ONNX model.

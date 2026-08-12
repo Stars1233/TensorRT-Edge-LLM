@@ -94,7 +94,7 @@ def _is_phi4mm_model(model_dir: str) -> bool:
     return root.get("model_type") in ("phi4mm", "phi4_multimodal")
 
 
-_QWEN3_OMNI_MODEL_TYPES = ("qwen3_omni", "qwen3_omni_moe")
+_QWEN3_OMNI_MODEL_TYPES = ("qwen3_omni", "qwen3_omni_moe", "qwen3_omni_next")
 _QWEN3_OMNI_STANDALONE_MODEL_TYPES = ("qwen3_omni_text", "qwen3_omni_talker",
                                       "qwen3_omni_moe_text",
                                       "qwen3_omni_moe_talker")
@@ -556,6 +556,11 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
                 },
                 "audio": {
                     "format": "<so_start><so_embedding><so_end>"
+                },
+                # Bare marker; the runner expands it into the per-tubelet Frame-label layout at
+                # textPreprocess time, once timestamps and EVS-pruned counts are known.
+                "video": {
+                    "format": "<image>"
                 },
             }
         elif is_vlm:

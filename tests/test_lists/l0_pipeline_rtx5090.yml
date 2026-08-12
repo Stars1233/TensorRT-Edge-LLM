@@ -1,6 +1,11 @@
 tests:
   - tests/defs/test_common.py::test_build_project
 
+  # ONNX-less frontend: compile pre-quantized checkpoints directly, then run
+  # the C++ runtime and existing accuracy check on an RTX 50-series system.
+  - tests/defs/test_builder_pipeline.py::test_build_and_run[Qwen2.5-0.5B-Instruct-FP8-fp8-mxsl2048-mxbs1-mxil1024-llm_basic]
+  - tests/defs/test_builder_pipeline.py::test_build_and_run[Qwen3-1.7B-NVFP4-nvfp4-mxsl2048-mxbs1-mxil1024-llm_basic]
+
   # Keep few-layer numeric validation automatic while B100 jobs are manual.
   # The Nemotron NVFP4 few-layer golden path is waived because HF cache
   # construction fails on interleaved MLP layer types; full Nemotron engine

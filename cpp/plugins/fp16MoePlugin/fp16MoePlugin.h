@@ -38,7 +38,8 @@ class Fp16MoePlugin : public nvinfer1::IPluginV3,
 {
 public:
     Fp16MoePlugin(std::string const& name, int32_t numExperts, int32_t topK, int32_t hiddenSize, int32_t moeInterSize,
-        int32_t activationType, int32_t normTopkProb, int32_t maxRoutedRows);
+        int32_t activationType, int32_t nGroup, int32_t topkGroup, int32_t normTopkProb, float routedScalingFactor,
+        int32_t routingMode, int32_t maxRoutedRows);
     Fp16MoePlugin(std::string const& name, nvinfer1::PluginFieldCollection const* fields);
     Fp16MoePlugin() = delete;
     Fp16MoePlugin(Fp16MoePlugin const&) = delete;
@@ -73,6 +74,10 @@ public:
     nvinfer1::PluginFieldCollection const* getFieldsToSerialize() noexcept override;
 
 private:
+    //! Number of plugin inputs, which depends on the routing mode: the sigmoid group-topk path adds a trailing
+    //! e_score_correction_bias input, the softmax path does not.
+    int32_t numInputs() const noexcept;
+
     std::string mLayerName;
     std::string mNamespace;
     int32_t mNumExperts{};
@@ -80,7 +85,11 @@ private:
     int32_t mHiddenSize{};
     int32_t mMoeInterSize{};
     int32_t mActivationType{};
+    int32_t mNGroup{};
+    int32_t mTopkGroup{};
     int32_t mNormTopkProb{};
+    float mRoutedScalingFactor{1.0F};
+    int32_t mRoutingMode{};
     int32_t mMaxRoutedRows{};
     int32_t mPersistentBlockCount{};
     bool mAutoMaxRoutedRows{};

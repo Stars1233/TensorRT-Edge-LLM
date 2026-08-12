@@ -19,6 +19,7 @@ fallback for VLMs), runs ModelOpt quantization, and writes a unified safetensors
 checkpoint consumable by the checkpoint-based ``tensorrt_edgellm`` exporter.
 """
 
+import gc
 import json
 import os
 import shutil
@@ -46,7 +47,11 @@ from .quantization_configs import build_quant_config
 from .qwen3_asr_loader import (asr_calibration_dataloader, is_qwen3_asr_model,
                                load_qwen3_asr_joint_for_calibration,
                                postprocess_qwen3_asr_checkpoint)
-from .qwen3_cp_loader import has_code_predictor, qwen3_cp_calibration_loop
+from .qwen3_cp_loader import (has_code_predictor, is_qwen3_next_omni,
+                              qwen3_cp_calibration_loop,
+                              qwen3_next_cp_calibration_loop)
+from .qwen3_omni import (_load_omni_model, is_omni_model_dir,
+                         quantize_and_export_omni)
 
 
 def _text_calib_dataloader(tokenizer,
@@ -96,6 +101,36 @@ def _is_phi4mm_model(model_dir: str) -> bool:
         return model_type in ("phi4mm", "phi4_multimodal")
     except (OSError, ValueError):
         return False
+
+
+def _pre_register_phi4mm_attention_for_kv_quant(
+        model: torch.nn.Module) -> None:
+    # ModelOpt's register_hf_attentions_on_the_fly short-circuits when ANY
+    # attention in the model uses the new ALL_ATTENTION_FUNCTIONS interface
+    # (SiglipAttention in the visual encoder), so Phi4MMAttention (text
+    # decoder, older-style trust_remote_code module) is never registered for
+    # KV-cache BMM quantization.  Pre-register it explicitly before mtq.quantize.
+    import logging
+
+    from modelopt.torch.quantization.conversion import QuantModuleRegistry
+    from modelopt.torch.quantization.plugins.attention import \
+        register_attention_for_kv_quant
+    logger = logging.getLogger(__name__)
+    registered: set[type] = set()
+    for _, module in model.named_modules():
+        attn_type = type(module)
+        # trust_remote_code classes are loaded under 'transformers_modules';
+        # match on __module__ so this survives class renames.
+        if (getattr(attn_type, "__module__",
+                    "").startswith("transformers_modules")
+                and hasattr(module, "k_proj") and attn_type not in registered
+                and QuantModuleRegistry.get(attn_type) is None):
+            register_attention_for_kv_quant(attn_type)
+            registered.add(attn_type)
+    if not registered:
+        logger.warning(
+            "_pre_register_phi4mm_attention_for_kv_quant: no trust_remote_code "
+            "attention modules found; KV-cache pre-registration skipped")
 
 
 def _copy_phi4mm_processor_files(model_dir: str, output_dir: str) -> None:
@@ -252,7 +287,10 @@ def _load_model(model_dir, dtype="fp16", device="cuda"):
                     model_dir,
                     torch_dtype=torch_dtype,
                     trust_remote_code=True,
+                    low_cpu_mem_usage=True,
                 ).to(device)
+                gc.collect(
+                )  # release safetensor mmap handles after GPU transfer
                 break
             except (ValueError, KeyError) as e:
                 last_err = e
@@ -486,6 +524,17 @@ def _fix_generation_config_for_strict_validate(model) -> None:
         gc.do_sample = True
 
 
+def _is_moe_model(model):
+    """Return True if the model has MoE (mixture-of-experts) layers."""
+    config = model.config
+    if hasattr(config, "text_config"):
+        config = config.text_config
+    if getattr(config, "num_experts", None) or getattr(
+            config, "num_local_experts", None):
+        return True
+    return any("experts" in n for n, _ in model.named_modules())
+
+
 def _is_hybrid_model(model):
     """Return True if the model has hybrid Mamba+Attention layers.
 
@@ -516,6 +565,16 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     incorrectly fused, corrupting the int4 weights.  For Phi-4 multimodal,
     the dummy forward is incompatible with the required ``input_mode``.
 
+    For dense INT4-AWQ models resmoothing is lossy: replacing each linear's
+    calibrated pre_quant_scale with the q/k/v (and gate/up) average and
+    re-quantizing the int4 weights against it deviates from the calibrated
+    model enough to collapse small-model accuracy (Qwen3-0.6B answers
+    English prompts in Chinese; ROUGE-1 0.09 vs 0.42 without resmoothing).
+    The exported checkpoint keeps each linear's own pre_quant_scale, which
+    the Edge-LLM export/runtime path fully supports.  MoE INT4-AWQ models
+    are exempt: expert weight stacking at export requires the shared scales
+    that resmoothing produces.
+
     NVFP4 is exempt: resmoothing works correctly for NVFP4 and is required
     to equalise per-tensor scales across GDN input projections that share
     the same input activation, enabling fusion into a single GEMM.
@@ -526,15 +585,18 @@ def _skip_resmooth_for_hybrid(model, quantization: str = ""):
     TODO: Remove once ModelOpt fixes these model paths upstream.
     """
     model_type = getattr(getattr(model, "config", None), "model_type", "")
+    quantization = quantization.lower()
     # NVFP4 on hybrid models: resmoothing is safe and required for GDN
     # input projection fusion — do NOT skip.
-    is_nvfp4 = quantization.lower() in ("nvfp4", "fp4")
+    is_nvfp4 = quantization in ("nvfp4", "fp4")
+    is_int4_awq = quantization == "int4_awq"
     # Multimodal wrappers have no top-level ``forward``; resmooth's dummy
     # ``model(fake_input)`` crashes on them. Resmooth is a no-op without
     # AWQ pre_quant_scales, so skipping is safe here.
     should_skip = ((_is_hybrid_model(model) and not is_nvfp4)
                    or model_type in ("phi4mm", "phi4_multimodal", "qwen3_omni",
-                                     "qwen3_omni_moe", "qwen3_omni_next"))
+                                     "qwen3_omni_moe", "qwen3_omni_next")
+                   or (is_int4_awq and not _is_moe_model(model)))
     if not should_skip:
         yield
         return
@@ -648,14 +710,88 @@ def quantize_and_export(
     never fails the run; an unknown name for the modality in use fails out
     with a pointer to the customization guide.
     """
-    t0 = time.time()
-    model, tokenizer, processor = _load_model(model_dir, dtype, device)
+    from ..chat_template import _get_model_type
 
+    # Qwen3-Omni needs a joint Thinker+Talker multimodal calibration chain
+    # the generic single-model path below can't express; delegate the full
+    # quant+export pipeline to the dedicated driver (auto-branches MoE vs
+    # non-MoE from ``config.json``). ``qwen3_omni_next`` is deliberately
+    # excluded: the shared chat-template tuple lumps all three variants,
+    # which would send Next into this driver whose HF classes cannot load
+    # a Next checkpoint — Next dispatches to its orchestrator below.
+    if _get_model_type(model_dir) in ("qwen3_omni", "qwen3_omni_moe"):
+        from .qwen3_omni import quantize_qwen3_omni
+
+        # Split num_samples across audio/image/text roughly evenly.
+        third = max(1, num_samples // 3)
+        quantize_qwen3_omni(
+            model_dir=model_dir,
+            output_dir=output_dir,
+            quantization=quantization,
+            lm_head_quantization=lm_head_quantization,
+            kv_cache_quantization=kv_cache_quantization,
+            visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization,
+            dtype=dtype,
+            device=device,
+            text_dataset=text_dataset,
+            num_samples=num_samples,
+            talker_num_audio=third,
+            talker_num_image=third,
+            talker_num_text=num_samples - 2 * third,
+        )
+        return output_dir
+
+    # Qwen3-Omni Next: dedicated orchestrator (transformers patch +
+    # thinker/talker multimodal calib + amax backfill). Shares the ``llm``
+    # flag surface; unsupported sub-encoder flags fail loudly there. EXCEPT
+    # CP-only quantization (``--cp_quantization`` without ``--quantization``),
+    # which the orchestrator doesn't support and the generic flow below does.
+    omni_dir = is_omni_model_dir(model_dir)
+    cp_only = cp_quantization is not None and quantization is None
+    if omni_dir and not cp_only:
+        if cp_quantization is not None:
+            raise ValueError(
+                "Joint --quantization + --cp_quantization on a "
+                "Qwen3-Omni Next root is not supported. Run "
+                "`--cp_quantization fp8` alone (CP-only checkpoint), and "
+                "quantize the backbone in a separate pass.")
+        kwargs = {}
+        if text_dataset is not None:
+            kwargs["text_dataset"] = text_dataset
+        return quantize_and_export_omni(
+            model_dir=model_dir,
+            output_dir=output_dir,
+            quantization=quantization,
+            lm_head_quantization=lm_head_quantization,
+            kv_cache_quantization=kv_cache_quantization,
+            visual_quantization=visual_quantization,
+            audio_quantization=audio_quantization,
+            cp_quantization=cp_quantization,
+            dtype=dtype,
+            device=device,
+            num_samples=num_samples,
+            **kwargs,
+        )
+
+    t0 = time.time()
+    if omni_dir:
+        # CP-only on an Omni root: the ForConditionalGeneration classes need
+        # the dedicated loader (transformers workarounds + delegating
+        # forward for ModelOpt's dummy walk); it loads bf16-declared
+        # checkpoints as bf16 regardless of the requested dtype.
+        model, tokenizer, processor = _load_omni_model(model_dir, dtype,
+                                                       device)
+    else:
+        model, tokenizer, processor = _load_model(model_dir, dtype, device)
+
+    base_already_quantized = is_quantized(model)
     mtp_layers = _mtp_num_hidden_layers(model)
     mtp_quantized = False
     mtp_state_dict: dict[str, torch.Tensor] = {}
     if (mtp_layers > 0 and quantization is not None
-            and not is_quantized(model)):
+            and not base_already_quantized):
         text_ds = resolve_dataset(text_dataset, "text")
         from .models.mtp_draft import (export_quantized_mtp_state_dict,
                                        quantize_mtp_from_base)
@@ -683,7 +819,7 @@ def quantize_and_export(
             torch.cuda.empty_cache()
 
     # --- Quantize base model ----------------------------------------------
-    if is_quantized(model):
+    if base_already_quantized:
         print("Model already quantized — skipping.")
     else:
         # Fail fast when the user asks for CP quantization on a model that
@@ -695,19 +831,15 @@ def quantize_and_export(
                 f"--cp_quantization={cp_quantization} requires a model with "
                 "talker.code_predictor (Qwen3-Omni / Qwen3-TTS); the loaded "
                 "checkpoint has none.")
-        # MoE Thinker backbone quantization runs through the dedicated
-        # ``tensorrt-edgellm-quantize thinker`` command (qwen3_omni_thinker.py);
-        # the ``llm`` command can't dummy-walk the MoE wrapper. Joint mode
-        # here would silently produce a Thinker-unquantized checkpoint.
+        # The generic path can't dummy-walk a MoE thinker wrapper; joint
+        # mode here would silently produce a Thinker-unquantized checkpoint.
+        # (Qwen3-Omni never reaches here — it is delegated above.)
         if (cp_quantization is not None and quantization is not None
                 and getattr(model, "thinker", None) is not None
                 and "Moe" in type(model).__name__):
             raise ValueError(
-                "Joint --quantization + --cp_quantization on the Qwen3-Omni-MoE "
-                "wrapper is not supported here. Use `--cp_quantization fp8` "
-                "alone via `tensorrt-edgellm-quantize llm`, and run "
-                "`tensorrt-edgellm-quantize thinker --quantization fp8` "
-                "separately for the MoE Thinker backbone.")
+                "Joint --quantization + --cp_quantization is not supported "
+                "on this MoE thinker wrapper via the generic path.")
         quant_cfg = build_quant_config(
             quantization,
             lm_head_quantization,
@@ -716,7 +848,42 @@ def quantize_and_export(
             audio_quantization=audio_quantization,
             cp_quantization=cp_quantization,
         )
-        if cp_quantization is not None and has_code_predictor(model):
+        # When INT4 is exported to the cuteDSL GEMM kernel's fragment layout, repack
+        # requires N%64==0 && K%64==0. Small hybrid/GDN projections (e.g. Qwen3.5
+        # in_proj_a / in_proj_b with out_features=16/32) cannot be repacked, so
+        # exclude any 64-misaligned Linear from int4 -- it stays fp16 and exports
+        # as a plain GEMM.
+        if quantization == "int4_awq":
+            for name, module in model.named_modules():
+                if isinstance(
+                        module,
+                        torch.nn.Linear) and (module.out_features % 64 != 0
+                                              or module.in_features % 64 != 0):
+                    quant_cfg["quant_cfg"][f"*{name}.weight_quantizer"] = {
+                        "enable": False
+                    }
+                    print(
+                        f"[int4] skipping {name}: weight [{module.out_features}, "
+                        f"{module.in_features}] not 64-aligned (kept fp16)")
+        if kv_cache_quantization is not None and _is_phi4mm_model(model_dir):
+            _pre_register_phi4mm_attention_for_kv_quant(model)
+        if cp_quantization is not None and is_qwen3_next_omni(model):
+            # Qwen3-Omni Next (dense + MoE share the class): the Talker fires
+            # the CP inside its own generate loop, so calibration drives the
+            # checkpoint's reference generation path with ChatML prompts
+            # instead of the hand-built Thinker->Talker chain below.
+            text_ds = resolve_dataset(text_dataset, "text")
+            print(f"Text calibration dataset: {dataset_name(text_ds)}")
+            cp_n = min(num_samples, 64)
+            # 2x margin: samples can be skipped (short thinker replies).
+            texts = list(islice(text_ds(), cp_n * 2))
+            mtq.quantize(
+                model,
+                quant_cfg,
+                forward_loop=lambda m: qwen3_next_cp_calibration_loop(
+                    m, tokenizer, texts, num_cp_samples=cp_n),
+            )
+        elif cp_quantization is not None and has_code_predictor(model):
             # CP is only reached via the Thinker->Talker->CP generation path,
             # so a dedicated loop drives that chain (bs=1: Talker uses 3D
             # RoPE, no batch-mixing). When backbone is co-quantized, prepend
@@ -833,10 +1000,25 @@ def quantize_and_export(
     cp_only_moe_wrapper = (cp_quantization is not None and quantization is None
                            and has_code_predictor(model)
                            and getattr(model, "thinker", None) is not None
-                           and "Moe" in type(model).__name__)
+                           and ("Moe" in type(model).__name__
+                                or is_qwen3_next_omni(model)))
     if cp_only_moe_wrapper:
         from .qwen3_omni import _export_submodel
         _export_submodel(model, "talker", output_dir)
+        # HF Talker configs carry ``model_type=""`` and would fail component
+        # dispatch. Patch in the Talker-root type — deliberately NOT the
+        # full-root ``qwen3_omni_next``, which AutoConfig would default-fill
+        # with the fork's non-JSON-serializable thinker/code2wav sections;
+        # an unregistered type falls back to the raw config.json everywhere.
+        # The CP exporter detects Talker-root via ``code_predictor_config``.
+        if is_qwen3_next_omni(model):
+            cfg_path = os.path.join(output_dir, "config.json")
+            with open(cfg_path) as f:
+                exported_cfg = json.load(f)
+            if not exported_cfg.get("model_type"):
+                exported_cfg["model_type"] = "qwen3_omni_next_talker"
+                with open(cfg_path, "w") as f:
+                    json.dump(exported_cfg, f, indent=2)
     else:
         with torch.inference_mode(), _skip_resmooth_for_hybrid(
                 model, quantization or ""):

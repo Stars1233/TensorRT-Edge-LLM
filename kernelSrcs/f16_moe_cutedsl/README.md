@@ -1,4 +1,4 @@
-# Cross-Platform FP16 MoE CuTeDSL Kernels
+# Cross-Platform FP16 MoE CuTe DSL Kernels
 
 The `f16_moe` AOT group provides raw FP16 grouped GEMM for
 `Fp16MoePlugin`. One device descriptor ABI and one weight layout are shared by
@@ -14,8 +14,8 @@ Every variant computes `D[M,N] = A[M,K] * B[N,K]^T` with row-major FP16
 operands/output and FP32 accumulation. The same module is invoked for FC1 and
 FC2. Activation and route reduction are intentionally separate CUDA kernels.
 The Blackwell datacenter implementation is adapted from the CUTLASS 4.4.2
-CuTeDSL grouped-GEMM example and retains its BSD-3-Clause notice; the repository
-exports all three variants with its existing `nvidia-cutlass-dsl==4.5.2`
+CuTe DSL grouped-GEMM example and retains its BSD-3-Clause notice; the repository
+exports all three variants with its existing `nvidia-cutlass-dsl==4.6.1`
 toolchain rather than adding a second C++ GEMM backend.
 
 ## Device descriptor ABI
@@ -48,35 +48,18 @@ values in order:
 The exact problem shapes and A/B/D addresses remain device resident, so the
 persistent scheduler can skip empty experts without host synchronization.
 
-## Export
+## Artifact Development
 
-`build_cutedsl.py` checks for `nvidia-cutlass-dsl==4.5.2`, the matching CuPy
-package, `cuda-python`, and `ar`. For example, the CUDA 13 environment uses:
+If you modify this kernel or its registry entries, manually regenerate the
+`f16_moe` group before running CMake. Otherwise, CMake uses the matching
+prebuilt tarball by default. Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
+for the supported Docker and local-venv commands, dependency versions,
+cross-compilation, artifact layout, and CMake configuration.
 
-```bash
-python3 -m pip install cuda-python cupy-cuda13x==13.6.0 \
-  'nvidia-cutlass-dsl[cu13]==4.5.2'
-```
-
-Generate each pack on a host whose CPU architecture and GPU SM exactly match
-the requested `--arch` and `--gpu_arch` values:
-
-```bash
-python kernelSrcs/build_cutedsl.py \
-  --kernels f16_moe \
-  --gpu_arch sm_87 \
-  --arch aarch64 \
-  --clean
-```
-
-Use `sm_110` for Thor and `sm_121` for GB10. These options select variants and
-name the artifact directory; they do not cross-compile CuTeDSL code or host
-objects. In particular, an SM121 export sets `CUTE_DSL_ARCH=sm_121a`, but it
-must still run on an SM121 GPU. Generated headers, objects, the group umbrella
-header, metadata, and static archive are placed below
-`cpp/kernels/cuteDSLArtifact/<arch>/<sm_tag>/` and are not source files. Link
-and execute a pack only on the exact SM named by its artifact tag, even when
-multiple SMs share one kernel implementation family.
+The selected target SM determines which implementation family is exported.
+The target CPU architecture can differ from the build host; the shared build
+wrapper performs the corresponding host-object cross-compilation.
 
 ## Fixed plugin contract
 

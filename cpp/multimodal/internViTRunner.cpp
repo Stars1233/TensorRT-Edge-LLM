@@ -82,6 +82,8 @@ bool InternViTRunner::validateAndFillConfig(std::string const& engineDir)
     }
 
     mConfig.imageTokenId = jsonConfig["image_token_id"].get<int32_t>();
+    mConfig.imgStartTokenId = jsonConfig.value("img_start_token_id", mConfig.imgStartTokenId);
+    mConfig.imgEndTokenId = jsonConfig.value("img_end_token_id", mConfig.imgEndTokenId);
     auto textConfig = jsonConfig["text_config"];
     mConfig.vocabSize = textConfig["vocab_size"].get<int32_t>();
 
@@ -147,14 +149,14 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "InternViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor(
         {maxImagePixels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mNormalizedImageDevice");
-    // Scratch buffer for resizeImage output (4D placeholder shape; resizeImage reshapes per call).
-    rt::Tensor resizeBuffer({1, 1, maxImagePixels, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "InternViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
-    // Thumbnail image has fixed size: 1 x blockImageSizeH x blockImageSizeW x channels (4D, frames=1).
-    rt::Tensor thumbnailBuffer({1, mConfig.blockImageSizeH, mConfig.blockImageSizeW, channels}, rt::DeviceType::kCPU,
-        nvinfer1::DataType::kUINT8, "InternViTRunner::thumbnailBuffer");
-    mThumbnailImageHost = rt::imageUtils::ImageData(std::move(thumbnailBuffer));
+
+    // GPU image-resize scratch.
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. computeBestBlockGridForResize snaps to a
+    // block grid and does NOT preserve aspect ratio, so bound each dimension independently: rawH by the
+    // raw cap and outW by the widest single-row block grid (maxNumBlocks * blockImageSizeW).
+    int64_t const kMaxResizeTmpElems
+        = kernel::kGpuResizeMaxRawDim * mConfig.maxNumBlocks * mConfig.blockImageSizeW * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
 
     return true;
 }
@@ -165,7 +167,6 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
     int64_t height = image.height;
     int64_t width = image.width;
     int64_t channels = image.channels;
-    unsigned char* imageData = image.data(); // In hwc order
 
     ELLM_CHECK(channels == mConfig.numChannels,
         "Image channels mismatch, got " + std::to_string(channels) + ", expected "
@@ -194,15 +195,9 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
         ++numImages;
     }
 
-    // Reshape pre-allocated temporary buffers to current image dimensions
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, height, width, channels] resized image, written by the shared GPU
+    // resize helper.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-
-    // Copy image to device
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
-
-    // Normalize image
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
 
     // Transpose to patch
@@ -214,7 +209,7 @@ void InternViTRunner::formatPatch(imageUtils::ImageData const& image, std::vecto
 }
 
 void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
-    std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
+    std::vector<int64_t>& numImages, cudaStream_t stream)
 {
     int64_t totalNumBlocks = 0;
 
@@ -223,31 +218,64 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         int64_t numImage = 0;
         for (auto const& image : req.imageBuffers)
         {
+            if (image.isVideo)
+            {
+                // Video: one 448 tile per frame (InternVL max_num=1). Downstream re-derives the
+                // frame count as tokens/256, so un-resized frames must already be a single block.
+                if (!image.doResize)
+                {
+                    ELLM_CHECK(image.width == mConfig.blockImageSizeW && image.height == mConfig.blockImageSizeH,
+                        "do_resize=false InternVL video frames must be exactly "
+                            + std::to_string(mConfig.blockImageSizeW) + "x" + std::to_string(mConfig.blockImageSizeH)
+                            + ", got " + std::to_string(image.width) + "x" + std::to_string(image.height));
+                }
+                int64_t const outHeight = image.doResize ? mConfig.blockImageSizeH : image.height;
+                int64_t const outWidth = image.doResize ? mConfig.blockImageSizeW : image.width;
+                for (int64_t t = 0; t < image.frames; ++t)
+                {
+                    // Resize source frame t straight into mImageDevice; formatPatch reads its pixels from there.
+                    kernel::copyImageToDeviceAndResize(image.data() + t * image.bytesPerFrame(), 1, image.height,
+                        image.width, image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, outHeight,
+                        outWidth, stream);
+                    formatPatch(image.resizedMeta(outHeight, outWidth), imageTokenLengths, numImage, totalNumBlocks,
+                        /*isThumbnail=*/t > 0, stream);
+                }
+                continue;
+            }
             int64_t const blocksBeforePatch = totalNumBlocks;
-            if (doResize)
+            if (image.doResize)
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageTokenLengths, numImage, totalNumBlocks,
+                    false, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
+
             // Add a thumbnail tile when (a) the image has more than 1 main block (matches
             // HuggingFace behavior) or (b) the engine's MIN-profile demands more than 1 block
             // (engines built with `visual_build --minImageTokens > 256`). Without (b), a
             // single-block image would invoke the engine with totalNumBlocks=1 and the
-            // optimization profile would reject it at runtime.
+            // optimization profile would reject it at runtime. The thumbnail is a one-block resize of
+            // the ORIGINAL image and is not gated by image.doResize.
             int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
             if (mainImageBlocks > 1 || mConfig.minNumBlocks > 1)
             {
-                rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
-                    mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+                kernel::copyImageToDeviceAndResize(image.data(), 1, image.height, image.width, image.channels,
+                    mRawImageDevice, mResizeTmpDevice, mImageDevice, mConfig.blockImageSizeH, mConfig.blockImageSizeW,
+                    stream);
+                formatPatch(image.resizedMeta(mConfig.blockImageSizeH, mConfig.blockImageSizeW), imageTokenLengths,
+                    numImage, totalNumBlocks, true, stream);
             }
         }
         numImages.emplace_back(numImage);
@@ -292,8 +320,10 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
     }
 
     int64_t imageIndex = 0;
-    // Image token id will start from vocabSize and increment for each image token position
-    int32_t imageTokenId = mConfig.vocabSize;
+    // Video placeholder ("<video>", one per video): expanded the HF way into per-frame
+    // "Frame{i}: <img>{256 IMG_CONTEXT}</img>" groups, newline-separated. getTokenId returns -1
+    // when the tokenizer has no such token (non-video models / older InternVL).
+    int32_t const videoTokenId = static_cast<int32_t>(tokenizer->getTokenId("<video>"));
 
     for (size_t i = 0; i < request.requests.size(); ++i)
     {
@@ -301,24 +331,67 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         std::vector<int32_t> ids = tokenizer->encode(request.formattedRequests[i].formattedCompleteRequest);
         check::check(!ids.empty(), "InternViTRunner::textPreprocess() Failed to encode text");
 
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
         // replace vis tokens
         std::vector<int32_t> newIds;
         for (size_t j = 0; j < ids.size(); ++j)
         {
             if (ids[j] == mConfig.imageTokenId)
             {
-                // Prepend <img> token
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: InternViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's media count");
+                // Image: <img> + N IMG_CONTEXT + </img>
                 newIds.push_back(mConfig.imgStartTokenId);
-
-                int64_t numImageTokens = imageTokenLengths.at(imageIndex);
+                int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
                 for (int64_t k = 0; k < numImageTokens; ++k)
                 {
-                    newIds.push_back(imageTokenId);
-                    ++imageTokenId;
+                    newIds.push_back(mConfig.imageTokenId);
                 }
-
-                // Append </img> token
                 newIds.push_back(mConfig.imgEndTokenId);
+                ++imageIndex;
+            }
+            else if (videoTokenId >= 0 && ids[j] == videoTokenId)
+            {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: InternViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's media count");
+                // Video: per-frame groups (format above); IMG_CONTEXT positions across
+                // all frames still total N, matching the ViT output.
+                int64_t const numImageTokens = imageTokenLengths.at(imageIndex);
+                int64_t const numFrames = numImageTokens / 256;
+                if (numFrames >= 1 && numImageTokens % 256 == 0)
+                {
+                    for (int64_t f = 0; f < numFrames; ++f)
+                    {
+                        if (f > 0)
+                        {
+                            std::vector<int32_t> const nl = tokenizer->encode("\n");
+                            newIds.insert(newIds.end(), nl.begin(), nl.end());
+                        }
+                        std::vector<int32_t> const prefix = tokenizer->encode("Frame" + std::to_string(f + 1) + ": ");
+                        newIds.insert(newIds.end(), prefix.begin(), prefix.end());
+                        newIds.push_back(mConfig.imgStartTokenId);
+                        for (int64_t k = 0; k < 256; ++k)
+                        {
+                            newIds.push_back(mConfig.imageTokenId);
+                        }
+                        newIds.push_back(mConfig.imgEndTokenId);
+                    }
+                }
+                else
+                {
+                    // Fallback (shouldn't happen for sampled video): single <img> wrap.
+                    newIds.push_back(mConfig.imgStartTokenId);
+                    for (int64_t k = 0; k < numImageTokens; ++k)
+                    {
+                        newIds.push_back(mConfig.imageTokenId);
+                    }
+                    newIds.push_back(mConfig.imgEndTokenId);
+                }
                 ++imageIndex;
             }
             else
@@ -327,19 +400,22 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             }
         }
         batchInputIds.emplace_back(std::move(newIds));
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: InternViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's media count");
     }
 }
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
 
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, !imageOnly, stream);
+        imagePreprocess(request, imageTokenLengths, numImages, stream);
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
@@ -347,7 +423,18 @@ bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Failed: %s", e.what());
+        }
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

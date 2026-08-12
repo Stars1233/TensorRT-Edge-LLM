@@ -24,6 +24,7 @@
 #include "runtime/exec/tensorMap.h"
 #include "runtime/exec/tensorRegistry.h"
 #include <NvInferRuntime.h>
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
@@ -146,7 +147,7 @@ public:
     //! @brief Access the underlying TRT engine for generic introspection.
     nvinfer1::ICudaEngine const& getEngine() const noexcept;
 
-    //! @brief Snapshot of all binding addresses and shapes — used for graph-cache verification.
+    //! @brief Snapshot of binding addresses and shapes — used for graph-cache verification.
     struct BindingSnapshot
     {
         std::vector<std::pair<uintptr_t, nvinfer1::Dims>> bindings;
@@ -174,6 +175,7 @@ private:
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
     TensorRegistry mRegistry;
+    int32_t mCurrentProfileIndex{-1};
 
     //! A captured CUDA graph together with its binding snapshot for verification.
     struct CapturedGraph
@@ -186,7 +188,7 @@ private:
     //! Graph cache keyed by a hash of all binding addresses + shapes.
     std::unordered_map<size_t, CapturedGraph> mGraphs;
 
-    //! Hash all current binding addresses and shapes into a single key.
+    //! Hash the current binding addresses and shapes into a single key.
     size_t computeBindingHash() const;
 
     //! Build a full snapshot of the current binding state.

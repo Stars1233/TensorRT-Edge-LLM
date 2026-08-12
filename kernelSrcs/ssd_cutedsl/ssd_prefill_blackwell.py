@@ -419,7 +419,7 @@ class SSDKernel:
         valid_lens: cute.Tensor,  # (B,) int32 -- per-seq valid length (padded_mode only)
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         self._setup_attributes()
@@ -4583,7 +4583,7 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         num_logical_chunks_val: cutlass.Int32,
         num_seqs_val: cutlass.Int32,
         dt_softplus: cutlass.Constexpr[bool],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         n_batch = x.layout.shape[0]
@@ -4703,11 +4703,11 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
     ph_valid_lens = ph_valid_lens.mark_compact_shape_dynamic(mode=0, stride_order=(0,))
 
     sm_count = cp.cuda.runtime.getDeviceProperties(cp.cuda.runtime.getDevice())["multiProcessorCount"]
-    # The AOT wrapper launches with cluster_size=1, where max active clusters
-    # equals SM count. Avoid HardwareInfo here because SM110 builds can target
-    # sm_110a for the SSD kernel compile, which makes HardwareInfo's dummy
-    # occupancy kernel invalid on Thor.
-    mac = sm_count
+    # max_active_clusters is a RUNTIME wrapper argument (cluster_size=1, so it
+    # equals the SM count of the GPU the kernel launches on). The deployed
+    # caller passes cudaDevAttrMultiProcessorCount at launch time; the trace
+    # value below is a placeholder seeded from the local device.
+    max_active_clusters = cutlass.Int32(sm_count)
 
     compile_opts = ("--gpu-arch " + gpu_arch) if gpu_arch else None
     compiled = cute.compile(ssd_blackwell_aot,
@@ -4718,7 +4718,7 @@ def _compile_ssd_blackwell_aot(L, D, N, nheads, ngroups, batch, nchunks,
         ph_valid_lens,
         cutlass.Int32(0), cutlass.Int32(0),
         cutlass.Int32(0), cutlass.Int32(0),
-        True, mac, stream,
+        True, max_active_clusters, stream,
         **(dict(options=compile_opts) if compile_opts else {}))
     _compiled_cache[key] = compiled
     return compiled
@@ -4858,6 +4858,10 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
     print(f"    Reference time: {time.time() - t_ref:.2f}s")
 
     stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
+    # Runtime max_active_clusters argument of the AOT wrapper (cluster_size=1,
+    # so it equals the SM count of the GPU the test runs on).
+    max_active_clusters = cutlass.Int32(cp.cuda.runtime.getDeviceProperties(
+        cp.cuda.runtime.getDevice())["multiProcessorCount"])
 
     print("  Compiling Blackwell SSD kernel (AOT path)...")
     t0 = time.time()
@@ -4980,6 +4984,7 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
         a["si"], a["ci"], a["co"], a["cs"], a["vl"],
         cutlass.Int32(total_seq), cutlass.Int32(total_chunks),
         cutlass.Int32(num_logical_chunks), cutlass.Int32(num_seqs),
+        max_active_clusters,
         stream,
     )
     cp.cuda.get_current_stream().synchronize()
@@ -5010,7 +5015,7 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
                      aa["D"], aa["dt_bias"], aa["out"], aa["state"],
                      aa["cumsum"], aa["dtproc"], aa["yws"],
                      aa["si"], aa["ci"], aa["co"], aa["cs"], aa["vl"],
-                     s_seq, s_nc, s_nlc, s_ns, stream)
+                     s_seq, s_nc, s_nlc, s_ns, max_active_clusters, stream)
 
         for _ in range(warmup):
             _call()
@@ -5038,7 +5043,7 @@ def run_test(n, nheads, dim, dstate, ngroups, seq_len,
                      aa["D"], aa["dt_bias"], aa["out"], aa["state"],
                      aa["cumsum"], aa["dtproc"], aa["yws"],
                      aa["si"], aa["ci"], aa["co"], aa["cs"], aa["vl"],
-                     s_seq, s_nc, s_nlc, s_ns, s)
+                     s_seq, s_nc, s_nlc, s_ns, max_active_clusters, s)
 
         with graph_stream:
             for _ in range(3):

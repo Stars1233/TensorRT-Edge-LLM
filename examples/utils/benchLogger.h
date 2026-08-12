@@ -21,6 +21,7 @@
 #include "common/trtUtils.h"
 #include "profiling/layerProfiler.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -38,6 +39,10 @@ enum class BenchMode
     kEAGLE_VERIFY,
     kEAGLE_DRAFT_PROPOSAL,
     kEAGLE_DRAFT_PREFILL,
+    kDFLASH_DRAFT_PROPOSAL,
+    kDFLASH_DRAFT_FIRST_ROUND,
+    kDFLASH_VERIFY,
+    kDFLASH_DDTREE_BUILD,
     kVISUAL
 };
 
@@ -123,6 +128,10 @@ struct BenchOutputParams
     int32_t iterations{0};
     int32_t acceptRate{5};
     int32_t draftStep{6};
+    int32_t blockSize{0};     // DFlash block size
+    int32_t draftDeltaLen{0}; // per-round delta length for DFlash draft
+    int32_t candidateTopK{0}; // DDTree branching factor
+    uint64_t seed{0};         // Random seed used to initialize benchmark inputs
 };
 
 // ==================== String Conversions ====================

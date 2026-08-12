@@ -53,27 +53,18 @@ accuracy/perf across the full matrix.
 
 All variants target SM120/SM121 only.
 
-## Build
+## Artifact Development
 
-```bash
-# Build all SM120-compatible kernels (auto-detects GPU):
-python kernelSrcs/build_cutedsl.py
+If you modify this kernel or its registry entries, manually regenerate the
+`nvfp4_fused_moe` group before running CMake. Otherwise, CMake uses the matching
+prebuilt tarball by default. Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
+for the supported Docker and local-venv commands, dependency versions,
+cross-compilation, artifact layout, and CMake configuration.
 
-# Build only the fused MoE group:
-python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe
+## CuTe DSL SM121 Support
 
-# Force SM121 (e.g., on a host without the target GPU):
-python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121
-```
-
-Artifacts land in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/`:
-- `libcutedsl_<arch>.a` (merged static library)
-- `include/nvfp4_fused_moe_*.h` (per-variant headers)
-- `include/cutedsl_nvfp4_fused_moe_all.h` (group umbrella header)
-
-## CuTeDSL SM121 Support
-
-`nvidia-cutlass-dsl==4.6.0` supports the `sm_121a` architecture used by
+`nvidia-cutlass-dsl==4.6.1` supports the `sm_121a` architecture used by
 DIGITS/GB10. For SM121 fused MoE builds, `build_cutedsl.py` sets
 `CUTE_DSL_ARCH=sm_121a` for this group so the generated image targets SM121
 directly instead of relying on an SM120-compatible cubin.
@@ -119,25 +110,6 @@ queue-driven producer/consumer model, and the resident-grid barrier scheme
 are derived from that work. Local changes include: additional activation
 variants (`identity`, `gelu`, `swiglu`), SM121 artifact generation, and
 integration with the TRT Edge-LLM plugin system.
-
-## Dependencies
-
-- `nvidia-cutlass-dsl == 4.6.0` (CUDA 13: `[cu13]` extra; CUDA 12: base package)
-- `cuda-python` (provides `cuda.bindings.driver`)
-- `cupy-cuda13x` (GPU memory allocation during AOT compilation)
-
-Pick the `cuda-python` and CuPy variant that matches your CUDA version before
-installing `nvidia-cutlass-dsl`:
-
-```bash
-pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
-# or
-pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
-
-# CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
-pip install 'nvidia-cutlass-dsl[cu13]==4.6.0'  # CUDA 13.x
-# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.0'
-```
 
 ## TensorRT plugin
 

@@ -20,6 +20,7 @@
 #include "common/checkMacros.h"
 #include "common/mathUtils.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/imageUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -265,55 +266,22 @@ bool Gemma4ViTRunner::allocateBuffer(cudaStream_t stream)
         cudaMemcpyAsync(mImageStd.rawPointer(), mConfig.imageStd.data(), nbBytes, cudaMemcpyHostToDevice, stream));
 
     int64_t const maxImagePixels = mConfig.maxPatchesPerImage * mConfig.patchSize * mConfig.patchSize;
-    rt::Tensor resizeBuffer({1, maxImagePixels, 1, channels}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "Gemma4ViTRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice = rt::Tensor(
         {maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "Gemma4ViTRunner::mImageDevice");
     mNormalizedImageDevice = rt::Tensor({maxImagePixels * channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "Gemma4ViTRunner::mNormalizedImageDevice");
 
+    // GPU image-resize scratch.
+    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
+    // Horizontal-pass scratch holds [rawH, outW, C] floats. gemma4ResizeTarget preserves aspect ratio,
+    // so rawH * outW <= sqrt(maxImagePixels * rawH * rawW) <= sqrt(maxImagePixels * kMaxRawPixels).
+    int64_t const kMaxResizeTmpElems
+        = static_cast<int64_t>(
+              std::sqrt(static_cast<double>(maxImagePixels) * kMaxRawPixels) * kernel::kGpuResizeScratchMargin)
+        * channels;
+    kernel::allocateResizeScratch(channels, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
+
     return true;
-}
-
-std::tuple<int64_t, int64_t> Gemma4ViTRunner::getResizedImageSize(int64_t height, int64_t width) const
-{
-    ELLM_CHECK(height > 0 && width > 0, "Gemma4 image height/width must be positive");
-    int64_t const maxPatches = mConfig.maxImageTokensPerImage * mConfig.poolingKernelSize * mConfig.poolingKernelSize;
-    double const totalPx = static_cast<double>(height) * static_cast<double>(width);
-    double const targetPx = static_cast<double>(maxPatches) * mConfig.patchSize * mConfig.patchSize;
-    double const factor = std::sqrt(targetPx / totalPx);
-    double const idealHeight = factor * static_cast<double>(height);
-    double const idealWidth = factor * static_cast<double>(width);
-    int64_t const sideMult = mConfig.poolingKernelSize * mConfig.patchSize;
-    auto floorBySideMult = [sideMult](double value) {
-        return static_cast<int64_t>(std::floor(value / static_cast<double>(sideMult))) * sideMult;
-    };
-    auto roundBySideMult = [sideMult](double value) {
-        return static_cast<int64_t>(std::round(value / static_cast<double>(sideMult))) * sideMult;
-    };
-
-    int64_t targetHeight = floorBySideMult(idealHeight);
-    int64_t targetWidth = floorBySideMult(idealWidth);
-    ELLM_CHECK(targetHeight != 0 || targetWidth != 0, "Gemma4 target image size rounded to 0x0");
-
-    int64_t const maxSideLength = (maxPatches / (mConfig.poolingKernelSize * mConfig.poolingKernelSize)) * sideMult;
-    if (targetHeight == 0)
-    {
-        targetHeight = sideMult;
-        int64_t const maxWidth = std::min(maxSideLength, floorBySideMult(targetPx / targetHeight));
-        targetWidth = std::clamp(roundBySideMult(idealWidth), sideMult, maxWidth);
-    }
-    else if (targetWidth == 0)
-    {
-        targetWidth = sideMult;
-        int64_t const maxHeight = std::min(maxSideLength, floorBySideMult(targetPx / targetWidth));
-        targetHeight = std::clamp(roundBySideMult(idealHeight), sideMult, maxHeight);
-    }
-
-    ELLM_CHECK(
-        static_cast<double>(targetHeight) * targetWidth <= targetPx, "Gemma4 target image size exceeds patch budget");
-    return {targetHeight, targetWidth};
 }
 
 void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::vector<ImageGrid>& imageGrids,
@@ -323,7 +291,6 @@ void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     int64_t const height = image.height;
     int64_t const width = image.width;
     int64_t const channels = image.channels;
-    unsigned char* imageData = image.data();
     int64_t const sideMult = mConfig.patchSize * mConfig.poolingKernelSize;
 
     ELLM_CHECK(channels == static_cast<int64_t>(mConfig.imageMean.size()),
@@ -342,11 +309,9 @@ void Gemma4ViTRunner::formatPatch(rt::imageUtils::ImageData const& image, std::v
     imageGrids.push_back(ImageGrid{patchHeight, patchWidth});
     maxSeqLen = std::max(maxSeqLen, curSeqLength);
 
-    check::check(mImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, height, width, channels] image (resized on the GPU by the
+    // caller); normalize and patchify consume it in place.
     check::check(mNormalizedImageDevice.reshape({1, height, width, channels}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), imageData, height * width * channels, cudaMemcpyHostToDevice, stream));
-
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mNormalizedImageDevice, stream);
     kernel::transposeToPatchGemma4ViT(
         mNormalizedImageDevice, mVitInput, prevCuSeqlen * mConfig.inputDim, mConfig.patchSize, stream);
@@ -384,7 +349,7 @@ void Gemma4ViTRunner::generatePoolingWeights(
 }
 
 void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<ImageGrid>& imageGrids,
-    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream)
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& numImages, cudaStream_t stream)
 {
     // Restore mVitInput to full engine-profile capacity before writing patches.
     // imagePreprocess shrinks it to {totalPatches, inputDim} at the end (for engine execution),
@@ -401,16 +366,21 @@ void Gemma4ViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         int64_t numImage = 0;
         for (auto const& image : req.imageBuffers)
         {
-            if (doResize)
+            if (image.doResize)
             {
-                auto [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
-                rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatPatch(
-                    mResizedImageHost, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
+                auto [resizedHeight, resizedWidth] = rt::imageUtils::gemma4ResizeTarget(image.height, image.width,
+                    mConfig.maxImageTokensPerImage, mConfig.poolingKernelSize, mConfig.patchSize);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatPatch(image.resizedMeta(resizedHeight, resizedWidth), imageGrids, imageTokenLengths,
+                    cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatPatch(image, imageGrids, imageTokenLengths, cuSeqlensData, cuSeqlensSize, maxSeqLen, stream);
             }
             ++numImage;
@@ -491,6 +461,10 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         }
 
         bool const wrapImages = mConfig.beginImageTokenId >= 0 && mConfig.endImageTokenId >= 0;
+        // Per-request media window (numImages[i]): a placeholder may only consume this request's own media (batch
+        // isolation).
+        int64_t const mediaEnd = imageIndex + numImages[i];
+
         std::vector<int32_t> newIds;
         // Compute expanded size: non-image tokens + sum of image token lengths
         // (+2 boundary tokens per image when wrapping).
@@ -498,8 +472,9 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         int64_t imgIdx = imageIndex;
         for (auto tokenId : ids)
         {
-            expandedSize
-                += (tokenId == mConfig.imageTokenId) ? imageTokenLengths.at(imgIdx++) + (wrapImages ? 2 : 0) : 1;
+            expandedSize += (tokenId == mConfig.imageTokenId && imgIdx < mediaEnd)
+                ? imageTokenLengths.at(imgIdx++) + (wrapImages ? 2 : 0)
+                : 1;
         }
         newIds.reserve(expandedSize);
         for (size_t tokenIndex = 0; tokenIndex < ids.size(); ++tokenIndex)
@@ -507,6 +482,9 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
             int32_t const tokenId = ids[tokenIndex];
             if (tokenId == mConfig.imageTokenId)
             {
+                ELLM_CHECK(imageIndex < mediaEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: Gemma4ViTRunner::textPreprocess() placeholder count exceeds this "
+                    "request's image count");
                 bool const alreadyHasBegin
                     = wrapImages && tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginImageTokenId;
                 bool const alreadyHasEnd
@@ -540,14 +518,15 @@ void Gemma4ViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
         {
             batchInputIds.emplace_back(std::move(newIds));
         }
+        ELLM_CHECK(imageIndex == mediaEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: Gemma4ViTRunner::textPreprocess() placeholder count is smaller than this "
+            "request's image count");
     }
-    check::check(imageIndex == static_cast<int64_t>(imageTokenLengths.size()),
-        "Gemma4ViTRunner::textPreprocess() placeholder count does not match image count");
 }
 
 bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     std::vector<ImageGrid> imageGrids;
     std::vector<int64_t> imageTokenLengths;
@@ -555,7 +534,7 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
 
     try
     {
-        imagePreprocess(request, imageGrids, imageTokenLengths, numImages, !imageOnly, stream);
+        imagePreprocess(request, imageGrids, imageTokenLengths, numImages, stream);
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
@@ -563,7 +542,18 @@ bool Gemma4ViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Failed: %s", e.what());
+        }
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 

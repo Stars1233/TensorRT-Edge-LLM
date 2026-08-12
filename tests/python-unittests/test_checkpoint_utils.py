@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for ``tensorrt_edgellm/checkpoint/checkpoint_utils.py`` —
-specifically the rope recovery path.
+"""Tests for runtime metadata emitted by
+``tensorrt_edgellm/checkpoint/checkpoint_utils.py``.
 
 Transformers v5 moved RoPE config from ``rope_scaling`` to ``rope_parameters``
 (with the old key left as ``null``), and for VLMs the settings live inside

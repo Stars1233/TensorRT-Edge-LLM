@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  server:
+    startup_timeout: 600
+    max_input_len: 2048
+    max_batch_size: 1
+    max_kv_cache_capacity: 8192
+    enable_batching: false
+    batch_timeout_ms: 10.0
+    max_queue_batch_size:
+
+  evaluator:
+    eval_type: mmlu
+    limit_samples: 250
+    parallelism: 1
+    max_new_tokens: 6144
+    request_timeout: 600
+    temperature: 0.0
+    top_p: 1.0
+    overrides: {}
+
+  score:
+    key: score
+    min:
+
+cases:
+  Qwen2.5-0.5B-Instruct:
+    model_param: Qwen2.5-0.5B-Instruct-fp16-mxsl8192-mxbs4-mxil2048
+
+  NVIDIA-Nemotron-3-Nano-4B-NVFP4:
+    model_param: NVIDIA-Nemotron-3-Nano-4B-NVFP4-nvfp4-mxsl8192-mxbs2-mxil2048
+    server:
+      max_batch_size: 2
+      enable_batching: true
+      max_queue_batch_size: 2
+    evaluator:
+      parallelism: 2
+    score:
+      min: 0.60

@@ -206,9 +206,15 @@ def load_hf_split(hf_id: str,
     local_path = local_override_path(name)
     if local_path:
         if os.path.isfile(local_path):
-            return load_dataset("json",
-                                data_files={split: local_path},
-                                split=split)
+            _file_kwargs: dict = {
+                "data_files": {
+                    split: local_path
+                },
+                "split": split
+            }
+            if streaming:
+                _file_kwargs["streaming"] = True
+            return load_dataset("json", **_file_kwargs)
         if os.path.isdir(local_path):
             # ``save_to_disk`` output has these sentinel files; anything else
             # is treated as a ``load_dataset``-style dataset directory.
@@ -224,9 +230,23 @@ def load_hf_split(hf_id: str,
                             f"{split!r}; found {list(ds.keys())}.")
                     return ds[split]
                 return ds
+            _load_kwargs = {"split": split}
+            if streaming:
+                _load_kwargs["streaming"] = True
             if config:
-                return load_dataset(local_path, config, split=split)
-            return load_dataset(local_path, split=split)
+                return load_dataset(local_path, config, **_load_kwargs)
+            # Detect multi-config layouts up front (e.g. MMMU with one config
+            # per subject area) so the branch is explicit rather than relying
+            # on catching an exception about a missing config name.
+            from datasets import get_dataset_config_names  # noqa: PLC0415  # isort:skip
+            configs = get_dataset_config_names(local_path)
+            if len(configs) > 1:
+                from datasets import concatenate_datasets  # noqa: PLC0415  # isort:skip
+                return concatenate_datasets([
+                    load_dataset(local_path, c, **_load_kwargs)
+                    for c in configs
+                ])
+            return load_dataset(local_path, **_load_kwargs)
         raise FileNotFoundError(
             f"Local dataset override {local_path!r} is neither a file nor a "
             f"directory.")

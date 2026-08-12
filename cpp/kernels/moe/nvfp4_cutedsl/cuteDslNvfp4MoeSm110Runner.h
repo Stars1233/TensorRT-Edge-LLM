@@ -19,14 +19,18 @@
 
 #ifdef CUTE_DSL_NVFP4_MOE_ENABLED
 
-#include <cuda.h>
+#include "kernels/cuteDslModuleLoader.h"
 
+#if defined(CUTE_DSL_CUDA_ERROR_CHECK)
+#undef CUTE_DSL_CUDA_ERROR_CHECK
+#endif
+#define CUTE_DSL_CUDA_ERROR_CHECK(error) ::trt_edgellm::detail::recordCuteDslCudaError(static_cast<cudaError_t>(error))
 #include "cutedsl_all.h"
+#undef CUTE_DSL_CUDA_ERROR_CHECK
 
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
-#include <mutex>
 
 namespace trt_edgellm
 {
@@ -103,8 +107,9 @@ public:
     static bool canImplement(int32_t hiddenSize, int32_t moeInterSize, int32_t numExperts, int32_t topK,
         int32_t smVersion, int32_t activationType, int32_t ioDtype, int32_t backend);
 
-    static bool loadKernelModules();
-    static void unloadKernelModules();
+    //! Load the selected FC1 activation module and the shared FC2 module. The
+    //! plugin calls this before routing so failure cannot mutate device buffers.
+    static bool ensureKernelModules(CuteDslNvfp4MoeSm110Params const& params, cudaStream_t stream);
 
     static size_t getWorkspaceSize(int32_t maxNumTokens, int32_t maxRoutedRows, int32_t numExperts, int32_t topK,
         int32_t hiddenSize, int32_t moeInterSize);
@@ -114,13 +119,10 @@ public:
 private:
     static int32_t selectMmaTilerN(int32_t moeInterSize);
 
-    static nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_t sFC1Relu2N128;
-    static nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_t sFC1SwiGLUN128;
-    static nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_t sFC1GeGLUN128;
-    static nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_t sFC2N128Fp16;
-
-    static bool sLoaded;
-    static std::mutex sLoadMutex;
+    static detail::LazyKernelModule<nvfp4_moe_sm110_fc1_relu2_n128_Kernel_Module_t> sFC1Relu2N128;
+    static detail::LazyKernelModule<nvfp4_moe_sm110_fc1_swiglu_n128_Kernel_Module_t> sFC1SwiGLUN128;
+    static detail::LazyKernelModule<nvfp4_moe_sm110_fc1_geglu_n128_Kernel_Module_t> sFC1GeGLUN128;
+    static detail::LazyKernelModule<nvfp4_moe_sm110_fc2_n128_fp16_Kernel_Module_t> sFC2N128Fp16;
 };
 
 } // namespace trt_edgellm

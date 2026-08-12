@@ -18,6 +18,7 @@
 #include "trtUtils.h"
 #include "checkMacros.h"
 #include "cudaUtils.h"
+#include "mmapReader.h"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -37,6 +38,8 @@ namespace trt_edgellm
 {
 namespace
 {
+
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 7)
 
 constexpr std::size_t kEngineDeviceTransferChunkSize = 4U * 1024U * 1024U;
 constexpr std::size_t kEngineDeviceTransferBufferCount = 2U;
@@ -304,6 +307,8 @@ private:
     std::array<PinnedHostBuffer, kEngineDeviceTransferBufferCount> mDeviceTransferBuffers;
 };
 
+#endif // IStreamReaderV2
+
 } // namespace
 
 std::optional<std::pair<cudaGraph_t, cudaGraphExec_t>> captureTRTCudaGraph(
@@ -461,8 +466,14 @@ bool engineHasOutputTensor(nvinfer1::ICudaEngine const* engine, char const* tens
 std::unique_ptr<nvinfer1::ICudaEngine> deserializeCudaEngineFromFile(
     nvinfer1::IRuntime& runtime, std::filesystem::path const& enginePath)
 {
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 7)
     FileStreamReaderV2 streamReader(enginePath);
     auto engine = std::unique_ptr<nvinfer1::ICudaEngine>(runtime.deserializeCudaEngine(streamReader));
+#else
+    file_io::MmapReader mmapReader(enginePath);
+    auto engine = std::unique_ptr<nvinfer1::ICudaEngine>(
+        runtime.deserializeCudaEngine(mmapReader.getData(), mmapReader.getSize()));
+#endif
     if (!engine)
     {
         LOG_ERROR("Failed to deserialize TensorRT engine from file: %s", enginePath.string().c_str());

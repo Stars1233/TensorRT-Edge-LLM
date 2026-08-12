@@ -301,7 +301,76 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
 }
 
 template <int32_t RotaryDim>
-__global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency,
+__global__ void initializeYarnCosSinKernel(
+    float* cosSinCache, float* invFreq, float mscale, int32_t rotaryEmbeddingMaxPositions)
+{
+    // Same launch geometry as the LongRope kernel: each half-warp (16 threads)
+    // fills one position, 8 positions per CTA. invFreq is the precomputed
+    // per-dimension inverse frequency; this kernel only does the position sweep.
+    static_assert(RotaryDim % 32 == 0, "rotaryDim must be multiple of 32");
+
+    uint32_t const bIdx = blockIdx.x;
+    uint32_t const tIdx = threadIdx.x;
+    uint32_t const tIdy = threadIdx.y;
+
+    uint32_t const bDimY = blockDim.y;
+    uint32_t const gDimX = gridDim.x;
+
+    uint32_t const startPosIdx = bIdx * bDimY + tIdy;
+    uint32_t const posStride = gDimX * bDimY;
+
+    float invFreqLocal[RotaryDim / 32];
+#pragma unroll
+    for (uint32_t i = 0; i < RotaryDim / 32; ++i)
+    {
+        invFreqLocal[i] = invFreq[tIdx + i * 16];
+    }
+
+    for (uint32_t posIdx = startPosIdx; posIdx < rotaryEmbeddingMaxPositions; posIdx += posStride)
+    {
+        uint32_t cosSinOffset = posIdx * RotaryDim;
+
+#pragma unroll
+        for (uint32_t i = 0; i < RotaryDim / 32; ++i)
+        {
+            uint32_t zid = tIdx + i * 16;
+            float angle = posIdx * invFreqLocal[i];
+            cosSinCache[cosSinOffset + zid] = cos(angle) * mscale;
+            cosSinCache[cosSinOffset + zid + RotaryDim / 2] = sin(angle) * mscale;
+        }
+    }
+}
+
+void initializeYarnCosSin(float* cosSinCache, float* invFreq, float mscale, int32_t rotaryDim,
+    int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream)
+{
+    dim3 block(16, 8);
+
+    cudaDeviceProp deviceProp;
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+    int32_t const numSMs = deviceProp.multiProcessorCount;
+
+    void* kernelPtr{nullptr};
+    switch (rotaryDim)
+    {
+    case 64: kernelPtr = (void*) initializeYarnCosSinKernel<64>; break;
+    case 128: kernelPtr = (void*) initializeYarnCosSinKernel<128>; break;
+    default:
+        throw std::runtime_error("Un-implemented rotaryDim for initializeYarnCosSin: " + std::to_string(rotaryDim));
+    }
+
+    int32_t maxBlockPerSM{};
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
+    int32_t const numBlocks = std::max(1, std::min(maxBlockPerSM * numSMs, (rotaryEmbeddingMaxPositions + 7) / 8));
+    dim3 grid(numBlocks);
+
+    void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&invFreq),
+        reinterpret_cast<void*>(&mscale), reinterpret_cast<void*>(&rotaryEmbeddingMaxPositions)};
+    CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
+}
+
+template <int32_t RotaryDim, typename TPos>
+__global__ void initializeMRopeCosSinKernel(float* cosSinCache, TPos* mropePositionIds, float rotaryBaseFrequency,
     int64_t rotaryEmbeddingMaxPositions, bool interleaved, int32_t sectionH, int32_t sectionW)
 {
     // mropePositionIds: [bs, 3, rotaryEmbeddingMaxPositions]
@@ -384,7 +453,7 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
                     groupIdx = 2;
                 }
             }
-            int64_t mropePosIdx
+            TPos const mropePosIdx
                 = mropePositionIds[batchPositionIdsOffset + groupIdx * rotaryEmbeddingMaxPositions + posIdx];
 
             float invFreq = mropePosIdx / ropeConstants[i];
@@ -397,7 +466,8 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
     }
 }
 
-void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+template <typename TPos>
+void initializeMRopeCosSinImpl(float* cosSinCache, TPos* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
     int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
     cudaStream_t stream)
 {
@@ -420,21 +490,38 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     void* kernelPtr{nullptr};
     switch (rotaryDim)
     {
-    case 64: kernelPtr = (void*) initializeMRopeCosSinKernel<64>; break;
-    case 128: kernelPtr = (void*) initializeMRopeCosSinKernel<128>; break;
+    case 64: kernelPtr = (void*) initializeMRopeCosSinKernel<64, TPos>; break;
+    case 128: kernelPtr = (void*) initializeMRopeCosSinKernel<128, TPos>; break;
     default:
         throw std::runtime_error("Un-implemented rotaryDim for initializeMRopeCosSin: " + std::to_string(rotaryDim));
     }
     int32_t maxBlockPerSM{};
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, kernelPtr, 128, 0));
 
-    int64_t const numBlocks = std::min(static_cast<int64_t>(maxBlockPerSM * numSMs), rotaryEmbeddingMaxPositions / 16);
+    int64_t const numBlocks = std::max(static_cast<int64_t>(1),
+        std::min(static_cast<int64_t>(maxBlockPerSM * numSMs), rotaryEmbeddingMaxPositions / 16));
     dim3 grid(numBlocks, batchSize);
 
     void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&mropePositionIds),
         static_cast<void*>(&rotaryBaseFrequency), static_cast<void*>(&rotaryEmbeddingMaxPositions),
         static_cast<void*>(&interleaved), static_cast<void*>(&sectionH), static_cast<void*>(&sectionW)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
+}
+
+void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
+    cudaStream_t stream)
+{
+    initializeMRopeCosSinImpl(cosSinCache, mropePositionIds, rotaryBaseFrequency, rotaryDim,
+        rotaryEmbeddingMaxPositions, batchSize, interleaved, sectionH, sectionW, stream);
+}
+
+void initializeMRopeCosSin(float* cosSinCache, float* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
+    cudaStream_t stream)
+{
+    initializeMRopeCosSinImpl(cosSinCache, mropePositionIds, rotaryBaseFrequency, rotaryDim,
+        rotaryEmbeddingMaxPositions, batchSize, interleaved, sectionH, sectionW, stream);
 }
 
 void initializeTextOnlyMRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim,

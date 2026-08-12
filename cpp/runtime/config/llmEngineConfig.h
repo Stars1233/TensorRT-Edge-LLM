@@ -44,6 +44,7 @@ enum class SpecDecodeMode : int32_t
     kMTP,
     kDFlash,
     kGemma4MTP,
+    kDSpark,
 };
 
 //! Gemma4 MTP assistant-layer to target-layer shared-KV mapping.
@@ -62,21 +63,35 @@ struct Gemma4MTPKVSharingEntry
 struct LLMEngineConfig
 {
     // --- Core model dimensions ---
-    int32_t hiddenSize{};              //!< Model hidden dimension
-    int32_t outputVocabSize{};         //!< Actual output vocab (reduced if vocab reduction active)
-    int32_t numAttentionLayers{};      //!< Number of attention layers needing KV cache
-    int32_t numKVHeads{};              //!< Number of key-value heads
-    int32_t headDim{};                 //!< Dimension of each attention head
-    int32_t maxSupportedBatchSize{};   //!< Maximum supported batch size
-    int32_t maxSupportedInputLength{}; //!< Maximum supported input length
-    int32_t maxKVCacheCapacity{};      //!< Maximum KV cache capacity (sequence length)
-    int32_t rotaryDim{};               //!< Rotary embedding dimension
-    int32_t numDecoderLayers{};        //!< Total decoder layers (attention + linear)
-    int32_t vocabSize{};               //!< Full vocabulary size
-    int32_t reducedVocabSize{0};       //!< 0 = no vocab reduction
+    int32_t hiddenSize{};                //!< Model hidden dimension
+    int32_t outputVocabSize{};           //!< Actual output vocab (reduced if vocab reduction active)
+    int32_t numAttentionLayers{};        //!< Number of attention layers needing KV cache
+    int32_t numKVHeads{};                //!< Number of key-value heads
+    int32_t headDim{};                   //!< Dimension of each attention head
+    int32_t maxSupportedBatchSize{};     //!< Maximum supported batch size
+    int32_t maxSupportedInputLength{};   //!< Maximum supported input length
+    int32_t maxKVCacheCapacity{};        //!< Maximum KV cache capacity (sequence length)
+    int64_t skipSoftmaxScaleOverride{0}; //!< skip-softmax scale-factor override (0 = disabled)
+    int32_t kvPoolPages{};               //!< Exact physical K-page count serialized in KV binding shapes
+    int32_t rotaryDim{};                 //!< Rotary embedding dimension
+    int32_t numDecoderLayers{};          //!< Total decoder layers (attention + linear)
+    int32_t vocabSize{};                 //!< Full vocabulary size
+    int32_t reducedVocabSize{0};         //!< 0 = no vocab reduction
+    int32_t diffusionCanvasLength{0};
+    int32_t diffusionMaxDenoisingSteps{0};
+    int32_t diffusionSelfConditioningSize{0};
+    float diffusionTMax{0.8F};
+    float diffusionTMin{0.4F};
+    float diffusionEntropyBound{0.1F};
+    float diffusionEntropyThreshold{0.005F};
+    float rmsNormEps{1.0e-6F};
+    int32_t diffusionStabilityWindow{2};
 
     // --- Feature flags ---
-    bool isSpecDecodeBase{false}; //!< Base engine exposes speculative decoding verification bindings
+    bool isSpecDecodeBase{false};             //!< Base engine exposes speculative decoding verification bindings
+    bool isDiffusionBackbone{false};          //!< DiffusionGemma phase-aware transformer backbone engine
+    bool diffusionUnifiedConditioning{false}; //!< Backbone engine owns DiffusionGemma self-conditioning inputs
+    bool contextMaskSelectorEnabled{false};   //!< Engine exposes context_mask_selector binding
     SpecDecodeMode specDecodeType{
         SpecDecodeMode::kNONE}; //!< Speculative decoding strategy mode (parsed from spec_decode_type)
     //! KV cache data type. Parsed from required top-level `kv_cache_dtype` in
@@ -121,12 +136,16 @@ struct LLMEngineConfig
     bool useVisionBidirectionalAttention{false};
 
     // --- Hybrid model (Mamba/GDN) state dimensions ---
-    int32_t numLinearAttnLayers{0};    //!< Number of linear attention / recurrent layers
-    int32_t recurrentStateNumHeads{0}; //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)
-    int32_t recurrentStateHeadDim{0};  //!< Recurrent state head dimension
-    int32_t recurrentStateSize{0};     //!< Recurrent state dimension (v for GDN, dstate for Mamba)
-    int32_t convDim{0};                //!< Conv1d channel dimension
-    int32_t convKernel{0};             //!< Conv1d kernel width
+    int32_t numLinearAttnLayers{0};     //!< Number of linear attention / recurrent layers
+    int32_t recurrentStateNumHeads{0};  //!< Recurrent state heads (hv for GDN, mamba_num_heads for Mamba)
+    int32_t recurrentStateHeadDim{0};   //!< Recurrent state head dimension
+    int32_t recurrentStateSize{0};      //!< Recurrent state dimension (v for GDN, dstate for Mamba)
+    int32_t recurrentStateNumGroups{0}; //!< Mamba B/C group count (spec-verify replay-B extent; 0 for GDN)
+    //! MTP spec-verify recurrent-state commit mode, parsed from `recurrent_spec_verify_mode`
+    //! ("replay" → true, "snapshot"/absent → false).
+    bool recurrentSpecVerifyUsesReplay{false};
+    int32_t convDim{0};    //!< Conv1d channel dimension
+    int32_t convKernel{0}; //!< Conv1d kernel width
 
     // --- SpecDecode engine limits (per-engine) ---
     //! Max seq_len the base engine accepts for proposal verification. Parsed from
@@ -150,15 +169,18 @@ struct LLMEngineConfig
     //! `DeploymentConfig::specDecode->baseOutputHiddenDim`.
     int32_t baseModelHiddenSize{0};
 
-    //! DFlash draft block size. Parsed from `dflash_config.block_size` or
-    //! top-level `block_size` on DFlash base/draft configs.
-    int32_t dflashBlockSize{0};
+    //! Cached draft proposal block size for DFlash/DSpark. Parsed from the
+    //! mode-specific config object (`dflash_config` or `dspark_config`).
+    int32_t specDraftBlockSize{0};
 
-    //! DFlash mask token ID used to seed draft input blocks.
-    int32_t dflashMaskTokenId{0};
+    //! Mask token ID used to seed cached draft input blocks for DFlash/DSpark.
+    int32_t specDraftMaskTokenId{0};
 
-    //! Target decoder-layer IDs whose hidden states are concatenated for DFlash.
-    std::vector<int32_t> dflashTargetLayerIds{};
+    //! Target decoder-layer IDs whose hidden states are concatenated for cached drafts.
+    //! EAGLE base engines own this contract through `eagle_hidden_state_layers`;
+    //! DFlash/DSpark keep their mode-specific target-layer metadata on the engine
+    //! that exports it.
+    std::vector<int32_t> specTargetLayerIds{};
 
     // --- Gemma4 MTP shared-target-KV metadata ---
     std::string modelType;              //!< Top-level model type string, if exported.
@@ -168,6 +190,14 @@ struct LLMEngineConfig
     bool returnsFeedbackHidden{false};  //!< Assistant emits backbone-space feedback hidden states.
     int32_t assistantHiddenSize{0};     //!< Assistant internal hidden dim, when distinct from hiddenSize.
     std::vector<Gemma4MTPKVSharingEntry> gemma4MTPKVSharingMap{}; //!< Assistant -> target KV sharing map.
+
+    //! DSpark Markov/confidence sidecar metadata.
+    bool dsparkEnableConfidenceHead{false};
+    bool dsparkConfidenceHeadWithMarkov{false};
+    std::string dsparkMarkovHeadType{};
+    int32_t dsparkMarkovRank{0};
+    std::string dsparkHeadsFile{};
+    std::string dsparkHeadsInfoFile{};
 
     // --- Per-layer type routing (hybrid cache) ---
 
@@ -206,13 +236,24 @@ struct LLMEngineConfig
     //! Prefill dims (vanilla LLM, SpecDecode base, and SpecDecode draft).
     //! seqLen is the prompt length being processed this step.
     //! kvCacheAllEmpty signals whether this is the initial prefill of an empty
-    //! KV cache — this drives the `kvcache_start_index` shape to `[0]` (engine's
-    //! "initial prefill" sentinel) instead of `[batch]`.
+    //! KV cache — this drives autoregressive engines' `kvcache_start_index`
+    //! shape to `[0]` (engine's "initial prefill" sentinel) instead of `[batch]`.
+    //! DiffusionGemma keeps `kvcache_start_index` at `[batch]` and uses
+    //! `context_mask_selector` as its attention-mask sentinel.
     InferenceDims prefillDims(int64_t batch, int64_t seqLen, bool kvCacheAllEmpty) const;
 
     //! Vanilla single-token decode dims.
     //! seqLen is always 1 here; packedMaskLen is 1 (no proposal mask in vanilla).
     InferenceDims decodeDims(int64_t batch) const;
+
+    //! DiffusionGemma denoise dims. Uses existing chunked-prefill execution:
+    //! seqLen/selectLen are the canvas length, kvcache_start_index is [batch],
+    //! and context_mask_selector is [batch] to select non-causal PADDING mask.
+    InferenceDims denoiseDims(int64_t batch, int64_t canvasLen) const;
+
+    //! DiffusionGemma commit dims. Reruns finalized tokens causally before KV
+    //! commit; context_mask_selector is [0], so AttentionPlugin keeps causal mask.
+    InferenceDims diffusionCommitDims(int64_t batch, int64_t commitLen) const;
 
     //! SpecDecode base verification dims.
     //! verifySize feeds three fields: seqLen, selectLen, and packedMaskLen.

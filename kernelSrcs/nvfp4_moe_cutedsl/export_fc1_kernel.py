@@ -122,7 +122,7 @@ def export_fc1(args: argparse.Namespace) -> tuple[str, str]:
         l: cutlass.Int64,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         activation_type: cutlass.Constexpr,
     ):

@@ -29,6 +29,8 @@
 #include "kernels/moe/moe_marlin/moeMarlin.h"
 #include "plugins/utils/pluginUtils.h"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -44,8 +46,11 @@ namespace
 {
 constexpr char const* kINT4_MOE_PLUGIN_VERSION{"1"};
 constexpr char const* kINT4_MOE_PLUGIN_NAME{"Int4MoePlugin"};
-// SiLU (Swish) is the only activation type currently supported by the MoE plugin.
-constexpr auto kSUPPORTED_ACTIVATION_TYPE = static_cast<ActivationType>(0);
+
+// Supported plugin-level activation types.
+constexpr auto kACTIVATION_SILU = static_cast<ActivationType>(0);
+constexpr auto kACTIVATION_GEGLU = static_cast<ActivationType>(5);
+constexpr std::array<ActivationType, 2> kSUPPORTED_ACTIVATION_TYPES{kACTIVATION_SILU, kACTIVATION_GEGLU};
 
 // Workspace size for Int4 MoE plugin using accumulateWorkspaceSize (same order as assignTensorFromWorkspace in
 // enqueue).
@@ -127,10 +132,11 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, int32_t const numExperts, 
     , mActivationType(activationType)
     , mQuantizationGroupSize(quantizationGroupSize)
 {
-    if (mActivationType != kSUPPORTED_ACTIVATION_TYPE)
+    if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
+        == kSUPPORTED_ACTIVATION_TYPES.end())
     {
-        LOG_ERROR(
-            "Int4MoePlugin only supports SiLU activation (type 0), got type %d", static_cast<int32_t>(mActivationType));
+        LOG_ERROR("Int4MoePlugin supports SiLU (type 0) and GeGLU (type 5), got type %d",
+            static_cast<int32_t>(mActivationType));
     }
 }
 
@@ -166,10 +172,11 @@ Int4MoePlugin::Int4MoePlugin(std::string const& name, PluginFieldCollection cons
         }
     }
 
-    if (mActivationType != kSUPPORTED_ACTIVATION_TYPE)
+    if (std::find(kSUPPORTED_ACTIVATION_TYPES.begin(), kSUPPORTED_ACTIVATION_TYPES.end(), mActivationType)
+        == kSUPPORTED_ACTIVATION_TYPES.end())
     {
-        LOG_ERROR(
-            "Int4MoePlugin only supports SiLU activation (type 0), got type %d", static_cast<int32_t>(mActivationType));
+        LOG_ERROR("Int4MoePlugin supports SiLU (type 0) and GeGLU (type 5), got type %d",
+            static_cast<int32_t>(mActivationType));
     }
 }
 
@@ -535,11 +542,15 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
             marlinWorkspaceTensor, moeBlockSize, mTopK, false, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        // ==================== Step 4: SwiGLU Activation ====================
+        // ==================== Step 4: Gated Activation ====================
         rt::Tensor activationOutputTensor(
             activationOutputPtr, {totalSlots, mMoeInterSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-        swiGluActivation(gateUpOutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, stream);
+        int32_t const kernelActivationType = (mActivationType == kACTIVATION_GEGLU)
+            ? trt_edgellm::kernel::MoeActivationType::kMoeGeGlu
+            : trt_edgellm::kernel::MoeActivationType::kMoeSwiGlu;
+        moeActivation(
+            gateUpOutputTensor, activationOutputTensor, totalSlots, mMoeInterSize, kernelActivationType, stream);
         CUDA_CHECK(cudaGetLastError());
 
         // ==================== Step 5: Down Projection (Marlin INT4 GEMM) ====================

@@ -60,6 +60,24 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
     int32_t originalMaxPositionEmbeddings, cudaStream_t stream);
 
 /*!
+ * @brief Initialize YaRN RoPE cos/sin cache from a precomputed per-dim inverse frequency.
+ *
+ * Fills cos/sin as cos(pos * invFreq[d]) * mscale (and sin likewise) on device.
+ * ``invFreq`` (length rotaryDim/2) is the NTK-by-parts blended inverse frequency
+ * computed once on the host; this kernel only does the position sweep, mirroring
+ * ``initializeNormalRopeCosSin`` for the common rotary dims.
+ *
+ * @param cosSinCache Output cos/sin cache, shape [1, rotaryEmbeddingMaxPositions, rotaryDim]
+ * @param invFreq Device array of per-dimension inverse frequencies (length rotaryDim/2)
+ * @param mscale YaRN attention magnitude scale applied to cos/sin
+ * @param rotaryDim Rotary dimension
+ * @param rotaryEmbeddingMaxPositions Maximum positions
+ * @param stream CUDA stream
+ */
+void initializeYarnCosSin(float* cosSinCache, float* invFreq, float mscale, int32_t rotaryDim,
+    int32_t rotaryEmbeddingMaxPositions, cudaStream_t stream);
+
+/*!
  * @brief Initialize multi-dimensional RoPE cos/sin cache (MRoPE)
  *
  * Precomputes cos/sin values for multi-dimensional rotary encoding (e.g., Qwen2-VL).
@@ -77,6 +95,16 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
  * @param stream CUDA stream
  */
 void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
+    cudaStream_t stream);
+
+/*!
+ * @brief Float-position overload of initializeMRopeCosSin.
+ *
+ * Identical math and layouts, but takes FLOAT position IDs for models whose temporal
+ * positions are fractional (e.g. fps-modulated diffusion streams such as Cosmos3-Edge GEN).
+ */
+void initializeMRopeCosSin(float* cosSinCache, float* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
     int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
     cudaStream_t stream);
 

@@ -43,22 +43,25 @@ namespace mamba_ssm
  * x:              [batch, seq_len, dim]
  * weight:         [dim, 1, width]
  * bias:           [dim] (optional)
- * contextLengths: [batch] INT32, per-batch actual token count (optional, prefill only)
+ * initialState:   [batch, dim, width] (optional continuation state)
+ * contextLengths: [batch] INT32, per-batch actual token count in [0, seq_len] (optional, prefill only)
  * out:            [batch, out_seq_len, dim]
  */
 void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& weight,
     trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out, int32_t stride, int32_t padding,
-    int32_t dilation, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
+    int32_t dilation, trt_edgellm::rt::OptionalInputTensor initialState,
+    trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
 
 /*!
  * \brief Capture conv state from prefill input.
  *
  * x:              [batch, seqLen, dim]
- * contextLengths: [batch] INT32, per-batch actual token count (optional)
- * convState:      [batch, dim, width]  (output, zero-initialized before call)
+ * contextLengths: [batch] INT32, per-batch actual token count in [0, seqLen] (optional)
+ * initialState:   [batch, dim, width]  (optional continuation state)
+ * convState:      [batch, dim, width]  (output; may alias initialState)
  */
-void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor& convState,
-    trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
+void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::OptionalInputTensor initialState,
+    trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
 
 /*!
  * \brief Decode-mode conv1d: shift conv_state, insert new column, and compute dot product.

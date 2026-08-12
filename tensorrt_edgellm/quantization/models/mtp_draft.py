@@ -41,10 +41,12 @@ from typing import Dict, Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
-from safetensors.torch import load_file, safe_open, save_file
+from safetensors.torch import load_file, safe_open
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from tensorrt_edgellm._safetensors_io import save_file
 
 from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
@@ -338,14 +340,32 @@ class MtpDraftModel(nn.Module):
 
 def _share_embed_tokens(base_model, mtp_draft):
     """Share the base model's embedding table with the MTP draft model."""
+    base_embed = None
     if hasattr(base_model, "model"):
         base_inner = base_model.model
         if hasattr(base_inner, "language_model"):
-            mtp_draft.embed_tokens = base_inner.language_model.embed_tokens
+            base_embed = base_inner.language_model.embed_tokens
         elif hasattr(base_inner, "embed_tokens"):
-            mtp_draft.embed_tokens = base_inner.embed_tokens
-    if mtp_draft.embed_tokens is None:
+            base_embed = base_inner.embed_tokens
+    if base_embed is None:
         raise ValueError("Could not find embed_tokens in the base model")
+    mtp_draft.embed_tokens = _EmbeddingProxy(base_embed)
+
+
+class _EmbeddingProxy(nn.Module):
+    """Read-only embedding view used so MTP quantization does not mutate base."""
+
+    def __init__(self, embedding: nn.Embedding):
+        super().__init__()
+        self.padding_idx = embedding.padding_idx
+        self.register_buffer("weight",
+                             embedding.weight.detach(),
+                             persistent=False)
+
+    def forward(self, input_ids):
+        return nn.functional.embedding(input_ids,
+                                       self.weight,
+                                       padding_idx=self.padding_idx)
 
 
 def quantize_mtp_from_base(

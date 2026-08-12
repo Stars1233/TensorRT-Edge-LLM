@@ -2,7 +2,7 @@
 
 TensorRT plugin that wraps the fused NVFP4 MoE kernel in
 [`kernelSrcs/nvfp4_fused_moe_cutedsl/`](../../../kernelSrcs/nvfp4_fused_moe_cutedsl/)
-(CuTeDSL SM120 / SM121, decode + prefill backends).
+(CuTe DSL SM120 / SM121, decode + prefill backends).
 
 This plugin is the **SM12x (consumer Blackwell)** counterpart of
 [`Nvfp4MoePlugin`](../nvfp4MoePlugin/nvfp4MoePlugin.cpp), which targets
@@ -13,7 +13,7 @@ attribute set, but consume **different on-disk weight layouts**:
 
 * `NvFP4MoEPluginGeforce` expects FC1 packed as the plain
   ``[up_all, gate_all]`` concat along the M axis (the layout the SM12x
-  fused CuTeDSL kernel reads natively).
+  fused CuTe DSL kernel reads natively).
 * `Nvfp4MoePlugin` expects FC1 packed as the 64-row up/gate interleave
   ``[up_chunk(64), gate_chunk(64), up_chunk(64), ...]`` (the layout the
   SM110 split FC1 kernel reads natively).
@@ -23,7 +23,7 @@ based on the target arch.
 
 ## Supported shapes
 
-The AOT-exported CuTeDSL kernel is **shape-polymorphic** in `I` / `E` /
+The AOT-exported CuTe DSL kernel is **shape-polymorphic** in `I` / `E` /
 `top_k`: the wrappers in
 [`export_decode_kernel.py`](../../../kernelSrcs/nvfp4_fused_moe_cutedsl/export_decode_kernel.py)
 and
@@ -82,7 +82,7 @@ difference is purely the per-enqueue execution pattern:
 ## Files
 
 - [`nvfp4MoePluginGeforce.h`](nvfp4MoePluginGeforce.h) / [`nvfp4MoePluginGeforce.cpp`](nvfp4MoePluginGeforce.cpp) — the `IPluginV3` implementation.
-- [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeRunner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/) — the AOT-module owner: module load/unload, shape-check, workspace layout, and wrapper dispatch. The runner is allocation-free on the enqueue path; the plugin owns the per-instance identity expert-id table (via `IGpuAllocator` in `attachToContext`) and threads it in through `CuteDslNvfp4MoeParams::weightExpertIds` / `globalToLocalExpertIds`.
+- [`../../kernels/moe/nvfp4_cutedsl/cuteDslNvfp4MoeRunner.{h,cpp}`](../../kernels/moe/nvfp4_cutedsl/) — the AOT-module owner: per-variant lazy loading, shape checks, workspace layout, and wrapper dispatch. Loaded modules remain resident for process lifetime. The runner is allocation-free on the enqueue path; the plugin owns the per-instance identity expert-id table (via `IGpuAllocator` in `attachToContext`) and threads it in through `CuteDslNvfp4MoeParams::weightExpertIds` / `globalToLocalExpertIds`.
 - [`../../../kernelSrcs/nvfp4_fused_moe_cutedsl/README.md`](../../../kernelSrcs/nvfp4_fused_moe_cutedsl/README.md) — kernel variants, AOT build flow, and data-layout notes.
 
 ## ONNX input surface
@@ -105,35 +105,21 @@ e_score_correction_bias  fp32    [E]     # router correction bias; zeros for sof
 -> output                fp16    [B, S, H]
 ```
 
-Block scales use the contiguous physical CuTeDSL NVFP4 layout
+Block scales use the contiguous physical CuTe DSL NVFP4 layout
 `[E, m_tiles, k_tiles, 32, 4, 4]`.
 
-## Build
+## Artifact Development
 
-1. Generate the AOT artifact (requires `nvidia-cutlass-dsl[cu13]==4.6.0`,
-   `cuda-python`, `cupy-cuda13x`, and a sm_120 / sm_121 GPU):
+If you modify the associated kernel or its registry entries, manually
+regenerate the `nvfp4_fused_moe` artifact before building this plugin.
+Otherwise, CMake uses the matching prebuilt tarball by default. Use the shared
+[CuTe DSL kernel development workflow](../../../kernelSrcs/README.md#cute-dsl-kernel-development-workflow)
+for the Docker or local-venv build and the subsequent CMake configuration.
 
-   ```bash
-   python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe
-   ```
-
-   `nvidia-cutlass-dsl==4.6.0` supports the `sm_121a` architecture used by
-   SM121.
-
-   Output lands in `cpp/kernels/cuteDSLArtifact/<arch>/<tag>/` and
-   includes `cutedsl_nvfp4_fused_moe_all.h`.
-
-2. Build the plugin with CuTeDSL linked in:
-
-   ```bash
-   cmake -S . -B build -DENABLE_CUTE_DSL=nvfp4_fused_moe ...
-   cmake --build build -j
-   ```
-
-   CMake auto-defines `CUTE_DSL_NVFP4_FUSED_MOE_ENABLED` on the plugin
-   target. Without it, the plugin still compiles but every `enqueue` call
-   returns an error (the plugin creator still registers, so deserialize
-   paths work in build-only environments).
+CMake auto-defines `CUTE_DSL_NVFP4_FUSED_MOE_ENABLED` on the plugin target.
+Without it, the plugin still compiles but every `enqueue` call returns an error
+(the plugin creator still registers, so deserialize paths work in build-only
+environments).
 
 ## Retargeting other shapes
 
@@ -157,7 +143,7 @@ integration should be tested at the export path that explicitly emits
 
 ### SM12x sign-off checklist (runner-test equivalent)
 
-1. `python kernelSrcs/build_cutedsl.py --kernels nvfp4_fused_moe --gpu_arch sm_121`
+1. Manually generate the `nvfp4_fused_moe` artifact with the shared workflow.
 2. Build the plugin with `-DENABLE_CUTE_DSL=nvfp4_fused_moe`.
 3. Run the full export → engine build → inference pipeline on a sm_120 /
    sm_121 host and verify the engine layer name binds to

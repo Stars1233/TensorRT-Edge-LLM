@@ -75,7 +75,7 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) noexcept override;
+        cudaStream_t stream, bool imageOnly = false) override;
 
     //! \brief Run inference on the vision encoder
     //! \param[in] stream CUDA stream for execution
@@ -108,7 +108,8 @@ private:
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[out] numImages Number of images processed
     //! \param[out] totalNumBlocks Total number of image blocks
-    //! \param[in] isThumbnail Whether the image is a thumbnail
+    //! \param[in] isThumbnail Whether the image is a thumbnail (or, for video, a follow-on frame:
+    //!            appends its tokens to the previous visual item instead of starting a new one)
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
@@ -118,20 +119,19 @@ private:
     //! \param[in] request LLM generation request containing images
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[out] numImages Number of images per request
-    //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if image size is unexpected, or number of blocks is excessive
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
-        std::vector<int64_t>& numImages, bool doResize, cudaStream_t stream);
+        std::vector<int64_t>& numImages, cudaStream_t stream);
 
-    InternViTConfig mConfig;                         //!< InternViT configuration
-    rt::Tensor mVitInput{};                          //!< Vision encoder input tensor
-    rt::Tensor mImageMean{};                         //!< Image mean tensor
-    rt::Tensor mImageStd{};                          //!< Image standard deviation tensor
-    rt::Tensor mImageDevice{};                       //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};             //!< Temporary normalized image buffer
-    rt::imageUtils::ImageData mResizedImageHost{};   //!< Pre-allocated buffer for image resizing
-    rt::imageUtils::ImageData mThumbnailImageHost{}; //!< Pre-allocated buffer for thumbnail generation
+    InternViTConfig mConfig;             //!< InternViT configuration
+    rt::Tensor mVitInput{};              //!< Vision encoder input tensor
+    rt::Tensor mImageMean{};             //!< Image mean tensor
+    rt::Tensor mImageStd{};              //!< Image standard deviation tensor
+    rt::Tensor mImageDevice{};           //!< Device image buffer (resized image)
+    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
+    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
 };
 
 } // namespace rt
