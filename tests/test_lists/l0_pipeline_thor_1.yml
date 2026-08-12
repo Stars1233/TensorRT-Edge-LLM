@@ -7,6 +7,8 @@ tests:
 
   - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_engine_build[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096]
   - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_inference[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096-tts_basic]
+  - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_inference[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096-tts_language]
+  - tests/defs/test_audio_pipeline.py::TestTTSPipeline::test_inference[Qwen3-TTS-12Hz-0.6B-CustomVoice-fp16-mxsl4096-mxbs1-mxil4096-tts_instruct]
 
   - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3.5-0.8B-fp16-mxsl4096-mxbs2-mxil4096-mnit128-mxit4096-mxpiit512]
   - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3.5-0.8B-fp16-mxsl4096-mxbs2-mxil4096-mnit128-mxit4096-mxpiit512-vlm_basic]

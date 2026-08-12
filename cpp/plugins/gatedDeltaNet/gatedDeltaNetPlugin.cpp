@@ -25,8 +25,11 @@
 #include "kernels/gdnKernels/gdnKernelUtils.cuh"
 #endif
 
+#include "kernels/gdnKernels/gdnTreeChunkKernels.h"
+
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
@@ -95,15 +98,6 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(
             mKDim, mVDim, mSMVersion);
         throw std::runtime_error("Cannot implement the GatedDeltaNetPlugin configuration (CuTe DSL GDN).");
     }
-
-    if (!CuteDslGDNRunner::loadKernelModules())
-    {
-        LOG_ERROR(
-            "Failed to load CuTe DSL GDN kernel modules (gdn_decode / gdn_prefill AOT). "
-            "Check that the engine was built with ENABLE_CUTE_DSL=gdn (or ALL), AOT .o/.h are present and match the "
-            "exported API, and the CUDA driver is compatible.");
-        throw std::runtime_error("Cannot load CuTe DSL GDN kernel modules for GatedDeltaNetPlugin.");
-    }
 }
 #else
 GatedDeltaNetPlugin::GatedDeltaNetPlugin(
@@ -130,7 +124,6 @@ GatedDeltaNetPlugin::GatedDeltaNetPlugin(std::string const& name, PluginFieldCol
 
 #ifdef CUTE_DSL_GDN_ENABLED
     mSMVersion = getSMVersion();
-    CuteDslGDNRunner::loadKernelModules();
 #else
     LOG_ERROR("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
     throw std::runtime_error("GatedDeltaNet plugin is not available: build with CUTE_DSL_GDN_ENABLED to enable it.");
@@ -234,7 +227,7 @@ int32_t GatedDeltaNetPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_u
 
 int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
-    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -251,10 +244,11 @@ int32_t GatedDeltaNetPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_un
         outputs[kOUT_H0_SOURCE_IDX] = inputs[kIN_H0_SOURCE_IDX];
         if (mUseSpecVerifyState)
         {
-            // Per-token recurrent checkpoints: [n, seq_len, hv, k, v].
+            // Only spec-verify produces recurrent checkpoints; normal prefill uses a zero-length marker.
             outputs[kOUT_INTERMEDIATE_STATES_IDX].nbDims = 5;
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[0] = inputs[kIN_Q_IDX].d[0];
-            outputs[kOUT_INTERMEDIATE_STATES_IDX].d[1] = inputs[kIN_Q_IDX].d[1];
+            outputs[kOUT_INTERMEDIATE_STATES_IDX].d[1] = exprBuilder.operation(
+                DimensionOperation::kPROD, *inputs[kIN_Q_IDX].d[1], *inputs[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].d[0]);
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[2] = inputs[kIN_V_IDX].d[2];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[3] = inputs[kIN_Q_IDX].d[3];
             outputs[kOUT_INTERMEDIATE_STATES_IDX].d[4] = inputs[kIN_V_IDX].d[3];
@@ -366,17 +360,27 @@ size_t GatedDeltaNetPlugin::getWorkspaceSize([[maybe_unused]] DynamicPluginTenso
     total = cuSeqPadded + h0ScratchBytes;
 #endif
 
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+    // Workspace sizes are serialized with the engine, so reserve a fixed
+    // architecture-wide upper bound rather than the build GPU's SM count.
+    size_t const blackwellGeforceTensorMapBytes = static_cast<size_t>(CuteDslGDNRunner::kBlackwellGeforceMaxSMCount)
+        * CuteDslGDNRunner::kBlackwellGeforceTensorMapDescriptorBytes;
+    total = std::max(total, blackwellGeforceTensorMapBytes);
+#endif
+
     if (mUseDDTree)
     {
         int32_t const maxN = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[0]);
         int32_t const maxSeqLen = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[1]);
-        int32_t const maxH = static_cast<int32_t>(inputs[kIN_Q_IDX].max.d[2]);
-        int32_t const maxHv = static_cast<int32_t>(inputs[kIN_V_IDX].max.d[2]);
 
-        size_t const qkScaleBytes = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxH * 2U * sizeof(float));
-        size_t const gateValueBytes
-            = alignTensorSize(static_cast<size_t>(maxN) * maxSeqLen * maxHv * 2U * sizeof(float));
-        total = std::max(total, qkScaleBytes + gateValueBytes);
+        // Chunk-form verify uses ancestor masks. The KS/QS + prep scratch
+        // lives in the intermediate-states row tail, NOT here — engine plans
+        // serialize this size at build time, so growing it silently overflows
+        // on pre-existing engines.
+        int32_t const chunkNodes = std::min(maxSeqLen, kernel::kGDN_TREE_CHUNK_MAX_NODES);
+        size_t const maskBytes = alignTensorSize(
+            static_cast<size_t>(maxN) * chunkNodes * kernel::kGDN_TREE_CHUNK_MASK_WORDS * sizeof(uint32_t));
+        total = std::max(total, maskBytes);
     }
 
     return total;
@@ -401,8 +405,6 @@ int32_t GatedDeltaNetPlugin::getAliasedInput(int32_t outputIndex) noexcept
 int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* /* outputDesc */,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
 {
-    CuteDslGDNRunner::loadKernelModules();
-
     int64_t const* qDims = inputDesc[kIN_Q_IDX].dims.d;
     int32_t const n = static_cast<int32_t>(qDims[0]);
     int32_t const seq_len = static_cast<int32_t>(qDims[1]);
@@ -450,6 +452,18 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         }
     }
 
+    GDNParams params{};
+    params.seq_len = seq_len;
+    params.h = h;
+    params.hv = hv;
+    params.smVersion = mSMVersion;
+    params.use_mtp = mtpActive;
+    if (!ddtreeActive && !CuteDslGDNRunner::ensureKernelModules(params, stream))
+    {
+        LOG_ERROR("gated_delta_net: failed to load the selected CuTe DSL GDN module");
+        return -1;
+    }
+
     // h0 is batch-dense [n, hv, k, v]
     size_t const h0Bytes = static_cast<size_t>(n) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
     void* h0Out = outputs[kOUT_H0_SOURCE_IDX];
@@ -466,7 +480,51 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
         cudaMemcpyAsync(h0Out, inputs[kIN_H0_SOURCE_IDX], h0Bytes, cudaMemcpyDeviceToDevice, stream);
     }
 
-    GDNParams params{};
+    if (ddtreeActive && !kernel::gdnTreeChunkVerifyEnabled(seq_len))
+    {
+        LOG_ERROR("gated_delta_net: DDTree chunk-form verify supports seq_len <= %d, got %d",
+            kernel::kGDN_TREE_CHUNK_MAX_NODES, seq_len);
+        return -1;
+    }
+
+    // Stateless chunk-form tree verify. Reads h0 strictly read-only and writes
+    // o plus replay stash into the head of the intermediate_states buffer.
+    if (ddtreeActive)
+    {
+        // Workspace: ancestor masks only (reserved by getWorkspaceSize when
+        // mUseDDTree). The KS/QS + prep scratch lives in the row tail of the
+        // intermediate-states buffer.
+        uint32_t* masks = static_cast<uint32_t*>(workspace);
+        if (cudaError_t const e
+            = kernel::gdnTreeBuildAncestorMasks(static_cast<int32_t const*>(inputs[kIN_TREE_PARENT_IDS_IDX]), masks, n,
+                seq_len, /*maxDepth=*/seq_len, stream);
+            e != cudaSuccess)
+        {
+            LOG_ERROR("gated_delta_net: gdnTreeBuildAncestorMasks launch failed: %s", cudaGetErrorString(e));
+            return -1;
+        }
+
+        // Per-batch stash stride == one intermediate buffer row, so batches
+        // land in disjoint, engine-compatible regions.
+        size_t const stashBatchStrideBytes
+            = static_cast<size_t>(seq_len) * hv * static_cast<size_t>(k_dim) * v_dim * sizeof(float);
+        // Standard scaled dot-product attention scale for the chunk-form verify kernel.
+        float const qScale = 1.f / std::sqrt(static_cast<float>(k_dim));
+        cudaError_t const verifyErr = kernel::gdnTreeVerifyChunk(static_cast<float const*>(inputs[kIN_H0_SOURCE_IDX]),
+            static_cast<__half const*>(inputs[kIN_Q_IDX]), static_cast<__half const*>(inputs[kIN_K_IDX]),
+            static_cast<__half const*>(inputs[kIN_V_IDX]), static_cast<__half const*>(inputs[kIN_A_IDX]),
+            static_cast<__half const*>(inputs[kIN_B_IDX]), static_cast<float const*>(inputs[kIN_A_LOG_IDX]),
+            static_cast<__half const*>(inputs[kIN_DT_BIAS_IDX]), masks, static_cast<__half*>(outputs[kOUT_O_IDX]),
+            outputs[kOUT_INTERMEDIATE_STATES_IDX], stashBatchStrideBytes, n, seq_len, h, hv, qScale,
+            /*useQKL2Norm=*/true, stream);
+        if (verifyErr != cudaSuccess)
+        {
+            LOG_ERROR("gated_delta_net: chunk-form verify launch failed: %s", cudaGetErrorString(verifyErr));
+            return -1;
+        }
+        return 0;
+    }
+
     params.q = const_cast<void*>(inputs[kIN_Q_IDX]);
     params.k = const_cast<void*>(inputs[kIN_K_IDX]);
     params.v = const_cast<void*>(inputs[kIN_V_IDX]);
@@ -485,21 +543,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
     params.v_dim = v_dim;
     params.smVersion = mSMVersion;
 
-    if (ddtreeActive)
-    {
-        params.use_ddtree = true;
-        params.tree_parent_ids = const_cast<void*>(inputs[kIN_TREE_PARENT_IDS_IDX]);
-        params.tree_depths = const_cast<void*>(inputs[kIN_TREE_DEPTHS_IDX]);
-        params.intermediate_states = outputs[kOUT_INTERMEDIATE_STATES_IDX];
-        if (workspace != nullptr)
-        {
-            size_t const qkScaleBytes = alignTensorSize(static_cast<size_t>(n) * seq_len * h * 2U * sizeof(float));
-            char* workspaceBase = static_cast<char*>(workspace);
-            params.ddtree_qk_scales = workspaceBase;
-            params.ddtree_gate_values = workspaceBase + qkScaleBytes;
-        }
-    }
-    else if (mtpActive)
+    if (mtpActive)
     {
         // MTP decode: process all seq_len draft tokens with per-step state caching.
         params.use_mtp = true;
@@ -510,7 +554,7 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
 #ifdef CUTE_DSL_GDN_BLACKWELL_ENABLED
         // Blackwell prefill: carve cu_seqlens and h0 scratch out of the pre-allocated workspace.
         //   workspace layout: [cu_seqlens: (n+1)*int32, pad to 128B] [h0_scratch: n*hv*k*v*f32]
-        if (seq_len > 1 && mSMVersion >= 100)
+        if (seq_len > 1 && (mSMVersion == 100 || mSMVersion == 101 || mSMVersion == 110))
         {
             size_t const cuSeqBytes = static_cast<size_t>(n + 1) * sizeof(int32_t);
             size_t const cuSeqPadded = (cuSeqBytes + 127u) & ~static_cast<size_t>(127u);
@@ -519,6 +563,12 @@ int32_t GatedDeltaNetPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTe
             launchGdnCalCuSeqLens(inputs[kIN_CONTEXT_LENGTHS_IDX], bwBase, n, stream);
             params.cu_seqlens = bwBase;
             params.h0_scratch = bwBase + cuSeqPadded;
+        }
+#endif
+#ifdef CUTE_DSL_GDN_BLACKWELL_GEFORCE_ENABLED
+        if (seq_len > 1 && (mSMVersion == 120 || mSMVersion == 121))
+        {
+            params.tensormap_scratch = workspace;
         }
 #endif
     }

@@ -39,7 +39,8 @@ struct MtpLayerInfo
 /// Skip if acceptLengths[b] <= 0; no-op if acceptLengths[b] >= verifyTreeSize.
 /// stateElements must be divisible by 8 (DVec<float> vec_size).
 void mtpScatterRecurrentStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
-    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptLengths, cudaStream_t stream);
+    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptLengths, cudaStream_t stream,
+    bool recurrentStateIsHalf = false);
 
 /// Batched scatter of accepted conv states (FP16). Same shape as recurrent variant.
 void mtpScatterConvStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,

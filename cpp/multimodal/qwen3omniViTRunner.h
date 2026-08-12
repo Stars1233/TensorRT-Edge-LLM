@@ -39,18 +39,22 @@ protected:
 
     //! 2D resize budget (unlike Qwen3-VL's 3D) — delegates to the base (Qwen2-VL) getResizedImageSize.
     std::tuple<int64_t, int64_t> getResizedImageSize(
-        int64_t numFrames, int64_t height, int64_t width, int64_t maxRatio = 200) override;
+        int64_t numFrames, bool isVideo, int64_t height, int64_t width, int64_t maxRatio = 200) override;
     bool validateExtraConfig(nlohmann::json const& jsonConfig) override;
+
+    //! HF keeps this family's temporal positions in float (`(arange(t) * spg).float() * pips`).
+    bool usesFractionalMRopePositions() const override;
 
     //! Mirrors HF Qwen3-Omni get_rope_index: temporal step = secondPerGrid * position_id_per_seconds; the span
     //! advance also counts the temporal extent (its large position_id_per_seconds can make T dominate).
-    void getMRopePositionIds(
-        std::vector<std::vector<int32_t>> const& batchInputIds, std::vector<VisionSpan> const& spans) noexcept override;
+    void getMRopePositionIds(std::vector<std::vector<int32_t>> const& batchInputIds,
+        std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest) noexcept override;
 
-    //! Fills visual pads with a constant imageTokenId (embeddingLookupMultimodal), vs the base's incrementing IDs.
+    //! Fills visual pads with a constant imageTokenId (embeddingLookup), vs the base's incrementing IDs.
     //! Omni is flat-only (no timestamped sub-spans), so this is a simpler walk than the base's.
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
-        std::vector<VisionSpan> const& spans, trt_edgellm::tokenizer::Tokenizer const* tokenizer) override;
+        std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest,
+        trt_edgellm::tokenizer::Tokenizer const* tokenizer) override;
 
     int64_t mPositionIdPerSecond{0}; //!< Position-ids/second for fps-aware video temporal MRoPE
 };

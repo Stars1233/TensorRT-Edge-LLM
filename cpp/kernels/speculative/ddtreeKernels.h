@@ -44,6 +44,15 @@ struct DDTreeBuildInputs
     //! Optional [vocabSize] reduced-to-full draft vocab mapping. When present, DDTree selects candidates in the
     //! reduced draft vocab space but emits full-vocab token ids for base verify and accept.
     rt::Tensor const* draftVocabMappingTable{nullptr};
+
+    //! Optional [batch, dflashBlockSize - 1] acceptance probabilities in [0, 1];
+    //! depthConfidence[b][d - 1] scores depth d. Growth scores gain log(conf) along
+    //! the path, steering the node budget away from low-confidence depths.
+    rt::Tensor const* depthConfidence{nullptr};
+
+    //! Survival floor in [0, 1): growth stops past depths whose confidence product
+    //! falls below it. 0 (default) disables. Only meaningful with depthConfidence.
+    float confidenceSurvivalThreshold{0.0F};
 };
 
 //! Tensor outputs produced by ddtreeBuild().

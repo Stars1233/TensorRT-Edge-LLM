@@ -139,6 +139,12 @@ bool AudioBuilder::build()
         engineFileName = "code2wav.engine";
         break;
     }
+    case AudioBuildType::RNNT_DECODER:
+    {
+        buildTypeName = "RnntDecoder";
+        engineFileName = "rnnt_step.engine";
+        break;
+    }
     default:
     {
         LOG_ERROR("Build type not determined. Check config.json for audio_config or code2wav_config.");
@@ -169,6 +175,13 @@ bool AudioBuilder::build()
     case AudioBuildType::CODE2WAV:
     {
         profileSetup = setupCode2WavProfile(*builder, *config, *network);
+        break;
+    }
+    case AudioBuildType::RNNT_DECODER:
+    {
+        // The RNN-T step engine has fully static I/O (single decode step), so
+        // it needs no optimization profile.
+        profileSetup = true;
         break;
     }
     default:
@@ -246,12 +259,21 @@ bool AudioBuilder::parseConfig()
 
     // Auto-detect build type from config.json contents
     // Code2Wav config can be either nested in "code2wav_config" or at top-level with "num_quantizers"
-    bool const hasAudioConfig = mModelConfig.contains("audio_config") || mModelConfig.contains("sound_config");
+    // Nemotron-3.5-ASR names its encoder sub-config "encoder_config"; its RNN-T
+    // step engine carries an "rnnt_decoder_config" marker instead.
+    bool const hasRnntDecoderConfig = mModelConfig.contains("rnnt_decoder_config");
+    bool const hasAudioConfig = mModelConfig.contains("audio_config") || mModelConfig.contains("sound_config")
+        || mModelConfig.contains("encoder_config");
     bool const hasCode2WavConfig = mModelConfig.contains("code2wav_config")
         || (mModelConfig.contains("num_quantizers") && mModelConfig.contains("upsample_rates"));
 
-    // Determine build type based on config presence (prioritize Code2Wav if both exist)
-    if (hasCode2WavConfig)
+    // Determine build type based on config presence. RNN-T step and Code2Wav
+    // markers take priority over the generic encoder sub-config.
+    if (hasRnntDecoderConfig)
+    {
+        mBuildType = AudioBuildType::RNNT_DECODER;
+    }
+    else if (hasCode2WavConfig)
     {
         mBuildType = AudioBuildType::CODE2WAV;
     }
@@ -275,11 +297,16 @@ bool AudioBuilder::parseConfig()
         LOG_INFO("Auto-detected build type: AudioEncoder (found audio_config in config.json)");
         mEngineDir = mEngineDir / "audio";
         break;
+    case AudioBuildType::RNNT_DECODER:
+        LOG_INFO("Auto-detected build type: RNN-T decoder step (found rnnt_decoder_config in config.json)");
+        mEngineDir = mEngineDir / "rnnt_decoder";
+        break;
     case AudioBuildType::UNKNOWN:
     default:
         LOG_ERROR(
-            "Cannot determine build type from config.json. "
-            "Expected either: 'audio_config' for audio encoder, or 'num_quantizers'+'upsample_rates' for code2wav");
+            "Cannot determine build type from config.json. Expected one of: 'audio_config'/'encoder_config' for "
+            "an audio encoder, 'num_quantizers'+'upsample_rates' for code2wav, or 'rnnt_decoder_config' for the "
+            "RNN-T step engine");
         return false;
     }
 
@@ -287,6 +314,9 @@ bool AudioBuilder::parseConfig()
     switch (mBuildType)
     {
     case AudioBuildType::CODE2WAV: return parseCode2WavConfig();
+    case AudioBuildType::RNNT_DECODER:
+        // Fully static-shape engine; nothing model-specific to read for the build.
+        return true;
     case AudioBuildType::AUDIO_ENCODER:
     {
         bool parseOk = false;
@@ -297,6 +327,10 @@ bool AudioBuilder::parseConfig()
         else if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
         {
             parseOk = parseNemotronOmniAudioConfig();
+        }
+        else if (mModelType == multimodal::ModelType::NEMOTRON3_5_ASR_AUDIO_ENCODER)
+        {
+            parseOk = parseNemotron35AsrAudioConfig();
         }
         else
         {
@@ -439,6 +473,21 @@ bool AudioBuilder::parseNemotronOmniAudioConfig()
     return true;
 }
 
+bool AudioBuilder::parseNemotron35AsrAudioConfig()
+{
+    // Nemotron-3.5-ASR names its encoder sub-config "encoder_config".
+    if (!mModelConfig.contains("encoder_config"))
+    {
+        LOG_ERROR("encoder_config not found in config.json for Nemotron-3.5-ASR audio encoder");
+        return false;
+    }
+    auto const& encoderConfig = mModelConfig["encoder_config"];
+    mMelBins = encoderConfig.value("num_mel_bins", int32_t{128});
+
+    LOG_INFO("Nemotron-3.5-ASR AudioEncoder config: mel_bins=%d", mMelBins);
+    return true;
+}
+
 bool AudioBuilder::setupAudioEncoderProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
@@ -450,10 +499,16 @@ bool AudioBuilder::setupAudioEncoderProfile(
     // Dispatch to model-specific setup based on model type
     switch (mModelType)
     {
-    case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile); break;
+    case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER:
+    case multimodal::ModelType::QWEN3_OMNI_NEXT_AUDIO_ENCODER:
+        result = setupQwen3OmniAudioEncoderProfile(*profile);
+        break;
     case multimodal::ModelType::GEMMA4_UNIFIED_AUDIO: result = setupGemma4UnifiedAudioEncoderProfile(*profile); break;
     case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
         result = setupNemotronOmniAudioEncoderProfile(*profile);
+        break;
+    case multimodal::ModelType::NEMOTRON3_5_ASR_AUDIO_ENCODER:
+        result = setupNemotron35AsrEncoderProfile(*profile);
         break;
     case multimodal::ModelType::GEMMA4_AUDIO_ENCODER: result = setupGemma4AudioEncoderProfile(*profile); break;
     default: LOG_ERROR("Unsupported model type for audio encoder: %d", static_cast<int>(mModelType)); return false;
@@ -645,6 +700,41 @@ bool AudioBuilder::setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationP
     if (!result)
     {
         LOG_ERROR("Failed to setup Nemotron-Omni audio encoder profile");
+    }
+    return result;
+}
+
+bool AudioBuilder::setupNemotron35AsrEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    bool result = true;
+
+    // Nemotron-3.5-ASR FastConformer encoder runs at batch=1 (same rationale as
+    // Nemotron-Omni: the depthwise conv is a local operator, so cross-clip
+    // batching with padding corrupts short-clip boundaries).
+    //
+    // Inputs:
+    //   input_features: [1, seq_len, mel_bins]  (mel frames; dynamic)
+    //   prompt_ids:     [1]                       (language-prompt index; static)
+    // seq_len is mel-spectrogram frames; the 3× stride-2 causal subsampling
+    // requires divisibility by 8.
+
+    constexpr int64_t kSubFactor = 8;
+    auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
+    int64_t const minSeqLen = alignUp(mBuilderConfig.minTimeSteps, kSubFactor);
+    int64_t const maxSeqLen = alignUp(mBuilderConfig.maxTimeSteps, kSubFactor);
+    int64_t const optSeqLen = alignUp((minSeqLen + maxSeqLen) / 2, kSubFactor);
+    constexpr int64_t kBatch = 1;
+
+    result &= setOptimizationProfile(&profile, "input_features", createDims({kBatch, minSeqLen, mMelBins}),
+        createDims({kBatch, optSeqLen, mMelBins}), createDims({kBatch, maxSeqLen, mMelBins}));
+
+    // prompt_ids is a fixed [1] index: min == opt == max.
+    result &= setOptimizationProfile(
+        &profile, "prompt_ids", createDims({kBatch}), createDims({kBatch}), createDims({kBatch}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Nemotron-3.5-ASR audio encoder profile");
     }
     return result;
 }

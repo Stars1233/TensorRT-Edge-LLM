@@ -20,6 +20,7 @@
 #include "common/trtUtils.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -41,6 +42,10 @@ std::string modeToString(BenchMode mode)
     case BenchMode::kEAGLE_VERIFY: return "eagle_verify";
     case BenchMode::kEAGLE_DRAFT_PROPOSAL: return "eagle_draft_proposal";
     case BenchMode::kEAGLE_DRAFT_PREFILL: return "eagle_draft_prefill";
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL: return "dflash_draft_proposal";
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND: return "dflash_draft_first_round";
+    case BenchMode::kDFLASH_VERIFY: return "dflash_verify";
+    case BenchMode::kDFLASH_DDTREE_BUILD: return "dflash_ddtree_build";
     case BenchMode::kVISUAL: return "visual";
     default: return "unknown";
     }
@@ -388,6 +393,12 @@ void writeModeSpecificCsvHeader(std::ofstream& csvFile, BenchOutputParams const&
     case BenchMode::kDECODE: csvFile << ",past_kv_len"; break;
     case BenchMode::kEAGLE_VERIFY: csvFile << ",verify_tree_size,past_kv_len"; break;
     case BenchMode::kEAGLE_DRAFT_PROPOSAL: csvFile << ",draft_tree_size,past_kv_len"; break;
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL: csvFile << ",seed,block_size,draft_delta_len,past_kv_len"; break;
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND: csvFile << ",seed,block_size,input_len"; break;
+    case BenchMode::kDFLASH_VERIFY: csvFile << ",seed,verify_tree_size,past_kv_len"; break;
+    case BenchMode::kDFLASH_DDTREE_BUILD:
+        csvFile << ",seed,block_size,verify_tree_size,candidate_topk,past_kv_len";
+        break;
     default: break;
     }
 }
@@ -404,6 +415,20 @@ void writeModeSpecificCsvData(std::ofstream& csvFile, BenchOutputParams const& p
     case BenchMode::kDECODE: csvFile << "," << params.pastKVLen; break;
     case BenchMode::kEAGLE_VERIFY: csvFile << "," << params.verifyTreeSize << "," << params.pastKVLen; break;
     case BenchMode::kEAGLE_DRAFT_PROPOSAL: csvFile << "," << params.draftTreeSize << "," << params.pastKVLen; break;
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL:
+        csvFile << "," << params.seed << "," << params.blockSize << "," << params.draftDeltaLen << ","
+                << params.pastKVLen;
+        break;
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND:
+        csvFile << "," << params.seed << "," << params.blockSize << "," << params.inputLen;
+        break;
+    case BenchMode::kDFLASH_VERIFY:
+        csvFile << "," << params.seed << "," << params.verifyTreeSize << "," << params.pastKVLen;
+        break;
+    case BenchMode::kDFLASH_DDTREE_BUILD:
+        csvFile << "," << params.seed << "," << params.blockSize << "," << params.verifyTreeSize << ","
+                << params.candidateTopK << "," << params.pastKVLen;
+        break;
     default: break;
     }
 }
@@ -487,15 +512,27 @@ void writeE2ECsv(std::string const& outputPath, BenchOutputParams const& params,
         return;
     }
 
-    // Header: common columns + mode-specific columns
-    csvFile << "mode,batch_size,osl,e2e_time_ms,per_token_ms,throughput_tps";
-    writeModeSpecificCsvHeader(csvFile, params);
-    csvFile << std::endl;
+    if (params.mode == BenchMode::kDFLASH_DDTREE_BUILD)
+    {
+        csvFile << "mode,batch_size,e2e_time_ms,trees_per_second";
+        writeModeSpecificCsvHeader(csvFile, params);
+        csvFile << std::endl;
 
-    // Data row
-    csvFile << std::fixed << std::setprecision(4);
-    csvFile << modeToString(params.mode) << "," << params.batchSize << "," << params.osl << "," << e2eTimeMs << ","
-            << (e2eTimeMs / numTokens) << "," << (1000.0f * numTokens / e2eTimeMs);
+        csvFile << std::fixed << std::setprecision(4);
+        csvFile << modeToString(params.mode) << "," << params.batchSize << "," << e2eTimeMs << ","
+                << (1000.0f * params.batchSize / e2eTimeMs);
+    }
+    else
+    {
+        // Preserve the established token-based schema for engine modes.
+        csvFile << "mode,batch_size,osl,e2e_time_ms,per_token_ms,throughput_tps";
+        writeModeSpecificCsvHeader(csvFile, params);
+        csvFile << std::endl;
+
+        csvFile << std::fixed << std::setprecision(4);
+        csvFile << modeToString(params.mode) << "," << params.batchSize << "," << params.osl << "," << e2eTimeMs << ","
+                << (e2eTimeMs / numTokens) << "," << (1000.0f * numTokens / e2eTimeMs);
+    }
     writeModeSpecificCsvData(csvFile, params, imageTokens);
     csvFile << std::endl;
 
@@ -520,6 +557,26 @@ std::string buildLayerCsvPath(std::string const& outputDir, BenchOutputParams co
     case BenchMode::kEAGLE_DRAFT_PROPOSAL:
         path += "eagle_draft_proposal_treesize" + std::to_string(params.draftTreeSize) + "_pastkvlen"
             + std::to_string(params.pastKVLen);
+        break;
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL:
+        path += "dflash_draft_proposal_bs" + std::to_string(params.blockSize) + "_delta"
+            + std::to_string(params.draftDeltaLen) + "_kv" + std::to_string(params.pastKVLen) + "_batch"
+            + std::to_string(params.batchSize) + "_seed" + std::to_string(params.seed);
+        break;
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND:
+        path += "dflash_draft_first_round_bs" + std::to_string(params.blockSize) + "_inputlen"
+            + std::to_string(params.inputLen) + "_batch" + std::to_string(params.batchSize) + "_seed"
+            + std::to_string(params.seed);
+        break;
+    case BenchMode::kDFLASH_VERIFY:
+        path += "dflash_verify_ts" + std::to_string(params.verifyTreeSize) + "_kv" + std::to_string(params.pastKVLen)
+            + "_batch" + std::to_string(params.batchSize) + "_seed" + std::to_string(params.seed);
+        break;
+    case BenchMode::kDFLASH_DDTREE_BUILD:
+        path += "dflash_ddtree_build_bs" + std::to_string(params.blockSize) + "_ts"
+            + std::to_string(params.verifyTreeSize) + "_tk" + std::to_string(params.candidateTopK) + "_kv"
+            + std::to_string(params.pastKVLen) + "_batch" + std::to_string(params.batchSize) + "_seed"
+            + std::to_string(params.seed);
         break;
     case BenchMode::kVISUAL:
         path += "visual_" + std::to_string(params.imageHeight) + "x" + std::to_string(params.imageWidth);
@@ -550,6 +607,26 @@ std::string buildE2ECsvPath(std::string const& outputDir, BenchOutputParams cons
         path += "eagle_draft_proposal_treesize" + std::to_string(params.draftTreeSize) + "_pastkvlen"
             + std::to_string(params.pastKVLen);
         break;
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL:
+        path += "dflash_draft_proposal_bs" + std::to_string(params.blockSize) + "_delta"
+            + std::to_string(params.draftDeltaLen) + "_kv" + std::to_string(params.pastKVLen) + "_batch"
+            + std::to_string(params.batchSize) + "_seed" + std::to_string(params.seed);
+        break;
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND:
+        path += "dflash_draft_first_round_bs" + std::to_string(params.blockSize) + "_inputlen"
+            + std::to_string(params.inputLen) + "_batch" + std::to_string(params.batchSize) + "_seed"
+            + std::to_string(params.seed);
+        break;
+    case BenchMode::kDFLASH_VERIFY:
+        path += "dflash_verify_ts" + std::to_string(params.verifyTreeSize) + "_kv" + std::to_string(params.pastKVLen)
+            + "_batch" + std::to_string(params.batchSize) + "_seed" + std::to_string(params.seed);
+        break;
+    case BenchMode::kDFLASH_DDTREE_BUILD:
+        path += "dflash_ddtree_build_bs" + std::to_string(params.blockSize) + "_ts"
+            + std::to_string(params.verifyTreeSize) + "_tk" + std::to_string(params.candidateTopK) + "_kv"
+            + std::to_string(params.pastKVLen) + "_batch" + std::to_string(params.batchSize) + "_seed"
+            + std::to_string(params.seed);
+        break;
     case BenchMode::kDECODE: path += "decode_pastkvlen" + std::to_string(params.pastKVLen); break;
     default: path += modeToString(params.mode); break;
     }
@@ -565,7 +642,7 @@ void logBenchConfig(BenchOutputParams const& params, int64_t imageTokens)
     LOG_INFO("  Mode: %s", modeToString(params.mode).c_str());
     LOG_INFO("  Batch Size: %d", params.batchSize);
     LOG_INFO("  Iterations: %d", params.iterations);
-    LOG_INFO("  Seed: 0");
+    LOG_INFO("  Seed: %" PRIu64, params.seed);
     switch (params.mode)
     {
     case BenchMode::kPREFILL:
@@ -587,6 +664,27 @@ void logBenchConfig(BenchOutputParams const& params, int64_t imageTokens)
     case BenchMode::kEAGLE_DRAFT_PREFILL:
         LOG_INFO("  Input Len: %d", params.inputLen);
         LOG_INFO("  Reuse KV Len: %d", params.reuseKVLen);
+        break;
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL:
+        LOG_INFO("  Block Size: %d", params.blockSize);
+        LOG_INFO("  Draft Delta Len: %d", params.draftDeltaLen);
+        LOG_INFO("  Past KV Len: %d", params.pastKVLen);
+        break;
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND:
+        LOG_INFO("  Block Size: %d", params.blockSize);
+        LOG_INFO("  Input Len: %d", params.inputLen);
+        break;
+    case BenchMode::kDFLASH_VERIFY:
+        LOG_INFO("  Block Size: %d", params.blockSize);
+        LOG_INFO("  Verify Tree Size: %d", params.verifyTreeSize);
+        LOG_INFO("  Candidate Top K: %d", params.candidateTopK);
+        LOG_INFO("  Past KV Len: %d", params.pastKVLen);
+        break;
+    case BenchMode::kDFLASH_DDTREE_BUILD:
+        LOG_INFO("  Block Size: %d", params.blockSize);
+        LOG_INFO("  Verify Tree Size: %d", params.verifyTreeSize);
+        LOG_INFO("  Candidate Top K: %d", params.candidateTopK);
+        LOG_INFO("  Past KV Len: %d", params.pastKVLen);
         break;
     case BenchMode::kVISUAL:
         LOG_INFO("  Image Size: %dx%d, Image Tokens: %ld", params.imageHeight, params.imageWidth, imageTokens);

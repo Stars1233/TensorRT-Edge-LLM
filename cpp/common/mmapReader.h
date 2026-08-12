@@ -35,15 +35,24 @@ namespace file_io
 class MmapReader
 {
 public:
+    enum class Mode
+    {
+        //! Read-only shared file mapping.
+        kReadOnly,
+        //! Writable copy-on-write mapping; writes cannot modify the file.
+        kCopyOnWrite,
+    };
+
     //! @brief Default constructor
     MmapReader() noexcept;
 
     /*!
      * @brief Construct and load file
      * @param fp Path to file to load
+     * @param mode Mapping protection and sharing mode
      * @throws std::runtime_error If file cannot be loaded
      */
-    explicit MmapReader(std::filesystem::path const& fp);
+    explicit MmapReader(std::filesystem::path const& fp, Mode mode = Mode::kReadOnly);
 
     //! @brief Deleted copy constructor
     MmapReader(MmapReader const&) = delete;
@@ -60,9 +69,10 @@ public:
     /*!
      * @brief Load and memory-map a file
      * @param fp Path to file to load
+     * @param mode Mapping protection and sharing mode
      * @return True on success, false on failure
      */
-    bool loadFile(std::filesystem::path const& fp);
+    bool loadFile(std::filesystem::path const& fp, Mode mode = Mode::kReadOnly);
 
     //! @brief Get mapped data as byte array
     //! @return Const pointer to byte data

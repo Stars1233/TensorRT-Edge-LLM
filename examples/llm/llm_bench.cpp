@@ -37,6 +37,7 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -56,6 +57,8 @@ using Json = nlohmann::json;
 
 constexpr int32_t kPrefillProfile{0};
 constexpr int32_t kDecodeProfile{1};
+// launchDFlashPrepareBaseVerifyInputs uses one CUDA thread per verify token.
+constexpr int32_t kDFlashPrepareBaseVerifyMaxSize{1024};
 
 enum ProfileBenchOptionId : int
 {
@@ -79,13 +82,17 @@ enum ProfileBenchOptionId : int
     EXTRACT_LAYER_INFO = 831,
     ACCEPT_RATE = 832,
     DRAFT_STEP = 833,
-    PROFILE = 834
+    PROFILE = 834,
+    BLOCK_SIZE = 835,
+    CANDIDATE_TOPK = 837,
+    CHECKPOINT_DIR = 838,
 };
 
 struct ProfileBenchArgs
 {
     bool help{false};
     std::string engineDir;
+    std::string checkpointDir;
     bool debug{false};
     int32_t batchSize{1};
     int32_t inputLen{-1}; // Input sequence length per batch (required for prefill modes)
@@ -110,6 +117,11 @@ struct ProfileBenchArgs
     int32_t osl{1};        // Output sequence length (LLM OSL per batch, default: 1)
     int32_t acceptRate{5}; // Avg accepted tokens per spec-decode iteration (default: 5)
     int32_t draftStep{6};  // Number of drafting steps per spec-decode iteration (default: 6)
+
+    int32_t blockSize{-1}; // DFlash draft block size; -1 = read from engine
+    // draftDeltaLen is derived from acceptRate (capped by blockSize) at DFlash setup time; not a CLI arg.
+    int32_t draftDeltaLen{0};
+    int32_t candidateTopK{-1}; // DDTree branching factor; required for isolated DDTree build
 
     // Random seed for reproducibility
     uint64_t seed{0};
@@ -137,6 +149,10 @@ struct ProfileBenchArgs
         p.iterations = iterations;
         p.acceptRate = acceptRate;
         p.draftStep = draftStep;
+        p.blockSize = blockSize;
+        p.draftDeltaLen = draftDeltaLen;
+        p.candidateTopK = candidateTopK;
+        p.seed = seed;
         return p;
     }
 };
@@ -160,6 +176,16 @@ void printUsage(char const* programName)
     std::cerr << "                              spec_draft_prefill - Speculative decoding draft prefill (EAGLE/MTP)"
               << std::endl;
     std::cerr << "                              visual            - Visual encoder" << std::endl;
+    std::cerr << "                              dflash_draft_proposal    - DFlash draft engine, decode round"
+              << std::endl;
+    std::cerr << "                              dflash_draft_first_round - DFlash draft engine, first round after base "
+                 "prefill"
+              << std::endl;
+    std::cerr << "                              dflash_verify            - DFlash target verify pass (linear or DDTree)"
+              << std::endl;
+    std::cerr
+        << "                              dflash_ddtree_build      - DDTree build kernel in isolation (no executor)"
+        << std::endl;
     std::cerr << std::endl;
     std::cerr << "Mode-Specific Required Options:" << std::endl;
     std::cerr << "  For prefill mode:" << std::endl;
@@ -182,6 +208,7 @@ void printUsage(char const* programName)
     std::cerr << std::endl;
     std::cerr << "Common Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
+    std::cerr << "  --checkpointDir           HF/ModelOpt checkpoint directory for runtime weight loading" << std::endl;
     std::cerr << "  --debug                   Use debug mode (verbose logging)" << std::endl;
     std::cerr << "  --batchSize               Batch size. Default = 1" << std::endl;
     std::cerr << "  --iterations              Number of profiling iterations (after warmup). Default = 10" << std::endl;
@@ -203,9 +230,19 @@ void printUsage(char const* programName)
     std::cerr << "Speculative Decoding Options:" << std::endl;
     std::cerr << "  --acceptRate              Avg accepted tokens per spec-decode iteration (default: 5)." << std::endl;
     std::cerr << "                            verify_steps = ceil((osl-1) / acceptRate)." << std::endl;
+    std::cerr << "                            Also feeds DFlash draft proposal deltaLen "
+                 "(capped at blockSize)."
+              << std::endl;
     std::cerr << "  --draftStep               Number of drafting steps per spec-decode iteration (default: 6)."
               << std::endl;
     std::cerr << "                            draft_calls = verify_steps * (draftStep-1)." << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "DFlash Options:" << std::endl;
+    std::cerr << "  --blockSize             DFlash draft block size. Default = engine's dflash_block_size."
+              << std::endl;
+    std::cerr << "  --candidateTopK         DDTree branching factor (for kDFLASH_DDTREE_BUILD). Required and must "
+                 "be > 1."
+              << std::endl;
     std::cerr << std::endl;
     std::cerr << "Examples:" << std::endl;
     std::cerr << "  # Prefill mode" << std::endl;
@@ -232,6 +269,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
 {
     static struct option options[] = {{"help", no_argument, 0, ProfileBenchOptionId::HELP},
         {"engineDir", required_argument, 0, ProfileBenchOptionId::ENGINE_DIR},
+        {"checkpointDir", required_argument, 0, ProfileBenchOptionId::CHECKPOINT_DIR},
         {"debug", no_argument, 0, ProfileBenchOptionId::DEBUG},
         {"batchSize", required_argument, 0, ProfileBenchOptionId::BATCH_SIZE},
         {"inputLen", required_argument, 0, ProfileBenchOptionId::INPUT_LEN},
@@ -250,7 +288,9 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
         {"noCudaGraph", no_argument, 0, ProfileBenchOptionId::NO_CUDA_GRAPH},
         {"extractLayerInfo", required_argument, 0, ProfileBenchOptionId::EXTRACT_LAYER_INFO},
         {"acceptRate", required_argument, 0, ProfileBenchOptionId::ACCEPT_RATE},
-        {"draftStep", required_argument, 0, ProfileBenchOptionId::DRAFT_STEP}, {0, 0, 0, 0}};
+        {"draftStep", required_argument, 0, ProfileBenchOptionId::DRAFT_STEP},
+        {"blockSize", required_argument, nullptr, ProfileBenchOptionId::BLOCK_SIZE},
+        {"candidateTopK", required_argument, nullptr, ProfileBenchOptionId::CANDIDATE_TOPK}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", options, nullptr)) != -1)
@@ -261,6 +301,7 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
             {
             case ProfileBenchOptionId::HELP: args.help = true; return true;
             case ProfileBenchOptionId::ENGINE_DIR: args.engineDir = optarg; break;
+            case ProfileBenchOptionId::CHECKPOINT_DIR: args.checkpointDir = optarg; break;
             case ProfileBenchOptionId::DEBUG: args.debug = true; break;
             case ProfileBenchOptionId::BATCH_SIZE:
                 args.batchSize = std::stoi(optarg);
@@ -320,6 +361,22 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
                 else if (modeStr == "visual")
                 {
                     args.mode = BenchMode::kVISUAL;
+                }
+                else if (modeStr == "dflash_draft_proposal")
+                {
+                    args.mode = BenchMode::kDFLASH_DRAFT_PROPOSAL;
+                }
+                else if (modeStr == "dflash_draft_first_round")
+                {
+                    args.mode = BenchMode::kDFLASH_DRAFT_FIRST_ROUND;
+                }
+                else if (modeStr == "dflash_verify")
+                {
+                    args.mode = BenchMode::kDFLASH_VERIFY;
+                }
+                else if (modeStr == "dflash_ddtree_build")
+                {
+                    args.mode = BenchMode::kDFLASH_DDTREE_BUILD;
                 }
                 else
                 {
@@ -429,6 +486,14 @@ bool parseArgs(ProfileBenchArgs& args, int argc, char* argv[])
             }
             case ProfileBenchOptionId::ACCEPT_RATE: args.acceptRate = std::stoi(optarg); break;
             case ProfileBenchOptionId::DRAFT_STEP: args.draftStep = std::stoi(optarg); break;
+            case ProfileBenchOptionId::BLOCK_SIZE:
+                args.blockSize = std::stoi(optarg);
+                ELLM_CHECK(args.blockSize > 0, "--blockSize must be positive");
+                break;
+            case ProfileBenchOptionId::CANDIDATE_TOPK:
+                args.candidateTopK = std::stoi(optarg);
+                ELLM_CHECK(args.candidateTopK > 0, "--candidateTopK must be positive");
+                break;
             default: return false;
             }
         }
@@ -458,6 +523,14 @@ bool validateArgs(ProfileBenchArgs const& args)
     if (args.mode == BenchMode::kNONE)
     {
         LOG_ERROR("--mode is required. Use --help for available modes.");
+        return false;
+    }
+
+    if (args.mode == BenchMode::kDFLASH_DDTREE_BUILD && !args.noProfile)
+    {
+        LOG_ERROR(
+            "--profile and --extractLayerInfo are not supported for dflash_ddtree_build because it does not "
+            "execute a TensorRT engine");
         return false;
     }
 
@@ -515,6 +588,61 @@ bool validateArgs(ProfileBenchArgs const& args)
             return false;
         }
         break;
+    case BenchMode::kDFLASH_DRAFT_FIRST_ROUND:
+        if (args.inputLen <= 0)
+        {
+            LOG_ERROR("--inputLen is required for dflash_draft_first_round mode");
+            return false;
+        }
+        break;
+    case BenchMode::kDFLASH_DRAFT_PROPOSAL:
+        if (args.pastKVLen < 0)
+        {
+            LOG_ERROR("--pastKVLen is required for dflash modes");
+            return false;
+        }
+        break;
+    case BenchMode::kDFLASH_DDTREE_BUILD:
+        if (args.candidateTopK <= 1)
+        {
+            LOG_ERROR("--candidateTopK is required for dflash_ddtree_build mode and must be > 1");
+            return false;
+        }
+        if (args.verifyTreeSize <= 0)
+        {
+            LOG_ERROR("--verifyTreeSize is required for dflash_ddtree_build mode");
+            return false;
+        }
+        if (args.verifyTreeSize > kernel::kDDTreeMaxVerifySize)
+        {
+            LOG_ERROR("DFlash DDTree verify size (%d) exceeds the production kernel limit (%d)", args.verifyTreeSize,
+                kernel::kDDTreeMaxVerifySize);
+            return false;
+        }
+        if (args.pastKVLen < 0)
+        {
+            LOG_ERROR("--pastKVLen is required for dflash_ddtree_build mode");
+            return false;
+        }
+        break;
+    case BenchMode::kDFLASH_VERIFY:
+        if (args.verifyTreeSize <= 0)
+        {
+            LOG_ERROR("--verifyTreeSize is required for dflash_verify mode");
+            return false;
+        }
+        if (args.verifyTreeSize > kDFlashPrepareBaseVerifyMaxSize)
+        {
+            LOG_ERROR("DFlash verify tree size (%d) exceeds the base verify metadata kernel limit (%d)",
+                args.verifyTreeSize, kDFlashPrepareBaseVerifyMaxSize);
+            return false;
+        }
+        if (args.pastKVLen < 0)
+        {
+            LOG_ERROR("--pastKVLen is required for dflash_verify mode");
+            return false;
+        }
+        break;
     default: LOG_ERROR("Unknown mode"); return false;
     }
 
@@ -523,15 +651,28 @@ bool validateArgs(ProfileBenchArgs const& args)
 
 // ==================== Helper: detect engine paths ====================
 
+static bool isDFlashMode(BenchMode mode)
+{
+    return mode == BenchMode::kDFLASH_DRAFT_PROPOSAL || mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND
+        || mode == BenchMode::kDFLASH_VERIFY || mode == BenchMode::kDFLASH_DDTREE_BUILD;
+}
+
+static bool needsExecutor(BenchMode mode)
+{
+    // All modes except DDTree build execute a TensorRT engine.
+    return mode != BenchMode::kDFLASH_DDTREE_BUILD;
+}
+
 bool isDraftEngineMode(BenchMode mode)
 {
-    return mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || mode == BenchMode::kEAGLE_DRAFT_PREFILL;
+    return mode == BenchMode::kEAGLE_DRAFT_PROPOSAL || mode == BenchMode::kEAGLE_DRAFT_PREFILL
+        || mode == BenchMode::kDFLASH_DRAFT_PROPOSAL || mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND;
 }
 
 bool isSpecDecodeMode(BenchMode mode)
 {
     return mode == BenchMode::kEAGLE_VERIFY || mode == BenchMode::kEAGLE_DRAFT_PROPOSAL
-        || mode == BenchMode::kEAGLE_DRAFT_PREFILL;
+        || mode == BenchMode::kEAGLE_DRAFT_PREFILL || isDFlashMode(mode);
 }
 
 // ==================== main ====================
@@ -570,7 +711,21 @@ int main(int argc, char** argv)
     LOG_INFO("=== LLM Profile Benchmark ===");
     LOG_INFO("Mode: %s", modeToString(args.mode).c_str());
 
-    auto pluginHandles = loadEdgellmPluginLib();
+    // Only load the edgellm plugin library when we actually create an EngineExecutor.
+    // kDFLASH_DDTREE_BUILD times a bare CUDA kernel and doesn't need TRT plugins.
+    std::unique_ptr<void, DlDeleter> pluginHandles;
+    if (needsExecutor(args.mode))
+    {
+        pluginHandles = loadEdgellmPluginLib();
+    }
+
+    // DDTree build times a raw CUDA kernel — CUDA graph capture is neither meaningful
+    // nor supported (no executor prepare/execute path), so force-disable it here.
+    if (args.mode == BenchMode::kDFLASH_DDTREE_BUILD)
+    {
+        args.noCudaGraph = true;
+        LOG_INFO("CUDA graph disabled for dflash_ddtree_build kernel timing");
+    }
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -607,6 +762,10 @@ int main(int argc, char** argv)
     std::unique_ptr<rt::DeepstackBinding> deepstack;
     rt::DeploymentConfig deployment;
     rt::Tensor contextMemory;
+    rt::Tensor diffusionCanvasIds;
+    rt::Tensor diffusionPrevSelfConditioningEmbeds;
+    rt::Tensor diffusionNextSelfConditioningEmbeds;
+    rt::Tensor diffusionSelfConditioningTemperature;
 
     // Visual mode uses MultimodalRunner (unchanged from legacy)
     std::unique_ptr<rt::MultimodalRunner> visualRunner;
@@ -636,7 +795,8 @@ int main(int argc, char** argv)
                     break;
                 }
             }
-            visualRunner = rt::MultimodalRunner::create(args.engineDir, args.batchSize, maxSeqLen, stream);
+            visualRunner
+                = rt::MultimodalRunner::create(args.engineDir, args.batchSize, maxSeqLen, stream, args.checkpointDir);
         }
         catch (std::exception const& e)
         {
@@ -653,10 +813,11 @@ int main(int argc, char** argv)
         for (int32_t b = 0; b < args.batchSize; ++b)
         {
             rt::LLMGenerationRequest::Request req;
-            rt::Tensor fakeImage({static_cast<int64_t>(args.imageHeight), static_cast<int64_t>(args.imageWidth), 3},
+            rt::Tensor fakeImage({1, static_cast<int64_t>(args.imageHeight), static_cast<int64_t>(args.imageWidth), 3},
                 rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "fake");
             std::memset(fakeImage.rawPointer(), 128, static_cast<size_t>(args.imageHeight) * args.imageWidth * 3);
             req.imageBuffers.emplace_back(std::move(fakeImage));
+            req.imageBuffers.back().doResize = false;
             dummyRequest.requests.push_back(std::move(req));
         }
 
@@ -672,7 +833,11 @@ int main(int argc, char** argv)
         LOG_INFO("Image Size: %dx%d -> %ld image tokens (batch=%d)", args.imageHeight, args.imageWidth, imageTokens,
             args.batchSize);
 
-        standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
+        // Only needed by the --extractLayerInfo path (used at Phase 4 below).
+        if (args.extractLayerInfo.any())
+        {
+            standaloneEngine = loadStandaloneEngine(std::filesystem::path(args.engineDir) / "visual.engine");
+        }
     }
     else
     {
@@ -696,9 +861,23 @@ int main(int argc, char** argv)
             // only needed for the full pipeline. Set reasonable defaults so the config
             // factory's positivity checks pass.
             rt::SpecDecodeDraftingConfig dc;
-            dc.draftingTopK = std::max(args.draftTreeSize, 1);
-            dc.draftingStep = std::max(args.draftStep, 1);
-            dc.verifySize = std::max(args.verifyTreeSize, 1);
+            if (isDFlashMode(args.mode))
+            {
+                // DFlash configs use different fields (topK is candidate branching factor,
+                // step is fixed to 1) — leave whatever args provided (or 1s) so the factory
+                // accepts, then fold engine-derived values into args after the deployment
+                // is loaded (see DFlash defaults block below).
+                dc.draftingStep = 1;
+                dc.draftingTopK = args.candidateTopK > 0 ? args.candidateTopK : 1;
+                dc.verifySize = args.verifyTreeSize > 0 ? args.verifyTreeSize : 1;
+                dc.dflashBlockSize = args.blockSize > 0 ? args.blockSize : 0;
+            }
+            else
+            {
+                dc.draftingTopK = std::max(args.draftTreeSize, 1);
+                dc.draftingStep = std::max(args.draftStep, 1);
+                dc.verifySize = std::max(args.verifyTreeSize, 1);
+            }
             draftingConfig = dc;
         }
 
@@ -712,126 +891,263 @@ int main(int argc, char** argv)
             LOG_ERROR("Failed to parse engine configuration: %s", e.what());
             return EXIT_FAILURE;
         }
-
-        // --- Determine which engine this mode operates on ---
-        bool const useDraftEngine = isDraftEngineMode(args.mode);
-        rt::LLMEngineConfig const& activeCfg = useDraftEngine ? *deployment.draft : deployment.base;
-
-        // --- Create EngineExecutor ---
-        std::filesystem::path enginePath;
-        if (useDraftEngine)
+        if (deployment.base.isDiffusionBackbone && args.mode == BenchMode::kDECODE)
         {
-            enginePath = dir / "spec_draft.engine";
-        }
-        else
-        {
-            enginePath = dir / "llm.engine";
-            if (!std::filesystem::exists(enginePath))
-            {
-                enginePath = dir / "spec_base.engine";
-            }
-        }
-
-        try
-        {
-            if (useDraftEngine)
-            {
-                executor = rt::EngineExecutor::createForDraft(enginePath, deployment);
-            }
-            else
-            {
-                std::optional<int32_t> specDecodeBaseOutputHiddenDim;
-                if (deployment.specConfig.has_value())
-                {
-                    specDecodeBaseOutputHiddenDim = deployment.specConfig->baseOutputHiddenDim;
-                }
-                executor = rt::EngineExecutor::createForLLM(enginePath, deployment.base, specDecodeBaseOutputHiddenDim);
-            }
-        }
-        catch (std::exception const& e)
-        {
-            LOG_ERROR("Failed to create EngineExecutor: %s", e.what());
+            LOG_ERROR(
+                "llm_bench --mode decode is not a valid DiffusionGemma serving benchmark because DiffusionGemma decode "
+                "uses a denoise/sample/commit runtime state machine. Use llm_inference or add a dedicated "
+                "diffusion_decode bench mode for end-to-end DG decode timing.");
             return EXIT_FAILURE;
         }
 
-        rt::validateAgainstEngine(activeCfg, *executor, useDraftEngine ? "draft" : "base");
-
-        if (layerProfiler::LayerProfiler::getInstance().isEnabled())
+        // --- DFlash: engine-config consistency + CLI-default resolution ---
+        // Runs before EngineExecutor creation so the DFlash validation guard rails
+        // reject mismatched deployments early, and so args.blockSize/draftDeltaLen/
+        // candidateTopK reflect the values baked into the engine for the mode
+        // dispatch below.
+        if (isDFlashMode(args.mode))
         {
-            executor->setProfiler(&layerProfiler::LayerProfiler::getInstance());
+            if (deployment.specDecodeMode() != rt::SpecDecodeMode::kDFlash)
+            {
+                LOG_ERROR("DFlash benchmark mode '%s' requires engine configs with spec_decode_type=dflash",
+                    modeToString(args.mode).c_str());
+                return EXIT_FAILURE;
+            }
+
+            ELLM_CHECK(deployment.specConfig.has_value(),
+                "DFlash mode requires a spec-decode deployment (base engine must be DFlash type)");
+            if (args.blockSize <= 0)
+                args.blockSize = deployment.specConfig->dflashBlockSize;
+            // draftDeltaLen models accepted tokens per round (excluding the first): it comes from
+            // acceptRate in production. Cap at blockSize because DFlash draft proposal cannot consume
+            // more than one block per round.
+            ELLM_CHECK(args.acceptRate > 0, "--acceptRate must be positive for DFlash modes");
+            args.draftDeltaLen = std::min(args.acceptRate, args.blockSize);
+            if (args.candidateTopK <= 0)
+                args.candidateTopK = deployment.specConfig->draftingTopK; // whatever the factory resolved
+
+            ELLM_CHECK(deployment.specConfig->draftingTopK > 0
+                    && (deployment.specConfig->draftingTopK == 1
+                        || deployment.specConfig->draftingTopK < deployment.specConfig->verifySize),
+                "DFlash: candidateTopK (" + std::to_string(deployment.specConfig->draftingTopK)
+                    + ") must be > 0 and (== 1 for linear mode, or < verifySize ("
+                    + std::to_string(deployment.specConfig->verifySize) + ") for DDTree mode)");
+
+            if (args.mode == BenchMode::kDFLASH_DDTREE_BUILD && deployment.draft.has_value()
+                && deployment.draft->reducedVocabSize > 0)
+            {
+                ELLM_CHECK(false,
+                    "DFlash DDTree build with reduced-vocab draft (vocab="
+                        + std::to_string(deployment.draft->reducedVocabSize)
+                        + ") not supported by llm_bench yet. Use a full-vocab engine or extend "
+                          "llm_bench to load draft_vocab_map.safetensors and thread it into DDTreeBuildParams.");
+            }
+
+            if (args.mode == BenchMode::kDFLASH_VERIFY)
+            {
+                ELLM_CHECK(args.verifyTreeSize <= deployment.base.maxVerifyTreeSize,
+                    "DFlash verify tree size (" + std::to_string(args.verifyTreeSize)
+                        + ") exceeds the base engine maximum verify tree size ("
+                        + std::to_string(deployment.base.maxVerifyTreeSize) + ")");
+                int64_t const requiredBaseCacheLength
+                    = static_cast<int64_t>(args.pastKVLen) + static_cast<int64_t>(args.verifyTreeSize);
+                ELLM_CHECK(requiredBaseCacheLength <= static_cast<int64_t>(deployment.base.maxKVCacheCapacity),
+                    "DFlash verify requires pastKVLen + verifyTreeSize (" + std::to_string(requiredBaseCacheLength)
+                        + ") to fit the base KV cache maximum sequence length ("
+                        + std::to_string(deployment.base.maxKVCacheCapacity) + ")");
+
+                // The production DFlash configuration normalizes greedy verify
+                // size to blockSize.  This isolated base-engine benchmark must
+                // retain the requested, profile-valid shape so the shared verify
+                // tensors are allocated for it (for example, verifyTreeSize=64).
+                deployment.specConfig->verifySize = args.verifyTreeSize;
+            }
+
+            LOG_INFO("DFlash config: blockSize=%d draftDeltaLen=%d candidateTopK=%d verifySize=%d", args.blockSize,
+                args.draftDeltaLen, args.candidateTopK, deployment.specConfig->verifySize);
         }
 
-        LOG_INFO("EngineExecutor loaded from %s", enginePath.c_str());
-
-        // --- Create SharedResources, PipelineIO, TensorMap ---
-        // Use spec-decode factories when the deployment has a draft config, even if
-        // the bench mode is prefill/decode. A spec-decode base engine has extra
-        // bindings (attention_mask, attention_pos_id) that require PipelineIO to
-        // allocate packedAttentionMask and specDecodePositionIds.
-        bool const useSpecDecodeResources = deployment.draft.has_value();
-        int32_t const maxBatch = deployment.maxRuntimeBatchSize();
-        std::unordered_map<std::string, std::string> emptyLoraMap;
-
-        if (useSpecDecodeResources)
+        // Everything from EngineExecutor creation through PipelineIO filling only
+        // makes sense when we actually run a TRT engine — DDTree build times a
+        // raw CUDA kernel with its own scratch (see DDTreeBuildScratch below).
+        if (needsExecutor(args.mode))
         {
-            resources = rt::SharedResources::createForSpecDecode(deployment, maxBatch, emptyLoraMap, stream);
-            io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForSpecDecode(deployment, maxBatch, stream));
-        }
-        else
-        {
-            resources = rt::SharedResources::createForLLM(deployment.base, emptyLoraMap, stream);
-            io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(deployment.base, stream));
-        }
+            // --- Determine which engine this mode operates on ---
+            bool const useDraftEngine = isDraftEngineMode(args.mode);
+            rt::LLMEngineConfig const& activeCfg = useDraftEngine ? *deployment.draft : deployment.base;
 
-        // Build TensorMap: kvCacheIndex=0 for base, 1 for draft
-        if (useDraftEngine)
-        {
-            rt::buildTensorMapForSpecDecodeDraft(tensorMap, *io, *resources, *deployment.draft);
-        }
-        else
-        {
-            rt::buildTensorMap(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
-        }
+            // --- Create EngineExecutor ---
+            std::filesystem::path enginePath;
+            if (useDraftEngine)
+            {
+                enginePath = dir / "spec_draft.engine";
+            }
+            else if (deployment.base.isDiffusionBackbone)
+            {
+                enginePath = dir / "dllm.engine";
+            }
+            else
+            {
+                enginePath = dir / "llm.engine";
+                if (!std::filesystem::exists(enginePath))
+                {
+                    enginePath = dir / "spec_base.engine";
+                }
+            }
 
-        // --- Load externalized model weights ---
-        std::filesystem::path const& activeConfigPath = useDraftEngine ? *draftConfigPath : baseConfigPath;
-        resources->externalWeightManager->load(dir, activeConfigPath, stream);
-        resources->externalWeightManager->validateAgainstEngine(*executor, useDraftEngine ? "draft" : "base");
-        resources->externalWeightManager->registerTensorMapEntries(tensorMap);
+            try
+            {
+                if (useDraftEngine)
+                {
+                    executor = rt::EngineExecutor::createForDraft(enginePath, deployment);
+                }
+                else
+                {
+                    std::optional<int32_t> specDecodeBaseOutputHiddenDim;
+                    if (deployment.specConfig.has_value())
+                    {
+                        specDecodeBaseOutputHiddenDim = deployment.specConfig->baseOutputHiddenDim;
+                    }
+                    executor
+                        = rt::EngineExecutor::createForLLM(enginePath, deployment.base, specDecodeBaseOutputHiddenDim);
+                }
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("Failed to create EngineExecutor: %s", e.what());
+                return EXIT_FAILURE;
+            }
 
-        // --- Context memory ---
-        int64_t memSize = executor->getRequiredContextMemorySize();
-        contextMemory
-            = rt::Tensor(rt::Coords{memSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "context_memory");
-        executor->setContextMemory(contextMemory);
+            rt::validateAgainstEngine(activeCfg, *executor, useDraftEngine ? "draft" : "base");
 
-        // --- StepPreparer (for prefill/decode metadata) ---
-        stepPreparer = std::make_unique<rt::StepPreparer>(activeCfg);
+            if (layerProfiler::LayerProfiler::getInstance().isEnabled())
+            {
+                executor->setProfiler(&layerProfiler::LayerProfiler::getInstance());
+            }
 
-        // --- DeepstackBinding (if applicable, base engine only) ---
-        if (!useDraftEngine && deployment.base.numDeepstackFeatures > 0)
-        {
-            deepstack = std::make_unique<rt::DeepstackBinding>(io->deepstackEmbeds, resources->zeroBuffer);
-        }
+            LOG_INFO("EngineExecutor loaded from %s", enginePath.c_str());
 
-        // --- Log engine config ---
-        LOG_INFO("Engine config:\n%s", rt::formatEngineConfig(activeCfg).c_str());
+            // --- Create SharedResources, PipelineIO, TensorMap ---
+            // Use spec-decode factories when the deployment has a draft config, even if
+            // the bench mode is prefill/decode. A spec-decode base engine has extra
+            // bindings (attention_mask, attention_pos_id) that require PipelineIO to
+            // allocate packedAttentionMask and specDecodePositionIds.
+            bool const useSpecDecodeResources = deployment.draft.has_value();
+            int32_t const maxBatch = deployment.maxRuntimeBatchSize();
+            std::unordered_map<std::string, std::string> emptyLoraMap;
 
-        // --- Standalone engine for layer metadata extraction ---
-        standaloneEngine = loadStandaloneEngine(enginePath);
+            if (useSpecDecodeResources)
+            {
+                resources = rt::SharedResources::createForSpecDecode(deployment, maxBatch, emptyLoraMap, stream);
+                io = std::make_unique<rt::PipelineIO>(
+                    rt::PipelineIO::createForSpecDecode(deployment, maxBatch, stream));
+            }
+            else
+            {
+                resources = rt::SharedResources::createForLLM(deployment.base, emptyLoraMap, stream);
+                io = std::make_unique<rt::PipelineIO>(rt::PipelineIO::createForLLM(deployment.base, stream));
+            }
 
-        // --- Fill PipelineIO tensors with random data ---
-        nvinfer1::DataType const dtype = nvinfer1::DataType::kHALF;
-        fillRandomData(io->inputsEmbeds, -1.0f, 1.0f, dtype, args.seed);
+            // Build TensorMap: kvCacheIndex=0 for base, 1 for draft
+            if (useDraftEngine)
+            {
+                rt::buildTensorMapForSpecDecodeDraft(tensorMap, *io, *resources, *deployment.draft);
+            }
+            else
+            {
+                if (deployment.base.isDiffusionBackbone)
+                {
+                    rt::buildTensorMapForDiffusionBackbone(
+                        tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
+                }
+                else
+                {
+                    rt::buildTensorMap(tensorMap, *io, *resources, deployment.base, /*kvCacheIndex=*/0);
+                }
+            }
 
-        if (!io->baseHiddenStates.isEmpty())
-        {
-            fillRandomData(io->baseHiddenStates, -1.0f, 1.0f, dtype, args.seed);
-        }
-        if (!io->draftHiddenStatesIn.isEmpty())
-        {
-            CUDA_CHECK(cudaMemsetAsync(
-                io->draftHiddenStatesIn.rawPointer(), 0, io->draftHiddenStatesIn.getMemoryCapacity(), stream));
+            if (!useDraftEngine && deployment.base.isDiffusionBackbone && deployment.base.diffusionUnifiedConditioning)
+            {
+                int32_t maxConditioningSeqLen = deployment.base.maxSupportedInputLength;
+                if (deployment.base.diffusionCanvasLength > maxConditioningSeqLen)
+                {
+                    maxConditioningSeqLen = deployment.base.diffusionCanvasLength;
+                }
+                diffusionCanvasIds = rt::Tensor({maxBatch, maxConditioningSeqLen}, rt::DeviceType::kGPU,
+                    nvinfer1::DataType::kINT32, "llm_bench::diffusionCanvasIds");
+                diffusionPrevSelfConditioningEmbeds
+                    = rt::Tensor({maxBatch, maxConditioningSeqLen, deployment.base.hiddenSize}, rt::DeviceType::kGPU,
+                        nvinfer1::DataType::kHALF, "llm_bench::diffusionPrevSelfConditioningEmbeds");
+                diffusionNextSelfConditioningEmbeds
+                    = rt::Tensor({maxBatch, maxConditioningSeqLen, deployment.base.hiddenSize}, rt::DeviceType::kGPU,
+                        nvinfer1::DataType::kHALF, "llm_bench::diffusionNextSelfConditioningEmbeds");
+                diffusionSelfConditioningTemperature = rt::Tensor({1}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT,
+                    "llm_bench::diffusionSelfConditioningTemperature");
+
+                CUDA_CHECK(cudaMemsetAsync(
+                    diffusionCanvasIds.rawPointer(), 0, diffusionCanvasIds.getMemoryCapacity(), stream));
+                CUDA_CHECK(cudaMemsetAsync(diffusionPrevSelfConditioningEmbeds.rawPointer(), 0,
+                    diffusionPrevSelfConditioningEmbeds.getMemoryCapacity(), stream));
+                CUDA_CHECK(cudaMemsetAsync(diffusionNextSelfConditioningEmbeds.rawPointer(), 0,
+                    diffusionNextSelfConditioningEmbeds.getMemoryCapacity(), stream));
+                float const diffusionTemperatureInit = 1.0F;
+                CUDA_CHECK(cudaMemcpyAsync(diffusionSelfConditioningTemperature.rawPointer(), &diffusionTemperatureInit,
+                    sizeof(float), cudaMemcpyHostToDevice, stream));
+
+                tensorMap.set(binding_names::kCanvasIds, diffusionCanvasIds);
+                tensorMap.set(binding_names::kPrevSelfConditioningEmbeds, diffusionPrevSelfConditioningEmbeds);
+                tensorMap.set(binding_names::kNextSelfConditioningEmbeds, diffusionNextSelfConditioningEmbeds);
+                tensorMap.set(binding_names::kSelfConditioningTemperature, diffusionSelfConditioningTemperature);
+            }
+
+            // --- Load externalized model weights ---
+            std::filesystem::path const& activeConfigPath = useDraftEngine ? *draftConfigPath : baseConfigPath;
+            resources->externalWeightManager->load(dir, activeConfigPath, stream, args.checkpointDir);
+            resources->externalWeightManager->validateAgainstEngine(*executor, useDraftEngine ? "draft" : "base");
+            resources->externalWeightManager->registerTensorMapEntries(tensorMap);
+
+            // --- Context memory ---
+            int64_t memSize = executor->getRequiredContextMemorySize();
+            contextMemory
+                = rt::Tensor(rt::Coords{memSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8, "context_memory");
+            executor->setContextMemory(contextMemory);
+
+            // --- StepPreparer (for prefill/decode metadata) ---
+            stepPreparer = std::make_unique<rt::StepPreparer>(activeCfg);
+
+            // --- DeepstackBinding (if applicable, base engine only) ---
+            if (!useDraftEngine && !deployment.base.isDiffusionBackbone && deployment.base.numDeepstackFeatures > 0)
+            {
+                deepstack = std::make_unique<rt::DeepstackBinding>(io->deepstackEmbeds, resources->zeroBuffer);
+            }
+
+            // --- Log engine config ---
+            LOG_INFO("Engine config:\n%s", rt::formatEngineConfig(activeCfg).c_str());
+
+            // --- Standalone engine for layer metadata extraction ---
+            // Only needed by the --extractLayerInfo path (used at Phase 4 below).
+            // Skip the load otherwise: a second engine deserialization holds an
+            // additional copy of the engine weights for the process lifetime and
+            // can double peak GPU memory (~15 GB for Qwen3-8B), OOM'ing on
+            // Jetson UMA and other memory-constrained targets.
+            if (args.extractLayerInfo.any())
+            {
+                standaloneEngine = loadStandaloneEngine(enginePath);
+            }
+
+            // --- Fill PipelineIO tensors with random data ---
+            nvinfer1::DataType const dtype = nvinfer1::DataType::kHALF;
+            fillRandomData(io->inputsEmbeds, -1.0f, 1.0f, dtype, args.seed);
+
+            if (!io->baseHiddenStates.isEmpty())
+            {
+                fillRandomData(io->baseHiddenStates, -1.0f, 1.0f, dtype, args.seed);
+            }
+            if (!io->draftHiddenStatesIn.isEmpty())
+            {
+                CUDA_CHECK(cudaMemsetAsync(
+                    io->draftHiddenStatesIn.rawPointer(), 0, io->draftHiddenStatesIn.getMemoryCapacity(), stream));
+            }
         }
     }
 
@@ -843,7 +1159,7 @@ int main(int argc, char** argv)
     std::string modeName;
 
     rt::Tensor reuseKVCacheLengths;
-    if (args.mode != BenchMode::kVISUAL)
+    if (args.mode != BenchMode::kVISUAL && needsExecutor(args.mode))
     {
         reuseKVCacheLengths = rt::Tensor(
             rt::Coords{args.batchSize}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "reuse_kv_lengths");
@@ -860,6 +1176,10 @@ int main(int argc, char** argv)
     int32_t const B = args.batchSize;
     bool const useDraftEngine = isDraftEngineMode(args.mode);
     int32_t const kvCacheIndex = useDraftEngine ? 1 : 0;
+    // DDTree build owns its own scratch; DFlash draft modes share one scratch struct
+    // whose Tensors must outlive the tensorMap (which stores raw pointers into them).
+    std::unique_ptr<DDTreeBuildScratch> ddtreeScratch;
+    DFlashDraftBenchScratch dflashDraftScratch;
 
     if (args.mode == BenchMode::kVISUAL)
     {
@@ -875,6 +1195,26 @@ int main(int argc, char** argv)
         // Reshape inputsEmbeds for this bench config
         check::check(
             io->inputsEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}), "inputsEmbeds reshape failed");
+        if (deployment.base.isDiffusionBackbone)
+        {
+            check::check(
+                io->outputLogits.reshape({B, 1, deployment.base.outputVocabSize}), "outputLogits reshape failed");
+            check::check(io->phaseIsEncoder.reshape({B}), "phaseIsEncoder reshape failed");
+            check::check(io->hostPhaseIsEncoder.reshape({B}), "hostPhaseIsEncoder reshape failed");
+            int32_t* hostPhase = io->hostPhaseIsEncoder.dataPointer<int32_t>();
+            std::fill(hostPhase, hostPhase + B, 1);
+            CUDA_CHECK(cudaMemcpyAsync(
+                io->phaseIsEncoder.rawPointer(), hostPhase, B * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+            if (deployment.base.diffusionUnifiedConditioning)
+            {
+                check::check(diffusionCanvasIds.reshape({B, args.inputLen}), "diffusionCanvasIds reshape failed");
+                check::check(
+                    diffusionPrevSelfConditioningEmbeds.reshape({B, args.inputLen, deployment.base.hiddenSize}),
+                    "diffusionPrevSelfConditioningEmbeds reshape failed");
+                check::check(diffusionNextSelfConditioningEmbeds.reshape({B, 1, deployment.base.hiddenSize}),
+                    "diffusionNextSelfConditioningEmbeds reshape failed");
+            }
+        }
 
         // Set context lengths on PipelineIO (host side, for StepPreparer)
         int32_t const contextLen = args.reuseKVLen + args.inputLen;
@@ -1091,6 +1431,234 @@ int main(int argc, char** argv)
             if (!executor->prepare(kPrefillProfile, dims, tensorMap, stream))
                 return false;
             return executor->execute(stream);
+        };
+    }
+    else if (args.mode == BenchMode::kDFLASH_DRAFT_PROPOSAL)
+    {
+        modeName = "DFlash Draft Proposal";
+        LOG_INFO("DFlash Draft Proposal mode: BlockSize=%d, DraftDeltaLen=%d, PastKVLen=%d", args.blockSize,
+            args.draftDeltaLen, args.pastKVLen);
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
+
+        pastKVLenVec.assign(B, args.pastKVLen);
+
+        tensorMap = rt::TensorMap{};
+        DFlashDraftBenchParams const draftParams{/*.batchSize=*/B, /*.blockSize=*/args.blockSize,
+            /*.deltaLen=*/args.draftDeltaLen, /*.pastKVLen=*/args.pastKVLen, /*.seed=*/args.seed};
+        buildDFlashDraftTensorMap(deployment, draftParams, *resources->cacheManagers[kvCacheIndex], *resources, *io,
+            dflashDraftScratch, tensorMap);
+        fillDFlashDraftInputs(*io, *resources->cacheManagers[kvCacheIndex], dflashDraftScratch, draftParams, stream);
+
+        rt::InferenceDims const dims{
+            /*.batch=*/B,
+            /*.seqLen=*/args.blockSize,
+            /*.kvLen=*/deployment.draft->maxKVCacheCapacity,
+            /*.selectLen=*/args.draftDeltaLen,
+            /*.attnMaskSeqLen=*/args.blockSize,
+            /*.ropeBatch=*/1,
+            /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
+            /*.startIndexLen=*/B,
+        };
+
+        resetState = [&]() {
+            std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+        };
+        step = [&, dims]() {
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
+        };
+        captureGraph = [&, dims]() {
+            resetState();
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
+        };
+    }
+    else if (args.mode == BenchMode::kDFLASH_DRAFT_FIRST_ROUND)
+    {
+        modeName = "DFlash Draft First Round";
+        LOG_INFO("DFlash Draft First Round mode: BlockSize=%d, InputLen=%d", args.blockSize, args.inputLen);
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
+
+        pastKVLenVec.assign(B, 0);
+
+        ELLM_CHECK(args.inputLen <= deployment.draft->maxSupportedInputLength,
+            "DFlash draft first round --inputLen (" + std::to_string(args.inputLen)
+                + ") exceeds the draft engine maximum supported input length ("
+                + std::to_string(deployment.draft->maxSupportedInputLength) + ")");
+        auto const& draftCacheConfig = resources->cacheManagers[kvCacheIndex]->getKVCacheManager().getConfig();
+        int64_t const requiredDraftCacheLength
+            = static_cast<int64_t>(args.inputLen) + static_cast<int64_t>(args.blockSize);
+        ELLM_CHECK(requiredDraftCacheLength <= static_cast<int64_t>(draftCacheConfig.maxSequenceLength),
+            "DFlash draft first round requires inputLen + blockSize (" + std::to_string(requiredDraftCacheLength)
+                + ") to fit the draft KV cache maximum sequence length ("
+                + std::to_string(draftCacheConfig.maxSequenceLength) + ")");
+
+        tensorMap = rt::TensorMap{};
+        DFlashDraftBenchParams const draftParams{/*.batchSize=*/B, /*.blockSize=*/args.blockSize,
+            /*.deltaLen=*/args.inputLen, /*.pastKVLen=*/0, /*.seed=*/args.seed};
+        buildDFlashDraftTensorMap(deployment, draftParams, *resources->cacheManagers[kvCacheIndex], *resources, *io,
+            dflashDraftScratch, tensorMap);
+        fillDFlashDraftInputs(*io, *resources->cacheManagers[kvCacheIndex], dflashDraftScratch, draftParams, stream);
+
+        rt::InferenceDims const dims{
+            /*.batch=*/B,
+            /*.seqLen=*/args.blockSize,
+            /*.kvLen=*/deployment.draft->maxKVCacheCapacity,
+            /*.selectLen=*/args.inputLen,
+            /*.attnMaskSeqLen=*/args.blockSize,
+            /*.ropeBatch=*/1,
+            /*.packedMaskLen=*/static_cast<int64_t>(divUp(args.blockSize, 32)),
+            /*.startIndexLen=*/B,
+        };
+
+        resetState = [&]() {
+            std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+        };
+        step = [&, dims]() {
+            if (!executor->prepare(kPrefillProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
+        };
+        captureGraph = [&, dims]() {
+            resetState();
+            if (!executor->prepare(kPrefillProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
+        };
+    }
+    else if (args.mode == BenchMode::kDFLASH_VERIFY)
+    {
+        modeName = "DFlash Verify";
+        LOG_INFO("DFlash Verify mode: VerifyTreeSize=%d, PastKVLen=%d", args.verifyTreeSize, args.pastKVLen);
+        LOG_INFO(args.noCudaGraph ? "CUDA graph disabled; using non-CUDA-graph execution" : "CUDA graph enabled");
+
+        pastKVLenVec.assign(B, args.pastKVLen);
+
+        check::check(io->inputsEmbeds.reshape({B, args.verifyTreeSize, deployment.base.hiddenSize}),
+            "inputsEmbeds reshape failed");
+        fillRandomData(io->inputsEmbeds, -1.0F, 1.0F, nvinfer1::DataType::kHALF, args.seed);
+
+        check::check(io->packedAttentionMask.reshape(
+                         {B, args.verifyTreeSize, static_cast<int64_t>(divUp(args.verifyTreeSize, 32))}),
+            "packedAttentionMask reshape failed");
+        check::check(
+            io->specDecodePositionIds.reshape({B, args.verifyTreeSize}), "specDecodePositionIds reshape failed");
+        check::check(io->selectTokenIndices.reshape({B, args.verifyTreeSize}), "selectTokenIndices reshape failed");
+        check::check(io->contextLengths.reshape({B}), "contextLengths reshape failed");
+
+        if (deepstack)
+        {
+            deepstack->useZeroTarget(tensorMap);
+        }
+
+        auto const dims = deployment.base.specVerifyDims(B, args.verifyTreeSize);
+
+        resetState = [&]() {
+            std::memcpy(reuseKVCacheLengths.rawPointer(), pastKVLenVec.data(), pastKVLenVec.size() * sizeof(int32_t));
+            resources->cacheManagers[kvCacheIndex]->resetForNewSequences(reuseKVCacheLengths, stream);
+        };
+
+        // Prepare valid verification metadata once, outside the timed loop.  A
+        // linear causal tree is a safe deterministic tree for both linear and
+        // DDTree-capable engines, and the production kernel supplies identity
+        // INT64 select indices plus matching positions, mask, and context lengths.
+        resetState();
+        kernel::launchDFlashPrepareBaseVerifyInputs(
+            resources->cacheManagers[kvCacheIndex]->getKVCacheLengths().dataPointer<int32_t>(), args.verifyTreeSize,
+            io->packedAttentionMask.dataPointer<int32_t>(), io->specDecodePositionIds.dataPointer<int32_t>(),
+            io->selectTokenIndices.dataPointer<int64_t>(), io->contextLengths.dataPointer<int32_t>(), B, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        step = [&, dims]() {
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->execute(stream);
+        };
+        captureGraph = [&, dims]() {
+            resetState();
+            if (!executor->prepare(kDecodeProfile, dims, tensorMap, stream))
+                return false;
+            return executor->captureGraph(stream);
+        };
+    }
+    else if (args.mode == BenchMode::kDFLASH_DDTREE_BUILD)
+    {
+        ELLM_CHECK(deployment.draft.has_value(), "DFlash DDTree build requires a draft engine configuration");
+        ELLM_CHECK(args.batchSize <= deployment.maxRuntimeBatchSize(),
+            "DFlash DDTree batchSize (" + std::to_string(args.batchSize)
+                + ") exceeds the deployment maximum batch size (" + std::to_string(deployment.maxRuntimeBatchSize())
+                + ")");
+        ELLM_CHECK(args.blockSize > 1, "DFlash DDTree build requires blockSize > 1");
+        ELLM_CHECK(args.verifyTreeSize <= deployment.base.maxVerifyTreeSize,
+            "DFlash DDTree verify size (" + std::to_string(args.verifyTreeSize)
+                + ") exceeds the base configuration maximum (" + std::to_string(deployment.base.maxVerifyTreeSize)
+                + ")");
+        ELLM_CHECK(args.candidateTopK > 0 && args.candidateTopK <= kernel::kDDTreeMaxCandidateTopK,
+            "DFlash DDTree candidateTopK must be in [1, " + std::to_string(kernel::kDDTreeMaxCandidateTopK) + "]");
+        ELLM_CHECK(args.candidateTopK < args.verifyTreeSize,
+            "DFlash DDTree candidateTopK must be less than verifyTreeSize because the root consumes one node");
+
+        rt::LLMEngineConfig const& draftCfg = *deployment.draft;
+        int32_t const draftVocabSize = draftCfg.outputVocabSize;
+        ELLM_CHECK(draftCfg.reducedVocabSize == 0 && draftVocabSize == draftCfg.vocabSize,
+            "DFlash DDTree build requires a full-vocabulary draft because no draft vocabulary map is loaded");
+        ELLM_CHECK(args.candidateTopK <= draftVocabSize,
+            "DFlash DDTree candidateTopK must not exceed the draft vocabulary size");
+
+        int64_t const requiredBaseCacheLength
+            = static_cast<int64_t>(args.pastKVLen) + static_cast<int64_t>(args.verifyTreeSize);
+        ELLM_CHECK(requiredBaseCacheLength <= static_cast<int64_t>(deployment.base.maxKVCacheCapacity),
+            "DFlash DDTree requires pastKVLen + verifyTreeSize (" + std::to_string(requiredBaseCacheLength)
+                + ") to fit the base KV cache maximum sequence length ("
+                + std::to_string(deployment.base.maxKVCacheCapacity) + ")");
+
+        modeName = "DFlash DDTree Build";
+        LOG_INFO(
+            "DFlash DDTree Build mode: VerifyTreeSize=%d, CandidateTopK=%d, BlockSize=%d, DraftVocabSize=%d, "
+            "PastKVLen=%d",
+            args.verifyTreeSize, args.candidateTopK, args.blockSize, draftVocabSize, args.pastKVLen);
+        LOG_INFO("CUDA graph disabled; DDTree build runs as an uncaptured production kernel call");
+
+        ddtreeScratch = std::make_unique<DDTreeBuildScratch>(
+            allocateDDTreeBuildScratch(B, args.blockSize, draftVocabSize, args.verifyTreeSize, args.candidateTopK));
+        fillRandomData(ddtreeScratch->draftLogits, -1.0F, 1.0F, nvinfer1::DataType::kFLOAT, args.seed);
+        fillInt32(ddtreeScratch->lastAcceptedTokens, 0);
+        fillInt32(ddtreeScratch->baseKVCacheLengths, args.pastKVLen);
+
+        resetState = []() {};
+        step = [&]() {
+            DDTreeBuildScratch& scratch = *ddtreeScratch;
+            kernel::DDTreeBuildParams const buildParams{
+                {scratch.draftLogits, scratch.lastAcceptedTokens, scratch.baseKVCacheLengths, nullptr},
+                {scratch.treeTokenIds, scratch.treeDepths, scratch.treeParentIds, scratch.treeNodeScores,
+                    scratch.validCounts, scratch.verifyTokenIds, scratch.specDecodePositionIds,
+                    scratch.packedAttentionMask, scratch.verifyTreeMask, scratch.contextLengths,
+                    scratch.selectTokenIndices},
+                args.candidateTopK, scratch.workspace.rawPointer(),
+                static_cast<size_t>(scratch.workspace.getMemoryCapacity()), stream};
+            // Drain any pre-existing error state so the post-launch check reflects
+            // only this launch, not a stale error from earlier CUDA calls.
+            (void) cudaGetLastError();
+            kernel::ddtreeBuild(buildParams);
+            cudaError_t const launchStatus = cudaPeekAtLastError();
+            if (launchStatus != cudaSuccess)
+            {
+                LOG_ERROR("DFlash DDTree build launch failed: %s", cudaGetErrorString(launchStatus));
+                return false;
+            }
+            // Force a sync to catch mid-execution kernel failures; cudaPeekAtLastError
+            // above only surfaces launch-config errors, not in-flight faults.
+            cudaError_t const execStatus = cudaStreamSynchronize(stream);
+            if (execStatus != cudaSuccess)
+            {
+                LOG_ERROR("DFlash DDTree build execution failed: %s", cudaGetErrorString(execStatus));
+                return false;
+            }
+            return true;
         };
     }
 

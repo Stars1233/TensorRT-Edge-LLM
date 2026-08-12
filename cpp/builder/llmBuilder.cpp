@@ -21,6 +21,7 @@
 #include "common/cudaUtils.h"
 #include "common/fileUtils.h"
 #include "common/logger.h"
+#include "common/pagedKvTypes.h"
 #include "common/ropeUtils.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
@@ -39,53 +40,6 @@ namespace trt_edgellm
 {
 namespace builder
 {
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
-namespace
-{
-
-void appendLunowudFlag(std::string& flags, std::string const& flag)
-{
-    if (flags.find(flag) != std::string::npos)
-    {
-        return;
-    }
-    if (!flags.empty())
-    {
-        flags += ' ';
-    }
-    flags += flag;
-}
-
-std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
-{
-    std::string lunowudFlags;
-    char const* existingLunowud = std::getenv("__LUNOWUD");
-    if (existingLunowud)
-    {
-        lunowudFlags = existingLunowud;
-    }
-#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
-    appendLunowudFlag(lunowudFlags, "-peep:match_dual_gemm=off");
-#endif
-#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 15)
-    appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
-    appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
-    appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
-    if (maxBatchSize == 1)
-    {
-        appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
-    }
-#endif
-    if (existingLunowud || !lunowudFlags.empty())
-    {
-        setenv("__LUNOWUD", lunowudFlags.c_str(), 1);
-    }
-    return lunowudFlags;
-}
-
-} // namespace
-#endif
-
 namespace
 {
 
@@ -111,12 +65,13 @@ bool isSpecDecodeDraft(Json const& config, char const* type)
 
 bool isValidSpecDecodeType(std::string const& type)
 {
-    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "gemma4_mtp";
+    return type == "none" || type == "mtp" || type == "eagle3" || type == "dflash" || type == "dspark"
+        || type == "gemma4_mtp";
 }
 
 bool isValidEngineRole(std::string const& role)
 {
-    return role == "llm" || role == "base" || role == "draft";
+    return role == "llm" || role == "base" || role == "draft" || role == "dllm";
 }
 
 bool hasInputBinding(nvinfer1::INetworkDefinition const& network, char const* inputName)
@@ -168,13 +123,11 @@ bool LLMBuilder::build()
     std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
         + std::to_string(NV_TENSORRT_PATCH);
     LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
-#if NV_TENSORRT_MAJOR >= 11 || NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
-    std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
+    std::string const lunowudFlags = applyCompileWorkarounds(mBuilderConfig.maxBatchSize);
     if (!lunowudFlags.empty())
     {
         LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
     }
-#endif
 
     // Load plugin library
     auto pluginHandles = loadEdgellmPluginLib();
@@ -182,6 +135,23 @@ bool LLMBuilder::build()
     // Parse model config
     if (!parseConfig())
     {
+        return false;
+    }
+
+    int64_t const minimumActivePages
+        = rt::computeMinimumKvPoolPages(mBuilderConfig.maxBatchSize, mBuilderConfig.maxKVCacheCapacity);
+    int64_t const kvPoolPages = mBuilderConfig.resolvedKVPoolPages();
+    bool const hasExtraRetainedPages = kvPoolPages > minimumActivePages;
+    std::string const mode = specDecodeType(mModelConfig);
+    bool const supportsCrossRequestRetention
+        = mNbKVCacheInputs > 0 && (mode == "none" || (mode == "eagle3" && mNumLinearAttnLayers == 0));
+    if (hasExtraRetainedPages && !supportsCrossRequestRetention)
+    {
+        LOG_ERROR(
+            "maxKVPoolPages=%ld adds extra retained pages for cross-request retention, but the engine configuration "
+            "(engine_role=%s, spec_decode_type=%s, num_linear_attn_layers=%d) does not support cross-request "
+            "retention. Use maxKVPoolPages=0 (resolved minimum active pages=%ld).",
+            kvPoolPages, engineRole(mModelConfig).c_str(), mode.c_str(), mNumLinearAttnLayers, minimumActivePages);
         return false;
     }
 
@@ -210,6 +180,33 @@ bool LLMBuilder::build()
     if (!parser)
     {
         return false;
+    }
+
+    // DFlash/DSpark drafts use DFlashTargetKVCacheUpdate, which needs pages_per_slot
+    // (capPadded / kTOKENS_PER_PAGE) to split its pool-shaped past_key_value binding's
+    // numPages back into (maxBatch, cap). That fact is builder-only
+    // (mBuilderConfig.maxKVCacheCapacity), unavailable at ONNX-export time, and this
+    // plugin's concrete class is intentionally not linked into the builder (plugins are
+    // opaque .so modules, loaded via EDGELLM_PLUGIN_PATH -- see common/trtUtils.h).
+    // Resolve the plugin's exported configuration hook via dlsym on the already-loaded
+    // handle instead of adding a new link dependency.
+    if (isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "dspark"))
+    {
+        using ConfigurePagesPerSlotFn = bool (*)(nvinfer1::INetworkDefinition*, int32_t);
+        auto* configureFn = reinterpret_cast<ConfigurePagesPerSlotFn>(
+            dlsym(pluginHandles.get(), "edgellm_dflash_configure_pages_per_slot"));
+        if (configureFn == nullptr)
+        {
+            LOG_ERROR(
+                "Failed to resolve edgellm_dflash_configure_pages_per_slot from the plugin library: %s", dlerror());
+            return false;
+        }
+        int32_t const pagesPerSlot = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        if (!configureFn(network.get(), pagesPerSlot))
+        {
+            LOG_ERROR("Failed to configure DFlashTargetKVCacheUpdate plugin pages_per_slot=%d", pagesPerSlot);
+            return false;
+        }
     }
 
     // Print network information
@@ -260,6 +257,10 @@ bool LLMBuilder::build()
     {
         engineFileName = "spec_base.engine";
     }
+    else if (mIsDiffusionBackbone)
+    {
+        engineFileName = "dllm.engine";
+    }
     else
     {
         engineFileName = "llm.engine";
@@ -303,6 +304,11 @@ bool LLMBuilder::build()
         return false;
     }
 
+    if (!copyDSparkFiles())
+    {
+        return false;
+    }
+
     if (!copyVocabMappingFiles())
     {
         return false;
@@ -337,40 +343,55 @@ bool LLMBuilder::parseConfig()
     std::string const role = engineRole(mModelConfig);
     if (!isValidSpecDecodeType(specType))
     {
-        LOG_ERROR(
-            "Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, gemma4_mtp.", specType.c_str());
+        LOG_ERROR("Invalid spec_decode_type='%s'. Expected one of: none, mtp, eagle3, dflash, dspark, gemma4_mtp.",
+            specType.c_str());
         return false;
     }
     if (!isValidEngineRole(role))
     {
-        LOG_ERROR("Invalid engine_role='%s'. Expected one of: llm, base, draft.", role.c_str());
+        LOG_ERROR("Invalid engine_role='%s'. Expected one of: llm, base, draft, dllm.", role.c_str());
         return false;
     }
-    if ((role == "llm") != (specType == "none"))
+    bool const isSpecRole = role == "base" || role == "draft";
+    mIsDiffusionBackbone = role == "dllm";
+    if ((role == "llm" || role == "dllm") && specType != "none")
     {
         LOG_ERROR(
-            "Invalid config: engine_role='%s' with spec_decode_type='%s'. LLM engines require "
-            "spec_decode_type=none; speculative base/draft engines require a non-none spec_decode_type.",
+            "Invalid config: engine_role='%s' with spec_decode_type='%s'. Non-speculative engines require "
+            "spec_decode_type=none.",
             role.c_str(), specType.c_str());
         return false;
     }
+    if (isSpecRole && specType == "none")
+    {
+        LOG_ERROR(
+            "Invalid config: engine_role='%s' with spec_decode_type='%s'. Speculative base/draft engines require "
+            "a non-none spec_decode_type.",
+            role.c_str(), specType.c_str());
+        return false;
+    }
+    bool const nonSpecBuild = !mBuilderConfig.specDraft && !mBuilderConfig.specBase;
+    bool const nonSpecRole = role == "llm" || role == "dllm";
     if ((mBuilderConfig.specDraft && role != "draft") || (mBuilderConfig.specBase && role != "base")
-        || (!mBuilderConfig.specDraft && !mBuilderConfig.specBase && role != "llm"))
+        || (nonSpecBuild && !nonSpecRole))
     {
         LOG_ERROR(
             "Build mode does not match config: engine_role='%s' (use --specBase for base, --specDraft for "
-            "draft, and neither flag for vanilla LLM).",
+            "draft, and neither flag for non-speculative engines).",
             role.c_str());
         return false;
     }
 
     mHiddenSize = mModelConfig["hidden_size"].get<int32_t>();
-    // For MTP draft, base model outputs hidden_size (1x); for EAGLE3 draft, it outputs hidden_size * 3.
+    // MTP draft consumes one target hidden state. Other draft modes may
+    // concatenate multiple target layers; prefer the exported contract when it
+    // is present and keep the legacy EAGLE3 hidden_size*3 fallback below.
     if (isSpecDecodeDraft(mModelConfig, "mtp"))
     {
         mTargetModelOutputHiddenDim = mHiddenSize;
     }
-    else if ((isSpecDecodeDraft(mModelConfig, "dflash") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
+    else if ((isSpecDecodeDraft(mModelConfig, "eagle3") || isSpecDecodeDraft(mModelConfig, "dflash")
+                 || isSpecDecodeDraft(mModelConfig, "dspark") || isSpecDecodeDraft(mModelConfig, "gemma4_mtp"))
         && mModelConfig.contains("base_model_hidden_size"))
     {
         mTargetModelOutputHiddenDim = mModelConfig["base_model_hidden_size"].get<int32_t>();
@@ -439,8 +460,22 @@ bool LLMBuilder::parseConfig()
     mConvDim = mModelConfig.value("conv_dim", 0);
     mConvKernel = mModelConfig.value("conv_kernel", 0);
 
-    // For hybrid models, only attention layers have KV caches
-    if (mNumLinearAttnLayers > 0)
+    // Only attention layers own a KV cache. Prefer the authoritative
+    // per-attention-layer kv_layer_configs count; it is the only signal that is
+    // correct for hybrid drafts whose non-attention layers are neither mamba nor
+    // linear-attention (e.g. the MTP attention+MoE draft, num_linear_attn == 0).
+    if (mModelConfig.contains("kv_layer_configs") && mModelConfig["kv_layer_configs"].is_array())
+    {
+        mNbKVCacheInputs = 0;
+        for (auto const& layerConfig : mModelConfig["kv_layer_configs"])
+        {
+            if (layerConfig.is_object())
+            {
+                ++mNbKVCacheInputs;
+            }
+        }
+    }
+    else if (mNumLinearAttnLayers > 0)
     {
         mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
     }
@@ -483,6 +518,12 @@ bool LLMBuilder::parseConfig()
             globalHeadSize);
     }
 
+    if (mModelConfig.contains("diffusion_config") && mModelConfig["diffusion_config"].is_object())
+    {
+        mDiffusionCanvasLength = mModelConfig["diffusion_config"].value("canvas_length", static_cast<int64_t>(0));
+    }
+    mDiffusionCanvasLength = mModelConfig.value("diffusion_canvas_length", mDiffusionCanvasLength);
+
     return true;
 }
 
@@ -524,8 +565,23 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
         return true;
     }
 
+    if (isSpecDecodeDraft(mModelConfig, "dspark"))
+    {
+        result &= setupDSparkDraftProfiles(*contextProfile, *generationProfile);
+        if (!result)
+        {
+            LOG_ERROR("Failed to setup DSpark draft optimization profiles");
+            return false;
+        }
+        LOG_DEBUG("%s", printOptimizationProfile(contextProfile, "context_profile", &network).c_str());
+        LOG_DEBUG("%s", printOptimizationProfile(generationProfile, "generation_profile", &network).c_str());
+        config.addOptimizationProfile(contextProfile);
+        config.addOptimizationProfile(generationProfile);
+        return true;
+    }
+
     // Setup common profiles
-    result &= setupCommonProfiles(*contextProfile, *generationProfile);
+    result &= setupCommonProfiles(*contextProfile, *generationProfile, network);
     result &= setupRopeProfiles(*contextProfile, *generationProfile, network);
 
     // Setup model-specific profiles
@@ -533,13 +589,18 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     {
         result &= setupSpecDecodeProfiles(*contextProfile, *generationProfile);
     }
+    else if (mIsDiffusionBackbone)
+    {
+        result &= setupDiffusionBackboneProfiles(*contextProfile, *generationProfile, network);
+    }
     else
     {
         result &= setupVanillaProfiles(*contextProfile, *generationProfile);
     }
 
-    // Setup hybrid state profiles for MTP/DFlash base models.
-    if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash"))
+    // Setup hybrid state profiles for MTP/DFlash/DSpark base models.
+    if (isSpecDecodeBase(mModelConfig, "mtp") || isSpecDecodeBase(mModelConfig, "dflash")
+        || isSpecDecodeBase(mModelConfig, "dspark"))
     {
         result &= setupIntermediateRecurrentStateProfiles(*contextProfile, *generationProfile);
         result &= setupIntermediateConvStateProfiles(*contextProfile, *generationProfile);
@@ -575,8 +636,8 @@ bool LLMBuilder::setupLLMOptimizationProfiles(
     return true;
 }
 
-bool LLMBuilder::setupCommonProfiles(
-    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+bool LLMBuilder::setupCommonProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
 {
     bool result = true;
 
@@ -586,13 +647,24 @@ bool LLMBuilder::setupCommonProfiles(
     result &= setOptimizationProfile(&generationProfile, binding_names::kContextLengths, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
-    // For KVCacheStartIndex, we use zero shape to indicate the kvcache is empty for all sequences in the batch.
-    // This can help distinguish the normal prefill and chunked prefill execution.
-    result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, createDims({0}),
+    // Autoregressive engines use shape [0] as the initial-prefill empty-KV sentinel.
+    // DiffusionGemma keeps kvcache_start_index materialized and uses context_mask_selector as its mask sentinel.
+    nvinfer1::Dims const contextKvStartMin = mIsDiffusionBackbone ? createDims({1}) : createDims({0});
+    result &= setOptimizationProfile(&contextProfile, binding_names::kKVCacheStartIndex, contextKvStartMin,
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kKVCacheStartIndex, createDims({1}),
         createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
+    // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Per-request page table (default
+    // identity => bit-equivalent to the non-paged path). Column count is fixed
+    // (maxPagesPerSeq = ceil(maxKVCacheCapacity / kTOKENS_PER_PAGE)); batch is dynamic.
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+    result &= setOptimizationProfile(&contextProfile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+        createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+        createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kKVPageTable,
+        createDims({1, 2, maxPagesPerSeq}), createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+        createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
@@ -605,6 +677,17 @@ bool LLMBuilder::setupCommonProfiles(
     // Conv state profiles for recurrent causal conv1d layers
     result &= setupConvStateProfiles(&contextProfile, &generationProfile);
     LOG_DEBUG("Conv state profiles done.");
+
+    // skip_softmax_scale: [S] INT8 shape-only runtime skip-softmax override carrier.
+    // dim0 IS the integer scale factor S; a meaningful S satisfies lambda < 1, i.e.
+    // S < context length <= maxKVCacheCapacity.
+    if (hasInputBinding(network, binding_names::kSkipSoftmaxScale))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kSkipSoftmaxScale, createDims({0}),
+            createDims({0}), createDims({mBuilderConfig.maxKVCacheCapacity}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kSkipSoftmaxScale, createDims({0}),
+            createDims({0}), createDims({mBuilderConfig.maxKVCacheCapacity}));
+    }
 
     return result;
 }
@@ -642,6 +725,62 @@ bool LLMBuilder::setupRopeProfiles(nvinfer1::IOptimizationProfile& contextProfil
     return result;
 }
 
+bool LLMBuilder::setupDiffusionBackboneProfiles(nvinfer1::IOptimizationProfile& contextProfile,
+    nvinfer1::IOptimizationProfile& generationProfile, nvinfer1::INetworkDefinition const& network)
+{
+    bool result = true;
+
+    int64_t const maxCanvasLen = std::max<int64_t>(1, std::max(mDiffusionCanvasLength, mBuilderConfig.maxInputLen));
+    int64_t const optPromptLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen / 2);
+
+    result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, optPromptLen, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}));
+
+    result &= setOptimizationProfile(&contextProfile, binding_names::kPhaseIsEncoder, createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kPhaseIsEncoder, createDims({1}),
+        createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+
+    result &= setOptimizationProfile(&contextProfile, binding_names::kSelectTokenIndices, createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
+    result &= setOptimizationProfile(&generationProfile, binding_names::kSelectTokenIndices, createDims({1, 1}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}),
+        createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}));
+
+    if (hasInputBinding(network, binding_names::kContextMaskSelector))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kContextMaskSelector, createDims({0}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kContextMaskSelector, createDims({0}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+    }
+
+    if (hasInputBinding(network, binding_names::kCanvasIds))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kCanvasIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optPromptLen}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kCanvasIds, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}),
+            createDims({mBuilderConfig.maxBatchSize, maxCanvasLen}));
+    }
+    if (hasInputBinding(network, binding_names::kPrevSelfConditioningEmbeds))
+    {
+        result &= setOptimizationProfile(&contextProfile, binding_names::kPrevSelfConditioningEmbeds,
+            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optPromptLen, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
+        result &= setOptimizationProfile(&generationProfile, binding_names::kPrevSelfConditioningEmbeds,
+            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxCanvasLen, mHiddenSize}));
+    }
+
+    return result;
+}
+
 bool LLMBuilder::setupVanillaProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
@@ -674,26 +813,32 @@ bool LLMBuilder::setupVanillaProfiles(
     return result;
 }
 
+int64_t LLMBuilder::effectiveOptTokens(int64_t maxToken) const
+{
+    return std::max<int64_t>(1, maxToken);
+}
+
 bool LLMBuilder::setupSpecDecodeProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
 
     int const maxTokens = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+    int const optTokens = static_cast<int>(effectiveOptTokens(maxTokens));
 
     // Input embeddings
     result &= setOptimizationProfile(&contextProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+        createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
         createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
     // Last token IDs - 2D shape [batch_size, num_selected_tokens]
     result &= setOptimizationProfile(&contextProfile, binding_names::kLastTokenIds, createDims({1, 1}),
         createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
     result &= setOptimizationProfile(&generationProfile, binding_names::kLastTokenIds, createDims({1, 1}),
-        createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+        createDims({mBuilderConfig.maxBatchSize, optTokens}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
 
     if (mBuilderConfig.specDraft)
     {
@@ -703,7 +848,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mHiddenSize}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kDraftModelHiddenStates,
-            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+            createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
 
         // Hidden states input
@@ -713,7 +858,7 @@ bool LLMBuilder::setupSpecDecodeProfiles(
             createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mTargetModelOutputHiddenDim}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kBaseModelHiddenStates,
             createDims({1, 1, mTargetModelOutputHiddenDim}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, optTokens, mTargetModelOutputHiddenDim}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens, mTargetModelOutputHiddenDim}));
     }
 
@@ -724,16 +869,15 @@ bool LLMBuilder::setupSpecDecodeProfiles(
         result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1, 1}), createDims({mBuilderConfig.maxBatchSize, 1, 1}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kAttentionMask, createDims({1, 1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2,
-                static_cast<int64_t>(divUp(maxTokens / 2, attnMaskAlignSize) * attnMaskAlignSize)}),
+            createDims({mBuilderConfig.maxBatchSize, optTokens,
+                static_cast<int64_t>(divUp(optTokens, attnMaskAlignSize) * attnMaskAlignSize)}),
             createDims({mBuilderConfig.maxBatchSize, maxTokens,
                 static_cast<int64_t>(divUp(maxTokens, attnMaskAlignSize) * attnMaskAlignSize)}));
 
         result &= setOptimizationProfile(&contextProfile, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, 1}));
         result &= setOptimizationProfile(&generationProfile, binding_names::kAttentionPosId, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens / 2}),
-            createDims({mBuilderConfig.maxBatchSize, maxTokens}));
+            createDims({mBuilderConfig.maxBatchSize, optTokens}), createDims({mBuilderConfig.maxBatchSize, maxTokens}));
     }
 
     return result;
@@ -748,8 +892,11 @@ bool LLMBuilder::setupDFlashDraftProfiles(
     int64_t const optDraftTokens = maxDraftTokens;
     int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
     int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
-    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens;
-    int64_t const optDecodeTargetHiddenLen = maxDraftTokens;
+    // DFlash verifies [anchor] + proposal tokens and can accept the base
+    // bonus token, so the next draft round may need one more target-hidden row
+    // than the proposal block.
+    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens + 1;
+    int64_t const optDecodeTargetHiddenLen = maxDraftTokens + 1;
 
     int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
     int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
@@ -778,6 +925,13 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         // kvcache_start_index: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
+        // table (default identity); the draft's own KV cache above has no page table.
+        int32_t const maxPagesPerSeq
+            = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
         // dflash_delta_lengths: [batch]
         ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
@@ -789,25 +943,23 @@ bool LLMBuilder::setupDFlashDraftProfiles(
         ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
-        // KV cache per-layer: [batch, 2, numKVHeads, kv_capacity, headDim]
+        // KV cache per-layer: DFlash's own combined draft cache, now unified on the paged-pool
+        // contract shared with the AttentionPlugin binding: [2, numPages, kTOKENS_PER_PAGE,
+        // numKVHeads, headDim] (single fixed numPages value, same as setupKVCacheProfiles).
+        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages and
+        // the pages_per_slot attribute the builder configures via edgellm_dflash_configure_pages_per_slot
+        // (see build()); this cache still has no page table of its own.
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
             int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
             std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
             std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
-            ok &= setOptimizationProfile(&profile, pastName.c_str(),
-                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}));
-            ok &= setOptimizationProfile(&profile, presentName.c_str(),
-                createDims({1, 2, layerNumKVHeads, 1, layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}),
-                createDims({mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity,
-                    layerHeadSize}));
+            nvinfer1::Dims const kvCacheShape
+                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+            ok &= setOptimizationProfile(&profile, pastName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+            ok &= setOptimizationProfile(&profile, presentName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
         }
         return ok;
     };
@@ -841,6 +993,15 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
         ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
             createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
 
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32 — the TARGET pool's page table
+        // (the assistant reads the target's paged KV pool; the runtime binds the target's
+        // identity table here).
+        int32_t const maxPagesPerSeq
+            = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+
         if (auto const rotaryDim = getStaticInputDim(network, binding_names::kRopeCosSinSliding, 2))
         {
             ok &= setupRopeProfile(profile, binding_names::kRopeCosSinSliding, *rotaryDim);
@@ -854,16 +1015,18 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
             ok &= setupRopeProfile(profile, binding_names::kRopeCosSin, *rotaryDim);
         }
 
+        // KV cache per-layer: the assistant binds the TARGET model's paged pool tensors
+        // directly ([2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]), so the profile
+        // uses the same fixed page count as the target's setupKVCacheProfiles.
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
         for (int i = 0; i < mNbKVCacheInputs; ++i)
         {
             int64_t const layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
             int64_t const layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-            nvinfer1::Dims const minKVCacheShape = createDims({1, 2, layerNumKVHeads, 1, layerHeadSize});
-            nvinfer1::Dims const optKVCacheShape = createDims(
-                {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-            nvinfer1::Dims const maxKVCacheShape = optKVCacheShape;
-            ok &= setOptimizationProfile(&profile, binding_names::formatKVCacheName(i, true).c_str(), minKVCacheShape,
-                optKVCacheShape, maxKVCacheShape);
+            nvinfer1::Dims const kvCacheShape
+                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+            ok &= setOptimizationProfile(
+                &profile, binding_names::formatKVCacheName(i, true).c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
         }
 
         return ok;
@@ -871,6 +1034,90 @@ bool LLMBuilder::setupGemma4MTPDraftProfiles(nvinfer1::IOptimizationProfile& con
 
     result &= setupOneProfile(contextProfile);
     result &= setupOneProfile(generationProfile);
+    return result;
+}
+
+bool LLMBuilder::setupDSparkDraftProfiles(
+    nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
+{
+    bool result = true;
+
+    int64_t const maxDraftTokens = std::max<int64_t>(1, mBuilderConfig.maxDraftTreeSize);
+    int64_t const optDraftTokens = maxDraftTokens;
+    int64_t const maxPrefillTargetHiddenLen = std::max<int64_t>(1, mBuilderConfig.maxInputLen);
+    int64_t const optPrefillTargetHiddenLen = std::max<int64_t>(1, maxPrefillTargetHiddenLen / 2);
+    // DSpark verifies [anchor] + proposal tokens and can accept the base bonus token,
+    // so the next draft round may need one more target-hidden row than the proposal block.
+    int64_t const maxDecodeTargetHiddenLen = maxDraftTokens + 1;
+    int64_t const optDecodeTargetHiddenLen = maxDraftTokens + 1;
+
+    int64_t const packedMaskLen = static_cast<int64_t>(divUp(maxDraftTokens, 32));
+    int64_t const optPackedMaskLen = static_cast<int64_t>(divUp(optDraftTokens, 32));
+
+    // Profile 0 handles round-0/system-prompt cache update, where target hidden spans the prompt.
+    // Profile 1 handles steady-state block proposal, where target hidden delta is bounded by block size.
+    auto setupOneProfile = [&](nvinfer1::IOptimizationProfile& profile, int64_t optTargetHiddenLen,
+                               int64_t maxTargetHiddenLen) {
+        bool ok = true;
+        // inputs_embeds: [batch, block_seq, hiddenSize]
+        ok &= setOptimizationProfile(&profile, binding_names::kInputsEmbeds, createDims({1, 1, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, mHiddenSize}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, mHiddenSize}));
+        // dflash_target_hidden_concat: [batch, delta_seq, baseOutputHiddenDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashTargetHiddenConcat,
+            createDims({1, 1, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, optTargetHiddenLen, mTargetModelOutputHiddenDim}),
+            createDims({mBuilderConfig.maxBatchSize, maxTargetHiddenLen, mTargetModelOutputHiddenDim}));
+        // rope_rotary_cos_sin: [1, kv_capacity, rotaryDim]
+        ok &= setOptimizationProfile(&profile, binding_names::kRopeCosSin, createDims({1, 1, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}),
+            createDims({1, mBuilderConfig.maxKVCacheCapacity, mRotaryDim}));
+        // context_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kContextLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kvcache_start_index: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kKVCacheStartIndex, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // kv_page_table: [batch, 2, maxPagesPerSeq] int32. Proposal self-attention's page
+        // table (default identity); the draft's own KV cache above has no page table.
+        int32_t const maxPagesPerSeq
+            = rt::computeMaxPagesPerSeq(static_cast<int32_t>(mBuilderConfig.maxKVCacheCapacity));
+        ok &= setOptimizationProfile(&profile, binding_names::kKVPageTable, createDims({1, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}),
+            createDims({mBuilderConfig.maxBatchSize, 2, maxPagesPerSeq}));
+        // dflash_delta_lengths: [batch]
+        ok &= setOptimizationProfile(&profile, binding_names::kDFlashDeltaLengths, createDims({1}),
+            createDims({mBuilderConfig.maxBatchSize}), createDims({mBuilderConfig.maxBatchSize}));
+        // attention_mask: [batch, block_seq, packed_mask_len]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionMask, createDims({1, 1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens, optPackedMaskLen}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens, packedMaskLen}));
+        // attention_pos_id: [batch, block_seq]
+        ok &= setOptimizationProfile(&profile, binding_names::kAttentionPosId, createDims({1, 1}),
+            createDims({mBuilderConfig.maxBatchSize, optDraftTokens}),
+            createDims({mBuilderConfig.maxBatchSize, maxDraftTokens}));
+        // KV cache per-layer: DSpark's own combined draft cache uses the same paged-pool
+        // contract as AttentionPlugin: [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
+        // DFlashTargetKVCacheUpdatePlugin recovers maxBatch/cap at enqueue time from numPages
+        // and the pages_per_slot attribute configured above; this cache still has no page table
+        // of its own.
+        int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
+        for (int32_t i = 0; i < mNbKVCacheInputs; ++i)
+        {
+            int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
+            int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
+            std::string pastName = std::string(binding_names::kPastKeyValuesTemplate) + "_" + std::to_string(i);
+            std::string presentName = std::string(binding_names::kPresentKeyValuesTemplate) + "_" + std::to_string(i);
+            nvinfer1::Dims const kvCacheShape
+                = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
+            ok &= setOptimizationProfile(&profile, pastName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+            ok &= setOptimizationProfile(&profile, presentName.c_str(), kvCacheShape, kvCacheShape, kvCacheShape);
+        }
+        return ok;
+    };
+
+    result &= setupOneProfile(contextProfile, optPrefillTargetHiddenLen, maxPrefillTargetHiddenLen);
+    result &= setupOneProfile(generationProfile, optDecodeTargetHiddenLen, maxDecodeTargetHiddenLen);
     return result;
 }
 
@@ -911,8 +1158,9 @@ bool LLMBuilder::setupPleProfiles(nvinfer1::IOptimizationProfile& contextProfile
         {
             int64_t const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            int64_t const optTokens = effectiveOptTokens(maxTokens);
             result &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1, pleHiddenSize}),
-                createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTokens / 2), pleHiddenSize}),
+                createDims({mBuilderConfig.maxBatchSize, optTokens, pleHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, pleHiddenSize}));
         }
         else
@@ -973,8 +1221,9 @@ bool LLMBuilder::setupDeepstackProfiles(nvinfer1::IOptimizationProfile& contextP
         {
             int const maxTokens
                 = mBuilderConfig.specDraft ? mBuilderConfig.maxDraftTreeSize : mBuilderConfig.maxVerifyTreeSize;
+            int const optTokens = static_cast<int>(effectiveOptTokens(maxTokens));
             result &= setOptimizationProfile(&generationProfile, deepstackInputName.c_str(),
-                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, maxTokens / 2, mHiddenSize}),
+                createDims({1, 1, mHiddenSize}), createDims({mBuilderConfig.maxBatchSize, optTokens, mHiddenSize}),
                 createDims({mBuilderConfig.maxBatchSize, maxTokens, mHiddenSize}));
         }
         else
@@ -998,7 +1247,7 @@ bool LLMBuilder::setupLmHeadWeightProfiles(nvinfer1::IOptimizationProfile& conte
 {
     bool result = true;
 
-    // Detect if lm_head_weight input exists (CodePredictor model)
+    // Detect if lm_head_weight input exists (gemma4 assistant)
     bool hasLmHeadWeight = false;
     for (int32_t idx = 0; idx < network.getNbInputs(); idx++)
     {
@@ -1118,21 +1367,26 @@ bool LLMBuilder::setupKVCacheProfiles(
     nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile)
 {
     bool result = true;
-    // KV cache shape is [B, 2, num_kv_heads, 0 to max_kv_cache_capacity, head_dim]
+    // Plugin path: paged pool binding [2, numPages, kTOKENS_PER_PAGE, num_kv_heads, head_dim].
+    // numPages is the exact engine-authoritative pool count for the life of the engine.
+    // maxKVPoolPages=0 resolves to the minimum active pages; a larger supported value adds pages retained
+    // across requests.
+    // "Empty vs non-empty" cache is conveyed by kvcache_start_index's own profile, not by this
+    // tensor's shape (the plugin reads numPages from dims.d[1], so the binding must always be
+    // pool-shaped).
+    int64_t const numPages = mBuilderConfig.resolvedKVPoolPages();
     for (int i = 0; i < mNbKVCacheInputs; ++i)
     {
+        // Per-layer dims mirror the runtime registry (kv_layer_configs): head size varies on
+        // Gemma4 today; the KV head count is per-layer for the same forward-compat reason.
         int64_t layerHeadSize = (!mPerLayerHeadSize.empty()) ? mPerLayerHeadSize[i] : mHeadSize;
         int64_t layerNumKVHeads = (!mPerLayerNumKVHeads.empty()) ? mPerLayerNumKVHeads[i] : mNumKVHeads;
-        nvinfer1::Dims minKVCacheShape = createDims({1, 2, layerNumKVHeads, 0, layerHeadSize});
-        nvinfer1::Dims optKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
-        nvinfer1::Dims maxKVCacheShape = createDims(
-            {mBuilderConfig.maxBatchSize, 2, layerNumKVHeads, mBuilderConfig.maxKVCacheCapacity, layerHeadSize});
+        nvinfer1::Dims kvCacheShape = createDims({2, numPages, rt::kTOKENS_PER_PAGE, layerNumKVHeads, layerHeadSize});
 
         result &= setOptimizationProfile(&contextProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            kvCacheShape, kvCacheShape, kvCacheShape);
         result &= setOptimizationProfile(&generationProfile, binding_names::formatKVCacheName(i, true).c_str(),
-            minKVCacheShape, optKVCacheShape, maxKVCacheShape);
+            kvCacheShape, kvCacheShape, kvCacheShape);
     }
 
     return result;
@@ -1208,21 +1462,25 @@ bool LLMBuilder::setupIntermediateRecurrentStateProfiles(
     bool result = true;
 
     // Intermediate recurrent state shape: [batch, seq_len, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
-    nvinfer1::Dims minShape = createDims({1, 1, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims optCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2,
-        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims maxCtxShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen,
-        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
-    nvinfer1::Dims optGenShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize / 2,
-        mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims minCtxShape
+        = createDims({1, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optCtxShape = createDims(
+        {mBuilderConfig.maxBatchSize, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims maxCtxShape = createDims(
+        {mBuilderConfig.maxBatchSize, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims minGenShape
+        = createDims({1, 0, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optGenShape
+        = createDims({mBuilderConfig.maxBatchSize, effectiveOptTokens(mBuilderConfig.maxVerifyTreeSize),
+            mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
     nvinfer1::Dims maxGenShape = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize,
         mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
 
     for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const name = binding_names::formatIntermediateRecurrentStateName(i);
-        result &= setOptimizationProfile(&contextProfile, name.c_str(), minShape, optCtxShape, maxCtxShape);
-        result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
+        result &= setOptimizationProfile(&contextProfile, name.c_str(), minCtxShape, optCtxShape, maxCtxShape);
+        result &= setOptimizationProfile(&generationProfile, name.c_str(), minGenShape, optGenShape, maxGenShape);
     }
 
     LOG_DEBUG("Set up intermediate recurrent state profiles for %d recurrent layers (MTP)", mNumLinearAttnLayers);
@@ -1240,21 +1498,20 @@ bool LLMBuilder::setupIntermediateConvStateProfiles(
     bool result = true;
 
     // Intermediate conv state shape: [batch, seq_len, conv_dim, conv_kernel]
-    nvinfer1::Dims minShape = createDims({1, 1, mConvDim, mConvKernel});
-    nvinfer1::Dims optCtxShape
-        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen / 2, mConvDim, mConvKernel});
-    nvinfer1::Dims maxCtxShape
-        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxInputLen, mConvDim, mConvKernel});
-    nvinfer1::Dims optGenShape
-        = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize / 2, mConvDim, mConvKernel});
+    nvinfer1::Dims minCtxShape = createDims({1, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims optCtxShape = createDims({mBuilderConfig.maxBatchSize, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims maxCtxShape = createDims({mBuilderConfig.maxBatchSize, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims minGenShape = createDims({1, 0, mConvDim, mConvKernel});
+    nvinfer1::Dims optGenShape = createDims(
+        {mBuilderConfig.maxBatchSize, effectiveOptTokens(mBuilderConfig.maxVerifyTreeSize), mConvDim, mConvKernel});
     nvinfer1::Dims maxGenShape
         = createDims({mBuilderConfig.maxBatchSize, mBuilderConfig.maxVerifyTreeSize, mConvDim, mConvKernel});
 
     for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const name = binding_names::formatIntermediateConvStateName(i);
-        result &= setOptimizationProfile(&contextProfile, name.c_str(), minShape, optCtxShape, maxCtxShape);
-        result &= setOptimizationProfile(&generationProfile, name.c_str(), minShape, optGenShape, maxGenShape);
+        result &= setOptimizationProfile(&contextProfile, name.c_str(), minCtxShape, optCtxShape, maxCtxShape);
+        result &= setOptimizationProfile(&generationProfile, name.c_str(), minGenShape, optGenShape, maxGenShape);
     }
 
     LOG_DEBUG("Set up intermediate conv state profiles for %d recurrent layers (MTP/DFlash)", mNumLinearAttnLayers);
@@ -1289,11 +1546,12 @@ bool LLMBuilder::setupLinearAttentionSpecVerifyProfiles(nvinfer1::IOptimizationP
         }
 
         int64_t const maxTreeTokens = std::max<int64_t>(1, mBuilderConfig.maxVerifyTreeSize);
+        int64_t const optTreeTokens = effectiveOptTokens(maxTreeTokens);
         bool ok = true;
         ok &= setOptimizationProfile(&contextProfile, inputName, createDims({1, 1}),
             createDims({mBuilderConfig.maxBatchSize, 1}), createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
         ok &= setOptimizationProfile(&generationProfile, inputName, createDims({1, 1}),
-            createDims({mBuilderConfig.maxBatchSize, std::max<int64_t>(1, maxTreeTokens / 2)}),
+            createDims({mBuilderConfig.maxBatchSize, optTreeTokens}),
             createDims({mBuilderConfig.maxBatchSize, maxTreeTokens}));
         return ok;
     };
@@ -1475,6 +1733,15 @@ bool LLMBuilder::copyTokenizerFiles()
         }
     }
 
+    // Optional (Qwen3-Next Omni TTS): friendly speaker aliases consumed by the runtime.
+    if (std::filesystem::exists(mOnnxDir / "voice_map.json"))
+    {
+        if (file_io::copyFile((mOnnxDir / "voice_map.json").string(), (mEngineDir / "voice_map.json").string()))
+        {
+            LOG_INFO("Copied voice_map.json");
+        }
+    }
+
     return allSuccess;
 }
 
@@ -1498,6 +1765,35 @@ bool LLMBuilder::copyEagleFiles()
     }
 
     return true;
+}
+
+bool LLMBuilder::copyDSparkFiles()
+{
+    if (!isSpecDecodeDraft(mModelConfig, "dspark"))
+    {
+        return true;
+    }
+
+    bool allSuccess = true;
+    char const* const requiredFiles[] = {
+        binding_names::kDSparkHeadsFileName,
+        binding_names::kDSparkHeadsInfoFileName,
+    };
+    for (auto const* filename : requiredFiles)
+    {
+        std::string const srcPath = (mOnnxDir / filename).string();
+        std::string const dstPath = (mEngineDir / filename).string();
+        if (file_io::copyFile(srcPath, dstPath))
+        {
+            LOG_INFO("Copied DSpark sidecar %s to %s", filename, dstPath.c_str());
+        }
+        else
+        {
+            LOG_ERROR("Failed to copy DSpark sidecar %s from %s to %s", filename, srcPath.c_str(), dstPath.c_str());
+            allSuccess = false;
+        }
+    }
+    return allSuccess;
 }
 
 bool LLMBuilder::copyVocabMappingFiles()

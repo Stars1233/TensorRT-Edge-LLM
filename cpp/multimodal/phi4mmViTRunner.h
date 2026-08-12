@@ -39,7 +39,6 @@ struct Phi4MMViTConfig
     int32_t numChannels{3};       //!< Image channels (RGB=3)
     int32_t outHiddenSize{0};     //!< Visual output hidden size (projection dim)
     int32_t imageTokenId{200010}; //!< Placeholder token id in text to be expanded into image tokens
-    int32_t vocabSize{0};         //!< Base vocabulary size; image ids start from vocabSize
     std::array<float, 3> imageMean{{0.5F, 0.5F, 0.5F}}; //!< Mean per channel used in normalize: (val/255 - mean)/std
     std::array<float, 3> imageStd{{0.5F, 0.5F, 0.5F}};  //!< Std per channel used in normalize
     int32_t minImageTokensPerImage{0};                  //!< Min visual tokens per image (for resize/grid selection)
@@ -78,7 +77,7 @@ public:
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
         tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut,
-        cudaStream_t stream, bool imageOnly = false) noexcept override;
+        cudaStream_t stream, bool imageOnly = false) override;
 
     //! \brief Run inference on the vision encoder and perform HD postprocess
     //! \param[in] stream CUDA stream for execution
@@ -102,12 +101,11 @@ private:
     //! \param[in] request LLM generation request containing images
     //! \param[out] imageTokenLengths Token lengths for each image
     //! \param[out] numImages Number of images per prompt
-    //! \param[in] doResize Whether to resize images
     //! \param[in] stream CUDA stream for execution
     //! \throws std::runtime_error if an image reshape fails, or the number of blocks is inconsistent
     void imagePreprocess(rt::LLMGenerationRequest const& request, std::vector<int64_t>& imageTokenLengths,
         std::vector<int64_t>& numImages, std::vector<std::vector<std::vector<int64_t>>>& imagesBlockGridHW,
-        bool doResize, cudaStream_t stream);
+        cudaStream_t stream);
 
     //! \brief Preprocess text portion of the request
     //! \param[in] request LLM generation request
@@ -121,19 +119,19 @@ private:
         std::vector<int64_t> const& numImages, std::vector<int64_t> const& imageTokenLengths,
         tokenizer::Tokenizer const* tokenizer);
 
-    //! \brief Copy and normalize one image, tile to blocks, and update token-length accounting
+    //! \brief Normalize the GPU-resident image, tile to blocks, and update token-length accounting
     //! \throws std::runtime_error if image not divisible into blocks
     void formatPatch(rt::imageUtils::ImageData const& image, std::vector<int64_t>& imageTokenLengths,
         int64_t& numImages, int64_t& totalNumBlocks, bool isThumbnail, cudaStream_t stream);
 
-    Phi4MMViTConfig mConfig{};                       //!< Phi-4MM visual configuration
-    rt::Tensor mVitInput{};                          //!< Visual engine input tensor
-    rt::Tensor mImageMean{};                         //!< Image mean tensor [C]
-    rt::Tensor mImageStd{};                          //!< Image std tensor [C]
-    rt::Tensor mImageDevice{};                       //!< Temporary image buffer for preprocessing
-    rt::Tensor mNormalizedImageDevice{};             //!< Temporary normalized image buffer
-    rt::imageUtils::ImageData mResizedImageHost{};   //!< Pre-allocated buffer for image resizing
-    rt::imageUtils::ImageData mThumbnailImageHost{}; //!< Pre-allocated buffer for thumbnail generation
+    Phi4MMViTConfig mConfig{};           //!< Phi-4MM visual configuration
+    rt::Tensor mVitInput{};              //!< Visual engine input tensor
+    rt::Tensor mImageMean{};             //!< Image mean tensor [C]
+    rt::Tensor mImageStd{};              //!< Image std tensor [C]
+    rt::Tensor mImageDevice{};           //!< Temporary image buffer (holds the GPU-resized image)
+    rt::Tensor mNormalizedImageDevice{}; //!< Temporary normalized image buffer
+    rt::Tensor mRawImageDevice{};        //!< Raw (pre-resize) image device buffer for the GPU resize path
+    rt::Tensor mResizeTmpDevice{};       //!< Float scratch (horizontal pass) for the GPU resize
     std::vector<std::vector<std::vector<int64_t>>> mImagesBlockGridHW; //!< Per-image block grid sizes [[hb, wb], ...]
 
     // Buffer for raw ViT outputs from the TRT engine before Phi4MM postprocess (HD transform)

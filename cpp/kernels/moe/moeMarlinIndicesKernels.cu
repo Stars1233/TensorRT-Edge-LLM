@@ -18,6 +18,7 @@
 #include "common/cudaUtils.h"
 #include "moeMarlinIndicesKernels.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace trt_edgellm
@@ -66,26 +67,104 @@ __global__ void buildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, 
     }
 }
 
-// Aggregate slot outputs back to tokens: sum over topK in slot order
-__global__ void aggregateSlotOutputsKernel(
-    half const* slotOutputs, half* aggregatedOutput, int32_t numTokens, int32_t topK, int32_t outDim)
+// Build the degenerate Marlin routing arrays for a dense (single-expert, topK=1) GEMM.
+__global__ void buildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize)
 {
-    int32_t tokenId = blockIdx.x;
-    int32_t dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
+    int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t const stride = gridDim.x * blockDim.x;
 
-    if (tokenId >= numTokens || dimIdx >= outDim)
-        return;
-
-    float accum = 0.0f;
-    int32_t base = tokenId * topK;
-    for (int32_t k = 0; k < topK; ++k)
+    // sortedTokenIds is the identity map with padded-tail slots masked by the out-of-range sentinel numTokens
+    // (== numTokens*topK for topK=1). topkWeights is filled with 1.0f only to keep the shared Marlin signature valid.
+    for (int32_t i = idx; i < paddedRows; i += stride)
     {
-        int32_t slot = base + k;
-        accum += __half2float(slotOutputs[slot * outDim + dimIdx]);
+        sortedTokenIds[i] = i < numTokens ? i : numTokens;
+        topkWeights[i] = 1.0f;
     }
 
-    aggregatedOutput[tokenId * outDim + dimIdx] = __float2half(accum);
+    int32_t const numBlocks = paddedRows / moeBlockSize;
+    for (int32_t b = idx; b < numBlocks; b += stride)
+    {
+        expertIds[b] = 0;
+    }
+
+    if (idx == 0)
+    {
+        numTokensPostPadded[0] = paddedRows;
+    }
 }
+
+namespace
+{
+
+constexpr int32_t kAggregateThreadsPerBlock{256};
+
+template <typename T>
+struct AggregationTypeTraits;
+
+template <>
+struct AggregationTypeTraits<half>
+{
+    static __device__ float toFloat(half const value)
+    {
+        return __half2float(value);
+    }
+
+    static __device__ half fromFloat(float const value)
+    {
+        return __float2half(value);
+    }
+};
+
+template <>
+struct AggregationTypeTraits<__nv_bfloat16>
+{
+    static __device__ float toFloat(__nv_bfloat16 const value)
+    {
+        return __bfloat162float(value);
+    }
+
+    static __device__ __nv_bfloat16 fromFloat(float const value)
+    {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+// Aggregate slot outputs back to tokens: sum over topK in slot order.
+template <typename T>
+__global__ void aggregateSlotOutputsKernel(
+    T const* slotOutputs, T* aggregatedOutput, int32_t numTokens, int32_t topK, int32_t outDim)
+{
+    int32_t const tokenId = blockIdx.x;
+    int32_t const dimIdx = blockIdx.y * blockDim.x + threadIdx.x;
+
+    if (tokenId >= numTokens || dimIdx >= outDim)
+    {
+        return;
+    }
+
+    float accum = 0.0F;
+    int32_t const base = tokenId * topK;
+    for (int32_t k = 0; k < topK; ++k)
+    {
+        int32_t const slot = base + k;
+        accum += AggregationTypeTraits<T>::toFloat(slotOutputs[slot * outDim + dimIdx]);
+    }
+
+    aggregatedOutput[tokenId * outDim + dimIdx] = AggregationTypeTraits<T>::fromFloat(accum);
+}
+
+template <typename T>
+void launchAggregateSlotOutputsKernelImpl(
+    T const* slotOutputs, T* aggregatedOutput, int32_t numTokens, int32_t topK, int32_t outDim, cudaStream_t stream)
+{
+    dim3 const grid(numTokens, static_cast<uint32_t>(trt_edgellm::divUp(outDim, kAggregateThreadsPerBlock)));
+    dim3 const block(kAggregateThreadsPerBlock);
+    aggregateSlotOutputsKernel<T><<<grid, block, 0, stream>>>(slotOutputs, aggregatedOutput, numTokens, topK, outDim);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
 
 void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32_t const* slotsPerExpertWorkspace,
     int32_t const* paddedCounts, int32_t const* paddedOffsets, float const* topkWeights, int32_t* sortedTokenIds,
@@ -98,14 +177,28 @@ void launchBuildMarlinIndicesKernel(int32_t const* slotsByExpertWorkspace, int32
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launchBuildDenseMarlinIndicesKernel(int32_t* sortedTokenIds, int32_t* expertIds, int32_t* numTokensPostPadded,
+    float* topkWeights, int32_t numTokens, int32_t paddedRows, int32_t moeBlockSize, cudaStream_t stream)
+{
+    constexpr int32_t kThreadsPerBlock = 256;
+    int32_t const grid = static_cast<int32_t>(trt_edgellm::divUp(std::max(paddedRows, 1), kThreadsPerBlock));
+    buildDenseMarlinIndicesKernel<<<grid, kThreadsPerBlock, 0, stream>>>(
+        sortedTokenIds, expertIds, numTokensPostPadded, topkWeights, numTokens, paddedRows, moeBlockSize);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launchAggregateSlotOutputsKernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens, int32_t topK,
     int32_t outDim, cudaStream_t stream)
 {
-    dim3 grid(numTokens, static_cast<uint32_t>(trt_edgellm::divUp(outDim, 256)));
-    dim3 block(256);
-    aggregateSlotOutputsKernel<<<grid, block, 0, stream>>>(
-        static_cast<half const*>(slotOutputs), static_cast<half*>(aggregatedOutput), numTokens, topK, outDim);
-    CUDA_CHECK(cudaGetLastError());
+    launchAggregateSlotOutputsKernelImpl(
+        static_cast<half const*>(slotOutputs), static_cast<half*>(aggregatedOutput), numTokens, topK, outDim, stream);
+}
+
+void launchAggregateSlotOutputsBf16Kernel(void const* slotOutputs, void* aggregatedOutput, int32_t numTokens,
+    int32_t topK, int32_t outDim, cudaStream_t stream)
+{
+    launchAggregateSlotOutputsKernelImpl(static_cast<__nv_bfloat16 const*>(slotOutputs),
+        static_cast<__nv_bfloat16*>(aggregatedOutput), numTokens, topK, outDim, stream);
 }
 
 } // namespace kernel

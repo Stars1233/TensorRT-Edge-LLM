@@ -19,29 +19,28 @@
 
 #include "cuteDslSSDRunner.h"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "ssdVarlenMetadata.h"
 
 #include <algorithm>
 #include <cmath>
-#include <mutex>
 
 namespace trt_edgellm
 {
 
-ssd_prefill_d128_n128_Kernel_Module_t CuteDslSSDRunner::sD128N128Module = {};
-ssd_prefill_d64_n128_Kernel_Module_t CuteDslSSDRunner::sD64N128Module = {};
-ssd_prefill_d128_n64_Kernel_Module_t CuteDslSSDRunner::sD128N64Module = {};
-ssd_prefill_d64_n64_Kernel_Module_t CuteDslSSDRunner::sD64N64Module = {};
+detail::LazyKernelModule<ssd_prefill_d128_n128_Kernel_Module_t> CuteDslSSDRunner::sD128N128Module{};
+detail::LazyKernelModule<ssd_prefill_d64_n128_Kernel_Module_t> CuteDslSSDRunner::sD64N128Module{};
+detail::LazyKernelModule<ssd_prefill_d128_n64_Kernel_Module_t> CuteDslSSDRunner::sD128N64Module{};
+detail::LazyKernelModule<ssd_prefill_d64_n64_Kernel_Module_t> CuteDslSSDRunner::sD64N64Module{};
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
-ssd_prefill_blackwell_d64_n128_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N128Module = {};
-ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N128InitStatesModule = {};
-ssd_prefill_blackwell_d64_n64_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N64Module = {};
-ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t CuteDslSSDRunner::sBlackwellD64N64InitStatesModule = {};
+detail::LazyKernelModule<ssd_prefill_blackwell_d64_n128_Kernel_Module_t> CuteDslSSDRunner::sBlackwellD64N128Module{};
+detail::LazyKernelModule<ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_t>
+    CuteDslSSDRunner::sBlackwellD64N128InitStatesModule{};
+detail::LazyKernelModule<ssd_prefill_blackwell_d64_n64_Kernel_Module_t> CuteDslSSDRunner::sBlackwellD64N64Module{};
+detail::LazyKernelModule<ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_t>
+    CuteDslSSDRunner::sBlackwellD64N64InitStatesModule{};
 #endif
-bool CuteDslSSDRunner::sLoaded = false;
-
-static std::mutex sSSDMutex;
 
 // Tensor struct helpers — contiguous row-major layout.
 #define SET_5D_TENSOR(tensor, data_ptr, d0, d1, d2, d3, d4)                                                            \
@@ -97,58 +96,67 @@ bool CuteDslSSDRunner::canImplement(int32_t dim, int32_t dstate, int32_t smVersi
     return (dim == 64 || dim == 128) && (dstate == 64 || dstate == 128);
 }
 
-bool CuteDslSSDRunner::loadKernelModules()
+bool CuteDslSSDRunner::ensureKernelModules(SSDParams const& params, cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock(sSSDMutex);
-    if (sLoaded)
-        return true;
-
-    try
-    {
-        ssd_prefill_d128_n128_Kernel_Module_Load(&sD128N128Module);
-        ssd_prefill_d64_n128_Kernel_Module_Load(&sD64N128Module);
-        ssd_prefill_d128_n64_Kernel_Module_Load(&sD128N64Module);
-        ssd_prefill_d64_n64_Kernel_Module_Load(&sD64N64Module);
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
-        ssd_prefill_blackwell_d64_n128_Kernel_Module_Load(&sBlackwellD64N128Module);
-        ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Load(&sBlackwellD64N128InitStatesModule);
-        ssd_prefill_blackwell_d64_n64_Kernel_Module_Load(&sBlackwellD64N64Module);
-        ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_Load(&sBlackwellD64N64InitStatesModule);
-        LOG_DEBUG("CuTe DSL SSD kernel modules (4 SM80 + 4 Blackwell) loaded");
-#else
-        LOG_DEBUG("CuTe DSL SSD kernel modules (4 SM80 variants) loaded");
-#endif
-        sLoaded = true;
-        return true;
-    }
-    catch (...)
+    if (params.smVersion >= 100 && params.smVersion < 120 && params.dim == 64)
     {
-        LOG_ERROR("Failed to load CuTe DSL SSD kernel modules");
+        if (params.dstate == 128 && params.has_init_states)
+        {
+            return detail::ensureModuleLoaded<ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Load,
+                ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Unload>(
+                sBlackwellD64N128InitStatesModule, "ssd_prefill_blackwell_d64_n128_init_states", stream);
+        }
+        if (params.dstate == 128)
+        {
+            return detail::ensureModuleLoaded<ssd_prefill_blackwell_d64_n128_Kernel_Module_Load,
+                ssd_prefill_blackwell_d64_n128_Kernel_Module_Unload>(
+                sBlackwellD64N128Module, "ssd_prefill_blackwell_d64_n128", stream);
+        }
+        if (params.dstate == 64 && params.has_init_states)
+        {
+            return detail::ensureModuleLoaded<ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_Load,
+                ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_Unload>(
+                sBlackwellD64N64InitStatesModule, "ssd_prefill_blackwell_d64_n64_init_states", stream);
+        }
+        if (params.dstate == 64)
+        {
+            return detail::ensureModuleLoaded<ssd_prefill_blackwell_d64_n64_Kernel_Module_Load,
+                ssd_prefill_blackwell_d64_n64_Kernel_Module_Unload>(
+                sBlackwellD64N64Module, "ssd_prefill_blackwell_d64_n64", stream);
+        }
         return false;
     }
-}
-
-void CuteDslSSDRunner::unloadKernelModules()
-{
-    std::lock_guard<std::mutex> lock(sSSDMutex);
-    if (sLoaded)
-    {
-        ssd_prefill_d128_n128_Kernel_Module_Unload(&sD128N128Module);
-        ssd_prefill_d64_n128_Kernel_Module_Unload(&sD64N128Module);
-        ssd_prefill_d128_n64_Kernel_Module_Unload(&sD128N64Module);
-        ssd_prefill_d64_n64_Kernel_Module_Unload(&sD64N64Module);
-#ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
-        ssd_prefill_blackwell_d64_n128_Kernel_Module_Unload(&sBlackwellD64N128Module);
-        ssd_prefill_blackwell_d64_n128_init_states_Kernel_Module_Unload(&sBlackwellD64N128InitStatesModule);
-        ssd_prefill_blackwell_d64_n64_Kernel_Module_Unload(&sBlackwellD64N64Module);
-        ssd_prefill_blackwell_d64_n64_init_states_Kernel_Module_Unload(&sBlackwellD64N64InitStatesModule);
 #endif
-        sLoaded = false;
+    if (params.dim == 128 && params.dstate == 128)
+    {
+        return detail::ensureModuleLoaded<ssd_prefill_d128_n128_Kernel_Module_Load,
+            ssd_prefill_d128_n128_Kernel_Module_Unload>(sD128N128Module, "ssd_prefill_d128_n128", stream);
     }
+    if (params.dim == 64 && params.dstate == 128)
+    {
+        return detail::ensureModuleLoaded<ssd_prefill_d64_n128_Kernel_Module_Load,
+            ssd_prefill_d64_n128_Kernel_Module_Unload>(sD64N128Module, "ssd_prefill_d64_n128", stream);
+    }
+    if (params.dim == 128 && params.dstate == 64)
+    {
+        return detail::ensureModuleLoaded<ssd_prefill_d128_n64_Kernel_Module_Load,
+            ssd_prefill_d128_n64_Kernel_Module_Unload>(sD128N64Module, "ssd_prefill_d128_n64", stream);
+    }
+    if (params.dim == 64 && params.dstate == 64)
+    {
+        return detail::ensureModuleLoaded<ssd_prefill_d64_n64_Kernel_Module_Load,
+            ssd_prefill_d64_n64_Kernel_Module_Unload>(sD64N64Module, "ssd_prefill_d64_n64", stream);
+    }
+    return false;
 }
 
 int CuteDslSSDRunner::run(SSDParams const& params, cudaStream_t stream)
 {
+    if (!ensureKernelModules(params, stream))
+    {
+        return -1;
+    }
 #ifdef CUTE_DSL_SSD_BLACKWELL_ENABLED
     // SM100-110 with D=64: use Blackwell persistent kernel (TMA/wgmma/TMEM).
     // SM120+ lacks TMEM/wgmma — falls through to SM80 kernel.
@@ -263,11 +271,6 @@ int CuteDslSSDRunner::run(SSDParams const& params, cudaStream_t stream)
 
 int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL SSD prefill kernel module not loaded.");
-        return -1;
-    }
     // buildSSDVarlenMetadata launches a single-block kernel; batch must fit one CTA's
     // 1024-thread cap. Production Nemotron-H workloads use batch <= 8.
     if (params.batch > 1024)
@@ -287,19 +290,19 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
 
     if (dim == 128 && dstate == 128)
     {
-        CALL_SSD_PREFILL(ssd_prefill_d128_n128, sD128N128Module);
+        CALL_SSD_PREFILL(ssd_prefill_d128_n128, sD128N128Module.module);
     }
     else if (dim == 64 && dstate == 128)
     {
-        CALL_SSD_PREFILL(ssd_prefill_d64_n128, sD64N128Module);
+        CALL_SSD_PREFILL(ssd_prefill_d64_n128, sD64N128Module.module);
     }
     else if (dim == 128 && dstate == 64)
     {
-        CALL_SSD_PREFILL(ssd_prefill_d128_n64, sD128N64Module);
+        CALL_SSD_PREFILL(ssd_prefill_d128_n64, sD128N64Module.module);
     }
     else if (dim == 64 && dstate == 64)
     {
-        CALL_SSD_PREFILL(ssd_prefill_d64_n64, sD64N64Module);
+        CALL_SSD_PREFILL(ssd_prefill_d64_n64, sD64N64Module.module);
     }
 
     LOG_ERROR("CuTe DSL SSD prefill: unsupported dim=%d dstate=%d", dim, dstate);
@@ -433,17 +436,12 @@ int CuteDslSSDRunner::runPrefill(SSDParams const& params, cudaStream_t stream)
             &cumsumTensor, &dtProcTensor, &yTensor,                                                                    \
             &seqIdxTensor, &chunkIndicesTensor, &chunkOffsetsTensor, &seqChunkCumsumTensor,                            \
             &validLensTensor,                                                                                          \
-            total_seq, total_chunks, numLogicalChunks, numSeqs, stream);                                               \
+            total_seq, total_chunks, numLogicalChunks, numSeqs, getDeviceMultiProcessorCount(), stream);              \
     } while (0)
 // clang-format on
 
 int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuTe DSL SSD Blackwell prefill kernel module not loaded.");
-        return -1;
-    }
     if (params.batch > 1024)
     {
         LOG_ERROR("CuTe DSL SSD Blackwell prefill: batch=%d exceeds supported maximum (1024)", params.batch);
@@ -462,16 +460,18 @@ int CuteDslSSDRunner::runPrefillBlackwell(SSDParams const& params, cudaStream_t 
     if (dstate == 128)
     {
         if (params.has_init_states)
-            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128_init_states, sBlackwellD64N128InitStatesModule);
+            CALL_SSD_PREFILL_BLACKWELL(
+                ssd_prefill_blackwell_d64_n128_init_states, sBlackwellD64N128InitStatesModule.module);
         else
-            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128, sBlackwellD64N128Module);
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n128, sBlackwellD64N128Module.module);
     }
     else if (dstate == 64)
     {
         if (params.has_init_states)
-            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64_init_states, sBlackwellD64N64InitStatesModule);
+            CALL_SSD_PREFILL_BLACKWELL(
+                ssd_prefill_blackwell_d64_n64_init_states, sBlackwellD64N64InitStatesModule.module);
         else
-            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64, sBlackwellD64N64Module);
+            CALL_SSD_PREFILL_BLACKWELL(ssd_prefill_blackwell_d64_n64, sBlackwellD64N64Module.module);
     }
 
     LOG_ERROR("CuTe DSL SSD Blackwell prefill: unsupported dstate=%d", dstate);

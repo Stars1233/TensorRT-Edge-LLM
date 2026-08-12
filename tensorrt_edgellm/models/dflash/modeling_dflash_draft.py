@@ -24,14 +24,22 @@ tree attention enabled.
 Engine bindings (cached path):
     inputs_embeds        [B, BS, H]     Embedding of [y0, mask, mask, ..., mask]
     target_hidden_concat [B, L, Nl*H]   Target hidden DELTA from base
-    past_key_values_i    [B, 2, Hkv, capacity, D]  Draft combined KV cache
+    past_key_values_i    [2, num_pages, KV_PAGE_SIZE, Hkv, D]  Draft combined KV cache —
+                         the paged pool (same contract as the AttentionPlugin kv_cache
+                         binding). maxBatch/capPadded are recovered at enqueue time from
+                         numPages and the builder-configured pages_per_slot attribute
+                         (see DFlashTargetKVCacheUpdatePlugin::setPagesPerSlot); this cache
+                         has no page table of its own (identity-contiguous, reuse opt-out).
     rope_rotary_cos_sin  [1, capacity, rotaryDim]   Shared RoPE cache
     context_lengths      [B]            Total context length (target + proposal)
     kvcache_start_index  [B]            Draft cache start index (for delta write)
+    kv_page_table        [B, 2, max_pages_per_seq]  int32 page table (proposal
+                         self-attention only; the draft KV cache above has no
+                         page table of its own)
     attention_mask       [B, BS, divUp(BS,32)]  Packed proposal mask
     attention_pos_id     [B, BS]        Position IDs for proposal tokens
     logits               [B, BS, V]     Full vocab logits
-    present_key_values_i [B, 2, Hkv, capacity, D]  Updated draft KV cache
+    present_key_values_i [2, num_pages, KV_PAGE_SIZE, Hkv, D]  Updated draft KV cache
 """
 
 import itertools
@@ -41,10 +49,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...config import ModelConfig
+from ...config import ModelConfig, _is_gemma4_model_type
 from ..default.modeling_default import OnnxSpec, RMSNorm
+# yapf: disable
+from ..gemma4.modeling_gemma4_text import (Gemma4MLP, Gemma4RMSNorm,
+                                           Gemma4ValueRMSNorm,
+                                           _attention_type_for_layer,
+                                           _head_dim_for_attention_type,
+                                           _num_kv_heads_for_attention_type,
+                                           _rotary_dim_from_rope_config,
+                                           _uses_attention_k_eq_v)
+# yapf: enable
 from ..linear import FP16Linear, make_linear
-from ..ops import attention_plugin, dflash_target_kv_cache_update
+from ..ops import KV_PAGE_SIZE, attention_plugin, dflash_target_kv_cache_update
 
 __all__ = ["DFlashDraftModel"]
 
@@ -103,9 +120,25 @@ class DFlashCachedAttention(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
+        self.is_gemma4 = _is_gemma4_model_type(config.model_type)
+        if self.is_gemma4:
+            self.attention_type = _attention_type_for_layer(config, layer_idx)
+            self.attention_k_eq_v = _uses_attention_k_eq_v(
+                config, self.attention_type)
+            self.num_heads = int(config.num_attention_heads)
+            self.num_kv_heads = _num_kv_heads_for_attention_type(
+                config, self.attention_type)
+            self.head_dim = _head_dim_for_attention_type(
+                config, self.attention_type)
+            self.sliding_window_size = (config.sliding_window_size
+                                        if self.attention_type
+                                        == "sliding_attention" else -1)
+        else:
+            self.attention_k_eq_v = False
+            self.num_heads = config.num_attention_heads
+            self.num_kv_heads = config.num_key_value_heads
+            self.head_dim = config.head_dim
+            self.sliding_window_size = -1
         self.attention_scale = config.attention_scaling
         self.hidden_size = config.hidden_size
 
@@ -113,34 +146,40 @@ class DFlashCachedAttention(nn.Module):
         self.q_proj = make_linear(config,
                                   config.hidden_size,
                                   self.num_heads * self.head_dim,
-                                  bias=False,
+                                  bias=config.attention_bias,
                                   module_name=f"{prefix}.q_proj")
         self.k_proj = make_linear(config,
                                   config.hidden_size,
                                   self.num_kv_heads * self.head_dim,
-                                  bias=False,
+                                  bias=config.attention_bias,
                                   module_name=f"{prefix}.k_proj")
-        self.v_proj = make_linear(config,
-                                  config.hidden_size,
-                                  self.num_kv_heads * self.head_dim,
-                                  bias=False,
-                                  module_name=f"{prefix}.v_proj")
+        if not self.attention_k_eq_v:
+            self.v_proj = make_linear(config,
+                                      config.hidden_size,
+                                      self.num_kv_heads * self.head_dim,
+                                      bias=config.attention_bias,
+                                      module_name=f"{prefix}.v_proj")
         self.o_proj = make_linear(config,
                                   self.num_heads * self.head_dim,
                                   config.hidden_size,
                                   module_name=f"{prefix}.o_proj")
 
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
+        self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
+                       if self.is_gemma4 and config.has_value_norm else None)
 
     def forward(
             self,
             hidden_states: torch.Tensor,  # [B, BS, H] proposal hidden
             h_delta: torch.
         Tensor,  # [B, L, H] target hidden delta (after fc+norm)
-            past_key_value: torch.Tensor,  # [B, 2, Hkv, capacity, D]
+            past_key_value: torch.
+        Tensor,  # paged pool [2, num_pages, KV_PAGE_SIZE, Hkv, D]
             rope_cos_sin: torch.Tensor,  # [ropeBatch, capacity, rotaryDim]
             kvcache_start_index: torch.Tensor,  # [B] INT32
+            kv_page_table: torch.Tensor,  # [B, 2, maxPagesPerSeq] INT32
             delta_lengths: torch.Tensor,  # [B] INT32, per-batch delta lengths
             context_lengths: torch.Tensor,  # [B] INT32
             attention_mask: torch.Tensor,  # [B, BS, packedMaskLen] INT32
@@ -155,11 +194,14 @@ class DFlashCachedAttention(nn.Module):
         L = h_delta.shape[1]
 
         # --- Target delta K/V: project and update cache ---
-        k_delta = self.k_proj(h_delta)  # [B, L, Hkv*D]
-        v_delta = self.v_proj(h_delta)  # [B, L, Hkv*D]
-        k_delta = k_delta.reshape(B, L, self.num_kv_heads, self.head_dim)
-        v_delta = v_delta.reshape(B, L, self.num_kv_heads, self.head_dim)
+        k_delta_raw = self.k_proj(h_delta)  # [B, L, Hkv*D]
+        v_delta_raw = (k_delta_raw
+                       if self.attention_k_eq_v else self.v_proj(h_delta))
+        k_delta = k_delta_raw.reshape(B, L, self.num_kv_heads, self.head_dim)
+        v_delta = v_delta_raw.reshape(B, L, self.num_kv_heads, self.head_dim)
         k_delta = self.k_norm(k_delta)  # [B, L, Hkv, D]
+        if self.v_norm is not None:
+            v_delta = self.v_norm(v_delta)
 
         updated_kv = dflash_target_kv_cache_update(k_delta, v_delta,
                                                    past_key_value,
@@ -173,30 +215,36 @@ class DFlashCachedAttention(nn.Module):
         q = self.q_norm(q)
         q = q.reshape(B, BS, self.num_heads * self.head_dim)
 
-        k_self = self.k_proj(hidden_states)  # [B, BS, Hkv*D]
-        k_self = k_self.reshape(B, BS, self.num_kv_heads, self.head_dim)
+        k_self_raw = self.k_proj(hidden_states)  # [B, BS, Hkv*D]
+        v_self = (k_self_raw
+                  if self.attention_k_eq_v else self.v_proj(hidden_states))
+        k_self = k_self_raw.reshape(B, BS, self.num_kv_heads, self.head_dim)
         k_self = self.k_norm(k_self)
         k_self = k_self.reshape(B, BS, self.num_kv_heads * self.head_dim)
-
-        v_self = self.v_proj(hidden_states)  # [B, BS, Hkv*D]
+        if self.v_norm is not None:
+            v_self = self.v_norm(
+                v_self.reshape(B, BS, self.num_kv_heads, self.head_dim))
+            v_self = v_self.reshape(B, BS, self.num_kv_heads * self.head_dim)
 
         # --- AttentionPlugin: proposal attention over full context ---
+        # (packed QKV: dflash applies q/k_norm explicitly above, so pack here)
         attn_4d, present_kv = attention_plugin(
-            q,
-            k_self,
-            v_self,
+            torch.cat([q, k_self, v_self], dim=-1),
             updated_kv,
             context_lengths,
             rope_cos_sin,
             kvcache_start_index,
+            kv_page_table,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
-            sliding_window_size=-1,
+            sliding_window_size=self.sliding_window_size,
             enable_tree_attention=True,
             enable_fp8_kv_cache=False,
             attention_scale=self.attention_scale,
+            enable_context_mask_selector=False,
             enable_vision_block_attention=False,
+            skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0])
@@ -219,11 +267,21 @@ class DFlashCachedDecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.is_gemma4 = _is_gemma4_model_type(config.model_type)
         self.self_attn = DFlashCachedAttention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config, layer_idx=layer_idx)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                config.rms_norm_eps)
+        self.mlp = (Gemma4MLP(config, layer_idx=layer_idx)
+                    if self.is_gemma4 else MLP(config, layer_idx=layer_idx))
+        norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
+        self.input_layernorm = norm_cls(config.hidden_size,
+                                        config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(config.hidden_size,
+                                                 config.rms_norm_eps)
+        if self.is_gemma4:
+            self.pre_feedforward_layernorm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.post_feedforward_layernorm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(
         self,
@@ -232,6 +290,7 @@ class DFlashCachedDecoderLayer(nn.Module):
         past_key_value: torch.Tensor,
         rope_cos_sin: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         delta_lengths: torch.Tensor,
         context_lengths: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -242,13 +301,26 @@ class DFlashCachedDecoderLayer(nn.Module):
 
         attn_output, present_kv = self.self_attn(
             normed, h_delta, past_key_value, rope_cos_sin, kvcache_start_index,
-            delta_lengths, context_lengths, attention_mask, attention_pos_id)
+            kv_page_table, delta_lengths, context_lengths, attention_mask,
+            attention_pos_id)
 
-        hidden_states = residual + attn_output
+        if self.is_gemma4:
+            hidden_states = self.post_attention_layernorm(attn_output)
+            hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = residual + self.mlp(
-            self.post_attention_layernorm(hidden_states))
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = hidden_states * self.layer_scalar.to(
+                dtype=hidden_states.dtype)
+        else:
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hidden_states = residual + self.mlp(
+                self.post_attention_layernorm(hidden_states))
 
         return hidden_states, present_kv
 
@@ -269,20 +341,21 @@ def _make_flat_wrapper_dflash(model: nn.Module, num_layers: int) -> nn.Module:
     # Build explicit parameter list
     param_names = ([
         "inputs_embeds", "dflash_target_hidden_concat", "rope_rotary_cos_sin",
-        "context_lengths", "kvcache_start_index", "dflash_delta_lengths",
-        "attention_mask", "attention_pos_id"
+        "context_lengths", "kvcache_start_index", "kv_page_table",
+        "dflash_delta_lengths", "attention_mask", "attention_pos_id"
     ] + [f"past_key_values_{i}" for i in range(num_layers)])
 
     past_kv_tuple = "({},)".format(", ".join(f"past_key_values_{i}"
                                              for i in range(num_layers)))
 
-    body = (f"    logits, present_kv_list = self._model(\n"
-            f"        inputs_embeds, dflash_target_hidden_concat,\n"
-            f"        rope_rotary_cos_sin, context_lengths,\n"
-            f"        kvcache_start_index, dflash_delta_lengths,\n"
-            f"        attention_mask, attention_pos_id,\n"
-            f"        list({past_kv_tuple}))\n"
-            f"    return (logits,) + tuple(present_kv_list)\n")
+    body = (
+        f"    logits, present_kv_list = self._model(\n"
+        f"        inputs_embeds, dflash_target_hidden_concat,\n"
+        f"        rope_rotary_cos_sin, context_lengths,\n"
+        f"        kvcache_start_index, kv_page_table, dflash_delta_lengths,\n"
+        f"        attention_mask, attention_pos_id,\n"
+        f"        list({past_kv_tuple}))\n"
+        f"    return (logits,) + tuple(present_kv_list)\n")
 
     src = "def _forward(self, {}):\n{}".format(", ".join(param_names), body)
     globs: dict = {}
@@ -327,18 +400,23 @@ class DFlashDraftModel(nn.Module):
                               hidden_size,
                               bias=False,
                               module_name="fc")
-        if not isinstance(self.fc, FP16Linear):
+        self.fc_native_precision = getattr(config,
+                                           "dflash_fc_native_precision", False)
+        if not self.fc_native_precision and not isinstance(
+                self.fc, FP16Linear):
             raise ValueError(
                 "DFlash draft fc projector must remain dense FP16 for the "
                 "full-FP32 target-hidden projection. Exclude module 'fc' "
                 "from draft quantization.")
-        self.hidden_norm = RMSNorm(hidden_size, config.rms_norm_eps)
+        norm_cls = (Gemma4RMSNorm
+                    if _is_gemma4_model_type(config.model_type) else RMSNorm)
+        self.hidden_norm = norm_cls(hidden_size, config.rms_norm_eps)
 
         self.layers = nn.ModuleList([
             DFlashCachedDecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(hidden_size, config.rms_norm_eps)
+        self.norm = norm_cls(hidden_size, config.rms_norm_eps)
         self.lm_head = make_linear(config,
                                    hidden_size,
                                    config.vocab_size,
@@ -352,6 +430,7 @@ class DFlashDraftModel(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,  # [ropeBatch, capacity, rotaryDim]
         context_lengths: torch.Tensor,  # [B] INT32
         kvcache_start_index: torch.Tensor,  # [B] INT32
+        kv_page_table: torch.Tensor,  # [B, 2, maxPagesPerSeq] INT32
         delta_lengths: torch.Tensor,  # [B] INT32, per-batch delta lengths
         attention_mask: torch.Tensor,  # [B, BS, packedMaskLen] INT32
         attention_pos_id: torch.Tensor,  # [B, BS] INT32
@@ -365,14 +444,17 @@ class DFlashDraftModel(nn.Module):
         """
         B, BS, _ = inputs_embeds.shape
 
-        # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H]
-        # Qwen3-8B target_hidden can spike above abs=2e4 for some first-token
-        # channels. The visible pre-RMSNorm FC result must remain FP32; casting
-        # an already-overflowed FP16 FC output back to FP32 is too late.
-        bias = (self.fc.bias.to(torch.float32)
-                if self.fc.bias is not None else None)
-        h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
-                               self.fc.weight.to(torch.float32), bias)
+        # Project multi-layer hidden states: [B, L, Nl*H] -> [B, L, H].
+        if self.fc_native_precision:
+            h_delta_acc = self.fc(target_hidden_concat.to(torch.float16))
+        else:
+            # Qwen3-8B target_hidden can spike above abs=2e4; the visible
+            # pre-RMSNorm FC result must remain FP32 (an already-overflowed FP16
+            # FC output cannot be recovered by a later up-cast).
+            bias = (self.fc.bias.to(torch.float32)
+                    if self.fc.bias is not None else None)
+            h_delta_acc = F.linear(target_hidden_concat.to(torch.float32),
+                                   self.fc.weight.to(torch.float32), bias)
         h_delta = self.hidden_norm(h_delta_acc).to(inputs_embeds.dtype)
 
         # Run through decoder layers
@@ -380,17 +462,21 @@ class DFlashDraftModel(nn.Module):
         present_key_values = []
 
         for i, layer in enumerate(self.layers):
-            hidden_states, present_kv = layer(hidden_states, h_delta,
-                                              past_key_values[i],
-                                              rope_rotary_cos_sin,
-                                              kvcache_start_index,
-                                              delta_lengths, context_lengths,
-                                              attention_mask, attention_pos_id)
+            hidden_states, present_kv = layer(
+                hidden_states, h_delta, past_key_values[i],
+                rope_rotary_cos_sin, kvcache_start_index, kv_page_table,
+                delta_lengths, context_lengths, attention_mask,
+                attention_pos_id)
             present_key_values.append(present_kv)
 
         # Final norm + lm_head
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states).to(torch.float32)
+        final_logit_softcapping = getattr(self.config,
+                                          "final_logit_softcapping", None)
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(
+                logits / final_logit_softcapping) * final_logit_softcapping
 
         return logits, present_key_values
 
@@ -412,6 +498,8 @@ class DFlashDraftModel(nn.Module):
         num_kv_heads = config.num_key_value_heads
         head_dim = config.head_dim
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        if _is_gemma4_model_type(config.model_type):
+            rotary_dim = _rotary_dim_from_rope_config(config, None, head_dim)
         num_layers = config.num_hidden_layers
         packed_mask_len = (block_size + 31) // 32
 
@@ -437,6 +525,11 @@ class DFlashDraftModel(nn.Module):
         kvcache_start_index = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
+        kv_page_table = torch.zeros(batch_size,
+                                    2,
+                                    1,
+                                    dtype=torch.int32,
+                                    device=device)
         delta_lengths = torch.zeros(batch_size,
                                     dtype=torch.int32,
                                     device=device)
@@ -450,19 +543,24 @@ class DFlashDraftModel(nn.Module):
                                        dtype=torch.int32,
                                        device=device)
 
+        # Paged KV pool binding — same contract as the AttentionPlugin's kv_cache input:
+        # [2, num_pages, KV_PAGE_SIZE, numKVHeads, headDim]. See
+        # DFlashTargetKVCacheUpdatePlugin's input 2 doc; maxBatch/cap are recovered at
+        # enqueue time from the builder-configured pages_per_slot attribute.
         past_key_values = [
-            torch.zeros(batch_size,
-                        2,
+            torch.zeros(2,
+                        1,
+                        KV_PAGE_SIZE,
                         num_kv_heads,
-                        kv_capacity,
                         head_dim,
                         dtype=dtype16,
                         device=device) for _ in range(num_layers)
         ]
 
         args = (inputs_embeds, target_hidden_concat, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, delta_lengths,
-                attention_mask, attention_pos_id, *past_key_values)
+                context_lengths, kvcache_start_index, kv_page_table,
+                delta_lengths, attention_mask, attention_pos_id,
+                *past_key_values)
 
         input_names = [
             "inputs_embeds",
@@ -470,6 +568,7 @@ class DFlashDraftModel(nn.Module):
             "rope_rotary_cos_sin",
             "context_lengths",
             "kvcache_start_index",
+            "kv_page_table",
             "dflash_delta_lengths",
             "attention_mask",
             "attention_pos_id",
@@ -486,6 +585,9 @@ class DFlashDraftModel(nn.Module):
         delta_seq = torch.export.Dim("delta_seq", min=1, max=32768)
         kv_len = torch.export.Dim("kv_len", min=1, max=32768)
         packed_mask = torch.export.Dim("packed_mask", min=1, max=64)
+        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
+        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
 
         dynamic_shapes = [
             {
@@ -506,6 +608,10 @@ class DFlashDraftModel(nn.Module):
                 0: batch
             },  # kvcache_start_index
             {
+                0: page_batch,
+                2: max_pages
+            },  # kv_page_table
+            {
                 0: batch
             },  # dflash_delta_lengths
             {
@@ -519,7 +625,8 @@ class DFlashDraftModel(nn.Module):
             },  # attention_pos_id
         ]
         for _ in range(num_layers):
-            dynamic_shapes.append({0: batch, 3: kv_len})  # past_key_values_i
+            dynamic_shapes.append({1: num_pages
+                                   })  # past_key_values_i (pool-shaped)
 
         wrapped = _make_flat_wrapper_dflash(self, num_layers)
         wrapped.eval()

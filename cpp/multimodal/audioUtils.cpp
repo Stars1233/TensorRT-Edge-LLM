@@ -130,8 +130,10 @@ void makeCentredWindowHost(std::vector<float> const& window, int32_t nFft, std::
     }
 }
 
-int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow)
+int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow, int32_t numConvStages)
 {
+    check::check(numConvStages >= 1, "numConvStages must be >= 1, got: " + std::to_string(numConvStages));
+
     // Floor division that always rounds toward negative infinity, matching Python's "//" operator.
     auto floorDiv = [](int64_t a, int64_t b) -> int64_t {
         int64_t q = a / b;
@@ -143,17 +145,25 @@ int64_t computeFeatExtractOutputLength(int64_t inputLength, int32_t nWindow)
         return q;
     };
 
+    // Each stride-2 conv applies ``out = (in - 1) // 2 + 1`` along the time dimension.
+    // Compose ``numConvStages`` of them. Lambda kept local so the recurrence stays adjacent
+    // to its only call sites below.
+    auto downsampleN = [&floorDiv, numConvStages](int64_t length) -> int64_t {
+        for (int32_t i = 0; i < numConvStages; ++i)
+        {
+            length = floorDiv(length - 1, 2) + 1;
+        }
+        return length;
+    };
+
     // Chunk size = nWindow * 2, matching the chunk size used in computeChunkInfo.
     int64_t const chunkSize = nWindow * 2;
 
-    // Three 2x downsampling Conv2D layers (stride=2 each)
-    // Layer 1: input -> (input - 1) // 2 + 1
-    int64_t len1 = floorDiv(inputLength % chunkSize - 1, 2) + 1;
-    // Layer 2: len1 -> (len1 - 1) // 2 + 1
-    int64_t len2 = floorDiv(len1 - 1, 2) + 1;
-    // Layer 3: len2 -> (len2 - 1) // 2 + 1
-    int64_t len3 = floorDiv(len2 - 1, 2) + 1;
-    return len3 + floorDiv(inputLength, chunkSize) * 13;
+    // The encoder runs ``numConvStages`` stride-2 Conv2D layers along time.
+    // Qwen3-Next Omni's 4 stages give 7 for the same chunkSize=100.
+    int64_t const tailLen = downsampleN(inputLength % chunkSize);
+    int64_t const perChunkLen = downsampleN(chunkSize);
+    return tailLen + floorDiv(inputLength, chunkSize) * perChunkLen;
 }
 
 ChunkInfo computeChunkInfo(int64_t featureLength, int32_t nWindow)
@@ -244,7 +254,7 @@ bool chunkAndPadFeatures(
 }
 
 bool createPaddedMask(ChunkInfo const& chunkInfo, [[maybe_unused]] int32_t nWindow, rt::Tensor& paddedMask,
-    std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
+    std::vector<int64_t>& afterCNNLens, cudaStream_t stream, int32_t numConvStages)
 {
     // Compute aftercnn_lens for each chunk
     afterCNNLens.clear();
@@ -253,7 +263,7 @@ bool createPaddedMask(ChunkInfo const& chunkInfo, [[maybe_unused]] int32_t nWind
     int64_t maxLenAfterCNN = 0;
     for (int64_t i = 0; i < chunkInfo.numChunks; ++i)
     {
-        int64_t lenAfterCNN = computeFeatExtractOutputLength(chunkInfo.chunkLengths[i], nWindow);
+        int64_t lenAfterCNN = computeFeatExtractOutputLength(chunkInfo.chunkLengths[i], nWindow, numConvStages);
         afterCNNLens.push_back(lenAfterCNN);
         maxLenAfterCNN = std::max(maxLenAfterCNN, lenAfterCNN);
     }
@@ -291,7 +301,7 @@ bool createPaddedMask(ChunkInfo const& chunkInfo, [[maybe_unused]] int32_t nWind
 }
 
 bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow, rt::Tensor& paddedFeature,
-    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream)
+    rt::Tensor& paddedMaskAfterCNN, std::vector<int64_t>& afterCNNLens, cudaStream_t stream, int32_t numConvStages)
 {
     auto const& inputShape = melSpectrogram.getShape();
     if (inputShape.getNumDims() != 3)
@@ -311,7 +321,7 @@ bool preprocessAudioForEncoder(rt::Tensor const& melSpectrogram, int32_t nWindow
         return false;
     }
 
-    if (!createPaddedMask(chunkInfo, nWindow, paddedMaskAfterCNN, afterCNNLens, stream))
+    if (!createPaddedMask(chunkInfo, nWindow, paddedMaskAfterCNN, afterCNNLens, stream, numConvStages))
     {
         LOG_ERROR("Failed to create padded mask");
         return false;

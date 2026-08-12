@@ -22,6 +22,9 @@
 #include "common/logger.h"
 #include "common/trtUtils.h"
 #include "common/version.h"
+#include "multimodal/imageUtils.h"
+
+#include <cmath>
 
 using namespace trt_edgellm;
 
@@ -47,6 +50,15 @@ bool VisualBuilder::build()
     if (!parseConfig())
     {
         return false;
+    }
+
+    // Without these workarounds, fusing the separate Q/K/V projections that
+    // feed ViTAttentionPlugin yields an engine that faults at execution
+    // context creation.
+    std::string const lunowudFlags = applyCompileWorkarounds(/*maxBatchSize=*/1);
+    if (!lunowudFlags.empty())
+    {
+        LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
     }
 
     // Create builder and network
@@ -97,21 +109,26 @@ bool VisualBuilder::build()
         LOG_INFO("Created directory %s for saving Visual engine.", mEngineDir.string().c_str());
     }
 
-    // Phi-4MM specific: Copy GN projection weights
-    if (mModelType == multimodal::ModelType::PHI4MM)
-    {
-        constexpr char const* kPhi4mmGnProjFile = "phi4mm_gn_proj.safetensors";
-        std::string src = (mOnnxDir / kPhi4mmGnProjFile).string();
-        std::string dst = (mEngineDir / kPhi4mmGnProjFile).string();
-        if (file_io::copyFile(src, dst))
+    // Copy the model's required weight file (GN projection / patch embedder) next to the engine so
+    // the runtime finds it under the engine dir in the standard onnx_dir -> engine_dir flow.
+    auto copyRequiredWeightFile = [this](char const* filename) -> bool {
+        std::string const dst = (mEngineDir / filename).string();
+        if (!file_io::copyFile((mOnnxDir / filename).string(), dst))
         {
-            LOG_INFO("Copied Phi4MM GN projection weights to %s", dst.c_str());
-        }
-        else
-        {
-            LOG_ERROR("Failed to copy Phi4MM GN projection weights to %s", dst.c_str());
+            LOG_ERROR("Failed to copy required weight file %s to %s", filename, dst.c_str());
             return false;
         }
+        LOG_INFO("Copied required weight file to %s", dst.c_str());
+        return true;
+    };
+    if (mModelType == multimodal::ModelType::PHI4MM && !copyRequiredWeightFile("phi4mm_gn_proj.safetensors"))
+    {
+        return false;
+    }
+    if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER
+        && !copyRequiredWeightFile("nemotron_omni_embedder.safetensors"))
+    {
+        return false;
     }
 
     // Build and save engine
@@ -260,7 +277,8 @@ bool VisualBuilder::setupVisualOptimizationProfile(
     case multimodal::ModelType::QWEN2_5_VL:
     case multimodal::ModelType::QWEN3_VL:
     case multimodal::ModelType::QWEN3_5:
-    case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER: result = setupQwenViTProfile(*visualProfile, network); break;
+    case multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER:
+    case multimodal::ModelType::COSMOS3_EDGE: result = setupQwenViTProfile(*visualProfile, network); break;
 
     case multimodal::ModelType::INTERNVL:
     case multimodal::ModelType::PHI4MM: result = setupInternPhi4ViTProfile(*visualProfile); break;
@@ -323,7 +341,9 @@ bool VisualBuilder::setupQwenViTProfile(
         return false;
     }
 
-    if (ropeEmbedSize == 0)
+    // Cosmos3-Edge (SigLIP2) has no rotary embeddings, so its graph has no rotary_pos_emb input;
+    // every other Qwen-family ViT requires it.
+    if (ropeEmbedSize == 0 && mModelType != multimodal::ModelType::COSMOS3_EDGE)
     {
         LOG_ERROR("Cannot infer ropeEmbedSize. Do you have proper ONNX input: %s?", binding_names::kRotaryPosEmb);
         return false;
@@ -332,11 +352,17 @@ bool VisualBuilder::setupQwenViTProfile(
     // Base inputs
     result &= setOptimizationProfile(&profile, binding_names::kVisualInput, createDims({minHW, inputDim}),
         createDims({optHW, inputDim}), createDims({maxHW, inputDim}));
-    result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
-        createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
-    int64_t maxNumImages = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
+    if (ropeEmbedSize > 0)
+    {
+        result &= setOptimizationProfile(&profile, binding_names::kRotaryPosEmb, createDims({minHW, ropeEmbedSize}),
+            createDims({optHW, ropeEmbedSize}), createDims({maxHW, ropeEmbedSize}));
+    }
+    // OPT is the image-shaped group count -- TRT picks tactics from it, so widening MAX for
+    // per-frame video groups must not drag it along.
+    int64_t const optCuGroups = std::max<int64_t>(1, mBuilderConfig.maxImageTokens / mBuilderConfig.minImageTokens);
+    int64_t const maxCuGroups = rt::imageUtils::maxCuSeqlenGroups(mBuilderConfig.maxImageTokens);
     result &= setOptimizationProfile(&profile, binding_names::kCuSeqlens, createDims({2}),
-        createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+        createDims({optCuGroups + 1}), createDims({maxCuGroups + 1}));
 
     // kv_lengths is required when using TRT-native attention (TRT >= 11).
     // Read the flag from the exporter's config.json.
@@ -344,7 +370,7 @@ bool VisualBuilder::setupQwenViTProfile(
     if (mBuilderConfig.useTrtNativeVitAttn)
     {
         result &= setOptimizationProfile(&profile, binding_names::kKvLengths, createDims({2}),
-            createDims({maxNumImages + 1}), createDims({maxNumImages + 1}));
+            createDims({optCuGroups + 1}), createDims({maxCuGroups + 1}));
     }
 
     // max_seqlen_carrier is only present when using the ViTAttentionPlugin path (TRT 10).
@@ -394,7 +420,8 @@ bool VisualBuilder::setupQwenViTProfile(
             createDims({optHW / 4}), createDims({maxHW / 4}));
     }
     else if (mModelType == multimodal::ModelType::QWEN3_VL || mModelType == multimodal::ModelType::QWEN3_5
-        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER)
+        || mModelType == multimodal::ModelType::QWEN3_OMNI_VISION_ENCODER
+        || mModelType == multimodal::ModelType::COSMOS3_EDGE)
     {
         result &= setOptimizationProfile(&profile, binding_names::kFastPosEmbIdx, createDims({4, minHW}),
             createDims({4, optHW}), createDims({4, maxHW}));
@@ -451,10 +478,28 @@ bool VisualBuilder::setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& 
     int64_t minNumBlocks = std::max<int64_t>(1, mBuilderConfig.minImageTokens / kTokensPerBlock);
     int64_t optNumBlocks = (minNumBlocks + maxNumBlocks) / 2;
 
+    // Engine input is patch embeddings [blocks, patches, vitHidden] (the embedder GEMM runs in the
+    // runtime), not pixels; patch count is dynamic (video uses aspect-preserving grids).
+    if (!mModelConfig.contains("vit_hidden_size"))
+    {
+        LOG_ERROR(
+            "Nemotron-Omni: vit_hidden_size not found in config.json — re-export the visual model "
+            "(the ONNX boundary moved: the engine now consumes patch embeddings, not pixels)");
+        return false;
+    }
+    int64_t const vitHidden = mModelConfig["vit_hidden_size"].get<int64_t>();
+    int64_t const scale = static_cast<int64_t>(std::llround(1.0 / downsampleRatio));
+    int64_t const maxPatches = (mImageSizeH / patchSize) * (mImageSizeW / patchSize);
+    int64_t const minPatches = scale * scale;
+
     result &= setOptimizationProfile(&profile, binding_names::kVisualInput,
-        createDims({minNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
-        createDims({optNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}),
-        createDims({maxNumBlocks, mNumChannels, mImageSizeH, mImageSizeW}));
+        createDims({minNumBlocks, minPatches, vitHidden}), createDims({optNumBlocks, maxPatches, vitHidden}),
+        createDims({maxNumBlocks, maxPatches, vitHidden}));
+
+    result &= setOptimizationProfile(&profile, binding_names::kVisualShuffleIndices,
+        createDims({minPatches / (scale * scale), scale * scale}),
+        createDims({maxPatches / (scale * scale), scale * scale}),
+        createDims({maxPatches / (scale * scale), scale * scale}));
 
     if (!result)
     {

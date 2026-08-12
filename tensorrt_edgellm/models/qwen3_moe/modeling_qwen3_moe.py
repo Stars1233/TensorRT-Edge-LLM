@@ -64,11 +64,12 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-from ...config import QUANT_NVFP4, ModelConfig
+from ...config import QUANT_FP16, QUANT_NVFP4, ModelConfig
 from ..default.modeling_default import (MLP, Attention, OnnxSpec, RMSNorm,
                                         _make_flat_wrapper)
 from ..linear import FP16Linear, make_linear
-from ..ops import (int4_moe_plugin, nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
+from ..ops import (KV_PAGE_SIZE, fp16_moe_plugin, int4_moe_plugin,
+                   nvfp4_moe_plugin, nvfp4_moe_plugin_geforce,
                    use_geforce_nvfp4_moe)
 
 logger = logging.getLogger(__name__)
@@ -213,24 +214,25 @@ class Qwen3SparseMoeBlock(nn.Module):
         experts.*     -> Qwen3MoEExperts (per-expert modules for loading)
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, module_prefix: str = "") -> None:
         super().__init__()
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.moe_intermediate_size = config.moe_intermediate_size
+        self._padded_moe_intermediate_size = self.moe_intermediate_size
         self.hidden_size = config.hidden_size
         self.group_size = config.quant.group_size
         self.zero_point_offset = config.quant.gptq_zero_point_offset
         self._use_nvfp4_moe = config.quant.quant_type == QUANT_NVFP4
-        # ``activation_type`` integer is plugin-specific — ints carry
-        # different meanings between Int4MoePlugin (SiLU=0) and
-        # Nvfp4MoePlugin (SwiGLU=2). The per-path constants above
-        # document each mapping; see the corresponding C++ plugin headers
-        # for the source of truth.
-        if not self._use_nvfp4_moe:
-            self.activation_type = _INT4_ACTIVATION_SILU
-        else:
+        self._use_fp16_moe = config.quant.quant_type == QUANT_FP16
+        # All paths compute the same SwiGLU expert FFN; the integer is just
+        # each plugin's own enum for it. Int4MoePlugin names the elementwise
+        # activation ("SiLU"=0), Nvfp4MoePlugin/Fp16MoePlugin name the fused
+        # pattern ("SwiGLU"=2). See the C++ plugin headers.
+        if self._use_nvfp4_moe or self._use_fp16_moe:
             self.activation_type = _NVFP4_ACTIVATION_SWIGLU
+        else:
+            self.activation_type = _INT4_ACTIVATION_SILU
         # Plugin attributes consumed by ``Nvfp4MoePlugin``.
         self.backend = _NVFP4_MOE_BACKEND_AUTO
         self.io_dtype = _NVFP4_MOE_IO_DTYPE_FP16
@@ -250,22 +252,24 @@ class Qwen3SparseMoeBlock(nn.Module):
         shared_inter = config.moe_shared_expert_intermediate_size
         self._has_shared_expert = shared_inter > 0
         if self._has_shared_expert:
+            # Quant lookup keys are layer-prefixed ("layers.0.mlp.shared_expert.*").
+            prefix = module_prefix + "." if module_prefix else ""
             self.shared_expert = nn.Module()
             self.shared_expert.gate_proj = make_linear(
                 config,
                 self.hidden_size,
                 shared_inter,
-                module_name="shared_expert.gate_proj")
+                module_name=f"{prefix}shared_expert.gate_proj")
             self.shared_expert.up_proj = make_linear(
                 config,
                 self.hidden_size,
                 shared_inter,
-                module_name="shared_expert.up_proj")
+                module_name=f"{prefix}shared_expert.up_proj")
             self.shared_expert.down_proj = make_linear(
                 config,
                 shared_inter,
                 self.hidden_size,
-                module_name="shared_expert.down_proj")
+                module_name=f"{prefix}shared_expert.down_proj")
             self.shared_expert_gate = nn.Linear(self.hidden_size,
                                                 1,
                                                 bias=False,
@@ -278,12 +282,30 @@ class Qwen3SparseMoeBlock(nn.Module):
         regular GPTQ repacking.  After extraction, per-expert ``qweight``
         buffers are set to ``None`` so ``_repack_gptq_weights`` skips them.
         """
+        if self._use_fp16_moe:
+            self._prepare_fp16_moe_weights()
+            return
         if self._use_nvfp4_moe:
             self._prepare_nvfp4_moe_weights()
             return
 
-        from ...checkpoint.repacking import (_extract_gptq_for_marlin,
+        from ...checkpoint.repacking import (_extract_awq_for_marlin,
+                                             _extract_gptq_for_marlin,
                                              pack_int4_awq_marlin)
+        from ..linear import ModelOptAWQPrepackedLinear
+
+        # Detect ckpt format by inspecting the first expert. Both AWQ and GPTQ
+        # produce ([N,K] int16 nibbles, [N,G] fp16 scales) — same Marlin pack
+        # downstream. AWQ folds ``pre_quant_scale`` into the weight; GPTQ
+        # applies zero_point_offset.
+        first_proj = self.experts[0].gate_proj
+        is_awq_moe = isinstance(first_proj, ModelOptAWQPrepackedLinear)
+
+        def _extract(proj):
+            if is_awq_moe:
+                return _extract_awq_for_marlin(proj, self.group_size)
+            return _extract_gptq_for_marlin(proj, self.group_size,
+                                            self.zero_point_offset)
 
         # Promote Qwen3MoERouter weight -> nn.Linear for standard MatMul trace.
         self.gate_linear = nn.Linear(self.hidden_size,
@@ -292,24 +314,19 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
-        # Extract per-expert GPTQ weights -> [N, K] int16 + [N, groups] fp16.
+        # Extract per-expert quantized weights -> [N, K] int16 + [N, groups] fp16.
         gate_up_weights_list = []
         gate_up_scales_list = []
         down_weights_list = []
         down_scales_list = []
 
         for expert in self.experts:
-            gw, gs = _extract_gptq_for_marlin(expert.gate_proj,
-                                              self.group_size,
-                                              self.zero_point_offset)
-            uw, us = _extract_gptq_for_marlin(expert.up_proj, self.group_size,
-                                              self.zero_point_offset)
+            gw, gs = _extract(expert.gate_proj)
+            uw, us = _extract(expert.up_proj)
             gate_up_weights_list.append(torch.cat([gw, uw], dim=0))
             gate_up_scales_list.append(torch.cat([gs, us], dim=0))
 
-            dw, ds = _extract_gptq_for_marlin(expert.down_proj,
-                                              self.group_size,
-                                              self.zero_point_offset)
+            dw, ds = _extract(expert.down_proj)
             down_weights_list.append(dw)
             down_scales_list.append(ds)
 
@@ -344,6 +361,60 @@ class Qwen3SparseMoeBlock(nn.Module):
         # the (now-consumed) per-expert qweight buffers.
         self.experts = nn.ModuleList()
 
+    def _prepare_fp16_moe_weights(self) -> None:
+        """Stack unquantized experts into ``Fp16MoePlugin`` FP16 buffers.
+
+        FC1 uses the same 64-row up/gate interleave as the SM100/101/110
+        ``Nvfp4MoePlugin`` split kernel (see
+        kernelSrcs/f16_moe_cutedsl/README.md, "Fixed plugin contract"):
+        ``[up0:64, gate0:64, up64:128, gate64:128, ...]`` along FC1_N.
+        """
+        self.gate_linear = nn.Linear(self.hidden_size,
+                                     self.num_experts,
+                                     bias=False,
+                                     dtype=torch.float16)
+        self.gate_linear.weight.data = self.gate.weight.data
+
+        inter = self.moe_intermediate_size
+        chunk_rows = 64
+        if inter % chunk_rows != 0:
+            raise ValueError(
+                f"moe_inter_size ({inter}) must be a multiple of {chunk_rows} "
+                "for the Fp16MoePlugin SwiGLU FC1 layout")
+        n_chunks = inter // chunk_rows
+
+        fc1_list = []
+        fc2_list = []
+        for expert in self.experts:
+            gate_w = expert.gate_proj.weight.data.to(torch.float16)
+            up_w = expert.up_proj.weight.data.to(torch.float16)
+            down_w = expert.down_proj.weight.data.to(torch.float16)
+            up_chunks = up_w.reshape(n_chunks, chunk_rows, self.hidden_size)
+            gate_chunks = gate_w.reshape(n_chunks, chunk_rows,
+                                         self.hidden_size)
+            fc1_list.append(
+                torch.stack([up_chunks, gate_chunks],
+                            dim=1).reshape(2 * inter, self.hidden_size))
+            fc2_list.append(down_w)
+
+        device = self.gate.weight.device
+        self.register_buffer(
+            "fc1_weights",
+            torch.stack(fc1_list, dim=0).to(device).contiguous())
+        self.register_buffer(
+            "fc2_weights",
+            torch.stack(fc2_list, dim=0).to(device).contiguous())
+
+        logger.info(
+            "Fp16MoePlugin-packed %d Qwen3 experts (64-row interleave): "
+            "fc1 %s, fc2 %s",
+            self.num_experts,
+            list(self.fc1_weights.shape),
+            list(self.fc2_weights.shape),
+        )
+
+        self.experts = nn.ModuleList()
+
     def _prepare_nvfp4_moe_weights(self) -> None:
         """NVFP4 expert repack for ``Nvfp4MoePlugin``."""
         self._prepare_nvfp4_moe_weights_impl()
@@ -359,7 +430,10 @@ class Qwen3SparseMoeBlock(nn.Module):
         * SM12x ``NvFP4MoEPluginGeforce`` -- plain ``[up_all, gate_all]``
           concat along the M axis.
         """
-        from ...checkpoint.repacking import repack_nvfp4_qwen3_moe_experts
+        from ...checkpoint.repacking import (
+            NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT,
+            NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT,
+            repack_nvfp4_gated_moe_experts)
 
         self.gate_linear = nn.Linear(self.hidden_size,
                                      self.num_experts,
@@ -367,13 +441,20 @@ class Qwen3SparseMoeBlock(nn.Module):
                                      dtype=torch.float16)
         self.gate_linear.weight.data = self.gate.weight.data
 
-        fc1_layout = "concat" if use_geforce_nvfp4_moe() else "interleave"
+        use_geforce_plugin = use_geforce_nvfp4_moe()
+        fc1_layout = "concat" if use_geforce_plugin else "interleave"
+        moe_inter_size_alignment = (NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT
+                                    if use_geforce_plugin else
+                                    NVFP4_MOE_INTERLEAVE_SIZE_ALIGNMENT)
         fc1_qweights, fc1_blocks_scale, fc2_qweights, fc2_blocks_scale = (
-            repack_nvfp4_qwen3_moe_experts(self.experts,
-                                           self.hidden_size,
-                                           self.moe_intermediate_size,
-                                           self.group_size,
-                                           fc1_layout=fc1_layout))
+            repack_nvfp4_gated_moe_experts(
+                self.experts,
+                self.hidden_size,
+                self.moe_intermediate_size,
+                self.group_size,
+                fc1_layout=fc1_layout,
+                moe_inter_size_alignment=moe_inter_size_alignment))
+        self._padded_moe_intermediate_size = int(fc2_qweights.shape[-1]) * 2
 
         device = self.gate.weight.device
         self.register_buffer("fc1_qweights",
@@ -438,6 +519,23 @@ class Qwen3SparseMoeBlock(nn.Module):
         batch, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, hidden_dim)
         router_logits = self.gate_linear(hidden_flat).float()
+        if self._use_fp16_moe:
+            routed = fp16_moe_plugin(
+                router_logits,
+                hidden_states,
+                self.fc1_weights,
+                self.fc2_weights,
+                self.num_experts,
+                self.top_k,
+                self.hidden_size,
+                self.moe_intermediate_size,
+                self.activation_type,
+                1,
+                self.max_routed_rows,
+            )
+            if self._has_shared_expert:
+                routed = routed + self._shared_expert_forward(hidden_states)
+            return routed
         if self._use_nvfp4_moe:
             moe_op = (nvfp4_moe_plugin_geforce
                       if use_geforce_nvfp4_moe() else nvfp4_moe_plugin)
@@ -456,7 +554,7 @@ class Qwen3SparseMoeBlock(nn.Module):
                 self.num_experts,
                 self.top_k,
                 self.hidden_size,
-                self.moe_intermediate_size,
+                self._padded_moe_intermediate_size,
                 self.activation_type,
                 _NVFP4_MOE_N_GROUP_FLAT,
                 _NVFP4_MOE_TOPK_GROUP_FLAT,
@@ -509,7 +607,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx=layer_idx)
         if _is_moe_layer(config, layer_idx):
-            self.mlp = Qwen3SparseMoeBlock(config)
+            self.mlp = Qwen3SparseMoeBlock(
+                config, module_prefix=f"layers.{layer_idx}.mlp")
         else:
             self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -523,6 +622,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         attn_output, present_key_value = self.self_attn(
@@ -531,6 +632,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_page_table,
+            skip_softmax_scale=skip_softmax_scale,
         )
         hidden_states = residual + attn_output
 
@@ -589,7 +692,9 @@ class Qwen3MoeTransformer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
         hidden_states = inputs_embeds
         present_key_values_list: List[torch.Tensor] = []
@@ -608,6 +713,8 @@ class Qwen3MoeTransformer(nn.Module):
                 rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
+                kv_page_table,
+                skip_softmax_scale=skip_softmax_scale,
             )
             present_key_values_list.append(next_key_value)
 
@@ -714,11 +821,14 @@ class Qwen3MoeCausalLM(nn.Module):
                                     device=device)
         kv_dtype = (torch.float8_e4m3fn
                     if config.quant.kv_cache_quant == "fp8" else dtype16)
+        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
+        # num_pages is a dummy placeholder for export; the builder sets the real fixed
+        # value (see llmBuilder.cpp setupKVCacheProfiles).
         past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        2,
+            torch.zeros(2,
+                        1,
+                        KV_PAGE_SIZE,
                         config.num_key_value_heads,
-                        past_len,
                         config.head_dim,
                         dtype=kv_dtype,
                         device=device) for _ in range(Na)
@@ -735,6 +845,11 @@ class Qwen3MoeCausalLM(nn.Module):
         kvcache_start_index = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
+        kv_page_table = torch.zeros(batch_size,
+                                    2,
+                                    1,
+                                    dtype=torch.int32,
+                                    device=device)
         last_token_ids = torch.zeros(batch_size,
                                      1,
                                      dtype=torch.int64,
@@ -748,15 +863,17 @@ class Qwen3MoeCausalLM(nn.Module):
                         device=device) for _ in range(Nd)
         ]
 
+        skip_softmax_scale = torch.zeros(1, dtype=torch.int8, device=device)
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, last_token_ids,
-                *deepstack_embeds_list)
+                context_lengths, kvcache_start_index, kv_page_table,
+                last_token_ids, *deepstack_embeds_list, skip_softmax_scale)
 
-        input_names = (["inputs_embeds"] +
-                       [f"past_key_values_{i}" for i in range(Na)] + [
-                           "rope_rotary_cos_sin", "context_lengths",
-                           "kvcache_start_index", "last_token_ids"
-                       ] + [f"deepstack_embeds_{i}" for i in range(Nd)])
+        input_names = (
+            ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
+                "rope_rotary_cos_sin", "context_lengths",
+                "kvcache_start_index", "kv_page_table", "last_token_ids"
+            ] + [f"deepstack_embeds_{i}"
+                 for i in range(Nd)] + ["skip_softmax_scale"])
         output_names = (["logits"] +
                         [f"present_key_values_{i}" for i in range(Na)])
         if self.emit_hidden_states:
@@ -766,19 +883,27 @@ class Qwen3MoeCausalLM(nn.Module):
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
-        past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
+        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
+        skip_dim = torch.export.Dim("skip_softmax_scale_len",
+                                    min=0,
+                                    max=1048576)
 
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
-            all_shapes.append({0: batch, 3: past})  # past_key_values_i
+            all_shapes.append({1:
+                               num_pages})  # past_key_values_i (pool-shaped)
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
+        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
         all_shapes.append({0: batch})  # last_token_ids
         for _ in range(Nd):
             all_shapes.append({0: batch, 1: seq})  # deepstack_embeds_i
+        all_shapes.append({0: skip_dim})  # skip_softmax_scale
 
         wrapped = _make_flat_wrapper(
             self, Na, Nd, emit_hidden_states=self.emit_hidden_states)
@@ -791,14 +916,16 @@ class Qwen3MoeCausalLM(nn.Module):
                         dynamic_shapes=all_shapes)
 
     def forward(
-            self,
-            inputs_embeds: torch.Tensor,
-            past_key_values: Tuple[torch.Tensor, ...],
-            rope_rotary_cos_sin: torch.Tensor,
-            context_lengths: torch.Tensor,
-            kvcache_start_index: torch.Tensor,
-            last_token_ids: torch.Tensor,
-            deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
+        last_token_ids: torch.Tensor,
+        deepstack_embeds: Tuple[torch.Tensor, ...] = (),
+        skip_softmax_scale: "torch.Tensor | None" = None,
     ) -> Tuple:
         hidden_states, present_key_values = self.model(
             inputs_embeds,
@@ -806,7 +933,9 @@ class Qwen3MoeCausalLM(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_page_table,
             deepstack_embeds,
+            skip_softmax_scale=skip_softmax_scale,
         )
         # Select hidden states for specified token positions before lm_head.
         selected_hidden_states = torch.ops.trt.gather_nd(

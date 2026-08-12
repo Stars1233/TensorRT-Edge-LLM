@@ -18,6 +18,7 @@
 #include "runtime/exec/registryBuilder.h"
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 
 namespace trt_edgellm
 {
@@ -29,11 +30,29 @@ namespace rt
 // is no longer needed — every symbolic reference is a pointer-to-member of
 // `InferenceDims`, so the set of dims exists by construction of the type.
 
+//! Page count for paged-pool KV-cache bindings
+//! [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]. A single fixed value per engine
+//! (not resized per inference step), matching the serialized builder profile and
+//! KVCacheManager::numPages() (see sharedResources.cpp).
+constexpr int32_t kTokensPerPage = rt::kTOKENS_PER_PAGE;
+
+static int32_t computeNumPages(LLMEngineConfig const& cfg)
+{
+    int64_t const minimumActivePages = rt::computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    ELLM_CHECK(cfg.kvPoolPages >= minimumActivePages && cfg.kvPoolPages <= rt::kMAX_KV_POOL_PAGES,
+        "KV pool page count (" + std::to_string(cfg.kvPoolPages) + ") is outside [" + std::to_string(minimumActivePages)
+            + ", " + std::to_string(rt::kMAX_KV_POOL_PAGES) + "].");
+    return cfg.kvPoolPages;
+}
+
 void addRopeTensorSpecs(TensorRegistry& reg, LLMEngineConfig const& cfg)
 {
     auto addRopeTensor = [&](char const* name, int32_t rotaryDim) {
+        // RoPE caches are exported/bound as full-length lookup tables. KV cache
+        // tensors also bind physical capacity; logical lengths come from the
+        // runtime length tensors.
         reg.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
-            {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(rotaryDim)}});
+            {sym(&InferenceDims::ropeBatch), fixed(cfg.maxKVCacheCapacity), fixed(rotaryDim)}});
     };
 
     if (cfg.useDualRope)
@@ -58,20 +77,58 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
         {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
 
-    // logits: [batch, outputVocabSize] FLOAT for vanilla, or
-    // [batch, seq_len, outputVocabSize] for SpecDecode. The engine binding
-    // shape depends on mode, but output address is always set.
-    // For the registry we use the common 2D shape; SpecDecode resolves via symbolic dims.
-    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
-        {sym(&InferenceDims::batch), fixed(cfg.outputVocabSize)}});
+    if (cfg.isDiffusionBackbone)
+    {
+        // DiffusionGemma backbone emits F32 logits for every selected canvas token.
+        reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(cfg.outputVocabSize)}});
+    }
+    else
+    {
+        // logits: [batch, outputVocabSize] FLOAT for vanilla, or
+        // [batch, seq_len, outputVocabSize] for SpecDecode. The engine binding
+        // shape depends on mode, but output address is always set.
+        // For the registry we use the common 2D shape; SpecDecode resolves via symbolic dims.
+        reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+            {sym(&InferenceDims::batch), fixed(cfg.outputVocabSize)}});
+    }
 
     // context_lengths: [batch] INT32
     reg.addTensor(
         {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
 
-    // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
-    reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
-        {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+    if (cfg.isDiffusionBackbone)
+    {
+        // phase_is_encoder: [batch] INT32. Non-zero selects encoder-phase layer scalars.
+        reg.addTensor({binding_names::kPhaseIsEncoder, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::batch)}});
+
+        // select_token_indices: [batch, select_len] INT64. Denoise selects the full canvas.
+        reg.addTensor({binding_names::kSelectTokenIndices, TensorIO::kInput, nvinfer1::DataType::kINT64,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+
+        if (cfg.diffusionUnifiedConditioning)
+        {
+            // Unified DiffusionGemma ONNX embeds the self-conditioning graph in the backbone.
+            // These inputs share ONNX's seq_len symbol with inputs_embeds, so
+            // TRT requires equal binding dimensions even in encoder prefill
+            // where the branch does not read conditioning values.
+            reg.addTensor({binding_names::kCanvasIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen)}});
+            reg.addTensor({binding_names::kPrevSelfConditioningEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.hiddenSize)}});
+            reg.addTensor({binding_names::kSelfConditioningTemperature, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
+                {fixed(1)}});
+            reg.addTensor({binding_names::kNextSelfConditioningEmbeds, TensorIO::kOutput, nvinfer1::DataType::kHALF,
+                {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(cfg.hiddenSize)}});
+        }
+    }
+    else
+    {
+        // last_token_ids: [batch, select_len] INT64 — always [batch, 1] for vanilla, varies for SpecDecode.
+        reg.addTensor({binding_names::kLastTokenIds, TensorIO::kInput, nvinfer1::DataType::kINT64,
+            {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen)}});
+    }
 
     // kvcache_start_index: [start_index_len] INT32. The engine's context profile
     // uses shape [0] as a sentinel for "initial prefill of an empty KV cache";
@@ -82,11 +139,19 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // the bound address and the engine branches to the initial-prefill path.
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
 
     if (cfg.useVisionBidirectionalAttention)
     {
         reg.addTensor({binding_names::kVisionBlockIds, TensorIO::kInput, nvinfer1::DataType::kINT32,
             {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen)}});
+    }
+    if (cfg.contextMaskSelectorEnabled)
+    {
+        reg.addTensor({binding_names::kContextMaskSelector, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::contextMaskSelectorLen)}});
     }
 
     // RoPE cache inputs: single binding for single-RoPE models, explicit
@@ -113,9 +178,11 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io, std::vector<ShapeDim> const& shape) {
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
-            // Plugin: combined KV, 5D [batch, 2, numKVHeads, kv_len, headDim]
-            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
-                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+            // Plugin: paged pool, 5D [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim].
+            // numPages is fixed for the life of this engine context (see computeNumPages).
+            int32_t const numPages = computeNumPages(cfg);
+            std::vector<ShapeDim> const shape{
+                fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput, shape);
             addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput, shape);
             ++localAttnIdx;
@@ -138,18 +205,36 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
             addMambaTensor(binding_names::kConvStateTemplate, TensorIO::kInput, cfg.convStateDtype, convShape);
             addMambaTensor(binding_names::kPresentConvStateTemplate, TensorIO::kOutput, cfg.convStateDtype, convShape);
 
-            // Hybrid MTP/DFlash base only: per-layer intermediate state outputs
-            // written during prefill/verification so accepted recurrent/conv
-            // state snapshots can be committed after speculative verification.
-            //
-            // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
-            // intermediate_conv_state_%d:      [batch, seqLen, convDim, convKernel]
-            if (cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash)
+            // Hybrid MTP/DFlash/DSpark base: declare the per-layer spec-verify recurrent-state
+            // outputs. recurrentSpecVerifyUsesReplay selects which output set the engine declares
+            // (replay stash vs full-state snapshot).
+            if (cfg.specDecodeType == SpecDecodeMode::kMTP || cfg.specDecodeType == SpecDecodeMode::kDFlash
+                || cfg.specDecodeType == SpecDecodeMode::kDSpark)
             {
-                std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
-                    fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim), fixed(cfg.recurrentStateSize)};
-                addMambaTensor(binding_names::kIntermediateRecurrentStateTemplate, TensorIO::kOutput,
-                    cfg.recurrentStateDtype, interRecShape);
+                bool const useReplay = cfg.recurrentSpecVerifyUsesReplay;
+                if (useReplay)
+                {
+                    // replay_da_state_%d: [batch, seqLen, recurrentNumHeads]
+                    addMambaTensor(binding_names::kReplayDaStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads)});
+                    // replay_u_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim]
+                    addMambaTensor(binding_names::kReplayUStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumHeads),
+                            fixed(cfg.recurrentStateHeadDim)});
+                    // replay_b_state_%d: [batch, seqLen, recurrentNumGroups, recurrentStateSize]
+                    addMambaTensor(binding_names::kReplayBStateTemplate, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+                        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(cfg.recurrentStateNumGroups),
+                            fixed(cfg.recurrentStateSize)});
+                }
+                else
+                {
+                    // intermediate_recurrent_state_%d: [batch, seqLen, recurrentNumHeads, recurrentHeadDim, dstate]
+                    std::vector<ShapeDim> const interRecShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
+                        fixed(cfg.recurrentStateNumHeads), fixed(cfg.recurrentStateHeadDim),
+                        fixed(cfg.recurrentStateSize)};
+                    addMambaTensor(binding_names::kIntermediateRecurrentStateTemplate, TensorIO::kOutput,
+                        cfg.recurrentStateDtype, interRecShape);
+                }
                 if (cfg.convDim > 0 && cfg.convKernel > 0)
                 {
                     std::vector<ShapeDim> const interConvShape{sym(&InferenceDims::batch), sym(&InferenceDims::seqLen),
@@ -165,7 +250,7 @@ TensorRegistry buildRegistryForLLM(LLMEngineConfig const& cfg, std::optional<int
     // ---------------------------------------------------------------
     // Deepstack (Qwen3-VL / Qwen3-Omni)
     // ---------------------------------------------------------------
-    if (cfg.numDeepstackFeatures > 0)
+    if (!cfg.isDiffusionBackbone && cfg.numDeepstackFeatures > 0)
     {
         // deepstack_embeds_%d: [batch, seq_len, hiddenSize] HALF — one per feature.
         // DeepstackBinding swaps the backing tensor (real per-request buffer
@@ -261,6 +346,12 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
     reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
         {sym(&InferenceDims::startIndexLen)}});
 
+    if (cfg.contextMaskSelectorEnabled)
+    {
+        reg.addTensor({binding_names::kContextMaskSelector, TensorIO::kInput, nvinfer1::DataType::kINT32,
+            {sym(&InferenceDims::contextMaskSelectorLen)}});
+    }
+
     // RoPE cache inputs: single binding for single-RoPE models, explicit
     // sliding/full bindings for mixed-attention dual-RoPE models.
     addRopeTensorSpecs(reg, cfg);
@@ -309,8 +400,12 @@ TensorRegistry buildRegistryForSpecDecodeDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
-                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+            // Plugin: paged pool, 5D [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim] — same
+            // contract as the base LLM engine (see buildRegistryForLLM); EAGLE/MTP drafts share the
+            // AttentionPlugin binding via KVCacheManager's paged-pool view.
+            int32_t const numPages = computeNumPages(cfg);
+            std::vector<ShapeDim> const shape{
+                fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
@@ -380,8 +475,13 @@ TensorRegistry buildRegistryForDFlashDraft(DeploymentConfig const& bundle)
                 continue;
             }
             auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
-            std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(lc.numKVHeads),
-                sym(&InferenceDims::kvLen), fixed(lc.headDim)};
+            // DFlash's own combined draft cache uses the same paged-pool contract and the exact
+            // serialized engine page count. Deployment validation separately requires this mode
+            // to use only its minimum active pages because its update plugin recovers maxBatch/cap by
+            // dividing numPages by the builder-configured pages_per_slot.
+            int32_t const numPages = cfg.kvPoolPages;
+            std::vector<ShapeDim> const shape{
+                fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
             auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
                 reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
             };
@@ -436,11 +536,99 @@ TensorRegistry buildRegistryForGemma4MTPDraft(DeploymentConfig const& bundle)
                 && entry.targetAttentionLayerIdx < static_cast<int32_t>(bundle.base.kvLayerConfigs.size()),
             "buildRegistryForGemma4MTPDraft: invalid target attention layer index");
 
+        // The assistant binds the TARGET model's paged pool tensor directly, so the
+        // expected shape is the target pool contract [2, numPages, kTOKENS_PER_PAGE,
+        // numKVHeads, headDim] with the target's runtime-chosen numPages.
         auto const& targetKV = bundle.base.kvLayerConfigs[entry.targetAttentionLayerIdx];
-        std::vector<ShapeDim> const shape{sym(&InferenceDims::batch), fixed(2), fixed(targetKV.numKVHeads),
-            sym(&InferenceDims::kvLen), fixed(targetKV.headDim)};
+        int32_t const targetNumPages = computeNumPages(bundle.base);
+        std::vector<ShapeDim> const shape{fixed(2), fixed(targetNumPages), fixed(kTokensPerPage),
+            fixed(targetKV.numKVHeads), fixed(targetKV.headDim)};
         reg.addTensor({binding_names::formatKVCacheName(entry.assistantLayerIdx, /*isPast=*/true), TensorIO::kInput,
             bundle.base.kvCacheDtype, shape});
+    }
+
+    return reg;
+}
+
+TensorRegistry buildRegistryForDSparkDraft(DeploymentConfig const& bundle)
+{
+    check::check(bundle.draft.has_value(), "buildRegistryForDSparkDraft: bundle.draft must be set");
+    check::check(bundle.specConfig.has_value(), "buildRegistryForDSparkDraft: bundle.specConfig must be set");
+
+    TensorRegistry reg;
+    LLMEngineConfig const& cfg = *bundle.draft;
+    int32_t const draftHiddenSize = bundle.specConfig->draftHiddenSize;
+    int32_t const baseOutputHiddenDim = bundle.specConfig->baseOutputHiddenDim;
+    int32_t const draftVocabSize = cfg.outputVocabSize;
+
+    // inputs_embeds: [batch, seq_len, draftHiddenSize] HALF
+    reg.addTensor({binding_names::kInputsEmbeds, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftHiddenSize)}});
+
+    // dflash_target_hidden_concat: [batch, selectLen, baseOutputHiddenDim] HALF
+    reg.addTensor({binding_names::kDFlashTargetHiddenConcat, TensorIO::kInput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::selectLen), fixed(baseOutputHiddenDim)}});
+
+    // logits: [batch, seq_len, draftVocabSize] FLOAT
+    reg.addTensor({binding_names::kLogits, TensorIO::kOutput, nvinfer1::DataType::kFLOAT,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftVocabSize)}});
+
+    // dspark_hidden_states: [batch, seq_len, draftHiddenSize] HALF
+    reg.addTensor({binding_names::kDSparkHiddenStates, TensorIO::kOutput, nvinfer1::DataType::kHALF,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::seqLen), fixed(draftHiddenSize)}});
+
+    // context_lengths: [batch] INT32
+    reg.addTensor(
+        {binding_names::kContextLengths, TensorIO::kInput, nvinfer1::DataType::kINT32, {sym(&InferenceDims::batch)}});
+
+    // kvcache_start_index: [startIndexLen] INT32
+    reg.addTensor({binding_names::kKVCacheStartIndex, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::startIndexLen)}});
+
+    // kv_page_table: [batch, 2, maxPagesPerSeq] INT32
+    int32_t const maxPagesPerSeq = rt::computeMaxPagesPerSeq(cfg.maxKVCacheCapacity);
+    reg.addTensor({binding_names::kKVPageTable, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), fixed(2), fixed(maxPagesPerSeq)}});
+
+    // dflash_delta_lengths: [batch] INT32
+    reg.addTensor({binding_names::kDFlashDeltaLengths, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch)}});
+
+    // rope_rotary_cos_sin: [ropeBatch, kvLen, rotaryDim] FLOAT
+    reg.addTensor({binding_names::kRopeCosSin, TensorIO::kInput, nvinfer1::DataType::kFLOAT,
+        {sym(&InferenceDims::ropeBatch), sym(&InferenceDims::kvLen), fixed(cfg.rotaryDim)}});
+
+    // attention_mask: [batch, attnMaskSeqLen, packedMaskLen] INT32
+    reg.addTensor({binding_names::kAttentionMask, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen), sym(&InferenceDims::packedMaskLen)}});
+
+    // attention_pos_id: [batch, attnMaskSeqLen] INT32
+    reg.addTensor({binding_names::kAttentionPosId, TensorIO::kInput, nvinfer1::DataType::kINT32,
+        {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
+
+    // Per-layer KV cache (plugin path: combined KV)
+    {
+        int32_t localAttnIdx = 0;
+        for (int32_t absIdx = 0; absIdx < static_cast<int32_t>(cfg.layerTypes.size()); ++absIdx)
+        {
+            if (cfg.layerTypes[absIdx] != rt::HybridCacheManager::LayerType::kAttention)
+            {
+                continue;
+            }
+            auto const& lc = cfg.kvLayerConfigs[localAttnIdx];
+            // DSpark uses the exact serialized engine page count. Deployment validation separately
+            // requires the minimum active pages because the update plugin derives (maxBatch, cap) from
+            // this count and the build-time pages_per_slot.
+            int32_t const numPages = cfg.kvPoolPages;
+            std::vector<ShapeDim> const shape{
+                fixed(2), fixed(numPages), fixed(kTokensPerPage), fixed(lc.numKVHeads), fixed(lc.headDim)};
+            auto addKVCacheTensor = [&](char const* tmpl, TensorIO io) {
+                reg.addTensor({std::string(tmpl) + "_" + std::to_string(localAttnIdx), io, cfg.kvCacheDtype, shape});
+            };
+            addKVCacheTensor(binding_names::kPastKeyValuesTemplate, TensorIO::kInput);
+            addKVCacheTensor(binding_names::kPresentKeyValuesTemplate, TensorIO::kOutput);
+            ++localAttnIdx;
+        }
     }
 
     return reg;

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from conftest import RemoteConfig
 
 _SENSITIVE_ENV_KEY_PARTS = ("TOKEN", "PASSWORD", "SECRET", "API_KEY")
+_SHARED_STORAGE_UMASK = "0000"
 
 
 def _quote_env_assignment(key: str, value: str, mask_sensitive: bool) -> str:
@@ -44,6 +45,21 @@ def _format_command_for_display(
         _quote_env_assignment(key, value, mask_sensitive_env)
         for key, value in env_vars.items())
     return f"{env_display} {cmd_display}"
+
+
+# Library size reports collected during the run. Pytest's fd capture hides
+# everything a passing test prints, so conftest replays these in the terminal
+# summary, which is where a CI job log can show them. This lives here rather
+# than in conftest.py because pytest registers conftest as its own plugin
+# module instance -- a test importing `conftest` gets a different object and
+# would append to a list the hook never sees.
+library_size_reports: List[str] = []
+
+
+def record_library_size_report(text: str) -> None:
+    """Queue a library size report for the end-of-run terminal summary."""
+    if text:
+        library_size_reports.append(text)
 
 
 def _tee_line_to_process_stdout(text: str) -> None:
@@ -78,23 +94,25 @@ def run_command(cmd: List[str],
             'ServerAliveCountMax=10', '-o', 'TCPKeepAlive=yes', remote_host
         ]
 
-        # Build the command string with environment variables if provided
-        env_prefix = ""
+        remote_steps = [f"umask {_SHARED_STORAGE_UMASK}"]
         if env_vars:
-            env_parts = []
             for key, value in env_vars.items():
-                env_parts.append(f"export {key}={shlex.quote(value)}")
-            env_prefix = " && ".join(env_parts) + " && "
+                remote_steps.append(f"export {key}={shlex.quote(value)}")
 
         base_cmd_display = _format_command_for_display(cmd, env_vars)
         if remote_config.remote_workspace:
-            cmd_str = f"{env_prefix}cd {shlex.quote(remote_config.remote_workspace)} && {' '.join(shlex.quote(arg) for arg in cmd)}"
-            cmd_display = (
-                f"[REMOTE] cd {shlex.quote(remote_config.remote_workspace)} && "
-                f"{base_cmd_display}")
-        else:
-            cmd_str = f"{env_prefix}{' '.join(shlex.quote(arg) for arg in cmd)}"
-            cmd_display = f"[REMOTE] {base_cmd_display}"
+            remote_steps.append(
+                f"cd {shlex.quote(remote_config.remote_workspace)}")
+        remote_steps.append(' '.join(shlex.quote(arg) for arg in cmd))
+
+        display_steps = [f"umask {_SHARED_STORAGE_UMASK}"]
+        if remote_config.remote_workspace:
+            display_steps.append(
+                f"cd {shlex.quote(remote_config.remote_workspace)}")
+        display_steps.append(base_cmd_display)
+
+        cmd_str = " && ".join(remote_steps)
+        cmd_display = f"[REMOTE] {' && '.join(display_steps)}"
         ssh_cmd.append(cmd_str)
         final_cmd = ssh_cmd
     else:

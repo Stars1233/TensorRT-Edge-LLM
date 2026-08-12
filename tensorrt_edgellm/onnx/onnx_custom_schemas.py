@@ -48,22 +48,16 @@ _attention_plugin_schema = OpSchema(
     name="AttentionPlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc=
-    "Custom TensorRT attention plugin with RoPE, KV cache, and attention computation.",
+    doc="Custom TensorRT attention plugin (packed-QKV contract) with RoPE, "
+    "KV cache, and attention computation.  Q/K/V are concatenated on the "
+    "last dim by the dynamo translation; the plugin internally splits the "
+    "packed tensor and fuses RoPE + KV-cache write in a single kernel.",
     inputs=[
         OpSchema.FormalParameter(
-            name="q",
-            description="Query tensor",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="k",
-            description="Key tensor",
-            type_str="T",
-        ),
-        OpSchema.FormalParameter(
-            name="v",
-            description="Value tensor",
+            name="qkv",
+            description=
+            "Packed QKV tensor [B, S, (H_q + 2*H_kv) * D] (concat on last "
+            "dim of separate Q/K/V projections)",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -88,6 +82,36 @@ _attention_plugin_schema = OpSchema(
             type_str="tensor(int32)",
         ),
         OpSchema.FormalParameter(
+            name="kv_page_table",
+            description=
+            "Per-request page table of shape [batch, 2, max_pages_per_seq]",
+            type_str="tensor(int32)",
+        ),
+        OpSchema.FormalParameter(
+            name="q_norm_gamma",
+            description=
+            "Per-head RMSNorm gamma weights for Q (FP16, 1-D, length == head_size). Fed as a "
+            "Constant initializer so TRT bakes it into the engine as weights at build time. "
+            "Optional: only wired when enable_qk_norm=1 (models without qk_norm, e.g. Qwen2.5, "
+            "omit this input entirely).",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="k_norm_gamma",
+            description=
+            "Per-head RMSNorm gamma weights for K (FP16, 1-D, length == head_size). Same "
+            "conventions as q_norm_gamma.",
+            type_str="T",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="context_mask_selector",
+            description="Runtime context-mask selector tensor (optional)",
+            type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
             name="attention_mask",
             description="Attention mask tensor (optional)",
             type_str="tensor(int32)",
@@ -97,6 +121,14 @@ _attention_plugin_schema = OpSchema(
             name="attention_pos_id",
             description="Position IDs tensor (optional)",
             type_str="tensor(int32)",
+            param_option=OpSchema.FormalParameterOption.Optional,
+        ),
+        OpSchema.FormalParameter(
+            name="skip_softmax_scale",
+            description="Runtime skip-softmax override carrier (optional): 1-D "
+            "INT8 dummy whose LENGTH is the integer scale-factor override "
+            "(0 = keep the engine default); data never read.",
+            type_str="tensor(int8)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
     ],
@@ -116,7 +148,7 @@ _attention_plugin_schema = OpSchema(
         (
             "T",
             ["tensor(float16)"],
-            "Input Q/K/V data type.",
+            "Input packed QKV data type.",
         ),
         (
             "T_KV",
@@ -157,6 +189,14 @@ _attention_plugin_schema = OpSchema(
             required=False,
         ),
         OpSchema.Attribute(
+            name="enable_context_mask_selector",
+            type=OpSchema.AttrType.INT,
+            description=(
+                "Use context_mask_selector as a runtime causal/non-causal "
+                "context-mask shape selector (0(false), 1(true)). Optional."),
+            required=False,
+        ),
+        OpSchema.Attribute(
             name="enable_vision_block_attention",
             type=OpSchema.AttrType.INT,
             description=(
@@ -183,6 +223,37 @@ _attention_plugin_schema = OpSchema(
             name="attention_scale",
             type=OpSchema.AttrType.FLOAT,
             description="Absolute multiplier applied to QK^T before softmax.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="skip_softmax_scale_factor",
+            type=OpSchema.AttrType.FLOAT,
+            description="Skip-softmax (BLASST) calibrated scale factor S "
+            "(0 = disabled); runtime derives lambda = S / context_length "
+            "per request for the prefill FMHA.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_qk_norm",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether the fused per-head q_norm / k_norm RMSNorm is enabled (0(false), 1(true)). "
+            "When 1, the q_norm_gamma / k_norm_gamma optional inputs must be wired.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="rms_norm_eps",
+            type=OpSchema.AttrType.FLOAT,
+            description=
+            "Epsilon for the q_norm / k_norm RMSNorm formula. Ignored when enable_qk_norm=0.",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="enable_kv_shared",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Whether this layer reads K/V from a donated (shared) cache; the packed qkv "
+            "input then carries Q only [B, S, Hq*D] (0(false), 1(true)).",
             required=False,
         ),
     ],
@@ -511,14 +582,14 @@ _trt_mxfp8_dequantize_linear_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
-# trt_edgellm::Int4GroupwiseGemmPlugin
+# trt_edgellm::Int4GroupwiseGemmPlugin (AWQ swizzled weights)
 # ---------------------------------------------------------------------------
 
 _int4_groupwise_gemm_schema = OpSchema(
     name="Int4GroupwiseGemmPlugin",
     domain="trt_edgellm",
     since_version=_SCHEMA_SINCE_VERSION,
-    doc="TensorRT Int4 groupwise GEMM plugin.",
+    doc="TensorRT Int4 groupwise GEMM plugin (AWQ swizzled weights).",
     inputs=[
         OpSchema.FormalParameter(
             name="input",
@@ -527,7 +598,7 @@ _int4_groupwise_gemm_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="qweight",
-            description="Quantized weights (int8)",
+            description="Quantized weights, AWQ swizzle layout (int8)",
             type_str="tensor(int8)",
         ),
         OpSchema.FormalParameter(
@@ -568,6 +639,132 @@ _int4_groupwise_gemm_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description="Group size",
             required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::Int4GroupwiseGemmPluginV2 (cuteDSL fragment-layout weights)
+# ---------------------------------------------------------------------------
+
+_int4_groupwise_gemm_v2_schema = OpSchema(
+    name="Int4GroupwiseGemmPluginV2",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=
+    "TensorRT Int4 groupwise GEMM plugin (cuteDSL fragment-layout weights).",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="input",
+            description="Input tensor",
+            type_str="T",
+        ),
+        OpSchema.FormalParameter(
+            name="qweight",
+            description="Quantized weights, cuteDSL fragment layout (int8)",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="scales",
+            description="Scales (float16)",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="Output tensor",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and output data type.",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="group_size",
+            type=OpSchema.AttrType.INT,
+            description="Group size",
+            required=True,
+        ),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::Nvfp4A16GemmPlugin (dense FP16-A / NVFP4-W4 Marlin GEMM)
+# ---------------------------------------------------------------------------
+
+_nvfp4_a16_gemm_schema = OpSchema(
+    name="Nvfp4A16GemmPlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc="TensorRT dense NVFP4 (W4A16) Marlin GEMM plugin.",
+    inputs=[
+        OpSchema.FormalParameter(
+            name="activation",
+            description="FP16 activation [B, S, gemm_k]",
+            type_str="tensor(float16)",
+        ),
+        OpSchema.FormalParameter(
+            name="qweights",
+            description=
+            "Marlin-packed E2M1 codes, INT8 view [1, gemm_k/16, 8*gemm_n]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="block_scales",
+            description=
+            "Marlin-permuted E4M3 block-scale bytes [1, gemm_k/16, gemm_n]",
+            type_str="tensor(int8)",
+        ),
+        OpSchema.FormalParameter(
+            name="global_scale",
+            description="Per-tensor FP16 global scale (pre-scaled by 2**7) [1]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    outputs=[
+        OpSchema.FormalParameter(
+            name="output",
+            description="FP16 output [B, S, gemm_n]",
+            type_str="tensor(float16)",
+        ),
+    ],
+    attributes=[
+        OpSchema.Attribute(
+            name="gemm_n",
+            type=OpSchema.AttrType.INT,
+            description="Marlin-padded output feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="gemm_k",
+            type=OpSchema.AttrType.INT,
+            description="Input feature dimension",
+            required=True,
+        ),
+        OpSchema.Attribute(
+            name="max_m",
+            type=OpSchema.AttrType.INT,
+            description=
+            "Profile token capacity for workspace sizing (0 == auto)",
+            required=False,
         ),
     ],
 )
@@ -685,6 +882,17 @@ _update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(name="context_lengths",
                                  description="Context lengths per batch",
                                  type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="state_start_index",
+            description=
+            "[0] initial-prefill sentinel or [batch] restored-state marker",
+            type_str="T_CL"),
+        OpSchema.FormalParameter(
+            name="spec_verify_phase_marker",
+            description="Optional shape-only INT32 marker (len 0=ordinary, "
+            "1=verify) enabling per-token intermediate state capture",
+            type_str="T_CL",
+            param_option=OpSchema.FormalParameterOption.Optional),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -693,11 +901,30 @@ _update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(name="state_out",
                                  description="Updated SSM state",
                                  type_str="T"),
+        OpSchema.FormalParameter(
+            name="replay_da",
+            description="Optional spec-verify replay stash: per-token decay "
+            "dA [batch, seq, nheads] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
+        OpSchema.FormalParameter(
+            name="replay_u",
+            description="Optional spec-verify replay stash: per-token input "
+            "factor u=dt*x [batch, seq, nheads, dim] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
+        OpSchema.FormalParameter(
+            name="replay_b",
+            description="Optional spec-verify replay stash: per-token key "
+            "B [batch, seq, ngroups, dstate] FP32",
+            type_str="T_F32",
+            param_option=OpSchema.FormalParameterOption.Optional),
     ],
     type_constraints=[
         ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
         ("T_A", ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"], ""),
         ("T_CL", ["tensor(int32)"], ""),
+        ("T_F32", ["tensor(float)"], ""),
     ],
     attributes=[
         OpSchema.Attribute(name="dt_softplus",
@@ -717,6 +944,12 @@ _update_ssm_state_schema = OpSchema(
                            type=OpSchema.AttrType.FLOATS,
                            description="Time step clamping range",
                            required=False),
+        OpSchema.Attribute(
+            name="use_spec_verify_state",
+            type=OpSchema.AttrType.INT,
+            description="Emit per-token intermediate recurrent states (1) or "
+            "not (0)",
+            required=False),
     ],
 )
 
@@ -1196,6 +1429,124 @@ _nvfp4_moe_plugin_schema = OpSchema(
 )
 
 # ---------------------------------------------------------------------------
+# trt_edgellm::Fp16MoePlugin (unquantized experts, CuTeDSL grouped GEMM)
+# ---------------------------------------------------------------------------
+
+_fp16_moe_plugin_schema = OpSchema(
+    name="Fp16MoePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=(
+        "FP16 MoE plugin (CuTeDSL grouped GEMM): FP16 hidden states and "
+        "plain FP16 expert weights. FC1 is 64-row up/gate interleaved for "
+        "SwiGLU or a plain [E, I, H] block for ReLU2. No quantization scales. "
+        "Routing is softmax top-k (routing_mode=0, default) or sigmoid "
+        "group-topk (routing_mode=1), which additionally consumes the "
+        "optional e_score_correction_bias input and the n_group / topk_group "
+        "/ routed_scaling_factor attributes."),
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T_ROUTER",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter("fc1_weights", "T_HIDDEN",
+                                 "FC1 weights [E, N1, H] FP16"),
+        OpSchema.FormalParameter("fc2_weights", "T_HIDDEN",
+                                 "FC2 weights [E, H, I] FP16"),
+        OpSchema.FormalParameter(
+            "e_score_correction_bias",
+            "T_ROUTER",
+            "Router correction bias [E] FP32 (sigmoid group-topk only)",
+            param_option=OpSchema.FormalParameterOption.Optional),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T_HIDDEN",
+                                 "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
+        ("T_HIDDEN", ["tensor(float16)"], "FP16 tensors"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+        # Sigmoid group-topk routing (routing_mode=1) only; optional so the
+        # softmax export (Qwen) can omit them.
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT, required=False),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT,
+                           required=False),
+        OpSchema.Attribute("routed_scaling_factor",
+                           OpSchema.AttrType.FLOAT,
+                           required=False),
+        OpSchema.Attribute("routing_mode",
+                           OpSchema.AttrType.INT,
+                           required=False),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# trt_edgellm::Nvfp4A16MoePlugin (Marlin FP16-A / NVFP4-W4 weight-only MoE)
+# ---------------------------------------------------------------------------
+
+_nvfp4_a16_moe_plugin_schema = OpSchema(
+    name="Nvfp4A16MoePlugin",
+    domain="trt_edgellm",
+    since_version=_SCHEMA_SINCE_VERSION,
+    doc=("Marlin NVFP4 (W4A16) MoE plugin: FP16 hidden states, Marlin-packed "
+         "E2M1 expert weights (INT8 view), raw E4M3 block scales, and FP16 "
+         "per-expert global scales pre-scaled by 2**7."),
+    inputs=[
+        OpSchema.FormalParameter("router_logits", "T_ROUTER",
+                                 "Router logits [B*S, E] FP32"),
+        OpSchema.FormalParameter("hidden_states", "T_HIDDEN",
+                                 "Hidden states [B, S, H] FP16"),
+        OpSchema.FormalParameter(
+            "fc1_qweights", "T_INT8",
+            "FC1 Marlin weights [E, H/16, 8*fc1_out] INT8"),
+        OpSchema.FormalParameter(
+            "fc1_block_scales", "T_INT8",
+            "FC1 E4M3 block scales [E, H/16, fc1_out] INT8"),
+        OpSchema.FormalParameter("fc1_global_scales", "T_HIDDEN",
+                                 "FC1 per-expert global scales [E] FP16"),
+        OpSchema.FormalParameter("fc2_qweights", "T_INT8",
+                                 "FC2 Marlin weights [E, I/16, 8*H] INT8"),
+        OpSchema.FormalParameter("fc2_block_scales", "T_INT8",
+                                 "FC2 E4M3 block scales [E, I/16, H] INT8"),
+        OpSchema.FormalParameter("fc2_global_scales", "T_HIDDEN",
+                                 "FC2 per-expert global scales [E] FP16"),
+        OpSchema.FormalParameter("e_score_correction_bias", "T_ROUTER",
+                                 "Router correction bias [E] FP32"),
+    ],
+    outputs=[
+        OpSchema.FormalParameter("output", "T_HIDDEN",
+                                 "Output [B, S, H] FP16"),
+    ],
+    type_constraints=[
+        ("T_ROUTER", ["tensor(float)"], "FP32 tensors"),
+        ("T_HIDDEN", ["tensor(float16)"], "FP16 tensors"),
+        ("T_INT8", ["tensor(int8)"], "INT8 byte tensors"),
+    ],
+    attributes=[
+        OpSchema.Attribute("num_experts", OpSchema.AttrType.INT),
+        OpSchema.Attribute("top_k", OpSchema.AttrType.INT),
+        OpSchema.Attribute("hidden_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("moe_inter_size", OpSchema.AttrType.INT),
+        OpSchema.Attribute("activation_type", OpSchema.AttrType.INT),
+        OpSchema.Attribute("n_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("topk_group", OpSchema.AttrType.INT),
+        OpSchema.Attribute("norm_topk_prob", OpSchema.AttrType.INT),
+        OpSchema.Attribute("routed_scaling_factor", OpSchema.AttrType.FLOAT),
+        OpSchema.Attribute("routing_mode", OpSchema.AttrType.INT),
+        OpSchema.Attribute("max_routed_rows", OpSchema.AttrType.INT),
+    ],
+)
+
+# ---------------------------------------------------------------------------
 # trt_edgellm::NvFP4MoEPluginGeforce (SM12x fused, plain [up, gate] concat)
 # ---------------------------------------------------------------------------
 
@@ -1343,7 +1694,8 @@ _dflash_target_kv_cache_update_schema = OpSchema(
         ),
         OpSchema.FormalParameter(
             name="past_key_value",
-            description="Combined KV cache [B, 2, Hkv, capacity, D]",
+            description=
+            "Combined KV cache, paged pool [2, num_pages, KV_PAGE_SIZE, Hkv, D]",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -1478,6 +1830,8 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _trt_mxfp8_dynamic_quantize_schema,
     _trt_mxfp8_dequantize_linear_schema,
     _int4_groupwise_gemm_schema,
+    _int4_groupwise_gemm_v2_schema,
+    _nvfp4_a16_gemm_schema,
     _causal_conv1d_schema,
     _update_ssm_state_schema,
     _rotary_embedding_schema,
@@ -1487,7 +1841,9 @@ _ALL_CUSTOM_SCHEMAS: tuple[OpSchema, ...] = (
     _gated_delta_net_schema,
     _int4_moe_plugin_schema,
     _nvfp4_moe_plugin_schema,
+    _nvfp4_a16_moe_plugin_schema,
     _nvfp4_moe_plugin_geforce_schema,
+    _fp16_moe_plugin_schema,
     _fused_nvfp4_gemm_allreduce_plugin_schema,
     _dflash_target_kv_cache_update_schema,
     _gemma4_audio_attention_plugin_schema,

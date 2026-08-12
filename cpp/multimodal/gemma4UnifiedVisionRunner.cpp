@@ -19,6 +19,7 @@
 #include "common/bindingNames.h"
 #include "common/checkMacros.h"
 #include "kernels/preprocessKernels/imageUtilKernels.h"
+#include "multimodal/imageUtils.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -237,47 +238,22 @@ bool Gemma4UnifiedVisionRunner::allocateBuffer([[maybe_unused]] cudaStream_t str
         cudaMemcpy(mImageStd.rawPointer(), stddev.data(), stddev.size() * sizeof(float), cudaMemcpyHostToDevice));
 
     int64_t const maxSpatialPixels = mConfig.maxPatchesPerImage * mConfig.modelPatchSize * mConfig.modelPatchSize;
-    rt::Tensor resizeBuffer({1, 1, maxSpatialPixels, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8,
-        "Gemma4UnifiedVisionRunner::resizeBuffer");
-    mResizedImageHost = rt::imageUtils::ImageData(std::move(resizeBuffer));
     mImageDevice = rt::Tensor({maxSpatialPixels * 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
         "Gemma4UnifiedVisionRunner::mImageDevice");
     mRescaledImageDevice = rt::Tensor({maxSpatialPixels * 3}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
         "Gemma4UnifiedVisionRunner::mRescaledImageDevice");
-    return true;
-}
 
-std::tuple<int64_t, int64_t> Gemma4UnifiedVisionRunner::getResizedImageSize(int64_t height, int64_t width) const
-{
-    ELLM_CHECK(height > 0 && width > 0, "Gemma4 Unified image dimensions must be positive");
-    double const targetPixels
-        = static_cast<double>(mConfig.maxPatchesPerImage) * mConfig.modelPatchSize * mConfig.modelPatchSize;
-    double const scale = std::sqrt(targetPixels / (static_cast<double>(height) * width));
-    double const idealHeight = scale * height;
-    double const idealWidth = scale * width;
-    int64_t const sideMultiple = mConfig.modelPatchSize;
-    auto floorToMultiple = [sideMultiple](double value) {
-        return static_cast<int64_t>(std::floor(value / sideMultiple)) * sideMultiple;
-    };
-    int64_t const maxSide = std::min(mConfig.maxPatchesPerImage, mConfig.positionEmbeddingSize) * sideMultiple;
-    int64_t targetHeight = std::min(floorToMultiple(idealHeight), maxSide);
-    int64_t targetWidth = std::min(floorToMultiple(idealWidth), maxSide);
-    ELLM_CHECK(targetHeight != 0 || targetWidth != 0, "Gemma4 Unified resized image rounded to 0x0");
-    if (targetHeight == 0)
-    {
-        targetHeight = sideMultiple;
-        targetWidth
-            = std::min(static_cast<int64_t>(std::floor(static_cast<double>(width) / height)) * sideMultiple, maxSide);
-    }
-    else if (targetWidth == 0)
-    {
-        targetWidth = sideMultiple;
-        targetHeight
-            = std::min(static_cast<int64_t>(std::floor(static_cast<double>(height) / width)) * sideMultiple, maxSide);
-    }
-    ELLM_CHECK(static_cast<double>(targetHeight) * targetWidth <= targetPixels,
-        "Gemma4 Unified resized image exceeds per-image patch budget");
-    return {targetHeight, targetWidth};
+    // GPU image-resize scratch.
+    int64_t const kMaxRawPixels = kernel::kGpuResizeMaxRawDim * kernel::kGpuResizeMaxRawDim;
+    // Horizontal-pass scratch holds [rawH, outW, 3] floats. gemma4UnifiedResizeTarget preserves aspect
+    // ratio, so rawH * outW <= sqrt(maxSpatialPixels * rawH * rawW) <= sqrt(maxSpatialPixels *
+    // kMaxRawPixels).
+    int64_t const kMaxResizeTmpElems
+        = static_cast<int64_t>(
+              std::sqrt(static_cast<double>(maxSpatialPixels) * kMaxRawPixels) * kernel::kGpuResizeScratchMargin)
+        * 3;
+    kernel::allocateResizeScratch(3, kMaxResizeTmpElems, mRawImageDevice, mResizeTmpDevice);
+    return true;
 }
 
 void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& image, int64_t& patchOffset,
@@ -296,10 +272,8 @@ void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& ima
     ELLM_CHECK(gridHeight <= mConfig.positionEmbeddingSize && gridWidth <= mConfig.positionEmbeddingSize,
         "Gemma4 Unified patch position exceeds mm_posemb_size");
 
-    check::check(mImageDevice.reshape({1, image.height, image.width, 3}), "Tensor reshape failed");
+    // mImageDevice already holds the [1, image.height, image.width, 3] image filled by the caller.
     check::check(mRescaledImageDevice.reshape({1, image.height, image.width, 3}), "Tensor reshape failed");
-    CUDA_CHECK(cudaMemcpyAsync(
-        mImageDevice.rawPointer(), image.data(), image.height * image.width * 3, cudaMemcpyHostToDevice, stream));
     kernel::normalizeImage(mImageDevice, mImageMean, mImageStd, mRescaledImageDevice, stream);
     kernel::transposeToPatchGemma4ViT(
         mRescaledImageDevice, mVisualInput, patchOffset * mConfig.inputDim, mConfig.modelPatchSize, stream);
@@ -319,7 +293,7 @@ void Gemma4UnifiedVisionRunner::formatImage(rt::imageUtils::ImageData const& ima
 }
 
 void Gemma4UnifiedVisionRunner::imagePreprocess(rt::LLMGenerationRequest const& request,
-    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest, bool doResize, cudaStream_t stream)
+    std::vector<int64_t>& imageTokenLengths, std::vector<int64_t>& imagesPerRequest, cudaStream_t stream)
 {
     check::check(mVisualInput.reshape({mConfig.maxPatches, mConfig.inputDim}), "Tensor reshape failed");
     check::check(mPixelPositionIdsHost.reshape({mConfig.maxPatches, 2}), "Tensor reshape failed");
@@ -329,18 +303,20 @@ void Gemma4UnifiedVisionRunner::imagePreprocess(rt::LLMGenerationRequest const& 
         imagesPerRequest.push_back(static_cast<int64_t>(req.imageBuffers.size()));
         for (auto const& image : req.imageBuffers)
         {
-            if (doResize)
+            if (image.doResize)
             {
-                auto const [resizedHeight, resizedWidth] = getResizedImageSize(image.height, image.width);
-                // The resize reuses this pinned host allocation. Wait for any
-                // in-flight asynchronous H2D copy before overwriting it.
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                rt::imageUtils::resizeImage(
-                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
-                formatImage(mResizedImageHost, totalPatches, imageTokenLengths, stream);
+                auto const [resizedHeight, resizedWidth] = rt::imageUtils::gemma4UnifiedResizeTarget(image.height,
+                    image.width, mConfig.maxPatchesPerImage, mConfig.modelPatchSize, mConfig.positionEmbeddingSize);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, resizedHeight, resizedWidth,
+                    stream);
+                formatImage(image.resizedMeta(resizedHeight, resizedWidth), totalPatches, imageTokenLengths, stream);
             }
             else
             {
+                LOG_DEBUG("Skipping resize for pre-resized image %ldx%ld", image.height, image.width);
+                kernel::copyImageToDeviceAndResize(image.data(), image.frames, image.height, image.width,
+                    image.channels, mRawImageDevice, mResizeTmpDevice, mImageDevice, image.height, image.width, stream);
                 formatImage(image, totalPatches, imageTokenLengths, stream);
             }
         }
@@ -380,7 +356,8 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
             int32_t const token = ids[tokenIndex];
             if (token == mConfig.imageTokenId)
             {
-                ELLM_CHECK(imageIndex < expectedEnd, "Too many image placeholders in Gemma4 Unified prompt");
+                ELLM_CHECK(imageIndex < expectedEnd,
+                    "EDGELLM_BAD_MEDIA_COUNT: too many image placeholders in Gemma4 Unified prompt");
                 bool const alreadyHasBegin = tokenIndex > 0 && ids[tokenIndex - 1] == mConfig.beginImageTokenId;
                 bool const alreadyHasEnd
                     = tokenIndex + 1 < ids.size() && ids[tokenIndex + 1] == mConfig.endImageTokenId;
@@ -400,7 +377,8 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
                 expanded.push_back(token);
             }
         }
-        ELLM_CHECK(imageIndex == expectedEnd, "Image placeholder count does not match Gemma4 Unified image count");
+        ELLM_CHECK(imageIndex == expectedEnd,
+            "EDGELLM_BAD_MEDIA_COUNT: image placeholder count does not match Gemma4 Unified image count");
         if (requestIndex < batchedInputIds.size())
         {
             batchedInputIds[requestIndex] = std::move(expanded);
@@ -415,13 +393,13 @@ void Gemma4UnifiedVisionRunner::textPreprocess(rt::LLMGenerationRequest const& r
 
 bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly) noexcept
+    [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream, bool imageOnly)
 {
     try
     {
         std::vector<int64_t> imageTokenLengths;
         std::vector<int64_t> imagesPerRequest;
-        imagePreprocess(request, imageTokenLengths, imagesPerRequest, !imageOnly, stream);
+        imagePreprocess(request, imageTokenLengths, imagesPerRequest, stream);
         if (!imageOnly)
         {
             textPreprocess(request, batchedInputIds, imageTokenLengths, imagesPerRequest, tokenizer);
@@ -430,7 +408,18 @@ bool Gemma4UnifiedVisionRunner::preprocess(rt::LLMGenerationRequest const& reque
     }
     catch (std::exception const& e)
     {
-        LOG_ERROR("Gemma4 Unified vision preprocessing failed: %s", e.what());
+        bool const actionable = isCallerActionable(e);
+        if (!actionable)
+        {
+            LOG_ERROR("Gemma4 Unified vision preprocessing failed: %s", e.what());
+        }
+        // Drain async H2D copies that may still read the request's image buffers, so the caller can
+        // safely release them after the failure -- including when the error propagates.
+        cudaStreamSynchronize(stream);
+        if (actionable)
+        {
+            throw;
+        }
         return false;
     }
 }

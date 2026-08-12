@@ -36,10 +36,10 @@ coalesced copy and dequantized in the mainloop with one lean
 ``fma.f16x2``, no per-fragment fixup).  Optional in-kernel serial split-K and a
 runtime grouped-M threadblock swizzle.
 
-Constraints: ``K % 64 == 0``, ``N % 64 == 0``, and ``group_size`` a multiple of
-16 that is mutually divisible with ``bK`` (=64) -- validated for 128 and 32 (one
-``bK=64`` kernel serves both via per-group scale staging).  A baked ``split_k``
-factor is correct only when it divides ``ceil(K / 64)``
+Constraints: ``K % 64 == 0`` and ``group_size`` a multiple of 16 that is mutually
+divisible with ``bK`` (=64) -- validated for 128 and 32 (one ``bK=64`` kernel
+serves both via per-group scale staging). N residue is predicated. A baked
+``split_k`` factor is correct only when it divides ``ceil(K / 64)``
 (``split_k == 1`` always holds); the consumer must pick a valid factor.
 
 Exported ABI (per compiled variant):
@@ -1017,8 +1017,8 @@ def run(
     bM, bN, bK = cta_tiler_mnk
     _tag = f"[{file_name}]"
 
-    if N % 64 != 0:
-        raise ValueError(f"N must be a multiple of 64 (got {N})")
+    if N <= 0:
+        raise ValueError(f"N must be positive (got {N})")
     if K % 64 != 0:
         raise ValueError(f"K must be a multiple of 64 (got {K})")
     k_tile_count = ceil_div(K, bK)

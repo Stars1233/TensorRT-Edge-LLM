@@ -50,6 +50,8 @@ pytestmark = pytest.mark.skipif(
     reason=f"TensorRT/torch CUDA not available: {IMPORT_ERROR}")
 
 DEV = "cuda"
+PLUGIN_NAME = "update_ssm_state"
+PLUGIN_VERSION = "1"
 
 
 def selective_scan_ref(
@@ -181,6 +183,7 @@ class MambaRunner:
             ("dt_bias", F16, (h, )),
             ("state", F16, (-1, h, dim, n)),
             ("context_lengths", I32, (-1, )),
+            ("state_start_index", I32, (-1, )),
         ]
         prof.update({
             "A": ((h, ), (h, ), (h, )),
@@ -188,12 +191,13 @@ class MambaRunner:
             "dt_bias": ((h, ), (h, ), (h, )),
             "state": ((1, h, dim, n), (1, h, dim, n), (mb, h, dim, n)),
             "context_lengths": ((1, ), (1, ), (mb, )),
+            "state_start_index": ((0, ), (1, ), (mb, )),
         })
         self.runner.build(
             input_specs=input_specs,
             output_names=["output", "state_out"],
-            plugin_name="update_ssm_state",
-            plugin_version="1",
+            plugin_name=PLUGIN_NAME,
+            plugin_version=PLUGIN_VERSION,
             plugin_fields=[
                 pf_int32("dim", dim),
                 pf_int32("dstate", n),
@@ -204,10 +208,25 @@ class MambaRunner:
             profiles=prof,
         )
 
-    def run(self, x, A, B, C, D, dt, dt_bias, state, context_lengths):
+    def run(self,
+            x,
+            A,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            context_lengths,
+            state_start_index=None):
         out = torch.empty_like(x)
         state_out = torch.empty_like(state)
-        self.runner.execute({
+        input_shapes = None
+        if state_start_index is None or state_start_index.numel() == 0:
+            # TensorRT requires a non-null address even when the runtime input shape is the cold-prefill [0] sentinel.
+            state_start_index = torch.empty(1, dtype=torch.int32, device=DEV)
+            input_shapes = {"state_start_index": (0, )}
+        bindings = {
             "x": x,
             "A": A,
             "B": B,
@@ -217,9 +236,11 @@ class MambaRunner:
             "dt_bias": dt_bias,
             "state": state,
             "context_lengths": context_lengths,
+            "state_start_index": state_start_index,
             "output": out,
             "state_out": state_out,
-        })
+        }
+        self.runner.execute(bindings, input_shapes=input_shapes)
         return out, state_out
 
 
@@ -353,6 +374,38 @@ def test_prefill_ssd(seq, batch):
     ref_y, ref_state = selective_scan_ref(x, A, B, C, dt, dt_bias, D, state0,
                                           cfg.ngroups, True, ctx)
     # SSD path accumulates over a long sequence in fp16 I/O -> looser tol.
+    _check(cfg, out, state_out, ref_y, ref_state, ctx, 5e-2, 5e-2)
+
+
+@pytest.mark.parametrize("restored", [False, True], ids=["cold", "restored"])
+def test_prefill_ssd_state_start_index_contract(restored):
+    cfg = MambaConfig(max_batch=1, max_seq=128)
+    seq = 128
+    batch = 1
+    gen = torch.Generator().manual_seed(900 + int(restored))
+    r = MambaRunner(cfg, prefill=True)
+    x, A, B, C, D, dt, dt_bias = _rand_inputs(cfg, batch, seq, gen)
+    if restored:
+        state0 = (torch.randn(batch,
+                              cfg.nheads,
+                              cfg.head_dim,
+                              cfg.dstate,
+                              generator=gen,
+                              device=DEV) * 0.1).to(torch.float16)
+        state_start_index = torch.zeros(batch, dtype=torch.int32, device=DEV)
+    else:
+        state0 = torch.zeros(batch,
+                             cfg.nheads,
+                             cfg.head_dim,
+                             cfg.dstate,
+                             dtype=torch.float16,
+                             device=DEV)
+        state_start_index = torch.empty(0, dtype=torch.int32, device=DEV)
+    ctx = torch.full((batch, ), seq, dtype=torch.int32, device=DEV)
+    out, state_out = r.run(x, A, B, C, D, dt, dt_bias, state0.clone(), ctx,
+                           state_start_index)
+    ref_y, ref_state = selective_scan_ref(x, A, B, C, dt, dt_bias, D, state0,
+                                          cfg.ngroups, True, ctx)
     _check(cfg, out, state_out, ref_y, ref_state, ctx, 5e-2, 5e-2)
 
 

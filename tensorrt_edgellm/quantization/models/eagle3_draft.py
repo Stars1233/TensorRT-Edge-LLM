@@ -22,6 +22,7 @@ Only the calibration forward path is implemented; the full inference
 forward with KV-cache and GatherND belongs in the ONNX export layer.
 """
 
+import gc
 import json
 import os
 from pathlib import Path
@@ -216,7 +217,8 @@ def quantize_and_export_draft(
         QUANTIZATION_NONE, _export_quantized_weight, get_quantization_format,
         is_quantlinear, postprocess_state_dict)
     from modelopt.torch.quantization.utils import is_quantized
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
 
     t0 = time.time()
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
@@ -345,7 +347,9 @@ def _load_for_draft_calib(model_dir, dtype, device):
     auto_cls = AutoModelForImageTextToText if is_vlm else AutoModelForCausalLM
     model = auto_cls.from_pretrained(model_dir,
                                      torch_dtype=torch_dtype,
-                                     trust_remote_code=True).to(device)
+                                     trust_remote_code=True,
+                                     low_cpu_mem_usage=True).to(device)
+    gc.collect()  # release safetensor mmap handles after GPU transfer
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return model, tok

@@ -18,8 +18,10 @@
 // Kernel-level accuracy test for the CuTe DSL INT4 (W4A16) FP16 GEMM. This
 // kernel has no C++ consumer yet, so the test drives the AOT-exported artifact
 // DIRECTLY (load module -> marshal the generated tensor structs -> call the
-// generated wrapper), rather than going through a runner. It covers ALL 75
-// compiled variants (5 tiles x {2,3,4} stages x {1,2,4,8,16} serial split-K).
+// generated wrapper), rather than going through a runner. It covers all compiled
+// variants -- the 16 variant subset (bN=128; see build_cutedsl.py / the plugin's
+// INT4_FP16_GEMM_VARIANTS) of the full 4-tile x {2,3,4}-stage x {1,2,4,8,16}
+// split-K = 60 space.
 
 #ifdef CUTE_DSL_INT4_FP16_GEMM_ENABLED
 
@@ -64,7 +66,7 @@ inline int32_t ceilDiv(int32_t a, int32_t b)
 
 // RAII device buffer: frees on scope exit so a mid-test ASSERT_* early-return
 // (Google Test ASSERT_* returns immediately on failure) cannot leak device
-// memory across the 78-config suite.
+// memory across this multi-config suite.
 template <typename T>
 struct DeviceBuffer
 {
@@ -86,88 +88,29 @@ struct DeviceBuffer
 };
 
 // ---------------------------------------------------------------------------
-// The full 75-variant table. X(prefix, bM, bN, bK, stages, splitK) is expanded
-// for module declaration, loading, and runtime dispatch below.
+// X(prefix, bM, bN, bK, stages, splitK) is expanded for module declaration,
+// loading, and runtime dispatch below.
 // ---------------------------------------------------------------------------
 #define INT4_FP16_GEMM_VARIANTS(X)                                                                                     \
-    X(int4_fp16_gemm_16x128x64_s2_sk1, 16, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_16x128x64_s2_sk2, 16, 128, 64, 2, 2)                                                              \
-    X(int4_fp16_gemm_16x128x64_s2_sk4, 16, 128, 64, 2, 4)                                                              \
-    X(int4_fp16_gemm_16x128x64_s2_sk8, 16, 128, 64, 2, 8)                                                              \
-    X(int4_fp16_gemm_16x128x64_s2_sk16, 16, 128, 64, 2, 16)                                                            \
     X(int4_fp16_gemm_16x128x64_s3_sk1, 16, 128, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_16x128x64_s3_sk2, 16, 128, 64, 3, 2)                                                              \
-    X(int4_fp16_gemm_16x128x64_s3_sk4, 16, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_16x128x64_s3_sk8, 16, 128, 64, 3, 8)                                                              \
-    X(int4_fp16_gemm_16x128x64_s3_sk16, 16, 128, 64, 3, 16)                                                            \
     X(int4_fp16_gemm_16x128x64_s4_sk1, 16, 128, 64, 4, 1)                                                              \
     X(int4_fp16_gemm_16x128x64_s4_sk2, 16, 128, 64, 4, 2)                                                              \
     X(int4_fp16_gemm_16x128x64_s4_sk4, 16, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk8, 16, 128, 64, 4, 8)                                                              \
-    X(int4_fp16_gemm_16x128x64_s4_sk16, 16, 128, 64, 4, 16)                                                            \
-    X(int4_fp16_gemm_16x256x64_s2_sk1, 16, 256, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_16x256x64_s2_sk2, 16, 256, 64, 2, 2)                                                              \
-    X(int4_fp16_gemm_16x256x64_s2_sk4, 16, 256, 64, 2, 4)                                                              \
-    X(int4_fp16_gemm_16x256x64_s2_sk8, 16, 256, 64, 2, 8)                                                              \
-    X(int4_fp16_gemm_16x256x64_s2_sk16, 16, 256, 64, 2, 16)                                                            \
-    X(int4_fp16_gemm_16x256x64_s3_sk1, 16, 256, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_16x256x64_s3_sk2, 16, 256, 64, 3, 2)                                                              \
-    X(int4_fp16_gemm_16x256x64_s3_sk4, 16, 256, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_16x256x64_s3_sk8, 16, 256, 64, 3, 8)                                                              \
-    X(int4_fp16_gemm_16x256x64_s3_sk16, 16, 256, 64, 3, 16)                                                            \
-    X(int4_fp16_gemm_16x256x64_s4_sk1, 16, 256, 64, 4, 1)                                                              \
-    X(int4_fp16_gemm_16x256x64_s4_sk2, 16, 256, 64, 4, 2)                                                              \
-    X(int4_fp16_gemm_16x256x64_s4_sk4, 16, 256, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_16x256x64_s4_sk8, 16, 256, 64, 4, 8)                                                              \
-    X(int4_fp16_gemm_16x256x64_s4_sk16, 16, 256, 64, 4, 16)                                                            \
     X(int4_fp16_gemm_32x128x64_s2_sk1, 32, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_32x128x64_s2_sk2, 32, 128, 64, 2, 2)                                                              \
-    X(int4_fp16_gemm_32x128x64_s2_sk4, 32, 128, 64, 2, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s2_sk8, 32, 128, 64, 2, 8)                                                              \
-    X(int4_fp16_gemm_32x128x64_s2_sk16, 32, 128, 64, 2, 16)                                                            \
-    X(int4_fp16_gemm_32x128x64_s3_sk1, 32, 128, 64, 3, 1)                                                              \
     X(int4_fp16_gemm_32x128x64_s3_sk2, 32, 128, 64, 3, 2)                                                              \
     X(int4_fp16_gemm_32x128x64_s3_sk4, 32, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s3_sk8, 32, 128, 64, 3, 8)                                                              \
-    X(int4_fp16_gemm_32x128x64_s3_sk16, 32, 128, 64, 3, 16)                                                            \
     X(int4_fp16_gemm_32x128x64_s4_sk1, 32, 128, 64, 4, 1)                                                              \
-    X(int4_fp16_gemm_32x128x64_s4_sk2, 32, 128, 64, 4, 2)                                                              \
-    X(int4_fp16_gemm_32x128x64_s4_sk4, 32, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_32x128x64_s4_sk8, 32, 128, 64, 4, 8)                                                              \
-    X(int4_fp16_gemm_32x128x64_s4_sk16, 32, 128, 64, 4, 16)                                                            \
     X(int4_fp16_gemm_64x128x64_s2_sk1, 64, 128, 64, 2, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s2_sk2, 64, 128, 64, 2, 2)                                                              \
-    X(int4_fp16_gemm_64x128x64_s2_sk4, 64, 128, 64, 2, 4)                                                              \
-    X(int4_fp16_gemm_64x128x64_s2_sk8, 64, 128, 64, 2, 8)                                                              \
-    X(int4_fp16_gemm_64x128x64_s2_sk16, 64, 128, 64, 2, 16)                                                            \
     X(int4_fp16_gemm_64x128x64_s3_sk1, 64, 128, 64, 3, 1)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk2, 64, 128, 64, 3, 2)                                                              \
     X(int4_fp16_gemm_64x128x64_s3_sk4, 64, 128, 64, 3, 4)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk8, 64, 128, 64, 3, 8)                                                              \
-    X(int4_fp16_gemm_64x128x64_s3_sk16, 64, 128, 64, 3, 16)                                                            \
-    X(int4_fp16_gemm_64x128x64_s4_sk1, 64, 128, 64, 4, 1)                                                              \
     X(int4_fp16_gemm_64x128x64_s4_sk2, 64, 128, 64, 4, 2)                                                              \
     X(int4_fp16_gemm_64x128x64_s4_sk4, 64, 128, 64, 4, 4)                                                              \
-    X(int4_fp16_gemm_64x128x64_s4_sk8, 64, 128, 64, 4, 8)                                                              \
-    X(int4_fp16_gemm_64x128x64_s4_sk16, 64, 128, 64, 4, 16)                                                            \
     X(int4_fp16_gemm_128x128x64_s2_sk1, 128, 128, 64, 2, 1)                                                            \
-    X(int4_fp16_gemm_128x128x64_s2_sk2, 128, 128, 64, 2, 2)                                                            \
     X(int4_fp16_gemm_128x128x64_s2_sk4, 128, 128, 64, 2, 4)                                                            \
-    X(int4_fp16_gemm_128x128x64_s2_sk8, 128, 128, 64, 2, 8)                                                            \
-    X(int4_fp16_gemm_128x128x64_s2_sk16, 128, 128, 64, 2, 16)                                                          \
-    X(int4_fp16_gemm_128x128x64_s3_sk1, 128, 128, 64, 3, 1)                                                            \
-    X(int4_fp16_gemm_128x128x64_s3_sk2, 128, 128, 64, 3, 2)                                                            \
-    X(int4_fp16_gemm_128x128x64_s3_sk4, 128, 128, 64, 3, 4)                                                            \
-    X(int4_fp16_gemm_128x128x64_s3_sk8, 128, 128, 64, 3, 8)                                                            \
-    X(int4_fp16_gemm_128x128x64_s3_sk16, 128, 128, 64, 3, 16)                                                          \
-    X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk2, 128, 128, 64, 4, 2)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk4, 128, 128, 64, 4, 4)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk8, 128, 128, 64, 4, 8)                                                            \
-    X(int4_fp16_gemm_128x128x64_s4_sk16, 128, 128, 64, 4, 16)
+    X(int4_fp16_gemm_128x128x64_s4_sk1, 128, 128, 64, 4, 1)
 
 // ---------------------------------------------------------------------------
-// Module storage + loading (all 75, loaded once).
+// Module storage + loading (all compiled gemm variants, loaded once).
 // ---------------------------------------------------------------------------
 #define DECL_MODULE(prefix, bM, bN, bK, st, sk) prefix##_Kernel_Module_t g_##prefix{};
 INT4_FP16_GEMM_VARIANTS(DECL_MODULE)
@@ -397,10 +340,10 @@ std::vector<Int4GemmTestConfig> buildConfigs()
 #define ADD_VARIANT(prefix, bM, bN, bK, st, sk) v.push_back(Int4GemmTestConfig{M, N, K, bM, bN, bK, st, sk, 1});
     INT4_FP16_GEMM_VARIANTS(ADD_VARIANT)
 #undef ADD_VARIANT
-    // Extra edge-case shapes on the 16x128x64 / 2-stage family.
-    v.push_back(Int4GemmTestConfig{200, 192, 256, 16, 128, 64, 2, 1, 1}); // M-residue (200 % 16 != 0), N=192
-    v.push_back(Int4GemmTestConfig{512, 256, 512, 16, 128, 64, 2, 1, 4}); // grouped-M swizzle = 4
-    v.push_back(Int4GemmTestConfig{64, 128, 256, 16, 128, 64, 2, 2, 1});  // small low-M split-K shape
+    // Extra edge-case shapes on the 16x128x64 tile.
+    v.push_back(Int4GemmTestConfig{200, 160, 256, 16, 128, 64, 4, 1, 1}); // M and N residues; N % 64 != 0
+    v.push_back(Int4GemmTestConfig{512, 256, 512, 16, 128, 64, 4, 1, 4}); // grouped-M swizzle = 4
+    v.push_back(Int4GemmTestConfig{64, 128, 256, 16, 128, 64, 4, 2, 1});  // small low-M split-K shape
     return v;
 }
 
@@ -424,10 +367,10 @@ TEST_P(Int4Fp16GemmCuteDslTest, CorrectnessVsFp32Reference)
     ASSERT_CUDA_OK(cudaDeviceGetAttribute(&smMinor, cudaDevAttrComputeCapabilityMinor, 0));
     int32_t const smVersion = smMajor * 10 + smMinor;
 
-    // N%64==0, K%64==0; a baked split_k is correct only when it divides
-    // ceil(K/bK) (split_k=1 always works); runs on Ampere or newer.
+    // N is predicated; K%64==0. A baked split_k is correct only when it
+    // divides ceil(K/bK) (split_k=1 always works); runs on Ampere or newer.
     bool const ok
-        = smVersion >= 80 && N % 64 == 0 && K % 64 == 0 && (cfg.splitK == 1 || ceilDiv(K, cfg.bK) % cfg.splitK == 0);
+        = smVersion >= 80 && N > 0 && K % 64 == 0 && (cfg.splitK == 1 || ceilDiv(K, cfg.bK) % cfg.splitK == 0);
     if (!ok)
     {
         GTEST_SKIP() << "Unsupported config";

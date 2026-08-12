@@ -50,21 +50,9 @@ std::vector<int32_t> toVec(rt::Tensor const& t)
 TEST(GenerateMultimodalIndices, AudioOnly)
 {
     int32_t constexpr kAudioTok = 99;
-    int32_t constexpr kVocab = 100;
     // batch=1, seqLen=5: two audio tokens at positions 1 and 3
     auto ids = makeCpuIds({10, kAudioTok, 20, kAudioTok, 30}, 1, 5);
-    auto result = rt::generateMultimodalIndices(ids, kAudioTok, std::nullopt, kVocab);
-    auto v = toVec(result);
-    EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 0}));
-}
-
-// Image-only tokens (tokens >= vocabSize)
-TEST(GenerateMultimodalIndices, ImageOnlyByVocabSize)
-{
-    int32_t constexpr kVocab = 100;
-    // tokens 100 and 101 are >= vocabSize, so treated as image tokens
-    auto ids = makeCpuIds({10, 100, 20, 101, 30}, 1, 5);
-    auto result = rt::generateMultimodalIndices(ids, std::nullopt, std::nullopt, kVocab);
+    auto result = rt::generateMultimodalIndices(ids, kAudioTok, std::nullopt);
     auto v = toVec(result);
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 0}));
 }
@@ -73,9 +61,8 @@ TEST(GenerateMultimodalIndices, ImageOnlyByVocabSize)
 TEST(GenerateMultimodalIndices, ImageOnlyExplicitId)
 {
     int32_t constexpr kImageTok = 50;
-    int32_t constexpr kVocab = 100;
     auto ids = makeCpuIds({10, kImageTok, 20, kImageTok, kImageTok}, 1, 5);
-    auto result = rt::generateMultimodalIndices(ids, std::nullopt, kImageTok, kVocab);
+    auto result = rt::generateMultimodalIndices(ids, std::nullopt, kImageTok);
     auto v = toVec(result);
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 2}));
 }
@@ -84,10 +71,9 @@ TEST(GenerateMultimodalIndices, ImageOnlyExplicitId)
 TEST(GenerateMultimodalIndices, MixedAudioImage)
 {
     int32_t constexpr kAudioTok = 99;
-    int32_t constexpr kVocab = 100;
-    // token 100 is an image token (>= vocabSize), token 99 is audio
-    auto ids = makeCpuIds({kAudioTok, 100, kAudioTok, 100, 10}, 1, 5);
-    auto result = rt::generateMultimodalIndices(ids, kAudioTok, std::nullopt, kVocab);
+    int32_t constexpr kImageTok = 50;
+    auto ids = makeCpuIds({kAudioTok, kImageTok, kAudioTok, kImageTok, 10}, 1, 5);
+    auto result = rt::generateMultimodalIndices(ids, kAudioTok, kImageTok);
     auto v = toVec(result);
     // audio indices: 0, 1; image indices: 0, 1
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 1, 1, 0}));
@@ -96,9 +82,8 @@ TEST(GenerateMultimodalIndices, MixedAudioImage)
 // No multimodal tokens (all normal text)
 TEST(GenerateMultimodalIndices, NoMultimodalTokens)
 {
-    int32_t constexpr kVocab = 100;
     auto ids = makeCpuIds({10, 20, 30, 40}, 1, 4);
-    auto result = rt::generateMultimodalIndices(ids, std::nullopt, std::nullopt, kVocab);
+    auto result = rt::generateMultimodalIndices(ids, std::nullopt, std::nullopt);
     auto v = toVec(result);
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 0}));
 }
@@ -107,12 +92,12 @@ TEST(GenerateMultimodalIndices, NoMultimodalTokens)
 TEST(GenerateMultimodalIndices, MultiBatchGlobalIndexing)
 {
     int32_t constexpr kAudioTok = 99;
-    int32_t constexpr kVocab = 100;
+    int32_t constexpr kImageTok = 50;
     // batch=2, seqLen=3
-    // batch 0: [99, 10, 100]  -> audio idx 0, text, image idx 0
-    // batch 1: [99, 100, 10]  -> audio idx 1, image idx 1, text
-    auto ids = makeCpuIds({kAudioTok, 10, 100, kAudioTok, 100, 10}, 2, 3);
-    auto result = rt::generateMultimodalIndices(ids, kAudioTok, std::nullopt, kVocab);
+    // batch 0: [99, 10, 50]  -> audio idx 0, text, image idx 0
+    // batch 1: [99, 50, 10]  -> audio idx 1, image idx 1, text
+    auto ids = makeCpuIds({kAudioTok, 10, kImageTok, kAudioTok, kImageTok, 10}, 2, 3);
+    auto result = rt::generateMultimodalIndices(ids, kAudioTok, kImageTok);
     auto v = toVec(result);
     EXPECT_EQ(v, (std::vector<int32_t>{0, 0, 0, 1, 1, 0}));
 }

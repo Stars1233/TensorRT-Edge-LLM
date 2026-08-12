@@ -29,6 +29,8 @@ Run:
 
 from __future__ import annotations
 
+import zlib
+
 import pytest
 from test_plugin_base import (DEPENDENCIES_AVAILABLE, IMPORT_ERROR, MAX_SEQ,
                               RAGGED_CASES, PluginRunner, assert_close,
@@ -133,7 +135,7 @@ def _rand_packed(total, h, d, gen):
 @pytest.mark.parametrize("label,seqlens", RAGGED_CASES)
 def test_ragged_prefill_batch_sizes(label, seqlens):
     h, d = 8, 64
-    gen = torch.Generator().manual_seed(hash(label) % 2**31)
+    gen = torch.Generator().manual_seed(zlib.crc32(label.encode()))
     total = sum(seqlens)
     q, k, v = (_rand_packed(total, h, d, gen) for _ in range(3))
     cu = _cu_seqlens(seqlens)
@@ -144,10 +146,9 @@ def test_ragged_prefill_batch_sizes(label, seqlens):
 
 
 # --------------------------------------------------------------------------- #
-# Window-partition shape: Qwen2.5-VL window-attention layers reorder tokens
-# window-first and feed the plugin many equal 64-token segments (8x8 patch
-# windows) through cu_window_seqlens. 32 windows x 64 tokens, with the
-# Qwen2.5-VL vision head config (16 heads, head dim 80).
+# Window-partition shape: Qwen2.5-VL window attention reorders tokens window-
+# first into equal 64-token segments (8x8 patch windows) via cu_window_seqlens.
+# 32 windows x 64 tokens, Qwen2.5-VL vision heads (16 heads, dim 80).
 # --------------------------------------------------------------------------- #
 def test_window_partition():
     h, d = 16, 80

@@ -298,7 +298,7 @@ std::vector<Int4GemvTestConfig> buildConfigs()
     std::vector<Int4GemvTestConfig> v;
     // (N, K) shapes: a canonical square-ish shape and Qwen2.5-0.5B projections
     // (incl. tall-K down_proj) -- N unconstrained, K % 64 == 0.
-    int32_t const shapes[][2] = {{256, 1024}, {896, 896}, {4864, 896}, {896, 4864}};
+    int32_t const shapes[][2] = {{160, 256}, {256, 1024}, {896, 896}, {4864, 896}, {896, 4864}};
     for (int32_t M = 1; M <= 8; ++M)
     {
         for (auto const& s : shapes)

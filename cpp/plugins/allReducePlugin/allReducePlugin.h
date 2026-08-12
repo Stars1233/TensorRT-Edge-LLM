@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include "common/allReducePath.h"
+#include "plugins/utils/pluginUtils.h"
+
 #include <NvInferRuntime.h>
 #include <cstdint>
 #include <string>
@@ -28,15 +31,37 @@ namespace trt_edgellm
 namespace plugins
 {
 
-//! \brief TensorRT plugin for NCCL all-reduce in tensor parallel inference
+//! \brief One device's NCCL resources used by plugin execution paths.
+struct NcclAllReducePathRegistration
+{
+    void* communicator{nullptr};
+    void* allReduceFunction{nullptr};
+};
+
+//! \brief Consistent snapshot of every registered execution path for one device.
+struct AllReducePathRegistrations
+{
+    NcclAllReducePathRegistration nccl{};
+};
+
+//! \brief Register NCCL resources for one CUDA device.
+bool registerNcclAllReducePath(int32_t deviceId, void* ncclComm, void* ncclAllReduceFunction) noexcept;
+
+//! \brief Remove NCCL resources only if the expected communicator is still registered.
+bool unregisterNcclAllReducePath(int32_t deviceId, void* expectedNcclComm) noexcept;
+
+//! \brief Snapshot all available path registrations while holding the registry lock once.
+AllReducePathRegistrations snapshotAllReducePathRegistrationsForDevice(int32_t deviceId) noexcept;
+
+//! \brief TensorRT plugin for tensor-parallel all-reduce
 //!
-//! This plugin performs NCCL all-reduce (sum) on intermediate activations during
-//! TensorRT engine execution. It is inserted after row-parallel linear layers
-//! (attention output projection and MLP down projection) to combine partial
-//! results from different tensor parallel ranks.
+//! This plugin sums intermediate activations during TensorRT engine execution.
+//! It is inserted after row-parallel linear layers (attention output projection
+//! and MLP down projection) to combine partial results from tensor-parallel ranks.
 //!
 //! The plugin is a passthrough when tpSize=1 (no tensor parallelism).
-//! It uses communicator handles registered by the runtime plugin communication registry.
+//! For TP, it uses an optional accelerated execution path when supported and
+//! otherwise falls back to the required NCCL path registered by the runtime.
 class AllReducePlugin : public nvinfer1::IPluginV3,
                         public nvinfer1::IPluginV3OneCore,
                         public nvinfer1::IPluginV3OneBuild,
@@ -129,40 +154,13 @@ private:
     std::string mNamespace;
 };
 
-/*!
- * @brief Register NCCL communicator for use by AllReducePlugin instances.
- *
- * Must be called by the runtime after NCCL initialization and before any TRT
- * engine execution that contains AllReducePlugin nodes.
- * This avoids linking the plugin shared library against the runtime library.
- *
- * @param deviceId CUDA device ID this communicator is for
- * @param ncclComm NCCL communicator handle (ncclComm_t)
- * @param ncclAllReduceFunc Pointer to ncclAllReduce function
- */
-void registerNcclCommForAllReducePlugin(int deviceId, void* ncclComm, void* ncclAllReduceFunc) noexcept;
-
-/*!
- * @brief Snapshot the NCCL communicator and AllReduce function for one CUDA device.
- */
-void getNcclRegistrationForDevice(int deviceId, void** ncclComm, void** ncclAllReduceFunc) noexcept;
-
-/*!
- * @brief Get the NCCL communicator for a given CUDA device.
- * @return ncclComm_t handle, or nullptr if not registered
- */
-void* getNcclCommForDevice(int deviceId) noexcept;
-
-/*!
- * @brief Get the registered NCCL AllReduce function pointer.
- */
-void* getNcclAllReduceFunc() noexcept;
-
 } // namespace plugins
 } // namespace trt_edgellm
 
-// Stable C ABI entry points for runtime dlsym callers. Keep these names
+// Status-returning lifecycle C ABI used by the runtime. Keep these names
 // unmangled so runtime/plugin decoupling does not depend on the C++ ABI.
-extern "C" void edgellmRegisterNcclCommForAllReducePlugin(
-    int deviceId, void* ncclComm, void* ncclAllReduceFunc) noexcept;
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmRegisterNcclCommForAllReducePlugin(
+    int deviceId, void* ncclComm, void* ncclAllReduceFunction) noexcept;
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmUnregisterNcclCommForAllReducePlugin(
+    int deviceId, void* ncclComm) noexcept;
 

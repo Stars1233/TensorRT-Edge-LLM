@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "multimodal/imageUtils.h"
 #include "multimodal/modelTypes.h"
 #include <NvInfer.h>
 #include <filesystem>
@@ -51,6 +52,9 @@ struct VisualBuilderConfig
         json["min_image_tokens"] = minImageTokens;
         json["max_image_tokens"] = maxImageTokens;
         json["max_image_tokens_per_image"] = maxImageTokensPerImage;
+        // The cu_seqlens profile capacity, so the server can budget request
+        // media against the real engine limit instead of re-deriving it.
+        json["max_cu_seqlen_groups"] = rt::imageUtils::maxCuSeqlenGroups(maxImageTokens);
         json["use_trt_native_vit_attn"] = useTrtNativeVitAttn;
         return json;
     }

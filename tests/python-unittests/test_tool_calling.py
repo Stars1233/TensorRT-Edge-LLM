@@ -147,13 +147,19 @@ class _FakeLLM:
 
     def __init__(self, model_dir):
         self.model_dir = str(model_dir)
+        self._model_id = "fake-model"
+
+    def _make_generation_request(self, messages, params, **kw):
+        return object()  # the streaming path prebuilds (and reuses) a request
 
     def generate_stream(self,
                         messages,
                         params,
                         *,
                         tools=None,
-                        tool_choice=None):
+                        tool_choice=None,
+                        prebuilt_request=None,
+                        admission_handoff=None):
         yield StreamDelta(text="<think>plan</think>", finished=False)
         yield StreamDelta(
             text="<tool_call>{\"name\":\"get_weather\","
@@ -197,3 +203,86 @@ def test_builds_tool_response_shapes(tmp_path):
     assert payloads[3]["choices"][0]["delta"]["tool_calls"][0]["function"][
         "arguments"] == '{"city": "Paris"}'
     assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+class _FakeTokenLLM:
+    """Fake LLM whose deltas carry token ids, for usage accounting tests."""
+
+    def __init__(self, model_dir):
+        self.model_dir = str(model_dir)
+        self._model_id = "fake-model"
+
+    def _make_generation_request(self, messages, params, **kw):
+        return object()
+
+    def generate_stream(self,
+                        messages,
+                        params,
+                        *,
+                        tools=None,
+                        tool_choice=None,
+                        prebuilt_request=None,
+                        admission_handoff=None):
+        yield StreamDelta(text="Hello ", token_ids=[1, 2, 3], finished=False)
+        yield StreamDelta(text="world",
+                          token_ids=[4, 5],
+                          finished=True,
+                          finish_reason="stop")
+
+
+def test_stream_usage_chunk(tmp_path):
+    """include_usage adds exactly one final usage chunk; absent otherwise."""
+
+    def run(**kwargs):
+        return list(
+            _generate_stream_sse(
+                _FakeTokenLLM(tmp_path),
+                [{
+                    "role": "user",
+                    "content": "Hi"
+                }],
+                object(),
+                "chatcmpl-run",
+                False,
+                tool_config=None,
+                **kwargs,
+            ))
+
+    chunks = run(include_usage=True, prompt_tokens=7)
+    assert chunks[-1] == "data: [DONE]\n\n"
+    usage_payload = json.loads(chunks[-2].removeprefix("data: "))
+    assert usage_payload["choices"] == []
+    assert usage_payload["usage"] == {
+        "prompt_tokens": 7,
+        "completion_tokens": 5,
+        "total_tokens": 12,
+    }
+
+    plain = [
+        json.loads(c.removeprefix("data: ")) for c in run()
+        if c.startswith("data: {")
+    ]
+    assert all("usage" not in payload for payload in plain)
+
+
+def test_tool_stream_usage_chunk(tmp_path):
+    config = _tool_config()
+    chunks = list(
+        _generate_stream_sse(
+            _FakeLLM(tmp_path),
+            [{
+                "role": "user",
+                "content": "Weather?"
+            }],
+            object(),
+            "chatcmpl-toolusage",
+            False,
+            tool_config=config,
+            include_usage=True,
+            prompt_tokens=100,
+        ))
+    assert chunks[-1] == "data: [DONE]\n\n"
+    usage_payload = json.loads(chunks[-2].removeprefix("data: "))
+    assert usage_payload["usage"]["prompt_tokens"] == 100
+    assert usage_payload["usage"]["total_tokens"] == (
+        100 + usage_payload["usage"]["completion_tokens"])

@@ -38,6 +38,9 @@ from .config import ModelConfig, QuantConfig
 from .model import (AutoModel, register_attention_scale_default,
                     register_model, standard_attention_scale)
 # Register model-type-specific implementations
+from .models.cosmos3_reasoner.modeling_cosmos3_reasoner_text import \
+    Cosmos3ReasonerCausalLM
+from .models.diffusion_gemma import DiffusionGemmaBackbone
 from .models.gemma4.modeling_gemma4_text import Gemma4ForCausalLM
 from .models.nemotron_h.modeling_nemotron_h import NemotronHCausalLM
 from .models.qwen3_5.modeling_qwen3_5_text import Qwen3_5CausalLM
@@ -49,6 +52,12 @@ from .models.qwen3_omni.modeling_qwen3_omni_moe_talker import \
 from .models.qwen3_omni.modeling_qwen3_omni_moe_text import \
     Qwen3OmniMoeThinkerCausalLM
 from .models.qwen3_omni.modeling_qwen3_omni_text import Qwen3OmniLanguageModel
+from .models.qwen3_omni_next.modeling_qwen3_omni_next_moe_talker import \
+    Qwen3OmniNextMoeTalkerCausalLM
+from .models.qwen3_omni_next.modeling_qwen3_omni_next_moe_text import \
+    Qwen3OmniNextMoeLanguageModel
+from .models.qwen3_omni_next.modeling_qwen3_omni_next_text import \
+    Qwen3OmniNextLanguageModel
 from .onnx.export import export_onnx
 
 
@@ -62,8 +71,20 @@ register_model("gemma4_text", Gemma4ForCausalLM, _identity_attention_scale)
 register_model("gemma4_unified", Gemma4ForCausalLM, _identity_attention_scale)
 register_model("gemma4_unified_text", Gemma4ForCausalLM,
                _identity_attention_scale)
+register_model("diffusion_gemma", DiffusionGemmaBackbone,
+               _identity_attention_scale)
+register_model("diffusion_gemma_text", DiffusionGemmaBackbone,
+               _identity_attention_scale)
+register_model("diffusiongemma", DiffusionGemmaBackbone,
+               _identity_attention_scale)
 register_attention_scale_default("gemma4_assistant", _identity_attention_scale)
 register_model("nemotron_h", NemotronHCausalLM, standard_attention_scale)
+# Cosmos3-Edge reasoner text decoder ("cosmos3_edge_text" is the promoted
+# text_config model_type).
+register_model("cosmos3_edge", Cosmos3ReasonerCausalLM,
+               standard_attention_scale)
+register_model("cosmos3_edge_text", Cosmos3ReasonerCausalLM,
+               standard_attention_scale)
 register_model("qwen3_5_text", Qwen3_5CausalLM, standard_attention_scale)
 register_model("qwen3_5_moe_text", Qwen3_5MoeCausalLM,
                standard_attention_scale)
@@ -85,6 +106,16 @@ register_model("qwen3_omni_text", Qwen3OmniLanguageModel,
 register_model("qwen3_omni_moe_text", Qwen3OmniMoeThinkerCausalLM,
                standard_attention_scale)
 register_model("qwen3_omni_moe_talker", Qwen3OmniMoeTalkerCausalLM,
+               standard_attention_scale)
+register_model("qwen3_omni_next", Qwen3OmniNextLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_next_thinker", Qwen3OmniNextLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_next_text", Qwen3OmniNextLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_next_text_moe", Qwen3OmniNextMoeLanguageModel,
+               standard_attention_scale)
+register_model("qwen3_omni_next_talker_text", Qwen3OmniNextMoeTalkerCausalLM,
                standard_attention_scale)
 register_model("qwen3_asr", Qwen3ASRLanguageModel, standard_attention_scale)
 register_model("qwen3_asr_thinker", Qwen3ASRLanguageModel,

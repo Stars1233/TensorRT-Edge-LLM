@@ -845,7 +845,8 @@ void runMambaMultiStepTest(
     rt::OptionalInputTensor clOpt = clDevice.isEmpty() ? std::nullopt : std::optional(std::cref(clDevice));
 
     invokeSelectiveStateUpdatePrefill(xDevice, ADevice, BDevice, CDevice, dtDevice, dtBiasOpt, DOpt, zOpt, stateDevice,
-        outputDevice, config.dtSoftplus, clOpt, stream);
+        outputDevice, config.dtSoftplus, clOpt, /*replayDA=*/std::nullopt, /*replayU=*/std::nullopt,
+        /*replayB=*/std::nullopt, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 

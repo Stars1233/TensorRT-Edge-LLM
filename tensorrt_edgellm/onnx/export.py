@@ -23,15 +23,16 @@ ONNX input / output layout - attention-only model
 --------------------------------------------------
 Inputs:
     inputs_embeds           [batch, seq_len, hidden_size]            float16
-    past_key_values_0..N    [batch, 2, num_kv_heads, past, head_dim] float16
+    past_key_values_0..N    [2, num_pages, 128, num_kv_heads, head_dim] float16 (paged pool)
     rope_rotary_cos_sin     [batch, max_pos, rotary_dim]  float32
     context_lengths         [batch]                       int32
     kvcache_start_index     [batch]                       int32
+    kv_page_table           [batch, 2, max_pages_per_seq] int32
     last_token_ids          [batch, 1]                    int64
 
 Outputs:
     logits                  [batch, seq_len, vocab_size]             float32
-    present_key_values_0..N [batch, 2, num_kv_heads, past+seq_len, head_dim] float16
+    present_key_values_0..N [2, num_pages, 128, num_kv_heads, head_dim] float16 (aliases past)
 
 Additional I/O for hybrid (Mamba) models
 -----------------------------------------
@@ -45,6 +46,7 @@ Extra outputs:
 """
 
 import contextlib
+import gc
 import logging
 import os
 
@@ -225,24 +227,22 @@ def _fix_nvfp4_weight_dtype(onnx_path: str) -> None:
 
 
 def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
-    """Strip trailing empty optional inputs from AttentionPlugin ONNX nodes.
+    """Strip disabled optional inputs from AttentionPlugin ONNX nodes.
 
-    ``torch.export`` emits the two optional inputs (``attention_mask``,
-    ``attention_pos_id``) on every node, as empty strings when unused.  The
-    TRT AttentionPlugin C++ requires exactly ``kNUM_REQUIRED_INPUTS=7``
-    inputs for vanilla mode and raises ``(input) != nullptr`` when it
-    encounters the extra null entries via
-    ``INetworkDefinition::addPluginV2``.
-
-    This pass trims each ``AttentionPlugin`` node to its expected input
-    count: 7 for vanilla nodes, 8 for vision-block-attention nodes (the
-    real ``attention_mask`` input carrying block IDs is kept, the empty
-    ``attention_pos_id`` placeholder is dropped), and 9 for tree-attention
-    nodes (both optional inputs are real and kept).
+    The onnxscript translation always emits the full optional layout:
+    q/k norm gammas, context-mask selector, and tree/vision mask inputs. The
+    C++ plugin expects those optional groups compacted in that relative order,
+    with disabled groups removed from the ONNX node input list.
     """
-    _REQUIRED = 7
+    _NUM_REQUIRED = 6
+    _GAMMA_POSITIONS = (6, 7)
+    _CONTEXT_MASK_SELECTOR_POSITION = 8
+    _ATTENTION_MASK_POSITION = 9
+    _ATTENTION_POS_ID_POSITION = 10
+    _SKIP_SCALE_POSITION = 11
     model = onnx.load(onnx_path, load_external_data=False)
     changed = 0
+    dropped_gamma_tensors: set = set()
     for node in model.graph.node:
         if node.op_type != "AttentionPlugin":
             continue
@@ -250,26 +250,88 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
             (a.i for a in node.attribute if a.name == "enable_tree_attention"),
             0,
         )
+        context_mask_selector = next(
+            (a.i for a in node.attribute
+             if a.name == "enable_context_mask_selector"),
+            0,
+        )
         vision_block_attn = next(
             (a.i for a in node.attribute
              if a.name == "enable_vision_block_attention"),
             0,
         )
-        optional_count = 2 if tree_attn else (1 if vision_block_attn else 0)
-        keep = _REQUIRED + optional_count
-        trailing = list(node.input)[keep:]
-        if not trailing or any(i != "" for i in trailing):
+        qk_norm = next(
+            (a.i for a in node.attribute if a.name == "enable_qk_norm"),
+            0,
+        )
+        skip_scale_factor = next(
+            (a.f
+             for a in node.attribute if a.name == "skip_softmax_scale_factor"),
+            0.0,
+        )
+        inputs = list(node.input)
+
+        def get_input(index: int) -> str:
+            return inputs[index] if index < len(inputs) else ""
+
+        new_inputs = inputs[:_NUM_REQUIRED]
+        if qk_norm:
+            new_inputs += [get_input(i) for i in _GAMMA_POSITIONS]
+        else:
+            dropped_gamma_tensors.update(
+                get_input(i) for i in _GAMMA_POSITIONS if get_input(i))
+        if context_mask_selector:
+            new_inputs.append(get_input(_CONTEXT_MASK_SELECTOR_POSITION))
+        if tree_attn:
+            new_inputs.extend([
+                get_input(_ATTENTION_MASK_POSITION),
+                get_input(_ATTENTION_POS_ID_POSITION),
+            ])
+        elif vision_block_attn:
+            new_inputs.append(get_input(_ATTENTION_MASK_POSITION))
+        # Trailing runtime skip-softmax override carrier (shape-only INT8 input),
+        # emitted last by the translation; kept iff skip-softmax is enabled
+        # (scale factor > 0).
+        if skip_scale_factor > 0.0:
+            skip_input = get_input(_SKIP_SCALE_POSITION)
+            if skip_input:
+                new_inputs.append(skip_input)
+        if new_inputs == inputs:
             continue
-        # Keep the real vision-block-ID input while dropping its unused
-        # attention_pos_id placeholder.  Vanilla nodes retain only required
-        # inputs; tree nodes retain both optional inputs.
-        del node.input[keep:]
-        changed += len(trailing)
+        del node.input[:]
+        node.input.extend(new_inputs)
+        changed += 1
+
+    # Prune the gamma Constant/Cast chains that no longer feed any node.
+    if dropped_gamma_tensors:
+        consumed = {i for n in model.graph.node for i in n.input}
+        graph_outputs = {o.name for o in model.graph.output}
+        pruned = True
+        while pruned:
+            pruned = False
+            for n in list(model.graph.node):
+                if not n.output:
+                    continue
+                if all(o in dropped_gamma_tensors and o not in consumed
+                       and o not in graph_outputs for o in n.output):
+                    model.graph.node.remove(n)
+                    dropped_gamma_tensors.update(n.input)
+                    consumed = {
+                        i
+                        for node_ in model.graph.node
+                        for i in node_.input
+                    }
+                    pruned = True
+        # The dynamo exporter may lift the gamma Constants to graph
+        # initializers instead of Constant nodes — drop those as well.
+        for init in list(model.graph.initializer):
+            if init.name in dropped_gamma_tensors and init.name not in consumed:
+                model.graph.initializer.remove(init)
 
     if not changed:
         return
     logger.info(
-        "TRT fix: stripped %d empty optional input(s) from AttentionPlugin nodes",
+        "TRT fix: normalized optional inputs on %d AttentionPlugin node(s)",
         changed,
     )
     data_file = os.path.basename(onnx_path) + ".data"
@@ -281,6 +343,37 @@ def _strip_attention_plugin_optional_inputs(onnx_path: str) -> None:
         location=data_file,
         size_threshold=0,
     )
+
+
+def _fix_zero_volume_initializers(onnx_path: str) -> None:
+    """Clear stray payload bytes on zero-volume initializers.
+
+    A zero-volume initializer must carry zero payload bytes, otherwise the
+    TRT ONNX parser rejects the model with a size mismatch. Only the model
+    proto is rewritten; external-data references are left untouched.
+    """
+    model = onnx.load(onnx_path, load_external_data=False)
+    fixed = 0
+    for init in model.graph.initializer:
+        volume = 1
+        for d in init.dims:
+            volume *= d
+        if volume != 0:
+            continue
+        has_payload = (len(init.raw_data) > 0 or len(init.external_data) > 0
+                       or init.data_location != onnx.TensorProto.DEFAULT)
+        if not has_payload:
+            continue
+        init.raw_data = b""
+        del init.external_data[:]
+        init.data_location = onnx.TensorProto.DEFAULT
+        fixed += 1
+    if not fixed:
+        return
+    logger.info(
+        "TRT fix: cleared stray payload on %d zero-volume initializer(s)",
+        fixed)
+    onnx.save(model, onnx_path)
 
 
 def _strip_onnxscript_internal_attrs(onnx_path: str) -> None:
@@ -319,7 +412,7 @@ def _dedup_shared_dql_scales(model) -> int:
 
     The dynamo exporter deduplicates identical scalar initializers (e.g.
     per-tensor NVFP4 global scales) into a single initializer referenced
-    by DequantizeLinear nodes across many layers.  TRT's Myelin compiler
+    by DequantizeLinear nodes across many layers.  TRT's compiler backend
     segfaults when a single scalar initializer fans out to many DQL nodes
     spanning different transformer layers.
 
@@ -356,7 +449,7 @@ def _dedup_shared_dql_scales(model) -> int:
     skipped = 0
     for init_name, node_indices in shared.items():
         orig = init_map[init_name]
-        nbytes = len(orig.raw_data) if orig.raw_data else 0
+        nbytes = _initializer_data_nbytes(orig)
         if nbytes > _MAX_DUP_BYTES:
             skipped += 1
             logger.warning(
@@ -387,6 +480,160 @@ def _dedup_shared_dql_scales(model) -> int:
             "(%d unique, %d skipped as too large)", duplicated,
             len(shared) - skipped, skipped)
     return duplicated
+
+
+def _external_data_value(init, key: str) -> "str | None":
+    for entry in init.external_data:
+        if entry.key == key:
+            return entry.value
+    return None
+
+
+def _initializer_data_nbytes(init) -> int:
+    if init.raw_data:
+        return len(init.raw_data)
+    length = _external_data_value(init, "length")
+    if length is None:
+        return 0
+    try:
+        return int(length)
+    except ValueError:
+        return 0
+
+
+def _count_shared_dql_scale_duplicates(model) -> int:
+    _MAX_DUP_BYTES = 1024
+    dql_consumers: dict[str, list] = {}
+    for idx, node in enumerate(model.graph.node):
+        if node.op_type != "DequantizeLinear":
+            continue
+        for inp in node.input:
+            dql_consumers.setdefault(inp, []).append(idx)
+
+    init_map = {init.name: init for init in model.graph.initializer}
+    duplicated = 0
+    for init_name, node_indices in dql_consumers.items():
+        if len(node_indices) <= 1:
+            continue
+        init = init_map.get(init_name)
+        if init is None:
+            continue
+        if _initializer_data_nbytes(init) > _MAX_DUP_BYTES:
+            continue
+        duplicated += len(node_indices) - 1
+    return duplicated
+
+
+def _initializer_dtype_fixup_required(
+    model,
+    dedup_dql_scales: bool,
+    cast_fp32_weights_to_fp16: bool,
+    preserve_fp32_patterns: "tuple[str, ...]",
+    match_fp32_matmul_initializers: bool,
+    match_fp32_elementwise_initializers: bool,
+) -> bool:
+    if dedup_dql_scales and _count_shared_dql_scale_duplicates(model) > 0:
+        return True
+
+    plugin_fp32_init_names: set = set()
+    for node in model.graph.node:
+        if node.op_type == "update_ssm_state" and len(node.input) > 1:
+            plugin_fp32_init_names.add(node.input[1])
+        if node.op_type == "gated_delta_net" and len(node.input) > 5:
+            plugin_fp32_init_names.add(node.input[5])
+        if node.op_type in ("Nvfp4MoePlugin", "NvFP4MoEPluginGeforce"):
+            for input_idx in (4, 7, 8, 9, 10):
+                if len(node.input) > input_idx:
+                    plugin_fp32_init_names.add(node.input[input_idx])
+        if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
+            plugin_fp32_init_names.add(node.input[4])
+
+    init_map = {init.name: init for init in model.graph.initializer}
+    elem_types: dict[str, int] = {}
+    if match_fp32_matmul_initializers or match_fp32_elementwise_initializers:
+        for value in (list(model.graph.input) + list(model.graph.value_info) +
+                      list(model.graph.output)):
+            tensor_type = value.type.tensor_type
+            if tensor_type.HasField("elem_type"):
+                elem_types[value.name] = tensor_type.elem_type
+        for init in model.graph.initializer:
+            elem_types[init.name] = init.data_type
+
+    matmul_fp32_init_names: set = set()
+    if match_fp32_matmul_initializers:
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    matmul_fp32_init_names.add(init.name)
+
+    _EW_OPS = frozenset({"Mul", "Add", "Sub", "Div"})
+    elementwise_fp32_init_names: set = set()
+    if match_fp32_elementwise_initializers:
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None:
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    elementwise_fp32_init_names.add(init.name)
+
+    def _is_preserved_fp32(init_name: str) -> bool:
+        return any(p in init_name for p in preserve_fp32_patterns)
+
+    for init in model.graph.initializer:
+        if init.name in plugin_fp32_init_names and init.data_type == 10:
+            return True
+
+        if cast_fp32_weights_to_fp16 and init.data_type == 1:
+            dims = list(init.dims)
+            if len(dims) == 0 or (len(dims) == 1 and dims[0] <= 1):
+                continue
+            if (init.name.endswith(".weight_scale")
+                    or init.name.endswith(".input_scale")
+                    or init.name.endswith(".pre_quant_scale")
+                    or init.name.endswith("_scale")
+                    or init.name.endswith("_scale_2")):
+                continue
+            if init.name in plugin_fp32_init_names:
+                continue
+            if _is_preserved_fp32(init.name):
+                continue
+            if init.name in matmul_fp32_init_names:
+                continue
+            if init.name in elementwise_fp32_init_names:
+                continue
+            return True
+
+    if match_fp32_matmul_initializers:
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    return True
+
+    if match_fp32_elementwise_initializers:
+        for node in model.graph.node:
+            if node.op_type not in _EW_OPS or len(node.input) < 2:
+                continue
+            for init_idx, other_idx in ((0, 1), (1, 0)):
+                init = init_map.get(node.input[init_idx])
+                if init is None or init.data_type != 10:  # FLOAT16
+                    continue
+                if elem_types.get(node.input[other_idx]) == 1:  # FLOAT
+                    return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +712,31 @@ def _setup_fp8kv_scales_for_export(model: "CausalLM") -> None:
         ]
 
 
+def _capture_qk_norm_gammas_for_export(model: "CausalLM") -> None:
+    """Populate qk_norm gamma lists on every attention module before tracing.
+
+    Runs in the shared export path so every export entrypoint captures the
+    loaded gamma weights. Raises if a module carries qk_norm weights but no
+    gamma values were captured — the export must never silently drop the
+    fused norm.
+    """
+    for module in model.modules():
+        if not hasattr(module, "_capture_qk_norm_gamma_lists"):
+            continue
+        module._capture_qk_norm_gamma_lists()
+        has_norm = (getattr(module, "q_norm", None) is not None
+                    or getattr(module, "k_norm", None) is not None)
+        captured = bool(
+            getattr(module, "_q_norm_gamma_list", None)
+            or getattr(module, "_k_norm_gamma_list", None))
+        if has_norm and not captured:
+            raise RuntimeError(
+                "qk_norm gamma capture failed for "
+                f"{type(module).__name__}: the module has q_norm/k_norm "
+                "weights but no gamma values were captured — the export "
+                "would silently drop the fused qk_norm.")
+
+
 def _fix_initializer_dtypes(
     onnx_path: str,
     dedup_dql_scales: bool = False,
@@ -510,6 +782,23 @@ def _fix_initializer_dtypes(
     import numpy as np
 
     _onnx = __import__("onnx")
+    metadata_model = _onnx.load(onnx_path, load_external_data=False)
+    if not _initializer_dtype_fixup_required(
+            metadata_model,
+            dedup_dql_scales=dedup_dql_scales,
+            cast_fp32_weights_to_fp16=cast_fp32_weights_to_fp16,
+            preserve_fp32_patterns=preserve_fp32_patterns,
+            match_fp32_matmul_initializers=match_fp32_matmul_initializers,
+            match_fp32_elementwise_initializers=
+            match_fp32_elementwise_initializers,
+    ):
+        logger.info(
+            "_fix_initializer_dtypes: no dtype fixup required; skipped "
+            "external tensor load")
+        return
+    del metadata_model
+    gc.collect()
+
     model = _onnx.load(onnx_path)
 
     # --- Dedup shared DQL scale initializers (NVFP4 dynamo fix) ---
@@ -533,6 +822,10 @@ def _fix_initializer_dtypes(
             for input_idx in (4, 7, 8, 9, 10):
                 if len(node.input) > input_idx:
                     plugin_fp32_init_names.add(node.input[input_idx])
+        if node.op_type == "Nvfp4A16MoePlugin" and len(node.input) > 8:
+            plugin_fp32_init_names.add(node.input[8])
+        if node.op_type == "Fp16MoePlugin" and len(node.input) > 4:
+            plugin_fp32_init_names.add(node.input[4])
 
     init_map = {init.name: init for init in model.graph.initializer}
     elem_types: dict[str, int] = {}
@@ -717,6 +1010,7 @@ def _export_model(
     externalize_weights=None,
 ) -> "list[dict[str, object]]":
     _setup_fp8kv_scales_for_export(model)
+    _capture_qk_norm_gammas_for_export(model)
     spec = model.onnx_export_spec()
 
     translation_table = build_custom_translation_table()
@@ -739,6 +1033,8 @@ def _export_model(
     prog.save(output_path, external_data=True)
     with open(output_path, "rb") as _f:
         os.fsync(_f.fileno())
+    del prog
+    gc.collect()
     nvfp4 = model.config.quant.uses_nvfp4_weights
     mxfp8 = model.config.quant.uses_mxfp8_weights
     if nvfp4:
@@ -761,6 +1057,9 @@ def _export_model(
                                         "match_fp32_elementwise_initializers",
                                         False)))
     _strip_attention_plugin_optional_inputs(output_path)
+    # Must run after every pass that re-saves with save_as_external_data
+    # (which can re-materialize stray payloads on zero-volume tensors).
+    _fix_zero_volume_initializers(output_path)
     external_weight_files = externalize_model_weights(
         output_path, model, externalize_weights=externalize_weights)
     logger.info("Export complete: %s", output_path)

@@ -636,7 +636,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -700,7 +700,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param alpha: Alpha tensor for each group
         :type alpha: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
@@ -3424,7 +3424,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         raster_along_m: bool = False,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
@@ -3436,7 +3436,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
 
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
@@ -3796,7 +3796,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         l: cutlass.Int64,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         activation_type: cutlass.Constexpr = ActivationType.Swiglu,

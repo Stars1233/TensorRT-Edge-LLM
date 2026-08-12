@@ -61,8 +61,6 @@ requires a different AOT variant. Variants registered in
 
 Supported Blackwell-family SMs: 100, 101, 103, 110. SM 120/121
 (GeForce Blackwell Ultra) lack tcgen05.blockscaled and are NOT supported.
-SM110 additionally requires the two CuteDSL patches documented in
-``kernelSrcs/nvfp4_moe_cutedsl/README.md`` before AOT export.
 
 Usage::
 
@@ -304,13 +302,11 @@ class GemmBlackwellNvFp4WS:
         # WS body's epilog warps to call ``tmem.allocate(num_tmem_alloc_cols)``.
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
-        # Persistent tile scheduler worker count. Queried HERE (plain host
-        # Python, CUDA context already live) rather than inside ``__call__``
-        # because HardwareInfo is a host function that cannot run in the
-        # @cute.jit trace. Passed into ``_compute_grid`` as a constexpr.
-        self.max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
-            self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-        )
+        # Persistent tile scheduler worker count is a RUNTIME kernel argument
+        # (see ``__call__``/``wrapper``): the deployed caller passes the target
+        # GPU's value at launch time, so AOT artifacts size the persistent grid
+        # for the GPU they actually run on instead of baking the build
+        # machine's occupancy.
 
     def _setup_attributes(self):
         """Populate MMA + SMEM + TMEM + pipeline attributes post-``__call__``.
@@ -502,6 +498,7 @@ class GemmBlackwellNvFp4WS:
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         c: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         # Dtype + layout intro (like gemm_blackwell.py:171-181).
@@ -612,9 +609,10 @@ class GemmBlackwellNvFp4WS:
         # SM-cluster slot, capped by max_active_clusters) and stride over the
         # output tiles. Overlaps per-tile setup across the many N/M tiles at
         # prefill shapes (large-M down_proj), improving prefill throughput.
-        # max_active_clusters was queried in __init__ (host context).
+        # max_active_clusters is a runtime kernel argument supplied by the
+        # caller for the GPU the kernel actually launches on.
         tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, self.max_active_clusters
+            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
         )
 
         # WS SharedStorage: split full/empty mbar slots + per-operand
@@ -714,6 +712,7 @@ class GemmBlackwellNvFp4WS:
         n: cutlass.Int64,
         k: cutlass.Int64,
         scaling_vector_size: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         """AOT entry point — accepts raw GPU pointers + runtime dims.
@@ -733,7 +732,12 @@ class GemmBlackwellNvFp4WS:
               Kernel_Module_t* module,
               void* a_ptr, void* b_ptr, void* sfa_ptr, void* sfb_ptr, void* c_ptr,
               int64_t m, int64_t n, int64_t k,
+              int32_t max_active_clusters,
               CUstream stream);
+
+        ``max_active_clusters`` sizes the persistent tile-scheduler grid and
+        must describe the GPU the kernel launches on (typically
+        ``cudaDevAttrMultiProcessorCount`` for cluster (1,1)).
         """
         scale_k = k // scaling_vector_size
         m_padded = ((m + 127) // 128) * 128
@@ -769,7 +773,7 @@ class GemmBlackwellNvFp4WS:
         c = cute.make_tensor(
             c_ptr, layout=cute.make_ordered_layout((m, n, 1), order=(1, 0, 2))
         )
-        return self(a, b, sfa, sfb, c, stream)
+        return self(a, b, sfa, sfb, c, max_active_clusters, stream)
 
     @cute.kernel
     def kernel(
@@ -1759,12 +1763,23 @@ def run(
         sf_vec_size=sf_vec_size,
     )
 
+    # Runtime persistent-grid size: export traces with a placeholder (the
+    # deployed caller supplies the target GPU's value); run/verify probes the
+    # local GPU as before.
+    if export_only:
+        max_active_clusters = cutlass.Int32(1)
+    else:
+        max_active_clusters = cutlass.Int32(
+            utils.HardwareInfo().get_max_active_clusters(1)
+        )
+
     start_time = time.time()
     compiled_gemm = cute.compile(
         gemm.wrapper,
         ptrs["a"], ptrs["b"], ptrs["sfa"], ptrs["sfb"], ptrs["c"],
         m, n, k,
         sf_vec_size,
+        max_active_clusters,
         current_stream,
     )
     compilation_time = time.time() - start_time

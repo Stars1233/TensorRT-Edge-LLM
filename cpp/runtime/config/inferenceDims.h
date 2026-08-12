@@ -38,7 +38,7 @@ namespace rt
 //! `proposalDims`, `acceptDims`, `resetDims`). Direct construction (aggregate
 //! or designated initializers) is supported for unit tests.
 //!
-//! The nine fields are the complete set of symbolic dims used by LLM and SpecDecode
+//! The ten fields are the complete set of symbolic dims used by LLM, DiffusionGemma, and SpecDecode
 //! draft engines. Fixed-shape tensor dims do not appear here.
 struct InferenceDims
 {
@@ -59,6 +59,9 @@ struct InferenceDims
     int64_t attnMaskSeqLen;
     int64_t ropeBatch;     //!< RoPE broadcast dim (1 for non-MRope; batch for MRope)
     int64_t packedMaskLen; //!< divUp(attnMaskSeqLen, 32) for SpecDecode masks; else 1
+    //! Shape length for DiffusionGemma `context_mask_selector`. Zero selects
+    //! causal/default masking; batch selects non-causal PADDING masking.
+    int64_t contextMaskSelectorLen;
     //! Shape length for `kvcache_start_index`. Zero is the engine's sentinel
     //! for "initial prefill of an empty KV cache"; `batch` means "use these
     //! per-batch start offsets" for chunked prefill, decode, verify, and
@@ -68,19 +71,24 @@ struct InferenceDims
     //! prefill/decode; one means speculative verification. The plugin reads
     //! this shape, not the marker payload.
     int64_t specVerifyPhaseLen;
+    //! Shape length for `skip_softmax_scale`: the runtime skip-softmax
+    //! scale-factor override (integer S). Zero = keep the engine-carried
+    //! calibrated default. Like the phase marker, the plugin reads this
+    //! shape, never the payload.
+    int64_t skipSoftmaxScaleLen;
 };
 
 //! Tripwires: if `InferenceDims` gains, loses, or reorders a field, these asserts fire
 //! and force a visit to `kDimNames` (diagnostics), `toString` (formatting), and
-//! the six recipe methods on `LLMEngineConfig`. The size assert catches add/remove;
+//! the recipe methods on `LLMEngineConfig`. The size assert catches add/remove;
 //! the per-field `offsetof` asserts catch reorders (which would otherwise silently
 //! change the meaning of every positional aggregate init). Note: these do NOT catch
 //! "short" aggregate inits (omitting trailing fields) — the policy is that production
 //! construction goes through recipe methods, which always set every field.
-static_assert(sizeof(InferenceDims) == 9 * sizeof(int64_t),
+static_assert(sizeof(InferenceDims) == 11 * sizeof(int64_t),
     "InferenceDims layout changed: update kDimNames, toString(), kZeroAllowedMembers, and every recipe "
-    "method in LLMEngineConfig (prefillDims / decodeDims / specVerifyDims / "
-    "proposalDims / acceptDims / resetDims).");
+    "method in LLMEngineConfig (prefillDims / decodeDims / denoiseDims / diffusionCommitDims / "
+    "specVerifyDims / proposalDims / acceptDims / resetDims).");
 static_assert(offsetof(InferenceDims, batch) == 0 * sizeof(int64_t), "InferenceDims::batch reordered");
 static_assert(offsetof(InferenceDims, seqLen) == 1 * sizeof(int64_t), "InferenceDims::seqLen reordered");
 static_assert(offsetof(InferenceDims, kvLen) == 2 * sizeof(int64_t), "InferenceDims::kvLen reordered");
@@ -89,16 +97,20 @@ static_assert(
     offsetof(InferenceDims, attnMaskSeqLen) == 4 * sizeof(int64_t), "InferenceDims::attnMaskSeqLen reordered");
 static_assert(offsetof(InferenceDims, ropeBatch) == 5 * sizeof(int64_t), "InferenceDims::ropeBatch reordered");
 static_assert(offsetof(InferenceDims, packedMaskLen) == 6 * sizeof(int64_t), "InferenceDims::packedMaskLen reordered");
-static_assert(offsetof(InferenceDims, startIndexLen) == 7 * sizeof(int64_t), "InferenceDims::startIndexLen reordered");
+static_assert(offsetof(InferenceDims, contextMaskSelectorLen) == 7 * sizeof(int64_t),
+    "InferenceDims::contextMaskSelectorLen reordered");
+static_assert(offsetof(InferenceDims, startIndexLen) == 8 * sizeof(int64_t), "InferenceDims::startIndexLen reordered");
 static_assert(
-    offsetof(InferenceDims, specVerifyPhaseLen) == 8 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
+    offsetof(InferenceDims, specVerifyPhaseLen) == 9 * sizeof(int64_t), "InferenceDims::specVerifyPhaseLen reordered");
+static_assert(offsetof(InferenceDims, skipSoftmaxScaleLen) == 10 * sizeof(int64_t),
+    "InferenceDims::skipSoftmaxScaleLen reordered");
 
 namespace detail
 {
 //! Compile-time mapping from member pointer to human-readable name.
 //!
 //! Diagnostics-only (log messages, assertions). Never used on the bind-time
-//! hot path. Linear-scan over the small field set is fine for that use.
+//! hot path. A small linear scan is fine for that use.
 //!
 //! The array size is derived from `InferenceDims` layout so that an extra or
 //! missing entry here fails to compile alongside the `sizeof(InferenceDims)`
@@ -113,17 +125,21 @@ inline constexpr std::array<std::pair<int64_t InferenceDims::*, std::string_view
         {&InferenceDims::attnMaskSeqLen, "attn_seq_len"},
         {&InferenceDims::ropeBatch, "rope_batch"},
         {&InferenceDims::packedMaskLen, "packed_mask_len"},
+        {&InferenceDims::contextMaskSelectorLen, "context_mask_selector_len"},
         {&InferenceDims::startIndexLen, "start_index_len"},
         {&InferenceDims::specVerifyPhaseLen, "spec_verify_phase_len"},
+        {&InferenceDims::skipSoftmaxScaleLen, "skip_softmax_scale_len"},
     }};
 
 //! Members where `0` is a legitimate engine-meaningful value (not a recipe
 //! bypass). `firstInvalidMember` excludes these from the `> 0` positivity
 //! check. Keep this set as small as possible — default validation should be
 //! strict, and most dims (batch, seqLen, kvLen, etc.) must be > 0.
-inline constexpr std::array<int64_t InferenceDims::*, 2> kZeroAllowedMembers{
+inline constexpr std::array<int64_t InferenceDims::*, 4> kZeroAllowedMembers{
+    &InferenceDims::contextMaskSelectorLen,
     &InferenceDims::startIndexLen,
     &InferenceDims::specVerifyPhaseLen,
+    &InferenceDims::skipSoftmaxScaleLen,
 };
 } // namespace detail
 

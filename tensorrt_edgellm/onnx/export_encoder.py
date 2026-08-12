@@ -86,6 +86,7 @@ _VISUAL_REGISTRY: dict[str, str] = {
     # translates ckpt keys before delegating to build_qwen3_vl_visual.
     "qwen3_omni": "qwen3_omni",
     "qwen3_omni_moe": "qwen3_omni",
+    "qwen3_omni_next": "qwen3_omni_next",
     "qwen3_5": "qwen3_5",
     "qwen3_5_moe": "qwen3_5",
     "qwen2_5_vl": "qwen2_5_vl",
@@ -97,6 +98,9 @@ _VISUAL_REGISTRY: dict[str, str] = {
     "gemma4_unified": "gemma4_unified",
     "NemotronH_Nano_VL_V2": "nemotron_omni",
     "NemotronH_Nano_Omni_Reasoning_V3": "nemotron_omni",
+    # Cosmos3-Edge reasoner: SigLIP2 packed-patch ViT + Qwen3-VL-style
+    # PatchMerger, exported on the qwen3_vl visual ONNX I/O contract.
+    "cosmos3_edge": "cosmos3_reasoner",
 }
 
 # Maps family → dotted module path inside tensorrt_edgellm
@@ -105,6 +109,8 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.qwen3_vl.modeling_qwen3_vl_visual",
     "qwen3_omni":
     "tensorrt_edgellm.models.qwen3_omni.modeling_qwen3_omni_visual",
+    "qwen3_omni_next":
+    "tensorrt_edgellm.models.qwen3_omni_next.modeling_qwen3_omni_next_visual",
     "qwen3_5":
     "tensorrt_edgellm.models.qwen3_5.modeling_qwen3_5_visual",
     "qwen2_5_vl":
@@ -121,12 +127,15 @@ _VISUAL_FAMILY_MODULE: dict[str, str] = {
     "tensorrt_edgellm.models.gemma4.modeling_gemma4_unified_visual",
     "nemotron_omni":
     "tensorrt_edgellm.models.nemotron_omni.modeling_nemotron_omni_visual",
+    "cosmos3_reasoner":
+    "tensorrt_edgellm.models.cosmos3_reasoner.modeling_cosmos3_reasoner_visual",
 }
 
 # Maps family → build function name in that module
 _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "qwen3_vl": "build_qwen3_vl_visual",
     "qwen3_omni": "build_qwen3_omni_visual",
+    "qwen3_omni_next": "build_qwen3_omni_next_visual",
     "qwen3_5": "build_qwen3_5_visual",
     "qwen2_5_vl": "build_qwen25_vl_visual",
     "internvl3": "build_internvl_visual",
@@ -135,6 +144,7 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
     "gemma4": "build_gemma4_visual",
     "gemma4_unified": "build_gemma4_unified_visual",
     "nemotron_omni": "build_nemotron_omni_visual",
+    "cosmos3_reasoner": "build_cosmos3_reasoner_visual",
 }
 
 # ---------------------------------------------------------------------------
@@ -142,12 +152,15 @@ _VISUAL_FAMILY_BUILD_FN: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _AUDIO_MODEL_TYPES: frozenset[str] = frozenset([
+    "nemotron3_5_asr",
     "qwen3_asr",
     "qwen3_omni",
     "qwen3_omni_thinker",
     "qwen3_omni_moe",
     "qwen3_omni_moe_thinker",
     "gemma4",
+    "qwen3_omni_next",
+    "qwen3_omni_next_thinker",
     "gemma4_unified",
     *_NEMOTRON_OMNI_MODEL_TYPES,
     # qwen3_tts intentionally excluded: Qwen3-TTS has NO audio encoder.
@@ -163,6 +176,8 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
     "qwen3_omni_moe": "thinker.audio_tower.",
     "qwen3_omni_moe_thinker": "thinker.audio_tower.",
     "gemma4": "model.audio_tower.",
+    "qwen3_omni_next": "thinker.audio_tower.",
+    "qwen3_omni_next_thinker": "thinker.audio_tower.",
 }
 
 # ---------------------------------------------------------------------------
@@ -172,17 +187,19 @@ _AUDIO_KEY_PREFIX: dict[str, str] = {
 
 def _get_visual_config(model_type: str, config: dict) -> dict:
     """Extract visual encoder sub-config from the full model config."""
-    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_omni_moe", "qwen3_5",
-                      "qwen3_5_moe", "qwen2_5_vl"):
-        # Qwen3-Omni (dense + MoE) stores vision_config nested under
+    if model_type in ("qwen3_vl", "qwen3_omni", "qwen3_omni_moe",
+                      "qwen3_omni_next", "qwen3_5", "qwen3_5_moe",
+                      "qwen2_5_vl"):
+        # Qwen3-Omni (dense + MoE) / Qwen3-Next Omni store vision_config nested under
         # thinker_config; other Qwen VL variants keep it at the root.
         return (config.get("vision_config")
                 or config.get("thinker_config", {}).get("vision_config")
                 or config)
-    if (model_type in ("internvl", "internvl_chat", "gemma4", "gemma4_unified")
+    if (model_type in ("internvl", "internvl_chat", "gemma4", "gemma4_unified",
+                       "cosmos3_edge")
             or model_type in _NEMOTRON_OMNI_MODEL_TYPES):
-        # InternVL / Gemma4 / Nemotron-Omni need the full config
-        # (vision + text + projection/runtime fields).
+        # InternVL / Gemma4 / Nemotron-Omni / Cosmos3-Edge need the full
+        # config (vision + text + projection/runtime fields).
         return config
     if model_type in ("phi4mm", "phi4_multimodal"):
         # Phi-4mm visual config is hardcoded (not in config.json).
@@ -217,9 +234,18 @@ def _run_dynamo_export(
     model.eval()
     translation_table = build_custom_translation_table()
 
-    assert len(dynamo_inputs) == len(onnx_input_names) and \
-        len(dynamo_inputs) == len(dynamic_shapes), \
-        f"dynamo_inputs: {len(dynamo_inputs)}, onnx_input_names: {len(onnx_input_names)}, dynamic_shapes: {len(dynamic_shapes)}"
+    def _count_export_leaves(value, *, root: bool = False) -> int:
+        if root and isinstance(value, dict):
+            return len(value)
+        if isinstance(value, (tuple, list)):
+            return sum(_count_export_leaves(v) for v in value)
+        return 1
+
+    num_dynamo_inputs = _count_export_leaves(dynamo_inputs, root=True)
+    num_dynamic_shapes = _count_export_leaves(dynamic_shapes, root=True)
+    assert num_dynamo_inputs == len(onnx_input_names) and \
+        num_dynamo_inputs == num_dynamic_shapes, \
+        f"dynamo_inputs: {num_dynamo_inputs}, onnx_input_names: {len(onnx_input_names)}, dynamic_shapes: {num_dynamic_shapes}"
 
     if isinstance(dynamo_inputs, dict):
         args = ()
@@ -334,6 +360,13 @@ def export_visual_onnx(
             os.path.dirname(os.path.abspath(output_path)))
         logger.info("Saved Phi-4mm GN projection sidecar: %s", sidecar_path)
 
+    # Nemotron-Omni sidecar tensors (runtime-executed patch embedder GEMM
+    # weights + raw pos_embed; see modeling_nemotron_omni_visual docstring).
+    if family == "nemotron_omni":
+        sidecar_path = visual_model.save_onnx_sidecar(
+            os.path.dirname(os.path.abspath(output_path)))
+        logger.info("Saved Nemotron-Omni embedder sidecar: %s", sidecar_path)
+
 
 # ---------------------------------------------------------------------------
 # Audio encoder export
@@ -374,8 +407,8 @@ def export_audio_onnx(
         from ..models.gemma4.modeling_gemma4_unified_audio import \
             build_gemma4_unified_audio
         if model_config is None:
-            from ..config import ModelConfig
-            model_config = ModelConfig.from_pretrained(model_dir)
+            from ..model import load_model_config
+            model_config = load_model_config(model_dir)
         logger.info("Building Gemma4 Unified encoder-free audio model ...")
         audio_model = build_gemma4_unified_audio(config,
                                                  weights,
@@ -390,7 +423,15 @@ def export_audio_onnx(
 
     build_fn = None
     extra_kwargs = {}
-    if model_type in _NEMOTRON_OMNI_MODEL_TYPES:
+    if model_type == "nemotron3_5_asr":
+        # FastConformer encoder for the RNN-T ASR model. Output frames feed
+        # the RNN-T joint network (see modeling_nemotron3_5_asr_decoder.py),
+        # not LLM prompt embeddings.
+        from ..models.nemotron3_5_asr.modeling_nemotron3_5_asr_audio import \
+            build_nemotron3_5_asr_audio
+        logger.info("Building Nemotron-3.5-ASR FastConformer encoder ...")
+        build_fn = build_nemotron3_5_asr_audio
+    elif model_type in _NEMOTRON_OMNI_MODEL_TYPES:
         from ..models.nemotron_omni.modeling_nemotron_omni_audio import \
             build_nemotron_omni_audio
         logger.info("Building Nemotron-Omni audio encoder ...")
@@ -404,6 +445,23 @@ def export_audio_onnx(
         logger.info("Building Gemma4 audio encoder (prefix=%r) ...",
                     key_prefix)
         build_fn = build_gemma4_audio
+        extra_kwargs = {
+            "prefix": key_prefix,
+            "model_config": model_config,
+        }
+    elif model_type in ("qwen3_omni_next", "qwen3_omni_next_thinker"):
+        # Qwen3-Next audio encoder adds a 4th stride-2 Conv2d (16x downsample
+        # instead of Qwen3-ASR/Qwen3-Omni's 8x); the builder + subclass
+        # ``get_onnx_export_args`` override handle the shape difference.
+        from ..models.qwen3_omni_next.modeling_qwen3_omni_next_audio import \
+            build_qwen3_omni_next_audio
+        config = config.get("thinker_config",
+                            {}).get("audio_config",
+                                    config.get("audio_config", config))
+        key_prefix = _AUDIO_KEY_PREFIX.get(model_type)
+        logger.info("Building %s audio encoder (prefix=%r) ...", model_type,
+                    key_prefix)
+        build_fn = build_qwen3_omni_next_audio
         extra_kwargs = {
             "prefix": key_prefix,
             "model_config": model_config,

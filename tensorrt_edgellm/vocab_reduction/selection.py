@@ -34,18 +34,42 @@ def get_vocab_size(config: Any) -> int:
         "config.vocab_size or config.text_config.vocab_size.")
 
 
+def _resolve_d2t_target_ids(d2t_tensor: torch.Tensor,
+                            vocab_size: int) -> torch.Tensor:
+    """Resolve EAGLE d2t as either offsets or direct target token IDs."""
+    raw = d2t_tensor.detach().to(device="cpu", dtype=torch.int64).flatten()
+    draft_ids = torch.arange(raw.numel(), dtype=torch.int64)
+    direct_valid = bool(torch.all((raw >= 0) & (raw < vocab_size)).item())
+    offset_targets = draft_ids + raw
+    offset_valid = bool(
+        torch.all((offset_targets >= 0)
+                  & (offset_targets < vocab_size)).item())
+    if not direct_valid and not offset_valid:
+        raise ValueError(
+            "EAGLE d2t tensor is neither a valid direct map nor offset map")
+
+    use_offset_map = False
+    if offset_valid and not direct_valid:
+        use_offset_map = True
+    elif offset_valid and direct_valid:
+        direct_unique = int(torch.unique(raw).numel())
+        offset_unique = int(torch.unique(offset_targets).numel())
+        use_offset_map = offset_unique > direct_unique
+
+    print("Interpreting EAGLE d2t as "
+          f"{'offset' if use_offset_map else 'direct'} table")
+    return offset_targets if use_offset_map else raw
+
+
 def extract_d2t_required_tokens(d2t_tensor: torch.Tensor,
                                 vocab_size: int) -> Set[int]:
     """Return base-model token IDs referenced by an EAGLE d2t tensor."""
-    required_tokens = set()
     print(f"Processing d2t tensor with {len(d2t_tensor)} entries...")
-
-    for reduced_token_id in range(len(d2t_tensor)):
-        offset = int(d2t_tensor[reduced_token_id].item())
-        base_token_id = reduced_token_id + offset
-        if 0 <= base_token_id < vocab_size:
-            required_tokens.add(base_token_id)
-
+    target_ids = _resolve_d2t_target_ids(d2t_tensor, vocab_size)
+    required_tokens = {
+        int(token_id)
+        for token_id in target_ids.tolist() if 0 <= int(token_id) < vocab_size
+    }
     print(f"Extracted {len(required_tokens)} required tokens from d2t mapping")
     return required_tokens
 

@@ -35,6 +35,7 @@ Usage
 import json
 import logging
 import os
+import pathlib
 from typing import Callable, Dict, Iterator, Optional, Tuple
 
 import torch
@@ -50,6 +51,39 @@ logger = logging.getLogger(__name__)
 __all__ = ["load_weights", "load_submodule_weights"]
 
 _FUSED_INPUT_CHANNEL_ATTRS = {"pre_quant_scale"}
+
+
+def _is_awq_prepacked_weight(tensor: torch.Tensor, attr_suffix: str,
+                             expected_N: int) -> bool:
+    """True when *tensor* is the AWQ ModelOpt prepacked ``weight`` buffer.
+
+    The prepacked layout is ``uint8 [N//2, K]`` with two int4 nibbles per byte
+    (even N rows in the low nibble, odd N rows in the high nibble).  Any
+    per-head split has to unpack, slice, and re-pack instead of a plain
+    ``dim=0`` slice.
+    """
+    return (attr_suffix == "weight" and tensor.dtype == torch.uint8
+            and tensor.dim() == 2 and tensor.shape[0] * 2 == expected_N)
+
+
+def _unpack_awq_prepacked(w_u8: torch.Tensor, N: int) -> torch.Tensor:
+    """Unpack ``[N//2, K] uint8`` AWQ ModelOpt weight to ``[N, K] int16``."""
+    K = w_u8.shape[1]
+    w_u16 = w_u8.to(torch.int16) & 0xFF
+    unpacked = torch.zeros(N, K, dtype=torch.int16)
+    unpacked[0::2] = w_u16 & 0xF
+    unpacked[1::2] = (w_u16 >> 4) & 0xF
+    return unpacked
+
+
+def _repack_awq_prepacked(w_int16: torch.Tensor) -> torch.Tensor:
+    """Repack ``[N, K] int16`` nibbles back to AWQ ``[N//2, K] uint8``."""
+    N = w_int16.shape[0]
+    assert N % 2 == 0, f"AWQ repack requires even N, got {N}"
+    low = w_int16[0::2] & 0xF
+    high = w_int16[1::2] & 0xF
+    return ((high << 4) | low).to(torch.uint8)
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -244,6 +278,19 @@ def _detect_key_prefix(keys: list) -> Tuple[str, str]:
     return "", ""
 
 
+def _resolve_shard(model_dir: str, shard: str) -> str:
+    """Return the absolute shard path, asserting it stays inside model_dir."""
+    base = pathlib.Path(model_dir).resolve()
+    resolved = (base / shard).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        raise ValueError(
+            f"Shard path {shard!r} in checkpoint index escapes model_dir "
+            f"{model_dir!r}. This may indicate a malformed checkpoint.")
+    return str(resolved)
+
+
 def _build_shard_map(model_dir: str) -> Dict[str, str]:
     """Return a mapping of weight-key -> absolute shard file path.
 
@@ -264,7 +311,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
         missing_shards = {
             shard
             for shard in set(weight_map.values())
-            if not os.path.exists(os.path.join(model_dir, shard))
+            if not os.path.exists(_resolve_shard(model_dir, shard))
         }
         if missing_shards and os.path.exists(single_path):
             logger.warning(
@@ -275,7 +322,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
             )
         else:
             return {
-                key: os.path.join(model_dir, shard)
+                key: _resolve_shard(model_dir, shard)
                 for key, shard in weight_map.items()
             }
 
@@ -288,7 +335,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
 
     if os.path.exists(index_path):
         return {
-            key: os.path.join(model_dir, shard)
+            key: _resolve_shard(model_dir, shard)
             for key, shard in weight_map.items()
         }
 
@@ -301,7 +348,7 @@ def _build_shard_map(model_dir: str) -> Dict[str, str]:
             index = json.load(f)
         weight_map = index["weight_map"]
         return {
-            key: os.path.join(model_dir, shard)
+            key: _resolve_shard(model_dir, shard)
             for key, shard in weight_map.items()
         }
 
@@ -446,19 +493,16 @@ def _try_split_fused_tensor(model: nn.Module,
                             tensor: torch.Tensor,
                             *,
                             mapping: Optional[Mapping] = None) -> bool:
-    """Handle fused-weight checkpoint patterns not matched by _set_tensor.
+    """Handle fused-weight checkpoint patterns not matched by ``_set_tensor``.
 
-    Supports two transformations applied in order:
-    1. ``.base_layer.`` removal. PEFT/LoRA checkpoints nest the base weight
-       under ``module.base_layer.weight``. Strip ``.base_layer`` to recover the
-       plain ``module.weight`` name before trying again.
-    2. Fused QKV split. ``self_attn.qkv_proj.weight`` (shape
-       ``[q+k+v, hidden]``) is split into the three separate projection weights
-       ``q_proj``, ``k_proj``, ``v_proj`` using the model's attention head
-       configuration.
-    3. Fused gate+up split. ``mlp.gate_up_proj.weight`` (shape
-       ``[2*intermediate, hidden]``) is split into ``gate_proj`` and ``up_proj``
-       (each half of the first dimension).
+    Rules (first match wins):
+      1. ``.base_layer.`` PEFT prefix removal.
+      2. ``self_attn.qkv_proj`` → ``q_proj`` / ``k_proj`` / ``v_proj``.
+      3. ``mlp.gate_up_proj`` → ``gate_proj`` / ``up_proj``.
+      4. GDN ``in_proj_qkvz`` → ``in_proj_qkv`` / ``in_proj_z`` (Qwen3-Next
+         family; per-k-head ``[q | k | v | z]`` layout reshape).
+      5. GDN ``in_proj_ba``   → ``in_proj_b`` / ``in_proj_a`` (Qwen3-Next
+         family; per-k-head ``[b | a]`` layout with width ``2 * gqa``).
 
     Returns True if at least one split sub-tensor was set successfully.
     """
@@ -579,7 +623,214 @@ def _try_split_fused_tensor(model: nn.Module,
                          attr_suffix, prefix)
         return ok
 
+    # --- 4. GDN fused in_proj_qkvz split (Qwen3-Next family) ----------------
+    # HF layout is per-k-head ``[q | k | v | z]``; our GdnMixer keeps q/k/v
+    # fused (in_proj_qkv, head-major contiguous) and z separate (in_proj_z),
+    # so reshape-per-head → slice → reshape-back is required. AWQ ModelOpt
+    # prepacked ``weight`` (uint8 [N//2, K]) is unpacked/split/repacked;
+    # ``pre_quant_scale`` broadcasts unchanged to both splits.
+    if ".linear_attn.in_proj_qkvz." in key:
+        idx = key.index(".linear_attn.in_proj_qkvz.")
+        prefix = key[:idx]
+        attr_suffix = key[idx + len(".linear_attn.in_proj_qkvz."):]
+        mixer = _resolve_module(model, f"{prefix}.linear_attn")
+        if mixer is None:
+            return False
+        num_k_heads = mixer.num_k_heads
+        num_v_heads = mixer.num_v_heads
+        head_k_dim = mixer.k_dim
+        head_v_dim = mixer.v_dim
+        gqa = num_v_heads // num_k_heads
+        per_head_qkvz = 2 * head_k_dim + 2 * head_v_dim * gqa
+        expected_N = num_k_heads * per_head_qkvz
+
+        if attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS:
+            ok = _set_tensor(model,
+                             f"{prefix}.linear_attn.in_proj_qkv.{attr_suffix}",
+                             tensor,
+                             mapping=mapping)
+            ok |= _set_tensor(model,
+                              f"{prefix}.linear_attn.in_proj_z.{attr_suffix}",
+                              tensor,
+                              mapping=mapping)
+            return ok
+
+        is_awq_packed = _is_awq_prepacked_weight(tensor, attr_suffix,
+                                                 expected_N)
+        if is_awq_packed:
+            per_head = _unpack_awq_prepacked(tensor, expected_N).reshape(
+                num_k_heads, per_head_qkvz, tensor.shape[1])
+        else:
+            if tensor.dim() < 1 or tensor.shape[0] != expected_N:
+                logger.warning(
+                    "in_proj_qkvz.%s shape %s incompatible with num_k_heads=%d "
+                    "per_head_qkvz=%d", attr_suffix, tensor.shape, num_k_heads,
+                    per_head_qkvz)
+                return False
+            rest = tensor.shape[1:]
+            per_head = tensor.reshape(num_k_heads, per_head_qkvz, *rest)
+
+        rest_full = per_head.shape[2:]
+        off = 0
+        q_part = per_head[:, off:off + head_k_dim]
+        off += head_k_dim
+        k_part = per_head[:, off:off + head_k_dim]
+        off += head_k_dim
+        v_part = per_head[:, off:off + head_v_dim * gqa]
+        off += head_v_dim * gqa
+        z_part = per_head[:, off:off + head_v_dim * gqa]
+        key_dim = num_k_heads * head_k_dim
+        value_dim = num_v_heads * head_v_dim
+        qkv_full = torch.cat([
+            q_part.reshape(key_dim, *rest_full),
+            k_part.reshape(key_dim, *rest_full),
+            v_part.reshape(value_dim, *rest_full),
+        ],
+                             dim=0)
+        z_full = z_part.reshape(value_dim, *rest_full)
+
+        if is_awq_packed:
+            qkv_weight = _repack_awq_prepacked(qkv_full)
+            z_weight = _repack_awq_prepacked(z_full)
+        else:
+            qkv_weight = qkv_full
+            z_weight = z_full
+
+        ok = _set_tensor(model,
+                         f"{prefix}.linear_attn.in_proj_qkv.{attr_suffix}",
+                         qkv_weight,
+                         mapping=mapping)
+        ok |= _set_tensor(model,
+                          f"{prefix}.linear_attn.in_proj_z.{attr_suffix}",
+                          z_weight,
+                          mapping=mapping)
+        if ok:
+            logger.debug(
+                "Split in_proj_qkvz.%s -> in_proj_qkv / in_proj_z for prefix %r",
+                attr_suffix, prefix)
+        return ok
+
+    # --- 5. GDN fused in_proj_ba split (Qwen3-Next family) ------------------
+    # HF Qwen3-Next stores [b | a] per-k-head interleaved with width
+    # ``2 * (num_v_heads // num_k_heads)``.  Our ``GdnMixer`` keeps them as
+    # separate Linears of ``num_v_heads`` rows each — extract by strided
+    # slicing.  AWQ ModelOpt prepacked ``weight`` goes through the same
+    # unpack / slice / repack path as ``in_proj_qkvz`` above.
+    if ".linear_attn.in_proj_ba." in key:
+        idx = key.index(".linear_attn.in_proj_ba.")
+        prefix = key[:idx]
+        attr_suffix = key[idx + len(".linear_attn.in_proj_ba."):]
+        mixer = _resolve_module(model, f"{prefix}.linear_attn")
+        if mixer is None:
+            return False
+        num_k_heads = mixer.num_k_heads
+        num_v_heads = mixer.num_v_heads
+        gqa = num_v_heads // num_k_heads
+        per_head_ba = 2 * gqa
+        expected_N = num_k_heads * per_head_ba
+
+        if attr_suffix in _FUSED_INPUT_CHANNEL_ATTRS:
+            ok = _set_tensor(model,
+                             f"{prefix}.linear_attn.in_proj_b.{attr_suffix}",
+                             tensor,
+                             mapping=mapping)
+            ok |= _set_tensor(model,
+                              f"{prefix}.linear_attn.in_proj_a.{attr_suffix}",
+                              tensor,
+                              mapping=mapping)
+            return ok
+
+        is_awq_packed = _is_awq_prepacked_weight(tensor, attr_suffix,
+                                                 expected_N)
+        if is_awq_packed:
+            per_head = _unpack_awq_prepacked(tensor, expected_N).reshape(
+                num_k_heads, per_head_ba, tensor.shape[1])
+        else:
+            if tensor.dim() < 1 or tensor.shape[0] != expected_N:
+                logger.warning(
+                    "in_proj_ba.%s shape %s incompatible with num_k_heads=%d "
+                    "per_head_ba=%d", attr_suffix, tensor.shape, num_k_heads,
+                    per_head_ba)
+                return False
+            rest = tensor.shape[1:]
+            per_head = tensor.reshape(num_k_heads, per_head_ba, *rest)
+
+        rest_full = per_head.shape[2:]
+        b_part = per_head[:, 0:gqa]
+        a_part = per_head[:, gqa:2 * gqa]
+        b_full = b_part.reshape(num_v_heads, *rest_full)
+        a_full = a_part.reshape(num_v_heads, *rest_full)
+
+        if is_awq_packed:
+            b_weight = _repack_awq_prepacked(b_full)
+            a_weight = _repack_awq_prepacked(a_full)
+        else:
+            b_weight = b_full
+            a_weight = a_full
+
+        ok = _set_tensor(model,
+                         f"{prefix}.linear_attn.in_proj_b.{attr_suffix}",
+                         b_weight,
+                         mapping=mapping)
+        ok |= _set_tensor(model,
+                          f"{prefix}.linear_attn.in_proj_a.{attr_suffix}",
+                          a_weight,
+                          mapping=mapping)
+        if ok:
+            logger.debug(
+                "Split in_proj_ba.%s -> in_proj_b / in_proj_a for prefix %r",
+                attr_suffix, prefix)
+        return ok
+
+    # --- 6. Fused MoE expert split -------------------------------------------
+    # Fused 3-D expert tensors (gate rows first, then up):
+    #   mlp.experts.gate_up_proj [E, 2*I, H] / mlp.experts.down_proj [E, H, I]
+    # Split into the per-expert Linear weights held by Qwen3MoEExperts.
+    if key.endswith(".mlp.experts.gate_up_proj") and tensor.dim() == 3:
+        prefix = key[:-len("gate_up_proj")]
+        inter = tensor.shape[1] // 2
+        ok = True
+        for expert in range(tensor.shape[0]):
+            ok &= _set_tensor(model,
+                              f"{prefix}{expert}.gate_proj.weight",
+                              tensor[expert, :inter, :],
+                              mapping=mapping)
+            ok &= _set_tensor(model,
+                              f"{prefix}{expert}.up_proj.weight",
+                              tensor[expert, inter:, :],
+                              mapping=mapping)
+        if ok:
+            logger.debug(
+                "Split fused experts.gate_up_proj -> %d gate/up pairs "
+                "for prefix %r", tensor.shape[0], prefix)
+        return ok
+    if key.endswith(".mlp.experts.down_proj") and tensor.dim() == 3:
+        prefix = key[:-len("down_proj")]
+        ok = True
+        for expert in range(tensor.shape[0]):
+            ok &= _set_tensor(model,
+                              f"{prefix}{expert}.down_proj.weight",
+                              tensor[expert],
+                              mapping=mapping)
+        if ok:
+            logger.debug(
+                "Split fused experts.down_proj -> %d down weights "
+                "for prefix %r", tensor.shape[0], prefix)
+        return ok
+
     return False
+
+
+def _resolve_module(model: nn.Module, dotted: str) -> Optional[nn.Module]:
+    """Walk attribute path on *model*. Returns None on any miss."""
+    mod = model
+    for part in dotted.split("."):
+        if not part:
+            continue
+        if not hasattr(mod, part):
+            return None
+        mod = getattr(mod, part)
+    return mod
 
 
 def iter_checkpoint_keys(model_dir: str) -> Iterator[str]:

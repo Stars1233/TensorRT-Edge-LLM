@@ -17,13 +17,12 @@
 
 #include "allReducePlugin.h"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 #include "common/tensor.h"
 #include "plugins/utils/pluginUtils.h"
 
-#include <atomic>
 #include <cstdint>
-#include <dlfcn.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -42,6 +41,9 @@ namespace
 constexpr char const* kALL_REDUCE_PLUGIN_VERSION{"1"};
 constexpr char const* kALL_REDUCE_PLUGIN_NAME{"AllReducePlugin"};
 
+std::mutex gAllReducePathRegistryMutex;
+std::unordered_map<int32_t, NcclAllReducePathRegistration> gNcclRegistrations;
+
 // Input/output indices
 constexpr int32_t kIN_TENSOR_IDX{0};
 constexpr int32_t kOUT_TENSOR_IDX{0};
@@ -56,17 +58,103 @@ constexpr int32_t kNcclSuccess = 0;
 // Per-device NCCL state for single-process multi-GPU TP.
 // Each GPU device gets its own NCCL communicator handle.
 using NcclAllReduceFn = int (*)(void const*, void*, size_t, int, int, void*, cudaStream_t);
-static std::unordered_map<int, void*> gNcclCommMap; //!< cudaDevice -> ncclComm_t
-static NcclAllReduceFn gNcclAllReduceFn = nullptr;
-static std::mutex gCommStateMutex;
+
+AllReduceExecutionStatus executeIdentityAllReducePath(PluginTensorDesc const& inputDesc, void const* input,
+    void* output, int64_t numElements, int32_t tpSize, cudaStream_t stream)
+{
+    if (tpSize > 1)
+    {
+        return AllReduceExecutionStatus::kUnavailable;
+    }
+
+    size_t const typeSize = rt::utils::getTypeSize(inputDesc.type);
+    cudaError_t const error = cudaMemcpyAsync(output, input, numElements * typeSize, cudaMemcpyDeviceToDevice, stream);
+    if (error != cudaSuccess)
+    {
+        LOG_ERROR("AllReducePlugin: identity path copy failed: %s", cudaGetErrorString(error));
+        return AllReduceExecutionStatus::kFailure;
+    }
+    return AllReduceExecutionStatus::kSuccess;
+}
+
+AllReduceExecutionStatus executeNcclAllReducePath(NcclAllReducePathRegistration const& registration,
+    PluginTensorDesc const& inputDesc, void const* input, void* output, int64_t numElements, int32_t tpSize,
+    int32_t deviceId, cudaStream_t stream)
+{
+    if (tpSize <= 1 || registration.communicator == nullptr || registration.allReduceFunction == nullptr)
+    {
+        return AllReduceExecutionStatus::kUnavailable;
+    }
+
+    int32_t ncclType = kNcclFloat16;
+    if (inputDesc.type == DataType::kFLOAT)
+    {
+        ncclType = kNcclFloat32;
+    }
+    else if (inputDesc.type == DataType::kBF16)
+    {
+        ncclType = kNcclBfloat16;
+    }
+
+    auto const ncclAllReduce = reinterpret_cast<NcclAllReduceFn>(registration.allReduceFunction);
+    int32_t const result
+        = ncclAllReduce(input, output, numElements, ncclType, kNcclSum, registration.communicator, stream);
+    if (result != kNcclSuccess)
+    {
+        LOG_ERROR("AllReducePlugin: NCCL path failed with error %d on device %d", result, deviceId);
+        return AllReduceExecutionStatus::kFailure;
+    }
+    return AllReduceExecutionStatus::kSuccess;
+}
 
 } // namespace
 
-void registerNcclCommForAllReducePlugin(int deviceId, void* ncclComm, void* ncclAllReduceFunc) noexcept
+bool registerNcclAllReducePath(int32_t deviceId, void* ncclComm, void* ncclAllReduceFunction) noexcept
 {
-    std::lock_guard<std::mutex> lock(gCommStateMutex);
-    gNcclCommMap[deviceId] = ncclComm;
-    gNcclAllReduceFn = reinterpret_cast<NcclAllReduceFn>(ncclAllReduceFunc);
+    if (deviceId < 0 || ncclComm == nullptr || ncclAllReduceFunction == nullptr)
+    {
+        LOG_ERROR("Cannot register NCCL AllReduce path: device=%d, communicator=%p, function=%p.", deviceId, ncclComm,
+            ncclAllReduceFunction);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(gAllReducePathRegistryMutex);
+    gNcclRegistrations[deviceId] = NcclAllReducePathRegistration{ncclComm, ncclAllReduceFunction};
+    return true;
+}
+
+bool unregisterNcclAllReducePath(int32_t deviceId, void* expectedNcclComm) noexcept
+{
+    if (deviceId < 0 || expectedNcclComm == nullptr)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(gAllReducePathRegistryMutex);
+    auto const registration = gNcclRegistrations.find(deviceId);
+    if (registration == gNcclRegistrations.end() || registration->second.communicator != expectedNcclComm)
+    {
+        return false;
+    }
+    gNcclRegistrations.erase(registration);
+    return true;
+}
+
+AllReducePathRegistrations snapshotAllReducePathRegistrationsForDevice(int32_t deviceId) noexcept
+{
+    AllReducePathRegistrations snapshot{};
+    if (deviceId < 0)
+    {
+        return snapshot;
+    }
+
+    std::lock_guard<std::mutex> lock(gAllReducePathRegistryMutex);
+    auto const ncclRegistration = gNcclRegistrations.find(deviceId);
+    if (ncclRegistration != gNcclRegistrations.end())
+    {
+        snapshot.nccl = ncclRegistration->second;
+    }
+    return snapshot;
 }
 
 // Static class fields initialization
@@ -231,60 +319,39 @@ int32_t AllReducePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensor
             numElements *= inDesc.dims.d[d];
         }
 
-        // Look up NCCL comm for the current CUDA device
         int currentDevice = -1;
-        cudaError_t const deviceErr = cudaGetDevice(&currentDevice);
-        if (deviceErr != cudaSuccess)
-        {
-            LOG_ERROR("AllReducePlugin: cudaGetDevice failed: %s", cudaGetErrorString(deviceErr));
-            return -1;
-        }
+        CUDA_CHECK(cudaGetDevice(&currentDevice));
 
-        void* ncclComm = nullptr;
-        NcclAllReduceFn ncclAllReduceFn = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(gCommStateMutex);
-            auto commIt = gNcclCommMap.find(currentDevice);
-            if (commIt != gNcclCommMap.end())
-            {
-                ncclComm = commIt->second;
-            }
-            ncclAllReduceFn = gNcclAllReduceFn;
-        }
+        AllReducePathRegistrations const registrations = snapshotAllReducePathRegistrationsForDevice(currentDevice);
 
-        if (mTpSize <= 1 || ncclComm == nullptr || ncclAllReduceFn == nullptr)
+        AllReduceExecutionStatus status = executeIdentityAllReducePath(
+            inDesc, inputs[kIN_TENSOR_IDX], outputs[kOUT_TENSOR_IDX], numElements, mTpSize, stream);
+        if (status == AllReduceExecutionStatus::kSuccess)
         {
-            // No tensor parallelism or no comm for this device: just copy input to output
-            size_t const typeSize = rt::utils::getTypeSize(inDesc.type);
-            cudaMemcpyAsync(outputs[kOUT_TENSOR_IDX], inputs[kIN_TENSOR_IDX], numElements * typeSize,
-                cudaMemcpyDeviceToDevice, stream);
             return 0;
         }
-
-
-        // Map TRT data type to NCCL data type
-        int32_t ncclType = kNcclFloat16;
-        if (inDesc.type == DataType::kFLOAT)
+        if (status == AllReduceExecutionStatus::kFailure)
         {
-            ncclType = kNcclFloat32;
-        }
-        else if (inDesc.type == DataType::kBF16)
-        {
-            ncclType = kNcclBfloat16;
-        }
-
-        // ---- Profiling: GPU event timing around AllReduce (zero-overhead) ----
-
-        // Perform NCCL all-reduce using the per-device communicator
-        int32_t ncclResult = ncclAllReduceFn(
-            inputs[kIN_TENSOR_IDX], outputs[kOUT_TENSOR_IDX], numElements, ncclType, kNcclSum, ncclComm, stream);
-        if (ncclResult != kNcclSuccess)
-        {
-            LOG_ERROR("AllReducePlugin: NCCL allReduce failed with error %d on device %d", ncclResult, currentDevice);
             return -1;
         }
 
-        return 0;
+
+        status = executeNcclAllReducePath(registrations.nccl, inDesc, inputs[kIN_TENSOR_IDX], outputs[kOUT_TENSOR_IDX],
+            numElements, mTpSize, currentDevice, stream);
+        if (status == AllReduceExecutionStatus::kSuccess)
+        {
+            return 0;
+        }
+        if (status == AllReduceExecutionStatus::kFailure)
+        {
+            return -1;
+        }
+
+        LOG_ERROR(
+            "AllReducePlugin: no execution path is available for TP size %d on device %d; the required "
+            "NCCL path is not registered",
+            mTpSize, currentDevice);
+        return -1;
     }
     catch (std::exception const& e)
     {
@@ -386,52 +453,17 @@ IPluginV3* AllReducePluginCreator::createPlugin(
     }
 }
 
-void getNcclRegistrationForDevice(int deviceId, void** ncclComm, void** ncclAllReduceFunc) noexcept
-{
-    if (ncclComm != nullptr)
-    {
-        *ncclComm = nullptr;
-    }
-    if (ncclAllReduceFunc != nullptr)
-    {
-        *ncclAllReduceFunc = nullptr;
-    }
-    if (deviceId < 0)
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(gCommStateMutex);
-    auto it = gNcclCommMap.find(deviceId);
-    if (ncclComm != nullptr && it != gNcclCommMap.end())
-    {
-        *ncclComm = it->second;
-    }
-    if (ncclAllReduceFunc != nullptr)
-    {
-        *ncclAllReduceFunc = reinterpret_cast<void*>(gNcclAllReduceFn);
-    }
-}
-
-void* getNcclCommForDevice(int deviceId) noexcept
-{
-    std::lock_guard<std::mutex> lock(gCommStateMutex);
-    auto it = gNcclCommMap.find(deviceId);
-    return (it != gNcclCommMap.end()) ? it->second : nullptr;
-}
-
-void* getNcclAllReduceFunc() noexcept
-{
-    std::lock_guard<std::mutex> lock(gCommStateMutex);
-    return reinterpret_cast<void*>(gNcclAllReduceFn);
-}
-
 } // namespace plugins
 } // namespace trt_edgellm
 
-extern "C" void edgellmRegisterNcclCommForAllReducePlugin(
-    int deviceId, void* ncclComm, void* ncclAllReduceFunc) noexcept
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmRegisterNcclCommForAllReducePlugin(
+    int deviceId, void* ncclComm, void* ncclAllReduceFunction) noexcept
 {
-    trt_edgellm::plugins::registerNcclCommForAllReducePlugin(deviceId, ncclComm, ncclAllReduceFunc);
+    return trt_edgellm::plugins::registerNcclAllReducePath(deviceId, ncclComm, ncclAllReduceFunction);
+}
+
+extern "C" EDGELLM_PLUGIN_EXPORT bool edgellmUnregisterNcclCommForAllReducePlugin(int deviceId, void* ncclComm) noexcept
+{
+    return trt_edgellm::plugins::unregisterNcclAllReducePath(deviceId, ncclComm);
 }
 

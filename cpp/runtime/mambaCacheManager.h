@@ -52,6 +52,12 @@ public:
         int32_t maxIntermediateSeqLen{0};  //!< Spec-verify intermediate state seq dim (0 = disabled)
         nvinfer1::DataType recurrentStateType{nvinfer1::DataType::kHALF}; //!< Recurrent state dtype
         nvinfer1::DataType convStateType{nvinfer1::DataType::kHALF};      //!< Conv state dtype
+        //! Number of B/C groups. Only consumed by the Mamba spec-verify replay stash (the replay-B
+        //! extent); GDN/DDTree leaves it 0.
+        int32_t recurrentStateNumGroups{0};
+        //! MTP spec-verify commit mode: true → Mamba replay reconstruction (allocate the dA/u/B
+        //! replay stash), false → GDN/DDTree per-token snapshot scatter.
+        bool specVerifyUsesReplay{false};
     };
     //! \endcond
 
@@ -122,11 +128,22 @@ public:
     //! @return Vector of device tensors with shape [1, convDim, convKernel].
     std::vector<rt::Tensor> captureConvStates(int32_t batchIdx, cudaStream_t stream);
 
-    //! Get spec-verify intermediate recurrent state tensor for a given layer.
-    //! Shape: [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads, recurrentStateHeadDim, recurrentStateSize]
+    //! Get a spec-verify replay-stash tensor for a given layer (FP32). During MTP verification the
+    //! Mamba plugin stashes the minimal per-token replay inputs here (instead of full-state
+    //! snapshots); scatterAcceptedLinearStates reconstructs the accepted recurrent state from them.
+    //!   dA: [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads]
+    //!   u:  [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumHeads, recurrentStateHeadDim]
+    //!   B:  [maxBatchSize, maxIntermediateSeqLen, recurrentStateNumGroups, recurrentStateSize]
     //! @param recurrentLayerIdx The recurrent layer index.
     //! @return A reference to the owned device tensor.
+    rt::Tensor& getReplayDaState(int32_t recurrentLayerIdx) noexcept;
+    rt::Tensor& getReplayUState(int32_t recurrentLayerIdx) noexcept;
+    rt::Tensor& getReplayBState(int32_t recurrentLayerIdx) noexcept;
+
     rt::Tensor& getIntermediateRecurrentState(int32_t recurrentLayerIdx) noexcept;
+
+    //! True when the recurrent state commits via replay reconstruction rather than GDN snapshot scatter.
+    bool recurrentUsesReplay() const noexcept;
 
     //! Get spec-verify intermediate conv state tensor for a given layer.
     //! Shape: [maxBatchSize, maxIntermediateSeqLen, convDim, convKernel]
@@ -173,15 +190,27 @@ public:
     void scatterAcceptedTreeStates(
         rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream);
 
-private:
-    Config mConfig{};                                     //!< Cache configuration
-    std::vector<rt::Tensor> mRecurrentStates;             //!< Per-layer recurrent state tensors on device
-    std::vector<rt::Tensor> mConvStates;                  //!< Per-layer conv state tensors on device
-    std::vector<rt::Tensor> mIntermediateRecurrentStates; //!< Per-layer spec-verify intermediate recurrent states
-    std::vector<rt::Tensor> mIntermediateConvStates;      //!< Per-layer spec-verify intermediate conv states
+    //! Chunk impl (the default): commit DDTree recurrent states by
+    //! REPLAYING the accepted path from the committed state, consuming the
+    //! per-node stash the chunk-form verify wrote into the head of each
+    //! layer's intermediate buffer. Conv states still commit via the
+    //! checkpoint scatter (conv checkpoints stay valid in this mode).
+    void replayCommitAcceptedTreeStates(
+        rt::Tensor const& acceptedStateNodeIds, rt::Tensor const& acceptLengths, cudaStream_t stream);
 
-    //! Device-resident MtpLayerInfo[numRecurrentLayers] for batched spec-verify state scatter,
-    //! built once at construction.  Empty when spec-verify intermediate states are unallocated.
+private:
+    Config mConfig{};                                //!< Cache configuration
+    std::vector<rt::Tensor> mRecurrentStates;        //!< Per-layer recurrent state tensors on device
+    std::vector<rt::Tensor> mConvStates;             //!< Per-layer conv state tensors on device
+    std::vector<rt::Tensor> mIntermediateConvStates; //!< Per-layer spec-verify intermediate conv states (scatter)
+    //! Per-layer GDN/DDTree spec-verify recurrent snapshot. Empty in the Mamba replay path.
+    std::vector<rt::Tensor> mIntermediateRecurrentStates;
+    //! Per-layer Mamba spec-verify recurrent replay stash; reconstructs the accepted state after
+    //! verify. Empty in the GDN snapshot path.
+    std::vector<rt::Tensor> mReplayDaStates;
+    std::vector<rt::Tensor> mReplayUStates;
+    std::vector<rt::Tensor> mReplayBStates;
+
     rt::Tensor mDeviceMtpLayerInfos;
 };
 

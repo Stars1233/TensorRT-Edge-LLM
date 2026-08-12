@@ -21,6 +21,7 @@
 #include "common/cudaMacros.h"
 #include "common/logger.h"
 #include "common/tensor.h"
+#include "common/trtUtils.h"
 #include "plugins/allReducePlugin/allReducePlugin.h"
 #include "plugins/utils/pluginUtils.h"
 
@@ -65,6 +66,64 @@ using NcclAllReduceFn = int (*)(void const*, void*, size_t, int, int, void*, cud
 constexpr int32_t kNcclFloat16 = 6;
 constexpr int32_t kNcclSum = 0;
 constexpr int32_t kNcclSuccess = 0;
+
+#if SUPPORTS_FP8
+struct FusedAllReduceExecutionContext
+{
+    kernels::CuteDslGemmNvFp4Runner* gemmRunner;
+    void const* const* inputs;
+    void* const* outputs;
+    uint8_t const* globalActScaleTiled;
+    uint8_t const* weightScaleTiled;
+    int32_t m;
+    int32_t n;
+    int32_t k;
+    int32_t tpSize;
+    int32_t deviceId;
+    int64_t outputElements;
+    cudaStream_t stream;
+};
+
+AllReduceExecutionStatus executeGemmNcclAllReducePath(
+    NcclAllReducePathRegistration const& registration, FusedAllReduceExecutionContext const& context)
+{
+    if (context.tpSize > 1 && (registration.communicator == nullptr || registration.allReduceFunction == nullptr))
+    {
+        return AllReduceExecutionStatus::kUnavailable;
+    }
+
+    static std::atomic<bool> sNcclPathLogged{false};
+    if (!sNcclPathLogged.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO("FusedNvfp4GemmAllReducePlugin: using GEMM + ncclAllReduce path");
+    }
+
+    cudaError_t const gemmError = context.gemmRunner->run(context.inputs[kFP4_ACT_IDX], context.inputs[kFP4_WEIGHT_IDX],
+        context.globalActScaleTiled, context.weightScaleTiled, context.outputs[kOUT_TENSOR_IDX], context.m, context.n,
+        context.k, context.stream);
+    if (gemmError != cudaSuccess)
+    {
+        LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (NCCL fallback) failed: %s",
+            cudaGetErrorString(gemmError));
+        return AllReduceExecutionStatus::kFailure;
+    }
+
+    if (context.tpSize <= 1)
+    {
+        return AllReduceExecutionStatus::kSuccess;
+    }
+
+    auto const ncclAllReduce = reinterpret_cast<NcclAllReduceFn>(registration.allReduceFunction);
+    int32_t const result = ncclAllReduce(context.outputs[kOUT_TENSOR_IDX], context.outputs[kOUT_TENSOR_IDX],
+        context.outputElements, kNcclFloat16, kNcclSum, registration.communicator, context.stream);
+    if (result != kNcclSuccess)
+    {
+        LOG_ERROR("FusedNvfp4GemmAllReducePlugin: NCCL allReduce failed (%d) on device %d", result, context.deviceId);
+        return AllReduceExecutionStatus::kFailure;
+    }
+    return AllReduceExecutionStatus::kSuccess;
+}
+#endif // SUPPORTS_FP8
 
 } // namespace
 
@@ -213,13 +272,13 @@ bool FusedNvfp4GemmAllReducePlugin::supportsFormatCombination(
     {
         return desc.type == DataType::kHALF;
     }
-    if (pos == kFP4_ACT_IDX)
+    if (pos == kFP4_ACT_IDX || pos == kFP4_WEIGHT_IDX)
     {
-        return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
-    }
-    if (pos == kFP4_WEIGHT_IDX)
-    {
-        return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
+        return desc.type == DataType::kINT8 || desc.type == DataType::kFP8
+#if IS_TRT_RTX || NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+            || desc.type == DataType::kFP4
+#endif
+            ;
     }
     if (pos == kFP4_ACT_SCALE_IDX)
     {
@@ -338,6 +397,7 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
         int currentDevice = -1;
         CUDA_CHECK(cudaGetDevice(&currentDevice));
 
+        AllReducePathRegistrations const registrations = snapshotAllReducePathRegistrationsForDevice(currentDevice);
         int64_t const outElements = M * N;
 
         // Cache weight scale UE4M3 + SfAtom tiled layout when the stream is not
@@ -430,36 +490,26 @@ int32_t FusedNvfp4GemmAllReducePlugin::enqueue(PluginTensorDesc const* inputDesc
             weightSFB = weightScaleTiled;
         }
 
-        static std::atomic<bool> sNcclPathLogged{false};
-        if (!sNcclPathLogged.exchange(true, std::memory_order_relaxed))
-        {
-            LOG_INFO("FusedNvfp4GemmAllReducePlugin: using GEMM + ncclAllReduce path");
-        }
+        FusedAllReduceExecutionContext const executionContext{mGemmRunner, inputs, outputs, globalActScaleTiled,
+            weightSFB, m, N, K, mTpSize, currentDevice, outElements, stream};
+        AllReduceExecutionStatus status = AllReduceExecutionStatus::kUnavailable;
 
-        cudaError_t err = mGemmRunner->run(inputs[kFP4_ACT_IDX], inputs[kFP4_WEIGHT_IDX], globalActScaleTiled,
-            weightSFB, outputs[kOUT_TENSOR_IDX], m, N, K, stream);
-        if (err != cudaSuccess)
+
+        status = executeGemmNcclAllReducePath(registrations.nccl, executionContext);
+        if (status == AllReduceExecutionStatus::kSuccess)
         {
-            LOG_ERROR("FusedNvfp4GemmAllReducePlugin: FP16 CuTe DSL GEMM (NCCL fallback) failed: %s",
-                cudaGetErrorString(err));
+            return 0;
+        }
+        if (status == AllReduceExecutionStatus::kFailure)
+        {
             return -1;
         }
 
-        void* ncclComm = nullptr;
-        void* ncclFnRaw = nullptr;
-        getNcclRegistrationForDevice(currentDevice, &ncclComm, &ncclFnRaw);
-        auto ncclFn = reinterpret_cast<NcclAllReduceFn>(ncclFnRaw);
-        if (ncclComm && ncclFn && mTpSize > 1)
-        {
-            int32_t ncclResult = ncclFn(outputs[kOUT_TENSOR_IDX], outputs[kOUT_TENSOR_IDX], outElements, kNcclFloat16,
-                kNcclSum, ncclComm, stream);
-            if (ncclResult != kNcclSuccess)
-            {
-                LOG_ERROR("FusedNvfp4GemmAllReducePlugin: NCCL allReduce failed (%d)", ncclResult);
-                return -1;
-            }
-        }
-        return 0;
+        LOG_ERROR(
+            "FusedNvfp4GemmAllReducePlugin: no execution path is available for TP size %d on device %d; "
+            "the required NCCL path is not registered",
+            mTpSize, currentDevice);
+        return -1;
 #endif // SUPPORTS_FP8
     }
     catch (std::exception const& e)

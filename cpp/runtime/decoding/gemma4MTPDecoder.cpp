@@ -50,8 +50,9 @@ constexpr int32_t kDecodeProfile{1};
 } // namespace
 
 Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-    SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream)
+    SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor, cudaStream_t stream)
     : mRuntime(runtime)
+    , mDraftExecutor(std::move(draftExecutor))
 {
     check::check(mRuntime.deployment.draft.has_value(), "Gemma4 MTP requires a draft model config.");
     check::check(mRuntime.deployment.specConfig.has_value(), "Gemma4 MTP requires a drafting config.");
@@ -62,11 +63,12 @@ Gemma4MTPDecoder::Gemma4MTPDecoder(DecodingRuntimeContext& runtime, std::filesys
     check::check(runtime.deployment.draft->sharesTargetKV && !runtime.deployment.draft->hasOwnKVCache,
         "Gemma4 MTP assistant must share target KV and must not own draft KV cache.");
 
-    mDraftExecutor = decoder_utils::loadDraftEngine(engineDir, mRuntime.deployment);
+    ELLM_CHECK(mDraftExecutor != nullptr, "Gemma4 MTP decoding requires a validated draft engine.");
     buildTensorMapForGemma4MTPDraft(
         mDraftTensorMap, mRuntime.base.pipelineIO, mRuntime.base.sharedResources, mRuntime.deployment);
 
-    mDraftExternalWeightManager.load(engineDir, engineDir / "draft_config.json", stream);
+    mDraftExternalWeightManager.load(
+        engineDir, engineDir / "draft_config.json", stream, mRuntime.draftCheckpointDir, mRuntime.checkpointDir);
     mDraftExternalWeightManager.validateAgainstEngine(*mDraftExecutor, "gemma4_mtp_draft");
     mDraftExternalWeightManager.registerTensorMapEntries(mDraftTensorMap);
 
@@ -256,8 +258,11 @@ void Gemma4MTPDecoder::resetForNewSequences(Tensor&, cudaStream_t)
 }
 
 void Gemma4MTPDecoder::onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch,
-    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream)
+    int32_t newActiveBatch, Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode)
 {
+    ELLM_CHECK(mode == BatchCompactionMode::kLegacyPhysicalKv,
+        "Gemma4 MTP does not support managed context-cache batch compaction.");
+
     if (newActiveBatch <= 0)
     {
         return;

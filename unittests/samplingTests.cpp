@@ -18,15 +18,19 @@
 #include "common/checkMacros.h"
 #include "common/tensor.h"
 #include "references.h"
+#include "sampler/diffusionGemma/diffusionGemmaSampling.h"
 #include "sampler/sampling.h"
 #include "testUtils.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <functional>
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <set>
 #include <sstream>
@@ -52,6 +56,29 @@ protected:
     void TearDown() override
     {
         // Cleanup is handled by individual tests
+    }
+
+    static DiffusionCanvasInitParams makeDiffusionInitParams(int32_t vocabSize, uint64_t randomOffset = 0ULL)
+    {
+        DiffusionCanvasInitParams params{};
+        params.vocabSize = vocabSize;
+        params.random.offset = randomOffset;
+        return params;
+    }
+
+    static DiffusionCanvasUpdateParams makeDiffusionUpdateParams(float entropyThreshold, float entropyBound,
+        int32_t stabilityWindow, bool forceAccept, int32_t vocabSize, uint64_t randomSeed = kDefaultDiffusionRandomSeed,
+        uint64_t randomOffset = 0ULL)
+    {
+        DiffusionCanvasUpdateParams params{};
+        params.entropyThreshold = entropyThreshold;
+        params.entropyBound = entropyBound;
+        params.stabilityWindow = stabilityWindow;
+        params.forceAccept = forceAccept;
+        params.vocabSize = vocabSize;
+        params.random.seed = randomSeed;
+        params.random.offset = randomOffset;
+        return params;
     }
 
     // Generate deterministic test logits (FP32 only)
@@ -281,16 +308,33 @@ TEST_F(SamplingTest, TemperatureZeroParameterOverride)
     }
 }
 
-TEST_F(SamplingTest, ShouldUseNonGreedySampling)
+TEST(SamplingUtilsTest, ShouldUseNonGreedySampling)
 {
     EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 1.0f));
-    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.0f, 0, 1.0f));
     EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 1, 0.95f)); // topK=1 forces greedy
     EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 1, 0.5f));  // topK=1 forces greedy
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 0, 1.0f));
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 0, 1.0f));
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 2, 1.0f));
     EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 0.95f));
+}
+
+TEST(SamplingUtilsTest, NearZeroTemperatureForcesGreedySampling)
+{
+    constexpr float kNEAR_ZERO_TEMPERATURE = 5e-4F;
+    constexpr float kNORMALIZATION_THRESHOLD = 1e-3F;
+
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.0F, 0, 1.0F));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(kNEAR_ZERO_TEMPERATURE, 2, 1.0F));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(kNEAR_ZERO_TEMPERATURE, 0, 0.95F));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(kNEAR_ZERO_TEMPERATURE, 2, 0.95F));
+
+    // Invalid negative temperatures are not normalized here; SamplingParams rejects them.
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(-1.0F, 2, 1.0F));
+
+    // SamplingParams only normalizes temperatures strictly below the threshold.
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(kNORMALIZATION_THRESHOLD, 2, 1.0F));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(kNORMALIZATION_THRESHOLD, 0, 0.95F));
 }
 
 TEST_F(SamplingTest, ApplyLogitBiasAffectsGreedySamplingPerBatch)
@@ -350,6 +394,514 @@ TEST_F(SamplingTest, ApplyLogitBiasCanBanGreedyTopToken)
     auto const gpuResults = copyDeviceToHost<int32_t>(selectedIndicesTensor);
     ASSERT_EQ(gpuResults.size(), 1U);
     EXPECT_EQ(gpuResults[0], 1);
+}
+
+TEST_F(SamplingTest, SelectArgmaxAndComputeEntropy)
+{
+    constexpr int32_t rows = 2;
+    constexpr int32_t vocabSize = 4;
+    std::vector<float> const hostLogits{
+        8.0F,
+        0.0F,
+        -2.0F,
+        -4.0F,
+        -1.0F,
+        2.0F,
+        5.0F,
+        4.0F,
+    };
+
+    rt::Tensor logits({rows, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor indices({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logits, hostLogits);
+
+    selectArgmaxAndComputeEntropy(logits, indices, entropy, /*temperature=*/1.0F, /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const hostIndices = copyDeviceToHost<int32_t>(indices);
+    auto const hostEntropy = copyDeviceToHost<float>(entropy);
+    EXPECT_EQ(hostIndices[0], 0);
+    EXPECT_EQ(hostIndices[1], 2);
+
+    auto entropyRef = [](std::vector<float> const& logitsRow) {
+        float const maxLogit = *std::max_element(logitsRow.begin(), logitsRow.end());
+        float sumExp = 0.0F;
+        float weightedShift = 0.0F;
+        for (float const logit : logitsRow)
+        {
+            float const shifted = logit - maxLogit;
+            float const expShifted = std::exp(shifted);
+            sumExp += expShifted;
+            weightedShift += expShifted * shifted;
+        }
+        return std::log(sumExp) - weightedShift / sumExp;
+    };
+
+    EXPECT_NEAR(hostEntropy[0], entropyRef({8.0F, 0.0F, -2.0F, -4.0F}), 1e-4F);
+    EXPECT_NEAR(hostEntropy[1], entropyRef({-1.0F, 2.0F, 5.0F, 4.0F}), 1e-4F);
+}
+
+TEST_F(SamplingTest, DiffusionFusedSamplerMatchesSeparateKernels)
+{
+    constexpr int32_t rows = 3;
+    constexpr int32_t vocabSize = 7;
+    std::vector<float> const hostLogits{
+        2.0F,
+        -1.0F,
+        0.5F,
+        4.0F,
+        -3.0F,
+        1.0F,
+        0.0F,
+        -2.0F,
+        3.0F,
+        1.5F,
+        0.0F,
+        5.0F,
+        -1.5F,
+        2.5F,
+        1.0F,
+        2.0F,
+        6.0F,
+        -2.5F,
+        0.5F,
+        4.5F,
+        -0.5F,
+    };
+
+    rt::Tensor logits({rows, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor separateSampled({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor separateIndices({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor separateEntropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor fusedSampled({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fusedIndices({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fusedEntropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logits, hostLogits);
+
+    DiffusionRandomParams random{};
+    random.seed = 123ULL;
+    random.offset = 17ULL;
+    float const temperature = 0.8F;
+    selectArgmaxAndComputeEntropy(logits, separateIndices, separateEntropy, temperature, /*stream=*/0);
+    sampleDiffusionTokensFromLogits(logits, separateSampled, temperature, /*stream=*/0, random);
+    sampleDiffusionTokensAndComputeEntropy(
+        logits, fusedSampled, fusedIndices, fusedEntropy, temperature, /*stream=*/0, random);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(fusedSampled), copyDeviceToHost<int32_t>(separateSampled));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(fusedIndices), copyDeviceToHost<int32_t>(separateIndices));
+    auto const fusedEntropyHost = copyDeviceToHost<float>(fusedEntropy);
+    auto const separateEntropyHost = copyDeviceToHost<float>(separateEntropy);
+    ASSERT_EQ(fusedEntropyHost.size(), separateEntropyHost.size());
+    for (size_t i = 0; i < fusedEntropyHost.size(); ++i)
+    {
+        EXPECT_NEAR(fusedEntropyHost[i], separateEntropyHost[i], 1e-5F);
+    }
+}
+
+TEST_F(SamplingTest, DiffusionArgmaxOnlySamplerMatchesFusedArgmax)
+{
+    constexpr int32_t rows = 3;
+    constexpr int32_t vocabSize = 7;
+    std::vector<float> const hostLogits{
+        2.0F,
+        -1.0F,
+        0.5F,
+        4.0F,
+        -3.0F,
+        1.0F,
+        0.0F,
+        -2.0F,
+        3.0F,
+        1.5F,
+        0.0F,
+        5.0F,
+        -1.5F,
+        2.5F,
+        1.0F,
+        2.0F,
+        6.0F,
+        -2.5F,
+        0.5F,
+        4.5F,
+        -0.5F,
+    };
+
+    rt::Tensor logits({rows, vocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor sampled({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor fusedIndices({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxOnlyIndices({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    copyHostToDevice<float>(logits, hostLogits);
+
+    DiffusionRandomParams random{};
+    random.seed = 123ULL;
+    random.offset = 17ULL;
+    float const temperature = 0.4F;
+    sampleDiffusionTokensAndComputeEntropy(logits, sampled, fusedIndices, entropy, temperature, /*stream=*/0, random);
+    selectDiffusionArgmaxFromLogits(logits, argmaxOnlyIndices, temperature, /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(argmaxOnlyIndices), copyDeviceToHost<int32_t>(fusedIndices));
+}
+
+TEST_F(SamplingTest, DiffusionCanvasSamplerUpdatesOnDevice)
+{
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t canvasLen = 3;
+    constexpr int32_t vocabSize = 8;
+    constexpr int32_t rows = batchSize * canvasLen;
+    std::vector<int32_t> const hostArgmax{1, 0, 2, 3, 2, 0};
+    std::vector<int32_t> const hostSampled{6, 5, 4, 3, 2, 1};
+    std::vector<float> const hostEntropy{0.01F, 0.20F, 0.20F, 0.01F, 0.20F, 0.20F};
+
+    rt::Tensor argmax({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor sampled({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxCanvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor previous({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor stable({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor prefix({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor commitCanvas({batchSize, 2}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(argmax, hostArgmax);
+    copyHostToDevice<int32_t>(sampled, hostSampled);
+    copyHostToDevice<float>(entropy, hostEntropy);
+
+    initializeDiffusionCanvas(
+        canvas, previous, stable, accepted, prefix, makeDiffusionInitParams(vocabSize), /*stream=*/0);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/1e-3F, /*entropyBound=*/0.1F, /*stabilityWindow=*/2, /*forceAccept=*/false, vocabSize),
+        /*stream=*/0);
+    compactDiffusionCanvas(argmaxCanvas, commitCanvas, batchSize, canvasLen, /*blockLen=*/2, /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const hostCanvas = copyDeviceToHost<int32_t>(canvas);
+    auto const hostArgmaxCanvas = copyDeviceToHost<int32_t>(argmaxCanvas);
+    auto const hostPrevious = copyDeviceToHost<int32_t>(previous);
+    auto const hostStable = copyDeviceToHost<int32_t>(stable);
+    auto const hostAccepted = copyDeviceToHost<int8_t>(accepted);
+    auto const hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    auto const hostCommitCanvas = copyDeviceToHost<int32_t>(commitCanvas);
+
+    EXPECT_EQ(hostArgmaxCanvas, hostArgmax);
+    EXPECT_EQ(hostPrevious, hostArgmax);
+    EXPECT_EQ(hostStable, std::vector<int32_t>(rows, 1));
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{0, 0}));
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[0]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[1]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[2]), 0);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[3]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[4]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[5]), 0);
+
+    EXPECT_EQ(hostCanvas[0], hostSampled[0]);
+    EXPECT_EQ(hostCanvas[1], hostSampled[1]);
+    EXPECT_GE(hostCanvas[2], 0);
+    EXPECT_LT(hostCanvas[2], vocabSize);
+    EXPECT_EQ(hostCanvas[3], hostSampled[3]);
+    EXPECT_EQ(hostCanvas[4], hostSampled[4]);
+    EXPECT_GE(hostCanvas[5], 0);
+    EXPECT_LT(hostCanvas[5], vocabSize);
+    EXPECT_EQ(hostCommitCanvas, (std::vector<int32_t>{1, 0, 3, 2}));
+}
+
+TEST_F(SamplingTest, DiffusionCanvasSamplerEntropyBudgetSortsAndIgnoresNonFinite)
+{
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t canvasLen = 5;
+    constexpr int32_t vocabSize = 16;
+    constexpr int32_t rows = batchSize * canvasLen;
+    std::vector<int32_t> const hostArgmax{10, 11, 12, 13, 14};
+    std::vector<int32_t> const hostSampled{0, 1, 2, 3, 4};
+    std::vector<float> const hostEntropy{
+        0.4F,
+        0.1F,
+        std::numeric_limits<float>::infinity(),
+        0.2F,
+        0.1F,
+    };
+
+    rt::Tensor argmax({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor sampled({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxCanvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor previous({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor stable({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor prefix({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(argmax, hostArgmax);
+    copyHostToDevice<int32_t>(sampled, hostSampled);
+    copyHostToDevice<float>(entropy, hostEntropy);
+
+    initializeDiffusionCanvas(
+        canvas, previous, stable, accepted, prefix, makeDiffusionInitParams(vocabSize), /*stream=*/0);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/1e-3F, /*entropyBound=*/0.25F, /*stabilityWindow=*/2, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const hostCanvas = copyDeviceToHost<int32_t>(canvas);
+    auto const hostAccepted = copyDeviceToHost<int8_t>(accepted);
+    auto const hostPrefix = copyDeviceToHost<int32_t>(prefix);
+
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{0}));
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[0]), 0);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[1]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[2]), 0);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[3]), 1);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[4]), 1);
+    EXPECT_EQ(hostCanvas[1], hostSampled[1]);
+    EXPECT_EQ(hostCanvas[3], hostSampled[3]);
+    EXPECT_EQ(hostCanvas[4], hostSampled[4]);
+    EXPECT_GE(hostCanvas[0], 0);
+    EXPECT_LT(hostCanvas[0], vocabSize);
+    EXPECT_GE(hostCanvas[2], 0);
+    EXPECT_LT(hostCanvas[2], vocabSize);
+}
+
+TEST_F(SamplingTest, DiffusionCanvasSamplerHonorsValidLengths)
+{
+    constexpr int32_t batchSize = 2;
+    constexpr int32_t canvasLen = 4;
+    constexpr int32_t vocabSize = 8;
+    constexpr int32_t rows = batchSize * canvasLen;
+    std::vector<int32_t> const hostArgmax{1, 2, 3, 4, 5, 6, 7, 0};
+    std::vector<int32_t> const hostSampled{1, 2, 3, 4, 5, 6, 7, 0};
+    std::vector<float> const hostEntropy{0.001F, 0.001F, 0.001F, 0.001F, 0.001F, 0.001F, 1000.0F, 1000.0F};
+    std::vector<int32_t> const hostValidLengths{4, 2};
+
+    rt::Tensor argmax({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor sampled({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor validLengths({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxCanvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor previous({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor stable({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor prefix({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(argmax, hostArgmax);
+    copyHostToDevice<int32_t>(sampled, hostSampled);
+    copyHostToDevice<float>(entropy, hostEntropy);
+    copyHostToDevice<int32_t>(validLengths, hostValidLengths);
+
+    initializeDiffusionCanvas(
+        canvas, previous, stable, accepted, prefix, makeDiffusionInitParams(vocabSize), /*stream=*/0);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/1, /*forceAccept=*/true, vocabSize),
+        /*stream=*/0, rt::OptionalInputTensor{std::cref(validLengths)});
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    auto const hostCanvas = copyDeviceToHost<int32_t>(canvas);
+    auto const hostArgmaxCanvas = copyDeviceToHost<int32_t>(argmaxCanvas);
+    auto const hostAccepted = copyDeviceToHost<int8_t>(accepted);
+
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{4, 2}));
+    EXPECT_EQ(hostCanvas[0], 1);
+    EXPECT_EQ(hostCanvas[1], 2);
+    EXPECT_EQ(hostCanvas[2], 3);
+    EXPECT_EQ(hostCanvas[3], 4);
+    EXPECT_EQ(hostCanvas[4], 5);
+    EXPECT_EQ(hostCanvas[5], 6);
+    EXPECT_EQ(hostArgmaxCanvas[4], 5);
+    EXPECT_EQ(hostArgmaxCanvas[5], 6);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[6]), 0);
+    EXPECT_EQ(static_cast<int32_t>(hostAccepted[7]), 0);
+}
+
+TEST_F(SamplingTest, CompactDiffusionCanvasSupportsVariableCommitLengths)
+{
+    constexpr int32_t batchSize = 3;
+    constexpr int32_t canvasLen = 5;
+    constexpr int32_t maxBlockLen = 4;
+    constexpr int32_t padTokenId = 99;
+    std::vector<int32_t> const hostCanvas{
+        10,
+        11,
+        12,
+        13,
+        14,
+        20,
+        21,
+        22,
+        23,
+        24,
+        30,
+        31,
+        32,
+        33,
+        34,
+    };
+    std::vector<int32_t> const hostCommitLengths{1, 3, 4};
+
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor commitLengths({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor commitCanvas({batchSize, maxBlockLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(canvas, hostCanvas);
+    copyHostToDevice<int32_t>(commitLengths, hostCommitLengths);
+
+    compactDiffusionCanvas(canvas, commitLengths, commitCanvas, batchSize, canvasLen, maxBlockLen, padTokenId,
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const hostCommitCanvas = copyDeviceToHost<int32_t>(commitCanvas);
+    EXPECT_EQ(hostCommitCanvas,
+        (std::vector<int32_t>{
+            10,
+            99,
+            99,
+            99,
+            20,
+            21,
+            22,
+            99,
+            30,
+            31,
+            32,
+            33,
+        }));
+}
+
+TEST_F(SamplingTest, DiffusionCanvasConvergesAfterStableWindow)
+{
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t canvasLen = 2;
+    constexpr int32_t vocabSize = 4;
+    constexpr int32_t rows = batchSize * canvasLen;
+    std::vector<int32_t> const hostArgmax{0, 1};
+    std::vector<float> const hostEntropy{0.001F, 0.001F};
+
+    rt::Tensor argmax({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor sampled({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxCanvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor previous({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor stable({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor prefix({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(argmax, hostArgmax);
+    copyHostToDevice<int32_t>(sampled, hostArgmax);
+    copyHostToDevice<float>(entropy, hostEntropy);
+
+    initializeDiffusionCanvas(
+        canvas, previous, stable, accepted, prefix, makeDiffusionInitParams(vocabSize), /*stream=*/0);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/2, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    auto hostStable = copyDeviceToHost<int32_t>(stable);
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{0}));
+    EXPECT_EQ(hostStable, std::vector<int32_t>(rows, 1));
+
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/2, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    hostStable = copyDeviceToHost<int32_t>(stable);
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{0}));
+    EXPECT_EQ(hostStable, std::vector<int32_t>(rows, 2));
+
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/2, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    hostStable = copyDeviceToHost<int32_t>(stable);
+    auto const hostCanvas = copyDeviceToHost<int32_t>(canvas);
+    auto const hostArgmaxCanvas = copyDeviceToHost<int32_t>(argmaxCanvas);
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{2}));
+    EXPECT_EQ(hostStable, std::vector<int32_t>(rows, 3));
+    EXPECT_EQ(hostArgmaxCanvas, hostArgmax);
+    EXPECT_EQ(hostCanvas, hostArgmax);
+}
+
+TEST_F(SamplingTest, DiffusionCanvasStabilityWindowOneRequiresPreviousObservation)
+{
+    constexpr int32_t batchSize = 1;
+    constexpr int32_t canvasLen = 2;
+    constexpr int32_t vocabSize = 4;
+    constexpr int32_t rows = batchSize * canvasLen;
+    std::vector<int32_t> const hostArgmax{0, 1};
+    std::vector<float> const hostEntropy{0.001F, 0.001F};
+
+    rt::Tensor argmax({rows, 1}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor sampled({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor entropy({rows}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
+    rt::Tensor canvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor argmaxCanvas({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor previous({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor stable({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    rt::Tensor accepted({batchSize, canvasLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT8);
+    rt::Tensor prefix({batchSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
+    copyHostToDevice<int32_t>(argmax, hostArgmax);
+    copyHostToDevice<int32_t>(sampled, hostArgmax);
+    copyHostToDevice<float>(entropy, hostEntropy);
+
+    initializeDiffusionCanvas(
+        canvas, previous, stable, accepted, prefix, makeDiffusionInitParams(vocabSize), /*stream=*/0);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/1, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    auto hostStable = copyDeviceToHost<int32_t>(stable);
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{0}));
+    EXPECT_EQ(hostStable, std::vector<int32_t>(rows, 1));
+
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/1, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    hostPrefix = copyDeviceToHost<int32_t>(prefix);
+    hostStable = copyDeviceToHost<int32_t>(stable);
+    auto const hostCanvas = copyDeviceToHost<int32_t>(canvas);
+    auto const hostArgmaxCanvas = copyDeviceToHost<int32_t>(argmaxCanvas);
+    EXPECT_EQ(hostPrefix, (std::vector<int32_t>{2}));
+    EXPECT_EQ(hostStable, std::vector<int32_t>(rows, 2));
+    EXPECT_EQ(hostArgmaxCanvas, hostArgmax);
+    EXPECT_EQ(hostCanvas, hostArgmax);
+
+    std::vector<int32_t> const changedArgmax{2, 3};
+    copyHostToDevice<int32_t>(argmax, changedArgmax);
+    copyHostToDevice<int32_t>(sampled, changedArgmax);
+    diffusionSampleAndUpdateCanvas(sampled, argmax, entropy, canvas, argmaxCanvas, previous, stable, accepted, prefix,
+        makeDiffusionUpdateParams(
+            /*entropyThreshold=*/0.01F, /*entropyBound=*/-1.0F, /*stabilityWindow=*/1, /*forceAccept=*/false,
+            vocabSize),
+        /*stream=*/0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    EXPECT_EQ(copyDeviceToHost<int32_t>(prefix), (std::vector<int32_t>{2}));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(stable), std::vector<int32_t>(rows, 2));
+    EXPECT_EQ(copyDeviceToHost<int32_t>(argmaxCanvas), hostArgmax);
+    EXPECT_EQ(copyDeviceToHost<int32_t>(canvas), hostArgmax);
 }
 
 // Unified sampling tests (accuracy only)

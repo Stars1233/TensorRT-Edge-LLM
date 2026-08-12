@@ -30,8 +30,9 @@ logger = logging.getLogger(__name__)
 
 
 # ModelOpt <=0.44's ``get_expert_linear_names`` falls back to Mixtral's
-# ``[w1,w2,w3]`` for Qwen3-Omni-MoE experts (which use ``gate/up/down_proj``),
-# crashing the CP-only exporter that still enumerates every MoE block.
+# ``[w1,w2,w3]`` for Qwen3-Omni-MoE / Qwen3-Omni Next experts (which use
+# ``gate/up/down_proj``), crashing the CP-only exporter that still
+# enumerates every MoE block.
 def _install_modelopt_expert_name_patch() -> None:
     try:
         from modelopt.torch.export import layer_utils, unified_export_hf
@@ -41,7 +42,8 @@ def _install_modelopt_expert_name_patch() -> None:
 
     def patched(module):
         name = type(module).__name__.lower()
-        if "qwen3omnimoe" in name and "sparsemoeblock" in name:
+        if (("qwen3omnimoe" in name or "qwen3omninext" in name)
+                and "sparsemoeblock" in name):
             return ["gate_proj", "down_proj", "up_proj"]
         return orig(module)
 
@@ -61,6 +63,13 @@ def has_code_predictor(model) -> bool:
     if talker is None:
         return False
     return getattr(talker, "code_predictor", None) is not None
+
+
+def is_qwen3_next_omni(model) -> bool:
+    """True for Qwen3-Omni Next (``Qwen3OmniNextForConditionalGeneration``),
+    dense and sparse-MoE alike (they share the class; MoE-ness only shows
+    in ``num_experts``)."""
+    return "Qwen3OmniNext" in type(model).__name__
 
 
 def _talker_inputs_from_thinker(model, input_ids, talker_cfg, accept_layer,
@@ -214,3 +223,113 @@ def qwen3_cp_calibration_loop(model, dataloader, num_cp_samples: int = 64):
             "CP calibration produced 0 samples. Dataloader exhausted or "
             "all batches were skipped (e.g. Thinker yielded fewer than "
             f"accept_layer={accept_layer} hidden layers).")
+
+
+def _call_without_inference_mode(bound_method, *args, **kwargs):
+    """Call *bound_method* bypassing a ``@torch.inference_mode()`` decorator.
+
+    ModelOpt calibrators create/update amax state inside forward hooks;
+    tensors created under inference mode poison later quantizer math
+    ("Inference tensors cannot be used outside InferenceMode"). The HF
+    decorator preserves the undecorated function as ``__wrapped__``.
+    """
+    fn = getattr(type(bound_method.__self__), bound_method.__name__)
+    inner = getattr(fn, "__wrapped__", None)
+    if inner is not None:
+        with torch.no_grad():
+            return inner(bound_method.__self__, *args, **kwargs)
+    return bound_method(*args, **kwargs)
+
+
+def _next_chat_input_ids(tokenizer, text, device):
+    """Tokenize *text* as a single-turn ChatML user prompt.
+
+    ``generate_talker`` locates ``im_start`` role tokens in ``input_ids``
+    to build the Talker row plan, so raw text (no chat structure) breaks
+    it. Prefer the checkpoint's chat template; fall back to literal ChatML.
+    """
+    try:
+        ids = tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": text
+            }],
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+    except (ValueError, TypeError, AttributeError):
+        prompt = (f"<|im_start|>user\n{text}<|im_end|>\n"
+                  f"<|im_start|>assistant\n")
+        ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+    return ids.to(device)
+
+
+def qwen3_next_cp_calibration_loop(model,
+                                   tokenizer,
+                                   texts,
+                                   num_cp_samples: int = 64,
+                                   thinker_max_new_tokens: int = 64,
+                                   talker_max_new_tokens: int = 16):
+    """Qwen3-Omni Next (qwen3_omni_next) CP calibration via the reference
+    generation path.
+
+    The Next Talker invokes ``code_predictor.generate`` inside
+    ``prepare_inputs_for_generation`` on every decode step, so driving the
+    checkpoint's own ``generate`` → ``generate_talker`` chain fires the CP
+    with exactly the production activation distribution (talker last-layer
+    hidden + codec embedding through ``talker_projection``). Hand-building
+    Talker inputs (the Omni loop's approach) would mean re-implementing the
+    Next row plan (speaker codec rows, tts special tokens, chunked text) —
+    the generation path already does all of it.
+
+    Cost per sample is bounded by ``thinker_max_new_tokens`` (text reply)
+    and ``talker_max_new_tokens`` (codec frames; each frame = 1 CP
+    prefill + ``num_code_groups - 2`` CP decode steps).
+    """
+    device = next(model.parameters()).device
+    speaker_map = getattr(model.config.talker_config, "speaker_id", None) or {}
+    speaker = sorted(speaker_map)[0] if speaker_map else "f245"
+
+    samples_done = 0
+    errors = 0
+    progress = tqdm(texts, desc="Calibrating Next+CP")
+    for text in progress:
+        if samples_done >= num_cp_samples:
+            break
+        if not text or not text.strip():
+            continue
+        input_ids = _next_chat_input_ids(tokenizer, text.strip()[:512], device)
+        try:
+            with torch.no_grad():
+                thinker_result, talker_kwargs = model.generate(
+                    input_ids=input_ids,
+                    return_audio=True,
+                    thinker_max_new_tokens=thinker_max_new_tokens,
+                    talker_max_new_tokens=talker_max_new_tokens,
+                    talker_do_sample=False,
+                    subtalker_dosample=False,
+                )
+            _call_without_inference_mode(
+                model.generate_talker,
+                input_ids,
+                thinker_result,
+                talker_kwargs,
+                speaker=speaker,
+            )
+        except Exception as error:
+            # One bad sample (e.g. thinker reply too short for the talker
+            # row plan) shouldn't kill the whole calibration; but log it —
+            # a 100% failure rate is caught below.
+            errors += 1
+            logger.warning("Next CP calibration sample failed: %s", error)
+            if errors >= 3 and samples_done == 0:
+                raise
+            continue
+        samples_done += 1
+        progress.set_postfix(done=samples_done)
+
+    if samples_done == 0:
+        raise RuntimeError(
+            "Next CP calibration produced 0 samples — the CP quantizers "
+            "hold uninitialised amax. Check the chat template / speaker "
+            "config and the warnings above.")

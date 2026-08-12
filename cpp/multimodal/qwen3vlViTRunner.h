@@ -46,12 +46,13 @@ protected:
 
     //! 3D temporal-aware smart-resize budget (t_bar = ceil(N/TPS)*TPS), vs the base 2D per-frame budget.
     std::tuple<int64_t, int64_t> getResizedImageSize(
-        int64_t numFrames, int64_t height, int64_t width, int64_t maxRatio = 200) override;
+        int64_t numFrames, bool isVideo, int64_t height, int64_t width, int64_t maxRatio = 200) override;
 
     //! Adds the Qwen3-VL video path: the <|vision_start|><|video_pad|><|vision_end|> triplet expands to one
     //! timestamped (<X.X s> + vision_start + pads + vision_end) group per per-frame sub-span; images stay flat.
     void textPreprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchInputIds,
-        std::vector<VisionSpan> const& spans, trt_edgellm::tokenizer::Tokenizer const* tokenizer) override;
+        std::vector<VisionSpan> const& spans, std::vector<int64_t> const& spansPerRequest,
+        trt_edgellm::tokenizer::Tokenizer const* tokenizer) override;
 
     int64_t mNumGridPerSide{0};                   //!< sqrt(num_position_embeddings) for fast position embedding
     int64_t mNumDeepstackFeatures{0};             //!< deepstack_visual_indexes count (0 for Qwen3.5 -> no deepstack)

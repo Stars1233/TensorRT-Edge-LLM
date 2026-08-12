@@ -18,6 +18,7 @@
 #include "common/checkMacros.h"
 #include "common/stringUtils.h"
 #include "eagleAcceptKernels.h"
+#include "kernels/common/argmaxKernel.h"
 #include "speculativeKernelsUtils.h"
 #include <algorithm>
 #include <cassert>
@@ -32,6 +33,8 @@ namespace trt_edgellm
 namespace kernel
 {
 
+constexpr int32_t kTop1BlocksPerRow{8};
+
 // Internal workspace structure for memory management (similar to SamplingWorkspace)
 struct EagleAcceptWorkspace
 {
@@ -44,10 +47,17 @@ struct EagleAcceptWorkspace
     // Array size: batchSize * numTokens elements (int32_t each)
     int32_t* top1Tokens;
 
+    // Per-lane top-1 candidates for the two-stage argmax. The layout is
+    // [batchSize * numTokens, kTop1BlocksPerRow].
+    int32_t* top1TempIndices;
+    float* top1TempValues;
+
     EagleAcceptWorkspace()
         : ptr(nullptr)
         , size(0)
         , top1Tokens(nullptr)
+        , top1TempIndices(nullptr)
+        , top1TempValues(nullptr)
     {
     }
 
@@ -64,10 +74,20 @@ struct EagleAcceptWorkspace
         // Calculate buffer sizes and offsets
         size_t offset = 0;
 
+        int32_t const totalRows = batchSize * numTokens;
+
         // Top-1 tokens buffer
-        size_t top1TokensSize = alignSpeculativeWorkspaceSize(batchSize * numTokens * sizeof(int32_t));
+        size_t top1TokensSize = alignSpeculativeWorkspaceSize(totalRows * sizeof(int32_t));
         top1Tokens = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
         offset += top1TokensSize;
+
+        size_t top1TempIndicesSize = alignSpeculativeWorkspaceSize(totalRows * kTop1BlocksPerRow * sizeof(int32_t));
+        top1TempIndices = reinterpret_cast<int32_t*>(static_cast<char*>(ptr) + offset);
+        offset += top1TempIndicesSize;
+
+        size_t top1TempValuesSize = alignSpeculativeWorkspaceSize(totalRows * kTop1BlocksPerRow * sizeof(float));
+        top1TempValues = reinterpret_cast<float*>(static_cast<char*>(ptr) + offset);
+        offset += top1TempValuesSize;
 
         // Validate workspace size
         ELLM_CHECK(offset <= workspaceSize,
@@ -79,8 +99,11 @@ struct EagleAcceptWorkspace
 // Calculate workspace size for Eagle accept algorithm
 size_t getEagleAcceptWorkspaceSize(int32_t batchSize, int32_t numTokens)
 {
-    // Top-1 tokens buffer
-    return alignSpeculativeWorkspaceSize(batchSize * numTokens * sizeof(int32_t));
+    int32_t const totalRows = batchSize * numTokens;
+    size_t const top1TokensSize = alignSpeculativeWorkspaceSize(totalRows * sizeof(int32_t));
+    size_t const top1TempIndicesSize = alignSpeculativeWorkspaceSize(totalRows * kTop1BlocksPerRow * sizeof(int32_t));
+    size_t const top1TempValuesSize = alignSpeculativeWorkspaceSize(totalRows * kTop1BlocksPerRow * sizeof(float));
+    return top1TokensSize + top1TempIndicesSize + top1TempValuesSize;
 }
 
 namespace
@@ -123,80 +146,6 @@ __forceinline__ size_t alignSharedMem(size_t size)
     return ((size + 15) / 16) * 16; // Align to 16 bytes
 }
 
-static constexpr int32_t kSequentialArgmaxBlockSize = 256;
-
-__global__ void sequentialAcceptArgmaxKernel(
-    float const* __restrict__ logits, int32_t* __restrict__ argmaxResults, int32_t totalPositions, int32_t vocabSize)
-{
-    int32_t const posIdx = blockIdx.x;
-    if (posIdx >= totalPositions)
-    {
-        return;
-    }
-
-    float const* posLogits = logits + static_cast<int64_t>(posIdx) * vocabSize;
-
-    float localMax = -FLT_MAX;
-    int32_t localIdx = 0;
-
-    for (int32_t vocabIdx = threadIdx.x; vocabIdx < vocabSize; vocabIdx += blockDim.x)
-    {
-        float const value = posLogits[vocabIdx];
-        if (value > localMax || (value == localMax && vocabIdx < localIdx))
-        {
-            localMax = value;
-            localIdx = vocabIdx;
-        }
-    }
-
-    for (int32_t offset = 16; offset > 0; offset >>= 1)
-    {
-        float const otherMax = __shfl_down_sync(0xFFFFFFFF, localMax, offset);
-        int32_t const otherIdx = __shfl_down_sync(0xFFFFFFFF, localIdx, offset);
-        if (otherMax > localMax || (otherMax == localMax && otherIdx < localIdx))
-        {
-            localMax = otherMax;
-            localIdx = otherIdx;
-        }
-    }
-
-    __shared__ float sharedMaxValues[32];
-    __shared__ int32_t sharedMaxIndices[32];
-
-    int32_t const warpId = threadIdx.x / 32;
-    int32_t const laneId = threadIdx.x % 32;
-    int32_t const numWarps = (blockDim.x + 31) / 32;
-
-    if (laneId == 0)
-    {
-        sharedMaxValues[warpId] = localMax;
-        sharedMaxIndices[warpId] = localIdx;
-    }
-    __syncthreads();
-
-    if (warpId == 0)
-    {
-        float warpMax = (laneId < numWarps) ? sharedMaxValues[laneId] : -FLT_MAX;
-        int32_t warpIdx = (laneId < numWarps) ? sharedMaxIndices[laneId] : 0;
-
-        for (int32_t offset = 16; offset > 0; offset >>= 1)
-        {
-            float const otherMax = __shfl_down_sync(0xFFFFFFFF, warpMax, offset);
-            int32_t const otherIdx = __shfl_down_sync(0xFFFFFFFF, warpIdx, offset);
-            if (otherMax > warpMax || (otherMax == warpMax && otherIdx < warpIdx))
-            {
-                warpMax = otherMax;
-                warpIdx = otherIdx;
-            }
-        }
-
-        if (laneId == 0)
-        {
-            argmaxResults[posIdx] = warpIdx;
-        }
-    }
-}
-
 __global__ void sequentialAcceptWalkKernel(int32_t const* __restrict__ argmaxResults,
     int32_t const* __restrict__ draftTokenIds, int32_t* __restrict__ acceptedTokenIds,
     int32_t* __restrict__ acceptLength, int32_t verifyLen)
@@ -226,52 +175,81 @@ __global__ void sequentialAcceptWalkKernel(int32_t const* __restrict__ argmaxRes
     acceptLength[batchIdx] = accepted;
 }
 
-// Stage 1: Compute top-1 tokens for all positions using sampling strategy
-// Optionally map from reduced vocab to full vocab if mapping table is provided
-template <int32_t BLOCK_SIZE>
-__global__ void eagleComputeTop1Kernel(float const* logits, int32_t* top1Tokens, int32_t const* vocabMappingTable,
+// Stage 1: compute a per-lane top-1 for each verify row. The lane
+// partitioning intentionally mirrors sampler::selectAllTopK(topK=1) so greedy
+// speculative accept resolves exact-logit ties the same way as vanilla decode.
+template <int32_t BLOCK_SIZE, int32_t BLOCKS_PER_ROW>
+__global__ void eagleComputeTop1Stage1Kernel(float const* logits, int32_t* top1TempIndices, float* top1TempValues,
     int32_t batchSize, int32_t numTokens, int32_t vocabSize)
 {
     typedef cub::BlockReduce<Top1Helper, BLOCK_SIZE> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
 
     auto const tid = static_cast<int32_t>(threadIdx.x);
-    auto const batchIdx = static_cast<int32_t>(blockIdx.x / numTokens);
-    auto const tokenIdx = static_cast<int32_t>(blockIdx.x % numTokens);
+    auto const rowIdx = static_cast<int32_t>(blockIdx.x / BLOCKS_PER_ROW);
+    auto const blockLane = static_cast<int32_t>(blockIdx.x % BLOCKS_PER_ROW);
+    int32_t const totalRows = batchSize * numTokens;
 
-    if (batchIdx >= batchSize || tokenIdx >= numTokens)
-        return;
-
-    // Calculate logits offset for this batch and token position
-    int32_t const logitsOffset = batchIdx * numTokens * vocabSize + tokenIdx * vocabSize;
-
-    Top1Helper partial;
-
-    // Find top-1 token using parallel reduction across vocab
-    for (int32_t v = tid; v < vocabSize; v += BLOCK_SIZE)
+    if (rowIdx >= totalRows)
     {
-        float logitValue = logits[logitsOffset + v];
-        partial.update(logitValue, v);
+        return;
     }
 
-    // Block-level reduction to find global max
-    Top1Helper blockMax = BlockReduce(tempStorage).Reduce(partial, top1MaxOpFunctor());
+    float const* rowLogits = logits + static_cast<int64_t>(rowIdx) * vocabSize;
+    Top1Helper partial;
 
-    // Store result - map from reduced vocab to full vocab if mapping table provided
+    for (int32_t v = tid + blockLane * BLOCK_SIZE; v < vocabSize; v += BLOCK_SIZE * BLOCKS_PER_ROW)
+    {
+        partial.update(rowLogits[v], v);
+    }
+
+    Top1Helper laneMax = BlockReduce(tempStorage).Reduce(partial, top1MaxOpFunctor());
+
     if (tid == 0)
     {
-        int32_t outputIdx = batchIdx * numTokens + tokenIdx;
-        int32_t selectedIdx = (blockMax.index != -1) ? blockMax.index : 0;
+        int32_t const tempOffset = rowIdx * BLOCKS_PER_ROW + blockLane;
+        top1TempIndices[tempOffset] = laneMax.index;
+        top1TempValues[tempOffset] = laneMax.value;
+    }
+}
 
-        // Apply vocab mapping if provided (for reduced vocabulary)
+// Stage 2: reduce the lane candidates to the final top-1 token. The tie order
+// matches the sampler top-k stage: the reduction compares values only.
+template <int32_t BLOCK_SIZE, int32_t BLOCKS_PER_ROW>
+__global__ void eagleComputeTop1Stage2Kernel(int32_t const* top1TempIndices, float const* top1TempValues,
+    int32_t* top1Tokens, int32_t const* vocabMappingTable, int32_t totalRows)
+{
+    typedef cub::BlockReduce<Top1Helper, BLOCK_SIZE> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+
+    auto const tid = static_cast<int32_t>(threadIdx.x);
+    auto const rowIdx = static_cast<int32_t>(blockIdx.x);
+
+    if (rowIdx >= totalRows)
+    {
+        return;
+    }
+
+    Top1Helper partial;
+    for (int32_t i = tid; i < BLOCKS_PER_ROW; i += BLOCK_SIZE)
+    {
+        int32_t const tempOffset = rowIdx * BLOCKS_PER_ROW + i;
+        partial.update(top1TempValues[tempOffset], top1TempIndices[tempOffset]);
+    }
+
+    Top1Helper rowMax = BlockReduce(tempStorage).Reduce(partial, top1MaxOpFunctor());
+
+    if (tid == 0)
+    {
+        int32_t selectedIdx = (rowMax.index != -1) ? rowMax.index : 0;
         if (vocabMappingTable != nullptr)
         {
             selectedIdx = vocabMappingTable[selectedIdx];
         }
-
-        top1Tokens[outputIdx] = selectedIdx;
+        top1Tokens[rowIdx] = selectedIdx;
     }
 }
+
 // Helper function to compute tree depth - count total connections (sum of 1s)
 __device__ int32_t computeTokenDepth(int32_t tokenIdx, int8_t const* attentionMask, int32_t numTokens)
 {
@@ -402,26 +380,30 @@ void launchEagleAcceptKernel(float const* logits, int32_t const* tokenIds, int8_
     // Validate workspace buffer
     assert(ws.top1Tokens != nullptr);
 
-    // Stage 1: Compute top-1 tokens for all positions (with optional vocab mapping)
-    dim3 const gridSizeStage1(batchSize * numTokens);
+    int32_t const totalRows = batchSize * numTokens;
+
+    // Stage 1/2: Compute top-1 tokens for all positions. The two-stage
+    // partitioning matches selectAllTopK(topK=1), which keeps greedy accept
+    // deterministic against the vanilla decoder when logits tie exactly.
+    dim3 const gridSizeStage1(totalRows * kTop1BlocksPerRow);
     dim3 const blockSizeStage1(blockSize);
+    eagleComputeTop1Stage1Kernel<blockSize, kTop1BlocksPerRow><<<gridSizeStage1, blockSizeStage1, 0, stream>>>(
+        logits, ws.top1TempIndices, ws.top1TempValues, batchSize, numTokens, vocabSize);
 
-    // Calculate shared memory for stage 1 (only CUB temp storage)
-    size_t sharedMemSizeStage1 = sizeof(typename cub::BlockReduce<Top1Helper, blockSize>::TempStorage);
-    sharedMemSizeStage1 = alignSharedMem(sharedMemSizeStage1);
+    dim3 const gridSizeStage2Top1(totalRows);
+    dim3 const blockSizeStage2Top1(blockSize);
+    eagleComputeTop1Stage2Kernel<blockSize, kTop1BlocksPerRow><<<gridSizeStage2Top1, blockSizeStage2Top1, 0, stream>>>(
+        ws.top1TempIndices, ws.top1TempValues, ws.top1Tokens, vocabMappingTable, totalRows);
 
-    eagleComputeTop1Kernel<blockSize><<<gridSizeStage1, blockSizeStage1, sharedMemSizeStage1, stream>>>(
-        logits, ws.top1Tokens, vocabMappingTable, batchSize, numTokens, vocabSize);
+    // Stage 3: Run optimized eagle accept algorithm
+    dim3 const gridSizeStage3(batchSize);
+    dim3 const blockSizeStage3(blockSize);
 
-    // Stage 2: Run optimized eagle accept algorithm
-    dim3 const gridSizeStage2(batchSize);
-    dim3 const blockSizeStage2(blockSize);
+    // Calculate shared memory for stage 3 (only token depths - much smaller!)
+    size_t sharedMemSizeStage3 = numTokens * sizeof(int32_t);
+    sharedMemSizeStage3 = alignSharedMem(sharedMemSizeStage3);
 
-    // Calculate shared memory for stage 2 (only token depths - much smaller!)
-    size_t sharedMemSizeStage2 = numTokens * sizeof(int32_t);
-    sharedMemSizeStage2 = alignSharedMem(sharedMemSizeStage2);
-
-    eagleAcceptKernel<<<gridSizeStage2, blockSizeStage2, sharedMemSizeStage2, stream>>>(ws.top1Tokens, tokenIds,
+    eagleAcceptKernel<<<gridSizeStage3, blockSizeStage3, sharedMemSizeStage3, stream>>>(ws.top1Tokens, tokenIds,
         attentionMask, acceptedTokenIds, acceptedLogitsIndices, acceptLength, batchSize, numTokens, maxDepth);
 }
 
@@ -434,8 +416,8 @@ void sequentialAccept(rt::Tensor const& logits, rt::Tensor const& draftTokenIds,
     int32_t const totalPositions = batchSize * verifyLen;
     int32_t* argmaxResults = static_cast<int32_t*>(argmaxScratch.rawPointer());
 
-    sequentialAcceptArgmaxKernel<<<totalPositions, kSequentialArgmaxBlockSize, 0, stream>>>(
-        static_cast<float const*>(logits.rawPointer()), argmaxResults, totalPositions, vocabSize);
+    invokeRowwiseArgmax<float>(
+        static_cast<float const*>(logits.rawPointer()), totalPositions, vocabSize, argmaxResults, stream);
     CUDA_CHECK(cudaGetLastError());
 
     sequentialAcceptWalkKernel<<<batchSize, 1, 0, stream>>>(argmaxResults,

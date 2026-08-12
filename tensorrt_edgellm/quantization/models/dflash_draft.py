@@ -36,6 +36,7 @@ The calibration forward drives all Linear modules with realistic
 activations produced from the unquantized base model's hidden states.
 """
 
+import gc
 import json
 import logging
 import os
@@ -44,10 +45,12 @@ from typing import Optional, Union
 
 import modelopt.torch.quantization as mtq
 import torch
-from safetensors.torch import safe_open, save_file
+from safetensors.torch import safe_open
 from torch import nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+from tensorrt_edgellm._safetensors_io import save_file
 
 from ..datasets import TextDataset, dataset_name, resolve_dataset
 from ..quantization_configs import build_quant_config
@@ -521,7 +524,11 @@ def _load_base_for_calib(model_dir, dtype, device):
     torch_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
     tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch_dtype, trust_remote_code=True).to(device)
+        model_dir,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True).to(device)
+    gc.collect()  # release safetensor mmap handles after GPU transfer
     model.eval()
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -546,14 +553,7 @@ def _resolve_base_embed_layer(base):
 
 def _disable_dflash_fc_quantization(quant_cfg):
     """Exclude only the DFlash target-hidden projector from draft PTQ."""
-    section = quant_cfg.setdefault("quant_cfg", {})
+    section = quant_cfg["quant_cfg"]
     names = ("fc.input_quantizer", "fc.weight_quantizer",
              "fc.output_quantizer")
-    if isinstance(section, list):
-        section.extend({
-            "quantizer_name": name,
-            "enable": False
-        } for name in names)
-    else:
-        for name in names:
-            section[name] = {"enable": False}
+    section.extend({"quantizer_name": name, "enable": False} for name in names)

@@ -17,6 +17,7 @@
 
 #include "scaleConvert.h"
 
+#include "common/checkMacros.h"
 #include "common/logger.h"
 
 #include <limits>
@@ -110,6 +111,7 @@ void fusedFp32ToSfAtom(
 
     fusedFp32ToSfAtomKernel<<<blocks, kBlockSize, 0, stream>>>(
         fp32Scales, tiledOut, numRows, numKBlocks, numNAtoms, numKAtoms);
+    CUDA_CHECK(cudaGetLastError());
 }
 #else
 void fusedFp32ToSfAtom(
@@ -176,6 +178,7 @@ void fusedFp8ToSfAtom(__nv_fp8_e4m3 const* fp8Scales, float const* fp32Global, u
 
     fusedFp8ToSfAtomKernel<<<blocks, kBlockSize, 0, stream>>>(
         fp8Scales, fp32Global, tiledOut, numRows, numKBlocks, numNAtoms, numKAtoms);
+    CUDA_CHECK(cudaGetLastError());
 }
 #endif // SUPPORTS_FP8
 

@@ -61,6 +61,30 @@ except ImportError as e:  # pragma: no cover - exercised only without deps
     trt = _DummyModule()
     torch = _DummyModule()
 
+
+def _device_sm() -> int:
+    """Compute capability as major*10+minor (0 without a CUDA device)."""
+    if not (DEPENDENCIES_AVAILABLE and torch.cuda.is_available()):
+        return 0
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
+class PluginUnsupportedError(RuntimeError):
+    """The plugin/engine cannot serve this config on this device (build-time).
+
+    The graceful-failure tests pass ``expect_unsupported`` to treat a clean
+    build-time rejection as a valid outcome instead of a failure."""
+
+
+def _fail_unsupported(msg: str):
+    """A config the device cannot serve must be gated by an explicit SM/feature
+    skipif (or an expect_unsupported graceful test). Reaching this fallback means
+    a missing gate or a broken build/env -- fail loudly rather than skip green."""
+    pytest.fail(msg + " (gate this config with an explicit SM/feature skipif, "
+                "or it is a real build/environment failure)")
+
+
 # --------------------------------------------------------------------------- #
 # Plugin library discovery / registration
 # --------------------------------------------------------------------------- #
@@ -134,6 +158,17 @@ def trt_dtype_to_torch(dtype):
     return _trt_to_torch_dtype_map()[dtype]
 
 
+def trt_dtype_to_numpy(dtype):
+    """Map a TensorRT DataType to the matching numpy dtype (constants)."""
+    m = {
+        trt.float32: np.float32,
+        trt.float16: np.float16,
+        trt.int32: np.int32,
+        trt.int8: np.int8,
+    }
+    return m[dtype]
+
+
 def make_field(name: str, value, field_type) -> "trt.PluginField":
     """Build a trt.PluginField from a python scalar / sequence."""
     np_dtype = {
@@ -162,12 +197,27 @@ class InputSpec:
     shape: Tuple[int, ...]  # may contain -1 for dynamic dims
 
 
+# TensorRT registers the logger of the FIRST builder/runtime globally and
+# ignores the ones passed later. A per-runner logger is garbage-collected
+# when its test ends while TensorRT still dereferences it, crashing a later
+# engine build. Share one process-lifetime logger instead (first caller's
+# severity wins).
+_LOGGER = None
+
+
+def _get_logger(verbose: bool):
+    global _LOGGER
+    if _LOGGER is None:
+        _LOGGER = trt.Logger(
+            trt.Logger.VERBOSE if verbose else trt.Logger.WARNING)
+    return _LOGGER
+
+
 class PluginRunner:
     """Builds and executes a single-plugin TensorRT engine with torch buffers."""
 
     def __init__(self, verbose: bool = False):
-        sev = trt.Logger.VERBOSE if verbose else trt.Logger.WARNING
-        self.logger = trt.Logger(sev)
+        self.logger = _get_logger(verbose)
         if not _plugins_loaded:
             load_edgellm_plugins(self.logger)
         self.engine = None
@@ -184,13 +234,28 @@ class PluginRunner:
         plugin_fields: Sequence["trt.PluginField"],
         profiles: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...],
                                   Tuple[int, ...]]],
+        constant_specs: Optional[Sequence[Tuple[str, object, Tuple[int, ...],
+                                                object]]] = None,
+        plugin_input_order: Optional[Sequence[str]] = None,
         plugin_namespace: str = "",
         workspace_bytes: int = 1 << 30,
+        expect_unsupported: bool = False,
     ):
-        """Construct the engine. ``input_specs`` order defines plugin input order.
+        """Construct the engine.
 
         ``profiles`` maps each input name to (min, opt, max) shape tuples.
         ``output_names`` are assigned to plugin outputs 0..N in order.
+
+        ``constant_specs`` optionally declares engine-weight constants wired
+        as plugin inputs: (name, trt_dtype, shape, values). ``values`` may be
+        a torch tensor, numpy array, or None; a None value or zero-volume
+        shape produces a zero-length constant (type-only weights).
+
+        ``plugin_input_order`` optionally lists names from ``input_specs`` and
+        ``constant_specs`` defining the plugin input order (so constants can
+        interleave with regular inputs). Defaults to all inputs in
+        ``input_specs`` order followed by all constants in ``constant_specs``
+        order.
         """
         builder = trt.Builder(self.logger)
         network = builder.create_network(
@@ -203,9 +268,36 @@ class PluginRunner:
             config.set_preview_feature(
                 trt.PreviewFeature.ALIASED_PLUGIN_IO_10_03, True)
 
-        inputs = []
+        tensors_by_name = {}
         for name, dtype, shape in input_specs:
-            inputs.append(network.add_input(name, dtype, shape))
+            tensors_by_name[name] = network.add_input(name, dtype, shape)
+
+        # trt.Weights does not own memory — keep the numpy buffers alive until
+        # the build completes.
+        self._constant_arrays = []
+        constant_names = []
+        for name, dtype, shape, values in (constant_specs or []):
+            if values is None or int(np.prod(shape)) == 0:
+                # TRT requires values == nullptr when count == 0 — use the
+                # type-only Weights constructor.
+                weights = trt.Weights(dtype)
+            else:
+                arr = values
+                if not isinstance(arr, np.ndarray):
+                    arr = arr.detach().cpu().numpy() if hasattr(
+                        arr, "detach") else np.asarray(arr)
+                arr = np.ascontiguousarray(
+                    arr.astype(trt_dtype_to_numpy(dtype)))
+                self._constant_arrays.append(arr)
+                weights = trt.Weights(arr)
+            const = network.add_constant(shape, weights)
+            const.get_output(0).name = name
+            tensors_by_name[name] = const.get_output(0)
+            constant_names.append(name)
+
+        if plugin_input_order is None:
+            plugin_input_order = [s[0] for s in input_specs] + constant_names
+        inputs = [tensors_by_name[n] for n in plugin_input_order]
 
         registry = trt.get_plugin_registry()
         creator = registry.get_creator(plugin_name, plugin_version,
@@ -218,9 +310,14 @@ class PluginRunner:
         plugin = creator.create_plugin(plugin_name, fc,
                                        trt.TensorRTPhase.BUILD)
         if plugin is None:
-            # The plugin is not built for this architecture (e.g. a CuTe DSL
-            # plugin compiled only for newer SMs); skip rather than fail.
-            pytest.skip(f"{plugin_name} plugin not available in this build")
+            # Not built for this architecture (e.g. a CuTe DSL plugin
+            # compiled only for newer SMs) -- expected only when the caller
+            # opts in; otherwise a missing gate or a broken build.
+            if expect_unsupported:
+                raise PluginUnsupportedError(
+                    f"{plugin_name} plugin not available in this build")
+            _fail_unsupported(
+                f"{plugin_name} plugin not available in this build")
 
         layer = network.add_plugin_v3(inputs, [], plugin)
         for i, oname in enumerate(output_names):
@@ -234,9 +331,14 @@ class PluginRunner:
 
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
-            # The engine could not be built for this config on this device
-            # (e.g. FP8 KV cache on an SM without FP8 tensor cores); skip.
-            pytest.skip(
+            # Unbuildable on this device (e.g. FP8 KV cache without FP8
+            # tensor cores) -- expected only when the caller opts in;
+            # otherwise a missing gate or a broken build.
+            if expect_unsupported:
+                raise PluginUnsupportedError(
+                    f"engine build unsupported for {plugin_name} on this device"
+                )
+            _fail_unsupported(
                 f"engine build unsupported for {plugin_name} on this device")
         runtime = trt.Runtime(self.logger)
         self.engine = runtime.deserialize_cuda_engine(serialized)
@@ -285,11 +387,20 @@ DEFAULT_RTOL = 1e-2
 
 
 def cosine_sim(expected: "torch.Tensor", actual: "torch.Tensor") -> float:
-    """Cosine similarity between two tensors (flattened, fp32)."""
-    e = expected.float().flatten().cpu()
-    a = actual.float().flatten().cpu()
-    denom = (e.norm() * a.norm()).clamp_min(1e-12)
-    return float(torch.dot(e, a) / denom)
+    """Cosine similarity between two tensors (flattened, fp64).
+
+    fp64 is required, not a luxury: an fp32 dot over ~64k elements
+    accumulates ~1e-5 of error -- larger than the margin the 0.99999
+    threshold leaves -- and the error depends on the platform's reduction
+    order (aarch64 torch builds crossed the bar while x86 stayed under)."""
+    e = expected.double().flatten().cpu()
+    a = actual.double().flatten().cpu()
+    en, an = float(e.norm()), float(a.norm())
+    if en == 0.0 and an == 0.0:
+        return 1.0  # identical all-zero tensors
+    if en == 0.0 or an == 0.0:
+        return 0.0
+    return float(torch.dot(e, a) / (en * an))
 
 
 def assert_close(name: str,
@@ -308,6 +419,11 @@ def assert_close(name: str,
     """
     e = expected.float()
     a = actual.float()
+    for label, t in (("expected", e), ("actual", a)):
+        if not torch.isfinite(t).all():
+            n_bad = int((~torch.isfinite(t)).sum())
+            raise AssertionError(
+                f"{name}: {label} has {n_bad}/{t.numel()} non-finite values")
     cos = cosine_sim(e, a)
     diff = (e - a).abs()
     n_viol = int((diff > atol + rtol * e.abs()).sum())

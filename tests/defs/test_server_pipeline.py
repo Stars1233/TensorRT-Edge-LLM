@@ -29,6 +29,10 @@ from pytest_helpers import run_command, timer_context
 
 from .config import ModelType, TaskType, TestConfig
 
+# Server-deps venv provisioned by test_build_pybind, relative to the repo root
+# (workspace root remotely, LLM_SDK_DIR locally).
+_SERVER_VENV = 'venv/server'
+
 
 def test_build_pybind(env_config: EnvironmentConfig,
                       remote_config: Optional[RemoteConfig],
@@ -42,7 +46,7 @@ def test_build_pybind(env_config: EnvironmentConfig,
     build_dir = env_config.build_dir
 
     repo_root = '.' if remote_config else env_config.llm_sdk_dir
-    pybind_venv = 'venv/server'
+    pybind_venv = _SERVER_VENV
     install_cmd = (f'cd {shlex.quote(repo_root)}'
                    f' && python3 -m venv {pybind_venv}'
                    f' && {pybind_venv}/bin/pip install -q'
@@ -827,6 +831,15 @@ class TestHLAPI:
                 f"os.environ['LD_LIBRARY_PATH'] += ':{trt_package_dir}/lib'")
         return "\n".join(parts)
 
+    @staticmethod
+    def _hlapi_python(env_config: EnvironmentConfig,
+                      remote_config: Optional[RemoteConfig]) -> str:
+        """Interpreter for the injected HLAPI script: the venv from
+        requirements-server.txt, resolved against the same base dir
+        test_build_pybind created it in."""
+        repo_root = '.' if remote_config else env_config.llm_sdk_dir
+        return f'{repo_root}/{_SERVER_VENV}/bin/python3'
+
     def test_hlapi_generate(self, test_param: str, executable_files: Dict[str,
                                                                           str],
                             remote_config: Optional[RemoteConfig],
@@ -852,7 +865,7 @@ class TestHLAPI:
 {setup}
 from experimental.server import LLM, SamplingParams
 
-llm = LLM(engine_dir={engine_dir!r}, visual_engine_dir={visual_engine_dir!r})
+llm = LLM(engine_dir={engine_dir!r}, multimodal_engine_dir={visual_engine_dir!r})
 outputs = llm.generate(
     [{prompt!r}],
     SamplingParams(temperature=0.7, max_tokens={max_tokens}),
@@ -867,7 +880,8 @@ assert len(ids) > 0, 'Empty output token ids'
 print('HLAPI_GENERATE_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
 
         env_vars = None
         if env_config.trt_package_dir:
@@ -967,13 +981,16 @@ print('HLAPI_GENERATE_LOGPROBS_PASSED')
                                        remote_config: Optional[RemoteConfig],
                                        test_logger: logging.Logger,
                                        env_config: EnvironmentConfig) -> None:
-        """HLAPI audio path: OpenAI input_audio.data base64 wav -> transcription."""
+        """HLAPI audio path, generate + streaming: OpenAI input_audio.data base64 wav -> transcription."""
         is_asr = "-asr" in test_param
         is_omni = "-omni" in test_param
         if not (is_asr or is_omni):
             pytest.skip(
                 "audio HLAPI test requires '-asr' or '-omni' test_param")
-        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+        # ASR/OMNI param strings carry audio-only tokens (mnts/mxts), which
+        # only those model types are allowed to parse.
+        model_type = ModelType.ASR if is_asr else ModelType.OMNI
+        config = TestConfig.from_param_string(test_param, model_type,
                                               TaskType.INFERENCE, env_config)
         engine_dir = config.get_llm_engine_dir()
         audio_engine_dir = (getattr(config, "get_audio_engine_dir",
@@ -983,26 +1000,47 @@ print('HLAPI_GENERATE_LOGPROBS_PASSED')
             pytest.skip("AUDIO_ENCODER_ENGINE_DIR not set")
         test_wav = (getattr(config, "get_audio_test_wav", lambda: "")()
                     or os.environ.get("AUDIO_TEST_WAV", ""))
-        if not test_wav:
-            pytest.skip("AUDIO_TEST_WAV not set")
+        if test_wav:
+            wav_setup = f"""\
+with open({test_wav!r}, 'rb') as f:
+    wav_bytes = f.read()"""
+        else:
+            # Synthesize a 1 s sine wav with the stdlib on the machine that
+            # runs inference; the transcription is meaningless but the full
+            # decode -> mel -> audio-encoder -> LLM path still executes.
+            wav_setup = """\
+import io, math, struct, wave
+buf = io.BytesIO()
+with wave.open(buf, 'wb') as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+    w.writeframes(b''.join(
+        struct.pack('<h', int(12000 * math.sin(2 * math.pi * 440 * t / 16000)))
+        for t in range(16000)))
+wav_bytes = buf.getvalue()"""
 
         setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
         script = f"""\
 {setup}
 import base64
-with open({test_wav!r}, 'rb') as f:
-    wav_b64 = base64.b64encode(f.read()).decode()
+{wav_setup}
+wav_b64 = base64.b64encode(wav_bytes).decode()
 from experimental.server import LLM, SamplingParams
-llm = LLM(engine_dir={engine_dir!r}, visual_engine_dir={audio_engine_dir!r})
+llm = LLM(engine_dir={engine_dir!r}, multimodal_engine_dir={audio_engine_dir!r})
 messages = [{{'role': 'user', 'content': [
     {{'type': 'input_audio', 'input_audio': {{'data': wav_b64, 'format': 'wav'}}}}
 ]}}]
 outputs = llm.generate([messages], SamplingParams(temperature=1.0, max_tokens=128))
 assert len(outputs[0].token_ids) > 0
 print('HLAPI_GENERATE_WITH_AUDIO_PASSED')
+chunks = list(llm.generate_stream(messages, SamplingParams(temperature=1.0, max_tokens=32)))
+# a sine input can transcribe to almost nothing, so a single terminal
+# chunk is a legal stream; require termination, not chunk count.
+assert chunks and any(c.finished for c in chunks), 'Audio stream failed'
+print('HLAPI_STREAM_WITH_AUDIO_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
         env_vars = {
             "LD_LIBRARY_PATH":
             f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
@@ -1014,11 +1052,11 @@ print('HLAPI_GENERATE_WITH_AUDIO_PASSED')
                                  timeout=600,
                                  logger=test_logger,
                                  env_vars=env_vars)
-        if not result[
-                'success'] or 'HLAPI_GENERATE_WITH_AUDIO_PASSED' not in result.get(
-                    'output', ''):
-            pytest.fail(
-                f"HLAPI audio generate failed:\n{result.get('output', '')}")
+        output = result.get('output', '')
+        if (not result['success']
+                or 'HLAPI_GENERATE_WITH_AUDIO_PASSED' not in output
+                or 'HLAPI_STREAM_WITH_AUDIO_PASSED' not in output):
+            pytest.fail(f"HLAPI audio generate failed:\n{output}")
 
     def test_hlapi_generate_with_logit_bias(
             self, test_param: str, executable_files: Dict[str, str],
@@ -1141,7 +1179,8 @@ assert negative_token_id != baseline_token_id, (
 print('HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
         env_vars = None
         if env_config.trt_package_dir:
             env_vars = {
@@ -1163,6 +1202,108 @@ print('HLAPI_GENERATE_WITH_LOGIT_BIAS_PASSED')
                 'output', ''):
             pytest.fail(
                 f"HLAPI logit_bias output:\n{result.get('output', '')}")
+
+    def test_hlapi_video_generate(self, test_param: str,
+                                  executable_files: Dict[str, str],
+                                  remote_config: Optional[RemoteConfig],
+                                  test_logger: logging.Logger,
+                                  env_config: EnvironmentConfig) -> None:
+        """HLAPI video path, generate + streaming: local clip -> decode+sample ->
+        video ImageData -> per-model ViT runner, covering any video-capable VLM
+        (Qwen-VL / InternVL3). ``VIDEO_TEST_CLIP`` overrides the synthetic PyAV
+        clip encoded on the inference machine; ``VIDEO_TEST_NFRAMES`` must fit
+        the visual engine's profile."""
+        is_vlm = "-mnit" in test_param
+        if not is_vlm:
+            pytest.skip("video HLAPI test requires a VLM test_param ('-mnit')")
+        config = TestConfig.from_param_string(test_param, ModelType.VLM,
+                                              TaskType.INFERENCE, env_config)
+        engine_dir = config.get_llm_engine_dir()
+        visual_engine_dir = (config.get_visual_engine_dir() or os.environ.get(
+            "VISUAL_ENCODER_ENGINE_DIR", ""))
+        if not visual_engine_dir:
+            pytest.skip("visual engine dir not set")
+        test_clip = os.environ.get("VIDEO_TEST_CLIP", "")
+        nframes = int(os.environ.get("VIDEO_TEST_NFRAMES", "8"))
+
+        setup = self._build_hlapi_env_setup(env_config.trt_package_dir or "")
+        if test_clip:
+            clip_setup = f"clip_path = {test_clip!r}"
+        else:
+            # Encode a deterministic synthetic clip (moving gradient bar)
+            # where the inference runs; decode uses the same PyAV the server
+            # video path depends on.
+            clip_setup = f"""\
+import numpy as np
+import av
+import tempfile
+clip_path = tempfile.mktemp(suffix='.mp4')
+container = av.open(clip_path, 'w')
+stream = container.add_stream('libx264', rate=4)
+# 256x256 keeps the sampled frames above the ViT engine's minimum
+# totalSeqLength for the mnit128 profiles used in CI.
+stream.width, stream.height, stream.pix_fmt = 256, 256, 'yuv420p'
+for i in range({max(16, nframes * 2)}):
+    frame = np.zeros((256, 256, 3), dtype=np.uint8)
+    frame[:, :, 0] = np.linspace(0, 255, 256, dtype=np.uint8)[None, :]
+    frame[(i * 16) % 256:(i * 16) % 256 + 32, :, 1] = 255
+    for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format='rgb24')):
+        container.mux(packet)
+for packet in stream.encode():
+    container.mux(packet)
+container.close()"""
+        script = f"""\
+{setup}
+{clip_setup}
+from experimental.server import LLM, SamplingParams
+llm = LLM(engine_dir={engine_dir!r}, multimodal_engine_dir={visual_engine_dir!r})
+messages = [{{'role': 'user', 'content': [
+    {{'type': 'video', 'video': clip_path, 'nframes': {nframes}}},
+    {{'type': 'text', 'text': 'Describe what happens in this video.'}}
+]}}]
+outputs = llm.generate([messages], SamplingParams(temperature=0.0, max_tokens=64))
+text = outputs[0].text
+print(f'HLAPI_VIDEO_TEXT={{text[:200]}}')
+assert len(outputs[0].token_ids) > 0, 'Empty output'
+print('HLAPI_GENERATE_WITH_VIDEO_PASSED')
+chunks = list(llm.generate_stream(messages, SamplingParams(temperature=0.0, max_tokens=32)))
+stream_text = ''.join(c.text for c in chunks)
+assert len(chunks) > 1 and stream_text, 'Empty video stream'
+assert any(c.finished for c in chunks), 'No terminal chunk'
+print('HLAPI_STREAM_WITH_VIDEO_PASSED')
+too_long = [{{'role': 'user', 'content': [
+    {{'type': 'video', 'video': clip_path, 'nframes': {nframes}}},
+    {{'type': 'text', 'text': 'word ' * 20000}}
+]}}]
+try:
+    llm.generate([too_long], SamplingParams(temperature=0.0, max_tokens=8))
+    raise AssertionError('over-long video request unexpectedly succeeded')
+except AssertionError:
+    raise
+except Exception as exc:
+    assert 'EDGELLM_INPUT_TOO_LONG' in str(exc), f'wrong error: {{exc}}'
+print('HLAPI_VIDEO_TOO_LONG_PASSED')
+"""
+        script_escaped = shlex.quote(script)
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
+        env_vars = {
+            "LD_LIBRARY_PATH":
+            f"$LD_LIBRARY_PATH:{env_config.trt_package_dir}/lib"
+        } if env_config.trt_package_dir else None
+        with timer_context(f"HLAPI video generate for {config.model_name}",
+                           test_logger):
+            result = run_command(cmd=cmd,
+                                 remote_config=remote_config,
+                                 timeout=600,
+                                 logger=test_logger,
+                                 env_vars=env_vars)
+        output = result.get('output', '')
+        if (not result['success']
+                or 'HLAPI_GENERATE_WITH_VIDEO_PASSED' not in output
+                or 'HLAPI_STREAM_WITH_VIDEO_PASSED' not in output
+                or 'HLAPI_VIDEO_TOO_LONG_PASSED' not in output):
+            pytest.fail(f"HLAPI video generate failed:\n{output}")
 
     def test_hlapi_streaming(self, test_param: str,
                              executable_files: Dict[str, str],
@@ -1200,7 +1341,8 @@ assert any(c.finished for c in chunks), 'No terminal chunk received'
 print('HLAPI_STREAMING_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
 
         env_vars = None
         if env_config.trt_package_dir:
@@ -1355,7 +1497,8 @@ assert reason == 'stop', f'Expected reason=stop, got {{reason}}'
 print('HLAPI_GENERATE_WITH_STOP_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
         env_vars = None
         if env_config.trt_package_dir:
             env_vars = {
@@ -1410,7 +1553,8 @@ assert terminal_reason == 'stop', f'Expected reason=stop, got {{terminal_reason}
 print('HLAPI_STREAMING_WITH_STOP_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
         env_vars = None
         if env_config.trt_package_dir:
             env_vars = {
@@ -1460,7 +1604,8 @@ assert outputs[0].finish_reason == 'length', f'Expected length, got {{outputs[0]
 print('HLAPI_GENERATE_LENGTH_REASON_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
         env_vars = None
         if env_config.trt_package_dir:
             env_vars = {
@@ -1510,7 +1655,8 @@ assert terminal_reason == 'length', f'Expected length, got {{terminal_reason}}'
 print('HLAPI_STREAMING_LENGTH_REASON_PASSED')
 """
         script_escaped = shlex.quote(script)
-        cmd = ['bash', '-c', f'python3 -c {script_escaped}']
+        python = self._hlapi_python(env_config, remote_config)
+        cmd = ['bash', '-c', f'{python} -c {script_escaped}']
         env_vars = None
         if env_config.trt_package_dir:
             env_vars = {

@@ -48,11 +48,12 @@ is absent (e.g. NemotronH-4B-BF16), it is derived from the ``conv1d.weight``
 shape in the checkpoint to break the circular dependency with ``n_groups``.
 """
 
+import fnmatch
 import json
 import math
 import os
-from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from dataclasses import asdict, dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     import torch
@@ -67,6 +68,10 @@ QUANT_FP16 = "fp16"
 QUANT_FP8 = "fp8"
 QUANT_MXFP8 = "mxfp8"
 QUANT_NVFP4 = "nvfp4"
+# Weight-only NVFP4 (W4A16): ModelOpt ``W4A16_NVFP4`` — 4-bit float weights,
+# FP16 activations. Distinct from QUANT_NVFP4 (W4A4); routed to the dense/MoE
+# Marlin FP16xE2M1 kernels.
+QUANT_NVFP4_A16 = "nvfp4_a16"
 QUANT_INT4_AWQ = "int4_awq"
 QUANT_INT4_AWQ_MODELOPT = "int4_awq_modelopt"
 QUANT_INT4_GPTQ = "int4_gptq"
@@ -88,9 +93,48 @@ LAYER_MOE = "moe"
 
 _VALID_ATTENTION_LAYER_TYPES = ("sliding_attention", "full_attention")
 
+# NemotronH ``hybrid_override_pattern`` / ``mtp_hybrid_override_pattern`` chars.
+_HYBRID_PATTERN_MAP = {
+    "M": LAYER_MAMBA,
+    "-": LAYER_MLP,
+    "*": LAYER_ATTN,
+    "E": LAYER_MOE,
+}
+
+_DIFFUSION_GEMMA_MODEL_TYPES = frozenset({
+    "diffusion_gemma",
+    "diffusion_gemma_text",
+    "diffusiongemma",
+})
+_DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
+
+
+def _is_diffusion_gemma_model_type(model_type: str) -> bool:
+    return str(model_type).lower() in _DIFFUSION_GEMMA_MODEL_TYPES
+
+
+def _is_diffusion_gemma_config(root_dict: Dict[str, Any],
+                               llm_dict: Dict[str, Any]) -> bool:
+    model_type = str(
+        root_dict.get("model_type", llm_dict.get("model_type", ""))).lower()
+    architectures_value = (root_dict.get("architectures")
+                           or llm_dict.get("architectures") or [])
+    if isinstance(architectures_value, str):
+        architectures = [architectures_value]
+    else:
+        architectures = [str(x) for x in architectures_value]
+    return (_is_diffusion_gemma_model_type(model_type)
+            or any("DiffusionGemma" in arch for arch in architectures))
+
 
 def _is_gemma4_model_type(model_type: str) -> bool:
-    return str(model_type).startswith("gemma4")
+    model_type = str(model_type)
+    return (model_type.startswith("gemma4")
+            or _is_diffusion_gemma_model_type(model_type))
+
+
+def _is_gemma4_assistant_model_type(model_type: str) -> bool:
+    return str(model_type) in ("gemma4_assistant", "gemma4_unified_assistant")
 
 
 def _check_num_attention_heads(num_attn_heads: int) -> None:
@@ -129,7 +173,10 @@ def _normalize_rope_scaling_for_config(
         return None
     normalized = dict(rope_params)
     rope_type = normalized.get("rope_type", normalized.get("type"))
-    if rope_type is not None:
+    if normalized.get("mrope_section") is not None:
+        normalized["rope_type"] = "mrope"
+        normalized["type"] = "mrope"
+    elif rope_type is not None:
         normalized.setdefault("rope_type", rope_type)
         normalized.setdefault("type", rope_type)
     return normalized
@@ -292,20 +339,17 @@ def _get_has_value_norm(llm_dict: Dict[str, Any], model_type: str) -> bool:
 
 @dataclass
 class Mapping:
-    """Parallel-execution placement (tensor/pipeline/expert ranks).
+    """Tensor-parallel placement for one exported or loaded rank.
 
-    Single source of truth for "which rank am I, out of how many" across
-    the loader and exporter. Pipeline / expert fields are reserved for
-    future use; only ``world_size``, ``tp_size``, and ``tp_rank`` are
-    consumed today.
+    ``tp_size`` / ``tp_rank`` are the only supported model-sharding
+    coordinates in the current Edge-LLM multi-device flow. Future CP/EP/PP/DP
+    work should add its own mapping fields together with matching export,
+    runtime, and validation support.
     """
     world_size: int = 1
+    rank: int = 0
     tp_size: int = 1
     tp_rank: int = 0
-    pp_size: int = 1
-    pp_rank: int = 0
-    ep_size: int = 1
-    ep_rank: int = 0
 
 
 @dataclass
@@ -403,7 +447,9 @@ def module_quant_type(module_name: str, model_config: "ModelConfig") -> str:
     (e.g. ``"lm_head"``).
     """
     quant = model_config.quant
-    if module_name and module_name in quant.excluded:
+    if module_name and any(
+            fnmatch.fnmatchcase(module_name, pattern)
+            for pattern in quant.excluded):
         return QUANT_FP16
     # Tied lm_head with no explicit override and an unquantized backbone has
     # no separate lm_head.weight in the checkpoint; treat it as fp16 so the
@@ -467,6 +513,59 @@ class GdnConfig:
 
 
 @dataclass
+class DiffusionConfig:
+    """Block-diffusion generation parameters parsed at export time."""
+
+    diffusion_family: str = "uniform_renoise"
+    canvas_length: int = 256
+    max_denoising_steps: int = _DEFAULT_DIFFUSION_MAX_DENOISING_STEPS
+    t_max: float = 0.8
+    t_min: float = 0.4
+    sampler_type: str = "entropy_bound"
+    entropy_bound: float = 0.1
+    entropy_threshold: float = 0.005
+    stability_window: int = 2
+    self_conditioning_enabled: bool = True
+    self_conditioning_repr: str = "embeds"
+    supported_modalities: List[str] = field(default_factory=lambda: ["text"])
+
+    @classmethod
+    def from_hf(
+            cls,
+            hf_config: Dict[str, Any],
+            gen_config: Optional[Dict[str, Any]] = None) -> "DiffusionConfig":
+        gen_config = gen_config or {}
+        sampler_cfg = gen_config.get("sampler_config", {}) or {}
+        sampler_name = str(sampler_cfg.get("_cls_name", "EntropyBound"))
+        sampler_type = ("entropy_bound"
+                        if "entropybound" in sampler_name.lower().replace(
+                            "_", "") else sampler_name.lower())
+        return cls(
+            canvas_length=int(
+                hf_config.get("canvas_length",
+                              gen_config.get("canvas_length", 256))),
+            max_denoising_steps=int(
+                gen_config.get("max_denoising_steps",
+                               _DEFAULT_DIFFUSION_MAX_DENOISING_STEPS)),
+            t_max=float(gen_config.get("t_max", 0.8)),
+            t_min=float(gen_config.get("t_min", 0.4)),
+            sampler_type=sampler_type,
+            entropy_bound=float(
+                sampler_cfg.get("entropy_bound",
+                                gen_config.get("entropy_bound", 0.1))),
+            entropy_threshold=float(
+                gen_config.get("entropy_threshold",
+                               gen_config.get("confidence_threshold", 0.005))),
+            stability_window=int(
+                gen_config.get("stability_window",
+                               gen_config.get("stability_threshold", 2))),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ModelConfig:
     """Flat model hyper-parameter config consumed by module builders."""
 
@@ -496,6 +595,8 @@ class ModelConfig:
     num_global_key_value_heads: int = 0
     # Hidden activation name used by architecture-specific auxiliary modules.
     hidden_activation: str = "silu"
+    # CodePredictor: RVQ code groups (lm_heads count = num_code_groups - 1).
+    num_code_groups: int = 0
     # Optional explicit RoPE configs for mixed sliding/full attention stacks.
     sliding_rope_config: Optional[dict] = None
     full_rope_config: Optional[dict] = None
@@ -520,6 +621,11 @@ class ModelConfig:
     # Gemma4 full/global attention reuses k_proj(hidden_states) as the value
     # projection source when enabled.
     attention_k_eq_v: bool = False
+    # DiffusionGemma uses one shared backbone with phase-dependent layer scalars.
+    encoder_layer_scalars: List[float] = field(default_factory=list)
+    decoder_layer_scalars: List[float] = field(default_factory=list)
+    self_conditioning_size: int = 0
+    diffusion: Optional[DiffusionConfig] = None
     # Multiplicative scale applied by the HF embedding module.
     embedding_scale: float = 1.0
     # Final logit softcapping: tanh(logits/cap)*cap.  None = disabled.
@@ -530,6 +636,8 @@ class ModelConfig:
     tie_word_embeddings: bool = False
     # Sliding window attention size; -1 means no sliding window.
     sliding_window_size: int = -1
+    # Skip-softmax (BLASST) calibrated scale factor S; 0.0 disables the feature.
+    skip_softmax_scale_factor: float = 0.0
     # Gemma4 Unified 12B+: image placeholder runs use block-causal
     # attention during prefill (bidirectional inside each contiguous vision
     # run, causal everywhere else).  Audio placeholders remain causal.
@@ -572,6 +680,14 @@ class ModelConfig:
     # ------------------------------------------ MTP config
     mtp_num_hidden_layers: Optional[int] = None
     mtp_use_dedicated_embeddings: bool = False
+    # Nemotron-H MTP: the draft module is a hybrid stack whose layer types come
+    # from this pattern (e.g. "*E" -> [attention, MoE]); ``mtp_num_hidden_layers``
+    # is then its length. ``num_nextn_predict_layers`` (the count of MTP prediction
+    # modules) is folded in during parsing.
+    mtp_hybrid_override_pattern: Optional[str] = None
+    # The same draft stack, resolved from either the pattern above or the
+    # ``mtp_layers_block_type`` list.
+    mtp_layer_types: List[str] = field(default_factory=list)
     # When True, the standard CausalLM is exported as the MTP base model variant
     # with tree-attention inputs (attention_mask, attention_pos_id) and
     # an extra hidden_states output.
@@ -593,9 +709,14 @@ class ModelConfig:
     centroid_intermediate_top_k: int = 0
     sparse_logits_enabled: bool = False
     kv_sharing_map: List[dict] = field(default_factory=list)
+    # When True, MTP base export also exposes DDTree parent/depth metadata
+    # for Qwen3.5 hybrid causal-conv/GDN tree-state execution (MTP tree drafting).
+    mtp_tree_base: bool = False
     # ------------------------------------------ EAGLE3 draft config
     draft_vocab_size: Optional[int] = None
     target_hidden_size: Optional[int] = None
+    is_eagle3_draft_flag: bool = False
+    eagle3_target_layer_ids: List[int] = field(default_factory=list)
     # ------------------------------------------ EAGLE3 base config
     # When True, the standard CausalLM is exported as an EAGLE3 base model
     # with tree-attention inputs (attention_mask, attention_pos_id) and
@@ -612,6 +733,23 @@ class ModelConfig:
     dflash_target_layer_ids: List[int] = field(default_factory=list)
     dflash_block_size: int = 16
     dflash_mask_token_id: int = 248070
+    # Run the fc feature projector at the checkpoint's native precision (e.g.
+    # NVFP4) instead of the default dense-FP16 + FP32 projection. Enabled only
+    # for targets measured to keep target-hidden well inside FP16 range
+    # (Nemotron-3.5). Qwen3-8B keeps the FP32 guard (target-hidden ~abs 2e4).
+    dflash_fc_native_precision: bool = False
+    # ------------------------------------------ DSpark config
+    # DSpark uses the DFlash-like target-hidden feedback path, then applies
+    # a sequential Markov/confidence head outside the draft backbone engine.
+    dspark_base: bool = False
+    is_dspark_draft_flag: bool = False
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_block_size: int = 7
+    dspark_mask_token_id: int = 151669
+    dspark_enable_confidence_head: bool = False
+    dspark_confidence_head_with_markov: bool = False
+    dspark_markov_head_type: str = ""
+    dspark_markov_rank: int = 0
     # ------------------------------------------ sparse MoE config (Qwen3-style)
     # num_experts=0 means dense (no MoE) for Qwen/Mixtral-style keys; Nemotron-H instead reports
     # its expert count via n_routed_experts, so n_routed_experts > 0 also indicates MoE.
@@ -661,7 +799,7 @@ class ModelConfig:
     # tp_size>1 returns a per-rank ONNX graph with col/row-parallel projections.
     mapping: Mapping = field(default_factory=Mapping)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # For standalone models, num_kv_shared_layers < num_hidden_layers is
         # required so that at least one non-shared donor layer exists.
         # Gemma4 assistant models (shares_target_kv=True) share KV from the
@@ -674,12 +812,7 @@ class ModelConfig:
                 f"num_kv_shared_layers ({self.num_kv_shared_layers}) must be "
                 f"less than num_hidden_layers ({self.num_hidden_layers})")
 
-    # ------------------------------------------------------------------
-    # Derived properties
-    # ------------------------------------------------------------------
-
-    def __post_init__(self) -> None:
-        """Resolve and validate the model family's attention scale."""
+        # Resolve and validate the model family's attention scale.
         self.default_attention_scale = _get_attention_scaling(
             {}, self.head_dim, self.default_attention_scale)
         scale_config = ({} if self.attention_scaling is None else {
@@ -687,6 +820,10 @@ class ModelConfig:
         })
         self.attention_scaling = _get_attention_scaling(
             scale_config, self.head_dim, self.default_attention_scale)
+
+    # ------------------------------------------------------------------
+    # Derived properties
+    # ------------------------------------------------------------------
 
     @property
     def tp_size(self) -> int:
@@ -698,14 +835,15 @@ class ModelConfig:
 
     @property
     def is_eagle3_draft(self) -> bool:
-        return self.draft_vocab_size is not None
+        return self.draft_vocab_size is not None or self.is_eagle3_draft_flag
 
     @property
     def is_mtp_draft(self) -> bool:
         """True for a derived MTP draft config built from a base checkpoint."""
         return bool(self.mtp_num_hidden_layers is not None
-                    and self.gdn_cfg is None and not self.mtp_base
-                    and not self.is_eagle3_draft and not self.is_dflash_draft)
+                    and self.gdn_cfg is None and self.mamba_cfg is None
+                    and not self.mtp_base and not self.is_eagle3_draft
+                    and not self.is_dflash_draft and not self.is_dspark_draft)
 
     @property
     def is_gemma4_mtp_draft(self) -> bool:
@@ -713,8 +851,17 @@ class ModelConfig:
         return self.gemma4_mtp_draft
 
     @property
+    def is_diffusion_gemma(self) -> bool:
+        return self.diffusion is not None or _is_diffusion_gemma_model_type(
+            self.model_type)
+
+    @property
     def is_dflash_draft(self) -> bool:
         return self.is_dflash_draft_flag
+
+    @property
+    def is_dspark_draft(self) -> bool:
+        return self.is_dspark_draft_flag
 
     @property
     def ple_enabled(self) -> bool:
@@ -724,6 +871,10 @@ class ModelConfig:
     @property
     def eagle3_target_hidden_size(self) -> int:
         return self.target_hidden_size or self.hidden_size
+
+    @property
+    def eagle3_num_target_layers(self) -> int:
+        return len(self.eagle3_target_layer_ids) or 3
 
     @property
     def is_hybrid(self) -> bool:
@@ -798,7 +949,10 @@ class ModelConfig:
                     f"TP world={world}: {name}={v} is not divisible by {world}"
                 )
         c = copy.deepcopy(self)
-        c.mapping = Mapping(world_size=world, tp_size=world, tp_rank=rank)
+        c.mapping = Mapping(world_size=world,
+                            rank=rank,
+                            tp_size=world,
+                            tp_rank=rank)
         c.num_attention_heads //= world
         c.num_key_value_heads //= world
         c.intermediate_size //= world
@@ -829,8 +983,12 @@ class ModelConfig:
 
         root_model_type = root.get("model_type", "")
         model_type = llm_dict.get("model_type", "llama")
-        if root_model_type == "gemma4_assistant":
-            model_type = root_model_type
+        is_diffusion_gemma = _is_diffusion_gemma_config(root, llm_dict)
+        is_gemma4_assistant = _is_gemma4_assistant_model_type(root_model_type)
+        if is_gemma4_assistant:
+            model_type = "gemma4_assistant"
+        elif is_diffusion_gemma:
+            model_type = "diffusion_gemma"
         hidden_size = llm_dict["hidden_size"]
         num_attn_heads = llm_dict["num_attention_heads"]
         _check_num_attention_heads(num_attn_heads)
@@ -844,6 +1002,16 @@ class ModelConfig:
         layer_types = _parse_layer_types(llm_dict)
         attention_layer_types = _parse_attention_layer_types(
             llm_dict, llm_dict["num_hidden_layers"], model_type)
+        num_kv_heads = llm_dict.get("num_key_value_heads", num_attn_heads)
+        full_attention_only = (_is_gemma4_model_type(model_type)
+                               and attention_layer_types and all(
+                                   layer_type == "full_attention"
+                                   for layer_type in attention_layer_types))
+        if full_attention_only:
+            if global_head_dim:
+                head_dim = global_head_dim
+            if num_global_kv_heads:
+                num_kv_heads = num_global_kv_heads
         dual_rope_configs = _get_dual_rope_configs(llm_dict)
         mamba_cfg = _parse_mamba_cfg(llm_dict,
                                      layer_types,
@@ -858,10 +1026,31 @@ class ModelConfig:
         embedding_scale = _get_embedding_scale(llm_dict, model_type,
                                                hidden_size)
 
+        generation_config_path = os.path.join(model_dir,
+                                              "generation_config.json")
+        generation_config: Dict[str, Any] = {}
+        if os.path.isfile(generation_config_path):
+            with open(generation_config_path) as f:
+                generation_config = json.load(f)
+        diffusion_source_config = dict(root)
+        diffusion_source_config.update(llm_dict)
+        diffusion_config = (DiffusionConfig.from_hf(diffusion_source_config,
+                                                    generation_config)
+                            if is_diffusion_gemma else None)
+        self_conditioning_size = 0
+
         # MTP config
         mtp_num_hidden_layers = llm_dict.get("mtp_num_hidden_layers")
         if mtp_num_hidden_layers is not None:
             mtp_num_hidden_layers = int(mtp_num_hidden_layers)
+        mtp_hybrid_override_pattern = llm_dict.get(
+            "mtp_hybrid_override_pattern")
+        mtp_layer_types = _parse_mtp_layer_types(llm_dict)
+        num_nextn_predict_layers = int(
+            llm_dict.get("num_nextn_predict_layers", 0) or 0)
+        if (mtp_num_hidden_layers is None and num_nextn_predict_layers > 0
+                and mtp_layer_types):
+            mtp_num_hidden_layers = len(mtp_layer_types)
         mtp_use_dedicated_embeddings = bool(
             llm_dict.get("mtp_use_dedicated_embeddings", False))
         _validate_mtp_constraints(
@@ -871,8 +1060,18 @@ class ModelConfig:
         )
 
         # EAGLE3 draft model fields
+        architectures = llm_dict.get("architectures", []) or []
+        is_eagle3_draft_flag = any("Eagle3" in str(arch)
+                                   for arch in architectures) or ("ttt_length"
+                                                                  in llm_dict)
         draft_vocab_size = llm_dict.get("draft_vocab_size", None)
         target_hidden_size = llm_dict.get("target_hidden_size", None)
+        eagle3_target_layer_ids = list(
+            llm_dict.get("target_layer_ids", [])
+            or []) if is_eagle3_draft_flag else []
+        if is_eagle3_draft_flag:
+            draft_vocab_size = draft_vocab_size or llm_dict.get("vocab_size")
+            target_hidden_size = target_hidden_size or hidden_size
         # Sliding window: active when use_sliding_window=True, or when
         # layer_types contains "sliding_attention" (Gemma4 convention).
         use_sw = llm_dict.get("use_sliding_window", False) or any(
@@ -880,6 +1079,8 @@ class ModelConfig:
             for layer_type in raw_layer_types)
         sw_raw = llm_dict.get("sliding_window") if use_sw else None
         sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+        skip_softmax_scale_factor = float(
+            llm_dict.get("skip_softmax_scale_factor", 0.0))
         use_vision_bidirectional_attention = bool(
             model_type in ("gemma4_unified", "gemma4_unified_text")
             and llm_dict.get("use_bidirectional_attention") == "vision")
@@ -924,14 +1125,19 @@ class ModelConfig:
             or llm_dict.get("shared_expert_intermediate_size")
             or llm_dict.get("moe_shared_expert_intermediate_size")
             or llm_dict.get("moe_intermediate_size", 0))
+        if self_conditioning_size <= 0:
+            self_conditioning_size = int(
+                llm_dict.get(
+                    "self_conditioning_size",
+                    root.get("self_conditioning_size", intermediate_size))
+                or intermediate_size)
 
         return cls(
             model_type=model_type,
             hidden_size=hidden_size,
             num_hidden_layers=llm_dict["num_hidden_layers"],
             num_attention_heads=num_attn_heads,
-            num_key_value_heads=llm_dict.get("num_key_value_heads",
-                                             num_attn_heads),
+            num_key_value_heads=num_kv_heads,
             intermediate_size=intermediate_size,
             head_dim=head_dim,
             global_head_dim=global_head_dim,
@@ -948,13 +1154,23 @@ class ModelConfig:
             partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
             hidden_activation=llm_dict.get("hidden_activation",
                                            llm_dict.get("hidden_act", "silu")),
+            num_code_groups=int(llm_dict.get("num_code_groups", 0) or 0),
             sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
             full_rope_config=dual_rope_configs.get("full_rope_config"),
             has_qk_norm=has_qk_norm,
             has_value_norm=has_value_norm,
             attention_bias=bool(llm_dict.get("attention_bias", False)),
             attention_scaling=attention_scaling,
-            attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+            attention_k_eq_v=(True if is_diffusion_gemma else bool(
+                llm_dict.get("attention_k_eq_v", False))),
+            encoder_layer_scalars=list(
+                llm_dict.get("encoder_layer_scalars",
+                             root.get("encoder_layer_scalars", [])) or []),
+            decoder_layer_scalars=list(
+                llm_dict.get("decoder_layer_scalars",
+                             root.get("decoder_layer_scalars", [])) or []),
+            self_conditioning_size=self_conditioning_size,
+            diffusion=diffusion_config,
             embedding_scale=embedding_scale,
             final_logit_softcapping=llm_dict.get("final_logit_softcapping",
                                                  None),
@@ -962,6 +1178,7 @@ class ModelConfig:
                                      llm_dict.get("dtype", "bfloat16")),
             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
             sliding_window_size=sliding_window_size,
+            skip_softmax_scale_factor=skip_softmax_scale_factor,
             use_vision_bidirectional_attention=
             use_vision_bidirectional_attention,
             layer_types=layer_types,
@@ -972,31 +1189,40 @@ class ModelConfig:
             attn_output_gate=bool(llm_dict.get("attn_output_gate", False)),
             mtp_num_hidden_layers=mtp_num_hidden_layers,
             mtp_use_dedicated_embeddings=mtp_use_dedicated_embeddings,
+            mtp_hybrid_override_pattern=mtp_hybrid_override_pattern,
+            mtp_layer_types=mtp_layer_types,
             mtp_base=bool(llm_dict.get("mtp_base", False)),
             root_model_type=root_model_type,
             raw_layer_types=raw_layer_types,
             rope_parameters=llm_dict.get("rope_parameters", None),
             backbone_hidden_size=int(
                 llm_dict.get("backbone_hidden_size", 0) or 0),
-            assistant_hidden_size=(hidden_size if root_model_type
-                                   == "gemma4_assistant" else 0),
-            shares_target_kv=(root_model_type == "gemma4_assistant"),
-            has_own_kv_cache=(root_model_type != "gemma4_assistant"),
-            constant_draft_positions=(root_model_type == "gemma4_assistant"),
-            returns_feedback_hidden=(root_model_type == "gemma4_assistant"),
+            assistant_hidden_size=(hidden_size if is_gemma4_assistant else 0),
+            shares_target_kv=is_gemma4_assistant,
+            has_own_kv_cache=not is_gemma4_assistant,
+            constant_draft_positions=is_gemma4_assistant,
+            returns_feedback_hidden=is_gemma4_assistant,
             use_ordered_embeddings=bool(
                 llm_dict.get("use_ordered_embeddings", False)),
             num_centroids=int(llm_dict.get("num_centroids", 0) or 0),
             centroid_intermediate_top_k=int(
                 llm_dict.get("centroid_intermediate_top_k", 0) or 0),
+            mtp_tree_base=bool(llm_dict.get("mtp_tree_base", False)),
             dflash_base=bool(llm_dict.get("dflash_base", False)),
             dflash_tree_base=bool(llm_dict.get("dflash_tree_base", False)),
+            dflash_target_layer_ids=list(
+                (llm_dict.get("dflash_config", {})
+                 or {}).get("target_layer_ids")
+                or llm_dict.get("eagle_aux_hidden_state_layer_ids") or []),
+            dspark_base=bool(llm_dict.get("dspark_base", False)),
             num_deepstack_features=_parse_num_deepstack_features(
                 llm_dict, model_type, root_config=root),
             accept_hidden_layer=_parse_accept_hidden_layer(llm_dict,
                                                            root_config=root),
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
+            is_eagle3_draft_flag=is_eagle3_draft_flag,
+            eagle3_target_layer_ids=eagle3_target_layer_ids,
             num_experts=num_experts,
             n_routed_experts=n_routed_experts,
             num_experts_per_tok=num_experts_per_tok,
@@ -1018,7 +1244,15 @@ class ModelConfig:
                 llm_dict.get("num_kv_shared_layers", 0) or 0),
             use_double_wide_mlp=bool(llm_dict.get("use_double_wide_mlp",
                                                   False)),
-            enable_moe_block=bool(llm_dict.get("enable_moe_block", False)),
+            enable_moe_block=bool(
+                llm_dict.get(
+                    "enable_moe_block", model_type in (
+                        "gemma4",
+                        "gemma4_text",
+                        "gemma4_unified",
+                        "gemma4_unified_text",
+                        "diffusion_gemma",
+                    ) and num_experts > 0 and moe_intermediate_size > 0)),
         )
 
 
@@ -1050,6 +1284,8 @@ _QWEN3_5_MTP_CONFIG_MODEL_TYPES = frozenset({
     "qwen3_5_text",
     "qwen3_5_moe",
     "qwen3_5_moe_text",
+    "qwen3_omni_next_text",
+    "qwen3_omni_next_text_moe",
 })
 
 
@@ -1066,15 +1302,39 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
             "MTP draft config requires mtp_num_hidden_layers in the base config."
         )
 
-    # MTP modules in the exclude list → unquantized (FP16); otherwise inherit
-    # base quant.  Only *compute linear* modules matter (fc, proj, etc.).
-    # Norms, embeddings, and lm_head always appear in `excluded` when lm_head
-    # is FP16 — their presence does NOT mean the whole draft is unquantized.
-    _MTP_COMPUTE_PREFIXES = ("mtp.fc", "mtp.layers.")
+    # Nemotron-H: Exclude all draft ``layers.*`` modules from quantization;
+    # the untouched lm_head keeps the base quant type.
+    if (base_config.model_type or "").lower().startswith("nemotron_h"):
+        draft_layer_types = list(base_config.mtp_layer_types)
+        if len(draft_layer_types) != mtp_num_hidden_layers:
+            declared = (base_config.mtp_hybrid_override_pattern
+                        or base_config.mtp_layer_types)
+            raise ValueError(
+                f"MTP draft stack {declared!r} yields "
+                f"{len(draft_layer_types)} layers != mtp_num_hidden_layers "
+                f"{mtp_num_hidden_layers}")
+        draft_quant = replace(
+            base_config.quant,
+            excluded=list(base_config.quant.excluded) + ["layers.*"],
+        )
+        return replace(
+            base_config,
+            num_hidden_layers=mtp_num_hidden_layers,
+            layer_types=draft_layer_types,
+            mamba_cfg=None,
+            gdn_cfg=None,
+            mtp_base=False,
+            quant=draft_quant,
+            tie_word_embeddings=False,
+        )
+
+    # The draft is quantized iff its FFN compute weights are quantized
+    # (routed experts for MoE, dense MLP otherwise) — other modules may be
+    # excluded in any recipe. Excluded entries are exact names or globs.
+    ffn_probe = ("mtp.layers.0.mlp.experts.0.gate_proj" if
+                 base_config.num_experts > 0 else "mtp.layers.0.mlp.gate_proj")
     mtp_is_quantized = not any(
-        any(e.startswith(p) for p in _MTP_COMPUTE_PREFIXES) and
-        ("norm" not in e and "embed" not in e)
-        for e in base_config.quant.excluded)
+        fnmatch.fnmatch(ffn_probe, e) for e in base_config.quant.excluded)
 
     if mtp_is_quantized:
         # MTP draft modules are independently quantized.  Strip base-model
@@ -1103,7 +1363,13 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
                               layer_overrides=draft_overrides,
                               is_mixed_precision=False)
     else:
-        draft_quant = QuantConfig()
+        # MTP draft lm_head is borrowed from the base model and may itself be quantized.
+        lm_head_overrides = {
+            k: v
+            for k, v in base_config.quant.layer_overrides.items()
+            if k == "lm_head" or k.startswith("lm_head.")
+        }
+        draft_quant = QuantConfig(layer_overrides=lm_head_overrides)
 
     return replace(
         base_config,
@@ -1113,6 +1379,109 @@ def make_mtp_draft_config(base_config: ModelConfig) -> ModelConfig:
         mtp_base=False,
         quant=draft_quant,
         tie_word_embeddings=False,
+    )
+
+
+def make_dspark_draft_config(
+        draft_dir: str,
+        default_attention_scale: Callable[[int], float]) -> ModelConfig:
+    """Build a DSpark draft ModelConfig from a DeepSpec DSpark checkpoint."""
+    _, llm_dict = load_checkpoint_config_dicts(draft_dir)
+    dspark_config = llm_dict.get("dspark_config", {}) or {}
+
+    quant = _parse_quant(draft_dir, llm_dict)
+    target_layer_ids = list(
+        dspark_config.get("target_layer_ids",
+                          llm_dict.get("target_layer_ids", [])))
+    if not target_layer_ids:
+        raise ValueError(
+            "DSpark draft config requires target_layer_ids in config.json.")
+
+    model_type = llm_dict.get("model_type", "qwen3")
+    raw_layer_types = _parse_raw_layer_types(llm_dict)
+    layer_types = _parse_layer_types(llm_dict)
+    attention_layer_types = _parse_attention_layer_types(
+        llm_dict, llm_dict["num_hidden_layers"], model_type)
+    full_attention_only = (_is_gemma4_model_type(model_type)
+                           and attention_layer_types
+                           and all(layer_type == "full_attention"
+                                   for layer_type in attention_layer_types))
+    head_dim = llm_dict.get(
+        "global_head_dim" if full_attention_only else "head_dim",
+        llm_dict.get(
+            "head_dim",
+            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]))
+    global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
+    num_global_kv_heads = int(
+        llm_dict.get("num_global_key_value_heads", 0) or 0)
+    num_kv_heads = (
+        num_global_kv_heads if full_attention_only and num_global_kv_heads else
+        llm_dict.get("num_key_value_heads", llm_dict["num_attention_heads"]))
+    dual_rope_configs = _get_dual_rope_configs(llm_dict)
+    use_sw = llm_dict.get("use_sliding_window", False) or any(
+        layer_type == "sliding_attention" for layer_type in raw_layer_types)
+    sw_raw = llm_dict.get("sliding_window") if use_sw else None
+    sliding_window_size = int(sw_raw) if sw_raw is not None else -1
+    default_attention_scale_value = float(default_attention_scale(head_dim))
+    default_mask_token_id = 4 if _is_gemma4_model_type(model_type) else 151669
+
+    return ModelConfig(
+        model_type=model_type,
+        hidden_size=llm_dict["hidden_size"],
+        num_hidden_layers=llm_dict["num_hidden_layers"],
+        num_attention_heads=llm_dict["num_attention_heads"],
+        num_key_value_heads=num_kv_heads,
+        intermediate_size=llm_dict["intermediate_size"],
+        head_dim=head_dim,
+        global_head_dim=global_head_dim,
+        num_global_key_value_heads=num_global_kv_heads,
+        rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
+        vocab_size=llm_dict["vocab_size"],
+        rope_theta=_get_rope_theta(llm_dict),
+        max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
+        default_attention_scale=default_attention_scale_value,
+        rope_scaling=_select_rope_scaling(llm_dict),
+        partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+        hidden_activation=llm_dict.get("hidden_activation",
+                                       llm_dict.get("hidden_act", "silu")),
+        sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
+        full_rope_config=dual_rope_configs.get("full_rope_config"),
+        has_qk_norm=True,
+        has_value_norm=_get_has_value_norm(llm_dict, model_type),
+        attention_bias=bool(llm_dict.get("attention_bias", False)),
+        attention_scaling=_get_attention_scaling(
+            llm_dict, head_dim, default_attention_scale_value),
+        attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+        final_logit_softcapping=llm_dict.get("final_logit_softcapping", None),
+        torch_dtype=llm_dict.get("torch_dtype",
+                                 llm_dict.get("dtype", "bfloat16")),
+        tie_word_embeddings=False,
+        sliding_window_size=sliding_window_size,
+        layer_types=layer_types,
+        attention_layer_types=attention_layer_types,
+        raw_layer_types=raw_layer_types,
+        rope_parameters=llm_dict.get("rope_parameters", None),
+        is_dspark_draft_flag=True,
+        dspark_target_layer_ids=target_layer_ids,
+        dspark_block_size=int(
+            dspark_config.get("block_size", llm_dict.get("block_size", 7))),
+        dspark_mask_token_id=int(
+            dspark_config.get(
+                "mask_token_id",
+                llm_dict.get("mask_token_id", default_mask_token_id))),
+        dspark_enable_confidence_head=bool(
+            dspark_config.get("enable_confidence_head",
+                              llm_dict.get("enable_confidence_head", False))),
+        dspark_confidence_head_with_markov=bool(
+            dspark_config.get(
+                "confidence_head_with_markov",
+                llm_dict.get("confidence_head_with_markov", False))),
+        dspark_markov_head_type=str(
+            dspark_config.get("markov_head_type",
+                              llm_dict.get("markov_head_type", ""))),
+        dspark_markov_rank=int(
+            dspark_config.get("markov_rank", llm_dict.get("markov_rank", 0))),
+        quant=quant,
     )
 
 
@@ -1132,43 +1501,88 @@ def make_dflash_draft_config(
     # Parse quantization config from the draft checkpoint directory.
     # For FP16 draft checkpoints this returns QuantConfig() (no quant).
     quant = _parse_quant(draft_dir, llm_dict)
+    # The fc feature projector must stay dense FP16 (the draft model asserts
+    # this). Finalized NVFP4 drafts ship a packed fc; excluding it here keeps
+    # ``make_linear`` producing FP16Linear, and the loader dequantizes the
+    # packed checkpoint tensors into it (see ``model.py``).
+    if "fc" not in quant.excluded:
+        quant.excluded = list(quant.excluded) + ["fc"]
 
     model_type = llm_dict.get("model_type", "qwen3")
     _check_num_attention_heads(llm_dict["num_attention_heads"])
+    raw_layer_types = _parse_raw_layer_types(llm_dict)
+    layer_types = _parse_layer_types(llm_dict)
+    attention_layer_types = _parse_attention_layer_types(
+        llm_dict, llm_dict["num_hidden_layers"], model_type)
+    full_attention_only = (_is_gemma4_model_type(model_type)
+                           and attention_layer_types
+                           and all(layer_type == "full_attention"
+                                   for layer_type in attention_layer_types))
     head_dim = llm_dict.get(
-        "head_dim", llm_dict["hidden_size"] // llm_dict["num_attention_heads"])
+        "global_head_dim" if full_attention_only else "head_dim",
+        llm_dict.get(
+            "head_dim",
+            llm_dict["hidden_size"] // llm_dict["num_attention_heads"]))
+    global_head_dim = int(llm_dict.get("global_head_dim", 0) or 0)
+    num_global_kv_heads = int(
+        llm_dict.get("num_global_key_value_heads", 0) or 0)
+    num_kv_heads = (
+        num_global_kv_heads if full_attention_only and num_global_kv_heads else
+        llm_dict.get("num_key_value_heads", llm_dict["num_attention_heads"]))
+    dual_rope_configs = _get_dual_rope_configs(llm_dict)
+    use_sw = llm_dict.get("use_sliding_window", False) or any(
+        layer_type == "sliding_attention" for layer_type in raw_layer_types)
+    sw_raw = llm_dict.get("sliding_window") if use_sw else None
+    sliding_window_size = int(sw_raw) if sw_raw is not None else -1
 
     default_attention_scale_value = float(default_attention_scale(head_dim))
+    default_mask_token_id = 4 if _is_gemma4_model_type(model_type) else 248070
 
     return ModelConfig(
         model_type=model_type,
         hidden_size=llm_dict["hidden_size"],
         num_hidden_layers=llm_dict["num_hidden_layers"],
         num_attention_heads=llm_dict["num_attention_heads"],
-        num_key_value_heads=llm_dict.get("num_key_value_heads",
-                                         llm_dict["num_attention_heads"]),
+        num_key_value_heads=num_kv_heads,
         intermediate_size=llm_dict["intermediate_size"],
         head_dim=head_dim,
+        global_head_dim=global_head_dim,
+        num_global_key_value_heads=num_global_kv_heads,
         rms_norm_eps=llm_dict.get("rms_norm_eps", 1e-6),
         vocab_size=llm_dict["vocab_size"],
         rope_theta=_get_rope_theta(llm_dict),
         max_position_embeddings=llm_dict.get("max_position_embeddings", 4096),
-        rope_scaling=(llm_dict.get("rope_scaling")
-                      or llm_dict.get("rope_parameters") or None),
+        default_attention_scale=default_attention_scale_value,
+        rope_scaling=_select_rope_scaling(llm_dict),
         partial_rotary_factor=_get_partial_rotary_factor(llm_dict),
+        hidden_activation=llm_dict.get("hidden_activation",
+                                       llm_dict.get("hidden_act", "silu")),
+        sliding_rope_config=dual_rope_configs.get("sliding_rope_config"),
+        full_rope_config=dual_rope_configs.get("full_rope_config"),
         has_qk_norm=True,
+        has_value_norm=_get_has_value_norm(llm_dict, model_type),
         attention_scaling=_get_attention_scaling(
             llm_dict, head_dim, default_attention_scale_value),
-        default_attention_scale=default_attention_scale_value,
+        attention_k_eq_v=bool(llm_dict.get("attention_k_eq_v", False)),
+        final_logit_softcapping=llm_dict.get("final_logit_softcapping", None),
         torch_dtype=llm_dict.get("torch_dtype", "bfloat16"),
         tie_word_embeddings=False,
-        layer_types=[LAYER_ATTN] * int(llm_dict["num_hidden_layers"]),
+        sliding_window_size=sliding_window_size,
+        layer_types=layer_types,
+        attention_layer_types=attention_layer_types,
+        raw_layer_types=raw_layer_types,
+        rope_parameters=llm_dict.get("rope_parameters", None),
         is_dflash_draft_flag=True,
         dflash_target_layer_ids=list(
-            dflash_config.get("target_layer_ids", [1, 8, 15, 22, 29])),
+            dflash_config.get(
+                "target_layer_ids",
+                llm_dict.get("target_layer_ids", [1, 8, 15, 22, 29]))),
         dflash_block_size=int(
             dflash_config.get("block_size", llm_dict.get("block_size", 16))),
-        dflash_mask_token_id=int(dflash_config.get("mask_token_id", 248070)),
+        dflash_mask_token_id=int(
+            dflash_config.get(
+                "mask_token_id",
+                llm_dict.get("mask_token_id", default_mask_token_id))),
         quant=quant,
     )
 
@@ -1202,6 +1616,9 @@ def _parse_num_deepstack_features(
                 return len(indexes)
 
     root_mt = (root_config or {}).get("model_type") or ""
+    # Strict equality, not substring — ``"qwen3_omni" in "qwen3_omni_next"``
+    # is True and would otherwise report 3 deepstack features for Qwen3-Next Omni
+    # (whose ``deepstack_visual_indexes`` is empty -> 0 features).
     if model_type in _DEEPSTACK_MODEL_TYPES or root_mt in _DEEPSTACK_MODEL_TYPES:
         return 3
     return 0
@@ -1249,9 +1666,16 @@ def _validate_mtp_constraints(
     """Validate the currently supported MTP config subset."""
     if mtp_num_hidden_layers is None and not mtp_use_dedicated_embeddings:
         return
+    if (model_type or "").lower().startswith("nemotron_h"):
+        if mtp_use_dedicated_embeddings:
+            raise NotImplementedError(
+                "Dedicated MTP embeddings are not supported for Nemotron-H MTP."
+            )
+        return
     if model_type not in _QWEN3_5_MTP_CONFIG_MODEL_TYPES:
         raise NotImplementedError(
-            "MTP config parsing is only supported for Qwen3.5 checkpoints.")
+            "MTP config parsing is only supported for Qwen3.5 and Nemotron-H "
+            "checkpoints.")
     if mtp_num_hidden_layers != 1:
         raise NotImplementedError(
             "Only mtp_num_hidden_layers == 1 is supported for Qwen3.5 MTP.")
@@ -1268,45 +1692,69 @@ def _parse_raw_layer_types(config: dict) -> List[str]:
     return [str(layer_type) for layer_type in raw]
 
 
+def _is_nemotron_h_config(config: dict) -> bool:
+    return (config.get("model_type") or "").lower().startswith("nemotron_h")
+
+
+def _canonical_layer_type(block_type: str, is_nemotron_h: bool) -> str:
+    """Map one checkpoint block-type name onto a canonical layer label.
+
+    ``"linear_attention"`` is ambiguous: it covers any sub-quadratic mixer, so
+    it denotes Mamba2 for NemotronH and GatedDeltaNet for Qwen3.5. The model
+    family therefore resolves it, along with ``"full_attention"``, which Gemma4
+    keeps verbatim for per-layer head_dim dispatch.
+    """
+    bt = str(block_type).lower()
+    if bt == "linear_attention":
+        return LAYER_MAMBA if is_nemotron_h else LAYER_GDN
+    if "mamba" in bt:
+        return LAYER_MAMBA
+    if bt == "moe":
+        return LAYER_MOE
+    if "mlp" in bt:
+        return LAYER_MLP
+    if bt in _VALID_ATTENTION_LAYER_TYPES:
+        return LAYER_ATTN if is_nemotron_h else bt
+    return LAYER_ATTN
+
+
+def _parse_mtp_layer_types(config: dict) -> List[str]:
+    """Return the MTP draft stack's per-layer block types.
+
+    NemotronH declares the stack either as ``mtp_layers_block_type`` (a list,
+    which transformers >= 5.14 rewrites into the ``linear_attention`` /
+    ``full_attention`` spelling) or as the legacy ``mtp_hybrid_override_pattern``
+    string (e.g. ``"*E"``).
+    """
+    raw = config.get("mtp_layers_block_type")
+    if raw:
+        is_nemotron_h = _is_nemotron_h_config(config)
+        return [_canonical_layer_type(bt, is_nemotron_h) for bt in raw]
+    pattern = config.get("mtp_hybrid_override_pattern") or ""
+    return [
+        _HYBRID_PATTERN_MAP[ch] for ch in pattern if ch in _HYBRID_PATTERN_MAP
+    ]
+
+
 def _parse_layer_types(config: dict) -> List[str]:
     """Return per-layer block type list from config.
 
-    Reads ``layers_block_type`` or ``layer_types`` directly if present.
-    For models using ``hybrid_override_pattern`` (e.g. NemotronH), parses the
-    pattern string where ``M`` = mamba, ``-`` = mlp, ``*`` = attention.
-    Falls back to all attention layers.
-
-    Qwen3.5 uses ``layer_types`` with values ``"linear_attention"`` (GDN)
-    and ``"full_attention"``.
+    Reads ``layers_block_type`` or ``layer_types`` directly if present, each
+    entry resolved by :func:`_canonical_layer_type`. For models using
+    ``hybrid_override_pattern`` (e.g. NemotronH), parses the pattern string
+    where ``M`` = mamba, ``-`` = mlp, ``*`` = attention. Falls back to all
+    attention layers.
     """
     raw = config.get("layers_block_type") or config.get("layer_types")
     if raw is not None:
-        result = []
-        for bt in raw:
-            bt_lower = str(bt).lower()
-            if bt_lower == "linear_attention":
-                result.append(LAYER_GDN)
-            elif "mamba" in bt_lower:
-                result.append(LAYER_MAMBA)
-            elif bt_lower == "moe":
-                result.append(LAYER_MOE)
-            elif "mlp" in bt_lower:
-                result.append(LAYER_MLP)
-            elif bt_lower in ("sliding_attention", "full_attention"):
-                # Gemma4: preserve raw string for per-layer head_dim dispatch
-                result.append(bt_lower)
-            else:
-                result.append(LAYER_ATTN)
-        return result
+        is_nemotron_h = _is_nemotron_h_config(config)
+        return [_canonical_layer_type(bt, is_nemotron_h) for bt in raw]
     pattern = config.get("hybrid_override_pattern")
     if pattern is not None:
-        _PATTERN_MAP = {
-            "M": LAYER_MAMBA,
-            "-": LAYER_MLP,
-            "*": LAYER_ATTN,
-            "E": LAYER_MOE,
-        }
-        return [_PATTERN_MAP[ch] for ch in pattern if ch in _PATTERN_MAP]
+        return [
+            _HYBRID_PATTERN_MAP[ch] for ch in pattern
+            if ch in _HYBRID_PATTERN_MAP
+        ]
     n = config["num_hidden_layers"]
     return [LAYER_ATTN] * n
 
@@ -1506,6 +1954,18 @@ def _normalize_module_name(name: str) -> str:
         return name[len("model.language_model."):]
     if name.startswith("thinker.model."):
         return name[len("thinker.model."):]
+    # Talker sub-LLM keys share the thinker short-name space after
+    # ``_make_sub_model_dir(key_prefix='talker.')`` staging.
+    if name.startswith("talker.model."):
+        return name[len("talker.model."):]
+    # Bare submodel prefixes (consolidated Qwen3-Omni roots): the visual /
+    # audio / code_predictor builders use short names without them.
+    if name.startswith("thinker."):
+        return name[len("thinker."):]
+    if name.startswith("talker."):
+        return name[len("talker."):]
+    if name.startswith("model.decoder."):
+        return name[len("model.decoder."):]
     for prefix in _VL_LLM_PREFIXES + ("model.", ):
         if name.startswith(prefix):
             return name[len(prefix):]
@@ -1549,10 +2009,38 @@ def _detect_unquantized_modules(model_dir: str) -> List[str]:
 _GDN_INPUT_PROJ_MODULES = ("in_proj_qkv", "in_proj_z", "in_proj_b",
                            "in_proj_a")
 
+# Fused HF GDN projection names (as they appear in a ModelOpt ``ignore`` /
+# ``modules_to_not_convert`` list) mapped to the split projections
+# trt-edge-llm actually builds. The checkpoint loader splits
+# ``in_proj_qkvz`` -> ``in_proj_qkv`` / ``in_proj_z`` and ``in_proj_ba`` ->
+# ``in_proj_b`` / ``in_proj_a`` (Qwen3-Next family). Excluding only the fused
+# name would otherwise leave the split Linears at the dominant quant type
+# (e.g. NVFP4) even though their weights are plain FP16, so ``make_linear``
+# would build an NVFP4Linear against an unquantized weight.
+_GDN_FUSED_PROJ_SPLITS: Dict[str, Tuple[str, ...]] = {
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
+
 
 def _with_gdn_fused_exclusions(modules: List[str]) -> List[str]:
-    """Add synthetic GDN fused projections when all source projections are FP16."""
+    """Reconcile GDN input-projection exclusions with the split/fused forms.
+
+    Expands fused HF names (``in_proj_qkvz`` / ``in_proj_ba``) present in the
+    ignore list into the split projections the model builds, and adds the
+    synthetic ``in_proj_fused`` when all four split projections are FP16.
+    """
     result = set(modules)
+    # Fused HF name -> split projections (so an excluded ``in_proj_qkvz``
+    # also excludes the ``in_proj_qkv`` / ``in_proj_z`` the model builds).
+    for module in list(result):
+        for fused, splits in _GDN_FUSED_PROJ_SPLITS.items():
+            suffix = f".{fused}"
+            if module.endswith(suffix):
+                prefix = module[:-len(suffix)]
+                for split in splits:
+                    result.add(f"{prefix}.{split}")
+                break
     by_prefix: Dict[str, set] = {}
     for module in result:
         for proj in _GDN_INPUT_PROJ_MODULES:
@@ -1734,10 +2222,19 @@ def _parse_quant(model_dir: str, config: dict) -> QuantConfig:
             first_group = next(iter(cg.values()), {})
             group_size = int(
                 first_group.get("weights", {}).get("group_size", 1))
+        elif qc.get("group_size") is not None:
+            group_size = int(qc.get("group_size"))
+        quant_type = _algo_to_quant_type(algo)
+        # NVFP4 uses a fixed FP8-block group size of 16. Minimal ModelOpt
+        # ``quantization_config`` blocks (``quant_algo`` only, no
+        # ``config_groups`` / ``group_size`` — e.g. Qwen3-Omni Next NVFP4)
+        # omit it, so default it here rather than leaving the per-tensor 1.
+        if quant_type == QUANT_NVFP4 and group_size == 1:
+            group_size = 16
         kv = qc.get("kv_cache_scheme")
         kv_str = "fp8" if kv else None
         return QuantConfig(
-            quant_type=_algo_to_quant_type(algo),
+            quant_type=quant_type,
             group_size=group_size,
             kv_cache_quant=kv_str,
             excluded=_effective_excluded_modules(model_dir,
@@ -1856,8 +2353,18 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
             algo_group_size[algo] = int(layer_cfg.get("group_size", 1))
     if not algo_count:
         return QUANT_FP16, 1, {}
+
+    def _mixed_quant_type(algo: str) -> str:
+        # ModelOpt tags weight-only NVFP4 as ``W4A16_NVFP4``; the generic mapper
+        # collapses it to plain (W4A4) ``nvfp4``. Preserve the A16 distinction so
+        # weight-only experts/lm_head route to the NVFP4-A16 Marlin path.
+        qt = _algo_to_quant_type(algo)
+        if qt == QUANT_NVFP4 and "W4A16" in algo.upper():
+            return QUANT_NVFP4_A16
+        return qt
+
     dominant_algo = algo_count.most_common(1)[0][0]
-    dominant_type = _algo_to_quant_type(dominant_algo)
+    dominant_type = _mixed_quant_type(dominant_algo)
     dominant_group_size = algo_group_size.get(dominant_algo, 1)
     # Expand fused projection keys (``self_attn.qkv_proj``,
     # ``mlp.gate_up_proj``) into the split names ``make_linear`` looks up
@@ -1866,7 +2373,7 @@ def _parse_mixed_precision(quantized_layers: dict) -> "tuple[str, int, dict]":
     for name, layer_cfg in quantized_layers.items():
         algo = layer_cfg.get("quant_algo", "").upper()
         short_name = _normalize_module_name(name)
-        quant_type = _algo_to_quant_type(algo)
+        quant_type = _mixed_quant_type(algo)
         if short_name.endswith(".self_attn.qkv_proj"):
             prefix = short_name[:-len("qkv_proj")]
             for proj in ("q_proj", "k_proj", "v_proj"):

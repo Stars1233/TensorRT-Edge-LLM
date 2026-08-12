@@ -94,32 +94,93 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
 //! \brief Fused non-streaming assistant preamble construction for TTS input projection
 //!
 //! Builds the complete non-streaming prefill buffer in one pass.
-//! Total rows written = 8 + textLen + 2 (= seqLen + 2).
+//! Total rows written = P + textLen + 2, where P = 8 without language conditioning or
+//! P = 9 when languageId >= 0 (CustomVoice language conditioning inserts one extra row).
 //!
-//! Row layout (written at outputOffset):
+//! Row layout without language (P = 8, byte-identical to the historical layout):
 //!   [0-2]:        projected[0-2]                            (role tokens)
 //!   [3]:          ttsPadEmbed + talkerEmbTable[codecNothinkId]
 //!   [4]:          ttsPadEmbed + talkerEmbTable[codecThinkBosId]
 //!   [5]:          ttsPadEmbed + talkerEmbTable[codecThinkEosId]
 //!   [6]:          ttsPadEmbed + talkerEmbTable[speakerId]
 //!   [7]:          ttsBosEmbed + talkerEmbTable[codecPadId]
-//!   [8..8+N-2]:   projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
-//!   [8+N-1]:      projected[3+N-1] + talkerEmbTable[codecBosId]  (last text = start-of-generation)
-//!   [8+N]:        ttsEosEmbed + talkerEmbTable[codecPadId]
-//!   [8+N+1]:      ttsPadEmbed + talkerEmbTable[codecBosId]
+//!
+//! Row layout with language (P = 9; think-token replaces the no-think token, language row inserted):
+//!   [0-2]:        projected[0-2]
+//!   [3]:          ttsPadEmbed + talkerEmbTable[codecThinkId]
+//!   [4]:          ttsPadEmbed + talkerEmbTable[codecThinkBosId]
+//!   [5]:          ttsPadEmbed + talkerEmbTable[languageId]
+//!   [6]:          ttsPadEmbed + talkerEmbTable[codecThinkEosId]
+//!   [7]:          ttsPadEmbed + talkerEmbTable[speakerId]
+//!   [8]:          ttsBosEmbed + talkerEmbTable[codecPadId]
+//!
+//! Shared text/suffix rows:
+//!   [P..P+N-2]:   projected[3+i] + talkerEmbTable[codecPadId]  (text tokens, N=textLen)
+//!   [P+N-1]:      projected[3+N-1] + talkerEmbTable[codecBosId]  (last text = start-of-generation)
+//!   [P+N]:        ttsEosEmbed + talkerEmbTable[codecPadId]
+//!   [P+N+1]:      ttsPadEmbed + talkerEmbTable[codecBosId]
 //!
 //! \param projected      MLP output [seqLen, H] (FP16)
 //! \param ttsPadEmbed/ttsBosEmbed/ttsEosEmbed  TTS special embeddings [H] (FP16)
 //! \param talkerEmbTable Talker embedding table [vocabSize, H] (FP16)
-//! \param codecNothinkId..codecBosId  Codec token IDs used in rows [3-8+N+1]
-//! \param speakerId      Speaker codec token ID (row 6)
-//! \param textLen        Number of text token rows (N = seqLen - 8)
-//! \param output         Full output buffer [8+N+2, H] (FP16)
+//! \param codecNothinkId..codecBosId  Codec token IDs used in the prefix/suffix rows
+//! \param speakerId      Speaker codec token ID
+//! \param codecThinkId   Codec think token ID (used instead of codecNothinkId when languageId >= 0;
+//!                       ignored otherwise, pass -1 if unavailable)
+//! \param languageId     Language codec token ID; -1 disables language conditioning (8-row prefix)
+//! \param textLen        Number of text token rows (N)
+//! \param output         Full output buffer [P+N+2, H] (FP16)
 //! \param stream         CUDA stream
 void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
-    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
-    rt::Tensor& output, cudaStream_t stream);
+    int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t codecThinkId,
+    int32_t languageId, int32_t textLen, rt::Tensor& output, cudaStream_t stream);
+
+//! \brief One prefill output row = srcA (+ srcB when non-null), both device pointers to [H] rows.
+//!
+//! The per-row math is identical to invokeAssistantPreamble (vectorized half2 add, same order),
+//! so rows described identically produce bit-identical output.
+struct PrefillRowDesc
+{
+    half const* srcA; //!< Required source row [hiddenDim]
+    half const* srcB; //!< Optional addend row [hiddenDim]; nullptr = copy srcA only
+};
+
+//! \brief Descriptor-driven prefill row assembly (generalization of invokeAssistantPreamble)
+//!
+//! Assembles arbitrary prefill layouts (instruction segments, no-speaker VoiceDesign prefixes,
+//! continuous speaker embeddings, ICL segments) from a host-built row descriptor list.
+//! One block per row; each row is srcA (+ srcB) with the same vectorized half2 add as
+//! invokeAssistantPreamble.
+//!
+//! \param deviceDescs Device array of numRows descriptors (uploaded by the caller)
+//! \param numRows     Number of output rows
+//! \param hiddenDim   Row width (must be a multiple of 8)
+//! \param output      Output buffer [numRows, hiddenDim] (FP16)
+//! \param stream      CUDA stream
+void invokePrefillRowAssemble(
+    PrefillRowDesc const* deviceDescs, int32_t numRows, int32_t hiddenDim, rt::Tensor& output, cudaStream_t stream);
+
+//! \brief Sum per-frame codec embeddings across all code groups (voice-clone ICL prompt)
+//!
+//! For each reference frame t: output[t] = sum_{g=0}^{numGroups-1} tables[g][codes[t][g]].
+//! Group 0 uses the Talker codec embedding table; groups 1..numGroups-1 the CodePredictor
+//! tables — the caller passes one device pointer per group. Accumulation in FP32.
+//!
+//! \param refCodes    Device codes [numFrames, numGroups] (INT32)
+//! \param tablePtrs   Device array of numGroups table pointers, each [vocab, hiddenDim] (FP16)
+//! \param numFrames   Reference frame count
+//! \param numGroups   Code group count (16 for the 12Hz tokenizer)
+//! \param hiddenDim   Embedding width
+//! \param output      Output [numFrames, hiddenDim] (FP16)
+//! \param stream      CUDA stream
+//! refCodes is INT64 so the codec-encoder engine output is consumed in place (no host
+//! round-trip or dtype conversion).
+void invokeSumCodecEmbeddings(int64_t const* refCodes, half const* const* tablePtrs, int32_t numFrames,
+    int32_t numGroups, int32_t hiddenDim, rt::Tensor& output, cudaStream_t stream);
+
+//! \brief Elementwise FP32 -> FP16 cast on device (small utility for engine-output adaptation)
+void invokeCastFp32ToFp16(float const* input, half* output, int64_t numElements, cudaStream_t stream);
 
 //! \brief Fused residual connection for TTS decode input
 //!
@@ -159,6 +220,12 @@ void invokeResidualConnection(rt::Tensor const& codecHiddens, rt::Tensor const& 
 //! \param[in] stream              CUDA stream for execution
 void invokeTalkerLogitAdjust(rt::Tensor const& seenTokens, rt::Tensor& logits, int32_t suppressStart,
     int32_t suppressEnd, int32_t codecEosId, int32_t numSeenTokens, float repetitionPenalty, cudaStream_t stream);
+
+//! Per-position sum across codec groups: out[d] = sum_g embPtrTable[g][codes[g]][d];
+//! codes[g] < 0 skips group g. embPtrTable is INT8-typed to carry `__half const*[numCodeGroups]`
+//! (rt::Tensor has no pointer-array dtype). numCodeGroups = codes.shape[0]; hiddenSize = output.volume().
+void invokeSpeakerCodecSum(rt::Tensor const& codes, rt::Tensor const& embPtrTable, rt::Tensor const& embVocabSizes,
+    rt::Tensor& output, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

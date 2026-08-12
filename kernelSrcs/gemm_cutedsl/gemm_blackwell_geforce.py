@@ -192,7 +192,7 @@ class GemmBlackwellGeforceFP16:
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         use_silu: cutlass.Constexpr = False,
         mBias: cute.Tensor = None,
@@ -993,8 +993,16 @@ def run(
         tile_shape_mnk=tile_shape_mnk,
     )
 
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(1)
+    # max_active_clusters is a RUNTIME kernel argument (persistent grid
+    # sizing): the deployed caller passes the target GPU's SM count at launch
+    # time, so the AOT artifact is correct on every SKU instead of baking the
+    # build GPU's occupancy. Export mode traces with a placeholder; run/verify
+    # mode probes the local GPU as before.
+    if export_only:
+        max_active_clusters = cutlass.Int32(1)
+    else:
+        hardware_info = cutlass.utils.HardwareInfo()
+        max_active_clusters = cutlass.Int32(hardware_info.get_max_active_clusters(1))
 
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
@@ -1023,7 +1031,7 @@ def run(
         return None
 
     # Run the kernel
-    compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
+    compiled_gemm(a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream)
     cp.cuda.Device().synchronize()
 
     if not skip_ref_check:
@@ -1054,14 +1062,14 @@ def run(
     # Benchmark
     if iterations > 0:
         for _ in range(warmup_iterations):
-            compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
+            compiled_gemm(a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream)
         cp.cuda.Device().synchronize()
 
         start_event = cp.cuda.Event()
         end_event = cp.cuda.Event()
         start_event.record()
         for _ in range(iterations):
-            compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
+            compiled_gemm(a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream)
         end_event.record()
         end_event.synchronize()
         elapsed_ms = cp.cuda.get_elapsed_time(start_event, end_event)

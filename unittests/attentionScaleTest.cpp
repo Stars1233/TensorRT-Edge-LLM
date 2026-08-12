@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "kernels/contextAttentionKernels/contextFMHARunner.h"
+#include "kernels/contextAttentionKernels/attentionScaleUtils.h"
 
 #include <gtest/gtest.h>
 

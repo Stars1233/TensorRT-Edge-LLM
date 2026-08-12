@@ -151,7 +151,7 @@ def export_decode_moe_variant(args):
             K: cutlass.Int32,
             N: cutlass.Int32,
             num_topk: cutlass.Int32,
-            max_active_clusters: cutlass.Constexpr,
+            max_active_clusters: cutlass.Int32,
             stream: cuda.CUstream,
         ):
             half_k = K // cutlass.Int32(2)
@@ -289,12 +289,12 @@ def export_decode_moe_variant(args):
 
     launch = _DecodeMoELaunch(kernel, is_gated=is_gated)
 
-    sm_count = get_num_sm()
-    # The AOT wrapper launches with cluster_size=1, where max active clusters
-    # equals SM count. Avoid HardwareInfo here because SM121 builds can target
-    # sm_120a for the fused kernel compile, which makes HardwareInfo's dummy
-    # occupancy kernel invalid on GB10.
-    mac = sm_count
+    # max_active_clusters is a RUNTIME wrapper argument (cluster_size=1, so it
+    # equals the SM count of the GPU the kernel launches on). The deployed
+    # caller passes cudaDevAttrMultiProcessorCount at launch time; the trace
+    # value below is a placeholder. This removes the build-GPU dependency the
+    # old constexpr bake had (and the HardwareInfo/GB10 sm_120a pitfall).
+    max_active_clusters = cutlass.Int32(get_num_sm())
 
     ab_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
@@ -378,8 +378,8 @@ def export_decode_moe_variant(args):
         _DUMMY_K,
         _DUMMY_N,
         _DUMMY_NUM_TOPK,
-        # Constexpr
-        mac,
+        # Runtime persistent-grid size
+        max_active_clusters,
         stream,
         options=cute_compile_options(),
     )

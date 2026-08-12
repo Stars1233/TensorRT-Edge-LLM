@@ -244,10 +244,21 @@ void launchAcceptedTreeScatter(MtpLayerInfo const* deviceLayerInfos, int32_t num
 } // anonymous namespace
 
 void mtpScatterRecurrentStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,
-    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptLengths, cudaStream_t stream)
+    int32_t verifyTreeSize, int32_t stateElements, int32_t const* acceptLengths, cudaStream_t stream,
+    bool recurrentStateIsHalf)
 {
-    launchScatter<float, StateKind::Recurrent>(
-        deviceLayerInfos, numLayers, activeBatchSize, verifyTreeSize, stateElements, acceptLengths, stream);
+    // GDN recurrent states are FP32; Mamba2 (Nemotron-H) recurrent states are FP16. Dispatch on the
+    // element type so byte offsets and vector widths match the actual buffer.
+    if (recurrentStateIsHalf)
+    {
+        launchScatter<half, StateKind::Recurrent>(
+            deviceLayerInfos, numLayers, activeBatchSize, verifyTreeSize, stateElements, acceptLengths, stream);
+    }
+    else
+    {
+        launchScatter<float, StateKind::Recurrent>(
+            deviceLayerInfos, numLayers, activeBatchSize, verifyTreeSize, stateElements, acceptLengths, stream);
+    }
 }
 
 void mtpScatterConvStates(MtpLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t activeBatchSize,

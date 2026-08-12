@@ -22,38 +22,41 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.12.0",
-    "transformers==5.9.0",
+    "torch==2.13.0",
+    "transformers==5.14.1",
     "onnx==1.19.0",
-    "onnxscript==0.7.0",
-    "safetensors==0.7.0",
-    "numpy==2.4.6",
+    "onnxscript==0.7.1",
+    "safetensors==0.8.0",
+    "numpy==2.2.6",
     "onnx-graphsurgeon==0.6.1",
 ]
 
 [project.optional-dependencies]
 tools = [
-    "nvidia-modelopt==0.44.0",
-    "datasets==4.8.5",
-    "tqdm==4.67.3",
+    "nvidia-modelopt==0.45.0",
+    "datasets==5.0.0",
+    "tqdm==4.69.0",
     "einops==0.8.2",
     "peft==0.19.1",
-    "soundfile==0.13.1",
+    "soundfile==0.14.0",
     "librosa==0.11.0",
     "tiktoken==0.13.0",
-    "torchvision==0.27.0",
+    "torchvision==0.28.0",
     "backoff",
 ]
 server = [
-    "fastapi==0.136.1",
-    "pybind11==2.13.6",
-    "uvicorn==0.47.0",
+    "fastapi==0.139.2",
+    "pybind11==3.0.4",
+    "uvicorn==0.51.0",
+    "av==17.1.0",
+    "python-multipart==0.0.32",
 ]
 dev = []
 
 [project.scripts]
 tensorrt-edgellm-quantize = "tensorrt_edgellm.scripts.quantize:main"
 tensorrt-edgellm-export = "tensorrt_edgellm.scripts.export:main"
+tensorrt-edgellm-build = "experimental.builder.cli:main"
 tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"
 tensorrt-edgellm-merge-lora = "tensorrt_edgellm.scripts.merge_lora:main"

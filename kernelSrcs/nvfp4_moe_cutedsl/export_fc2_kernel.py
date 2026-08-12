@@ -115,7 +115,7 @@ def export_fc2(args: argparse.Namespace) -> tuple[str, str]:
         top_k: cutlass.Int64,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
         return kernel.wrapper(

@@ -35,13 +35,18 @@ namespace decoder_utils
 {
 
 //! @brief Load the draft engine from disk and return an EngineExecutor.
-std::unique_ptr<EngineExecutor> loadDraftEngine(std::filesystem::path const& engineDir, DeploymentConfig& deployment);
+std::unique_ptr<EngineExecutor> loadDraftEngine(
+    std::filesystem::path const& engineDir, DeploymentConfig const& deployment);
 
 //! @brief Copy accepted tokens from device buffers into the host-side context token lists.
 //! On return, hostAcceptLengths holds the number of tokens actually appended per slot.
 void appendAcceptedTokens(DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& hostAcceptedTokenIds,
     Tensor const& deviceAcceptLength, Tensor const& deviceAcceptedTokenIds, int32_t maxAcceptDepth,
     tokenizer::Tokenizer const& tokenizer, cudaStream_t stream);
+
+//! @brief Clamp device accept lengths so multi-token speculative commits never exceed max_generate_length.
+void clampAcceptLengthsToRemainingGeneration(
+    DecodingInferenceContext& context, Tensor& hostAcceptLengths, Tensor& deviceAcceptLength, cudaStream_t stream);
 
 // Logprobs collection is split into a device-side enqueue and a host-side collect so that
 // decoding keeps a single host<->device synchronization point per round: decoders call
@@ -65,9 +70,10 @@ void enqueueLogprobsD2H(
 void collectLogprobsFromHost(
     DecodingRuntimeContext& runtime, DecodingInferenceContext& context, int32_t activeBatchSize, int32_t topK);
 
-//! @brief Collect staged logprobs into context.stepLogprobs (spec decode: acceptLen rows per slot).
+//! @brief Collect staged logprobs into context.stepLogprobs (multi-row decode: acceptLen rows per slot).
 //! Call after the round synchronization (appendAcceptedTokens) that made hostAcceptLens valid.
-//! @param rowsPerBatch Max rows per batch item: maxAcceptDepth for EAGLE/MTP, blockSize for DFlash.
+//! @param rowsPerBatch Max rows per batch item: maxAcceptDepth for EAGLE/MTP, blockSize for DFlash, or
+//!                    canvasLen for DiffusionGemma.
 void collectSpecLogprobsFromHost(DecodingRuntimeContext& runtime, DecodingInferenceContext& context,
     int32_t activeBatchSize, int32_t rowsPerBatch, int32_t const* hostAcceptLens, int32_t topK);
 

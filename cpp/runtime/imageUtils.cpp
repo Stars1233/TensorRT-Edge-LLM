@@ -17,6 +17,7 @@
 
 #include "runtime/imageUtils.h"
 #include "common/checkMacros.h"
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -50,6 +51,17 @@ ImageData::ImageData(rt::Tensor&& data)
 unsigned char* ImageData::data() const noexcept
 {
     return buffer ? buffer->dataPointer<unsigned char>() : nullptr;
+}
+
+ImageData ImageData::resizedMeta(int64_t newHeight, int64_t newWidth) const
+{
+    ImageData meta{};
+    meta.height = newHeight;
+    meta.width = newWidth;
+    meta.channels = channels;
+    meta.frames = frames;
+    meta.fps = fps;
+    return meta;
 }
 
 ImageData loadImageFromFile(std::string const& path)
@@ -107,7 +119,8 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
 ImageData loadVideoFromFrames(std::vector<std::string> const& framePaths, double const fps)
 {
     ELLM_CHECK(!framePaths.empty(), "loadVideoFromFrames: framePaths is empty");
-    ELLM_CHECK(fps > 0.0, "loadVideoFromFrames: fps must be positive, got " + std::to_string(fps));
+    ELLM_CHECK(std::isfinite(fps) && fps > 0.0,
+        "loadVideoFromFrames: fps must be a positive finite number, got " + std::to_string(fps));
 
     // Load the first frame to determine the common (H, W, C).
     ImageData firstFrame = loadImageFromFile(framePaths[0]);
@@ -142,12 +155,19 @@ ImageData loadVideoFromFrames(std::vector<std::string> const& framePaths, double
 
     ImageData video(std::move(stacked));
     video.fps = fps;
+    video.isVideo = true;
     return video;
 }
 
-void resizeImage(
+ImageData const& resizeImage(
     ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight, InterpolationMode mode)
 {
+    // Already at the target size — skip the resample and the scratch-buffer copy.
+    if (image.width == newWidth && image.height == newHeight)
+    {
+        return image;
+    }
+
     // Reshape pre-allocated buffer to target [T, H, W, C] (always 4D).
     bool const success = resizedImage.buffer->reshape({image.frames, newHeight, newWidth, image.channels});
     ELLM_CHECK(success, "Failed to reshape resized image buffer");
@@ -177,6 +197,7 @@ void resizeImage(
                 kOUTPUT_STRIDE_BYTES, STBIR_RGB);
         }
     }
+    return resizedImage;
 }
 
 } // namespace imageUtils

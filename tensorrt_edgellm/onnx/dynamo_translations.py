@@ -24,10 +24,10 @@ A single ``_attention_plugin_translation`` covers all feature combinations
 (vanilla, FP8-KV, tree attention, FP8-KV + tree attention).  Its signature
 matches the full ``trt::attention_plugin`` custom-op schema so positional
 alignment with the FX graph (where ``torch.export`` normalizes every kwarg
-into a positional arg) is always correct.  ``attention_mask`` /
-``attention_pos_id`` are optional ONNX inputs (empty when tree attention is
-off); ``qkv_scales`` defaults to ``[1.0, 1.0, 1.0]`` in the op schema so it
-is always a valid FLOATS attribute.
+into a positional arg) is always correct.  ``context_mask_selector``,
+``attention_mask`` and ``attention_pos_id`` are
+optional ONNX inputs; ``qkv_scales`` defaults to ``[1.0, 1.0, 1.0]`` in the op
+schema so it is always a valid FLOATS attribute.
 """
 
 from typing import Sequence
@@ -49,13 +49,12 @@ _trt_edgellm = onnxscript.values.Opset("trt_edgellm", 1)
 
 @script()
 def _attention_plugin_translation(
-    query_states: onnxscript.FLOAT16,
-    key_states: onnxscript.FLOAT16,
-    value_states: onnxscript.FLOAT16,
+    qkv: onnxscript.FLOAT16,
     past_key_value: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
     rope_rotary_cos_sin: onnxscript.FLOAT,
     kvcache_start_index: onnxscript.INT32,
+    kv_page_table: onnxscript.INT32,
     num_q_heads: int,
     num_kv_heads: int,
     head_size: int,
@@ -63,38 +62,67 @@ def _attention_plugin_translation(
     enable_tree_attention: int,
     enable_fp8_kv_cache: int,
     attention_scale: float,
+    enable_context_mask_selector: int,
     enable_vision_block_attention: int,
+    skip_softmax_scale_factor: float,
+    context_mask_selector: onnxscript.INT32,
     attention_mask: onnxscript.INT32,
     attention_pos_id: onnxscript.INT32,
     qkv_scales: Sequence[float],
+    # Defaults REQUIRED: torch.export strips default-matching kwargs, so callers
+    # without these features produce FX nodes lacking the attributes.
+    q_norm_gamma: Sequence[float] = (),
+    k_norm_gamma: Sequence[float] = (),
+    rms_norm_eps: float = 1e-6,
+    enable_qk_norm: int = 0,
+    enable_kv_shared: int = 0,
+    skip_softmax_scale: onnxscript.INT8 = None,
 ) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16]:
     """Unified attention plugin covering vanilla, FP8-KV, tree, and tree+FP8-KV.
 
-    The signature matches the full ``trt::attention_plugin`` custom-op schema
-    so torch.export's positional-arg normalisation is always aligned.
-    ``attention_mask`` / ``attention_pos_id`` are optional ONNX inputs (empty
-    when tree attention is off).  ``qkv_scales`` defaults to [1, 1, 1] in the
-    op schema and is always a valid FLOATS attribute.
+    Feeds the packed ``qkv`` tensor ``[B, S, (H_q + 2*H_kv) * D]`` to the V3
+    ``AttentionPlugin``. The translation always wires the complete optional
+    input layout in a stable order: q/k norm gammas, context-mask selector, and
+    tree/vision attention mask inputs. The export post-pass compacts disabled
+    optional groups so the ONNX node matches the C++ plugin contract.
     """
+    # Gammas enter the plugin as FP16 constant INPUTS (engine weights baked at
+    # build time); zero-length constants signal "qk_norm disabled".
+    q_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=q_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
+    k_norm_gamma_fp16 = _op21.Cast(
+        _op21.Constant(value_floats=k_norm_gamma),
+        to=int(onnx.TensorProto.FLOAT16),
+    )
     attn_4d, present_kv = _trt_edgellm.AttentionPlugin(
-        query_states,
-        key_states,
-        value_states,
+        qkv,
         past_key_value,
         context_lengths,
         rope_rotary_cos_sin,
         kvcache_start_index,
+        kv_page_table,
+        q_norm_gamma_fp16,
+        k_norm_gamma_fp16,
+        context_mask_selector,
         attention_mask,
         attention_pos_id,
+        skip_softmax_scale,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         enable_tree_attention=enable_tree_attention,
         enable_fp8_kv_cache=enable_fp8_kv_cache,
+        enable_context_mask_selector=enable_context_mask_selector,
         enable_vision_block_attention=enable_vision_block_attention,
         sliding_window_size=sliding_window_size,
         qkv_scales=qkv_scales,
         attention_scale=attention_scale,
+        skip_softmax_scale_factor=skip_softmax_scale_factor,
+        rms_norm_eps=rms_norm_eps,
+        enable_qk_norm=enable_qk_norm,
+        enable_kv_shared=enable_kv_shared,
         _outputs=2,
     )
     return attn_4d, present_kv
@@ -268,9 +296,48 @@ def _int4_groupwise_gemm_translation(
     )
 
 
+@script()
+def _int4_groupwise_gemm_v2_translation(
+    hidden_states: onnxscript.FLOAT16,
+    qweight: onnxscript.INT8,
+    scales: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+    group_size: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Int4GroupwiseGemmPluginV2(
+        hidden_states,
+        qweight,
+        scales,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        group_size=group_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # INT8 SmoothQuant ops
 # ---------------------------------------------------------------------------
+
+
+@script()
+def _nvfp4_a16_gemm_translation(
+    activation: onnxscript.FLOAT16,
+    qweights: onnxscript.INT8,
+    block_scales: onnxscript.INT8,
+    global_scale: onnxscript.FLOAT16,
+    gemm_n: int,
+    gemm_k: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Nvfp4A16GemmPlugin(
+        activation,
+        qweights,
+        block_scales,
+        global_scale,
+        gemm_n=gemm_n,
+        gemm_k=gemm_k,
+        max_m=0,
+    )
 
 
 @script()
@@ -616,6 +683,7 @@ def _update_ssm_state_translation(
     dt_bias: onnxscript.FLOAT16,
     state: onnxscript.FLOAT16,
     context_lengths: onnxscript.INT32,
+    state_start_index: onnxscript.INT32,
     dt_softplus: int,
     ngroups: int,
     chunk_size: int = 0,
@@ -630,12 +698,54 @@ def _update_ssm_state_translation(
         dt_bias,
         state,
         context_lengths,
+        state_start_index,
         dt_softplus=dt_softplus,
         ngroups=ngroups,
         chunk_size=chunk_size,
         _outputs=2,
     )
     return output, state_out
+
+
+@script()
+def _update_ssm_state_with_intermediate_translation(
+    hidden_states: onnxscript.FLOAT16,
+    ssm_a: onnxscript.FLOAT,
+    ssm_b: onnxscript.FLOAT16,
+    ssm_c: onnxscript.FLOAT16,
+    ssm_d: onnxscript.FLOAT16,
+    dt: onnxscript.FLOAT16,
+    dt_bias: onnxscript.FLOAT16,
+    state: onnxscript.FLOAT16,
+    context_lengths: onnxscript.INT32,
+    state_start_index: onnxscript.INT32,
+    spec_verify_phase_marker: onnxscript.INT32,
+    dt_softplus: int,
+    ngroups: int,
+    chunk_size: int = 0,
+) -> tuple[onnxscript.FLOAT16, onnxscript.FLOAT16, onnxscript.FLOAT,
+           onnxscript.FLOAT, onnxscript.FLOAT]:
+    # Spec-verify replay stash (dA / u / B) is FP32; the token output and state
+    # output follow the FP16 x/state types.
+    output, state_out, replay_da, replay_u, replay_b = _trt_edgellm.update_ssm_state(
+        hidden_states,
+        ssm_a,
+        ssm_b,
+        ssm_c,
+        ssm_d,
+        dt,
+        dt_bias,
+        state,
+        context_lengths,
+        state_start_index,
+        spec_verify_phase_marker,
+        dt_softplus=dt_softplus,
+        ngroups=ngroups,
+        chunk_size=chunk_size,
+        use_spec_verify_state=1,
+        _outputs=5,
+    )
+    return output, state_out, replay_da, replay_u, replay_b
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +944,53 @@ def _int4_moe_plugin_translation(
 
 
 @script()
+def _nvfp4_a16_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_qweights: onnxscript.INT8,
+    fc1_block_scales: onnxscript.INT8,
+    fc1_global_scales: onnxscript.FLOAT16,
+    fc2_qweights: onnxscript.INT8,
+    fc2_block_scales: onnxscript.INT8,
+    fc2_global_scales: onnxscript.FLOAT16,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    routing_mode: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    return _trt_edgellm.Nvfp4A16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_qweights,
+        fc1_block_scales,
+        fc1_global_scales,
+        fc2_qweights,
+        fc2_block_scales,
+        fc2_global_scales,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=routing_mode,
+        max_routed_rows=max_routed_rows,
+    )
+
+
+@script()
 def _nvfp4_moe_plugin_translation(
     router_logits: onnxscript.FLOAT,
     hidden_states: onnxscript.FLOAT16,
@@ -946,6 +1103,75 @@ def _nvfp4_moe_plugin_geforce_translation(
         backend=backend,
         io_dtype=io_dtype,
         max_routed_rows=max_routed_rows,
+    )
+    return output
+
+
+@script()
+def _fp16_moe_plugin_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_weights: onnxscript.FLOAT16,
+    fc2_weights: onnxscript.FLOAT16,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    norm_topk_prob: int,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.Fp16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_weights,
+        fc2_weights,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+        max_routed_rows=max_routed_rows,
+    )
+    return output
+
+
+@script()
+def _fp16_moe_plugin_sigmoid_translation(
+    router_logits: onnxscript.FLOAT,
+    hidden_states: onnxscript.FLOAT16,
+    fc1_weights: onnxscript.FLOAT16,
+    fc2_weights: onnxscript.FLOAT16,
+    e_score_correction_bias: onnxscript.FLOAT,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    moe_inter_size: int,
+    activation_type: int,
+    n_group: int,
+    topk_group: int,
+    norm_topk_prob: int,
+    routed_scaling_factor: float,
+    max_routed_rows: int,
+) -> onnxscript.FLOAT16:
+    output = _trt_edgellm.Fp16MoePlugin(
+        router_logits,
+        hidden_states,
+        fc1_weights,
+        fc2_weights,
+        e_score_correction_bias,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        moe_inter_size=moe_inter_size,
+        activation_type=activation_type,
+        norm_topk_prob=norm_topk_prob,
+        max_routed_rows=max_routed_rows,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_mode=1,
     )
     return output
 
@@ -1077,6 +1303,10 @@ def build_custom_translation_table() -> dict:
         _mxfp8_weight_dq_translation,
         torch.ops.trt.int4_groupwise_gemm.default:
         _int4_groupwise_gemm_translation,
+        torch.ops.trt.int4_groupwise_gemm_v2.default:
+        _int4_groupwise_gemm_v2_translation,
+        torch.ops.trt.nvfp4_a16_gemm.default:
+        _nvfp4_a16_gemm_translation,
         torch.ops.trt.int8_sq_act_qdq.default:
         _int8_sq_act_qdq_translation,
         torch.ops.trt.int8_sq_weight_dq.default:
@@ -1087,6 +1317,8 @@ def build_custom_translation_table() -> dict:
         _causal_conv1d_intermediate_dispatch,
         torch.ops.trt_edgellm.update_ssm_state.default:
         _update_ssm_state_translation,
+        torch.ops.trt_edgellm.update_ssm_state_with_intermediate.default:
+        _update_ssm_state_with_intermediate_translation,
         torch.ops.trt_edgellm.gated_delta_net.default:
         _gated_delta_net_dispatch,
         torch.ops.trt_edgellm.gated_delta_net_with_intermediate.default:
@@ -1101,8 +1333,14 @@ def build_custom_translation_table() -> dict:
         _int4_moe_plugin_translation,
         torch.ops.trt_edgellm.Nvfp4MoePlugin.default:
         _nvfp4_moe_plugin_translation,
+        torch.ops.trt_edgellm.Nvfp4A16MoePlugin.default:
+        _nvfp4_a16_moe_plugin_translation,
         torch.ops.trt_edgellm.NvFP4MoEPluginGeforce.default:
         _nvfp4_moe_plugin_geforce_translation,
+        torch.ops.trt_edgellm.Fp16MoePlugin.default:
+        _fp16_moe_plugin_translation,
+        torch.ops.trt_edgellm.Fp16MoePluginSigmoid.default:
+        _fp16_moe_plugin_sigmoid_translation,
         torch.ops.trt_edgellm.dflash_target_kv_cache_update.default:
         _dflash_target_kv_cache_update_translation,
         # TRT native attention ops (used by Alpamayo)

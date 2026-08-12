@@ -47,17 +47,15 @@ public:
 
     //! Embed token IDs into dense vectors, optionally inserting multimodal embeddings.
     //!
-    //! Dispatches to one of three kernel paths depending on the inputs:
-    //!   1. Explicit-id multimodal path (`kernel::embeddingLookupMultimodal`)
-    //!      when audio is present, or when vision is present on an
-    //!      audio-capable model family (Nemotron-Omni / Qwen3-Omni keep
-    //!      `<image>` in-stream; `mConfig.audioTokenId >= 0` identifies these).
-    //!   2. Legacy vision path (`kernel::embeddingLookupWithImageInsertion`)
-    //!      for vision-only families that remap image tokens as
-    //!      `vocabSize + k` (Qwen2.5-VL, InternVL; `audioTokenId == -1`).
-    //!   3. Text-only path (`kernel::embeddingLookup`) for pure-text requests.
+    //! All requests go through the single `kernel::embeddingLookup`. For a vision and/or audio
+    //! request the image/audio embeddings are inserted at the imageTokenId / audioTokenId
+    //! positions; for a pure-text request the same kernel performs a plain table lookup.
     //!
-    //! @param tokenIds    GPU tensor of token IDs [batchSize, seqLen].
+    //! The multimodal indices are generated on-device directly from the GPU token IDs (no host
+    //! round-trip: zero D2H/H2D), cached in `mMultimodalIndices`, and reused by a subsequent
+    //! `prepareDeepstack`/`assembleDeepstack` for the same tokens.
+    //!
+    //! @param tokenIds     GPU tensor of token IDs [batchSize, seqLen].
     //! @param visionEmbeds Optional vision (image) embeddings.
     //! @param audioEmbeds  Optional audio embeddings.
     //! @param io           Pipeline I/O – `inputsEmbeds` is written.
@@ -98,7 +96,9 @@ private:
     EmbeddingData const& mEmbedding;
     LLMEngineConfig mConfig;
 
-    //! Scratch tensor for multimodal indices (reused across calls).
+    //! Multimodal indices for the prefill embedding lookup, computed once per prefill in `embed()`
+    //! from the host token IDs and reused by `assembleDeepstack()` for the same tokens (deepstack
+    //! always follows `embed()` in the base prefill). Persisted for async kernel lifetime.
     Tensor mMultimodalIndices;
 };
 

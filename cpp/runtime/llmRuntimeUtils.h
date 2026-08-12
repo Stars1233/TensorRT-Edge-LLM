@@ -21,12 +21,15 @@
 #include "common/tensor.h"
 #include "runtime/audioUtils.h"
 #include "runtime/imageUtils.h"
+#include "runtime/state/contextCache/contextCacheConfig.h"
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#ifndef __CUDACC__
 #include <nlohmann/json.hpp>
+#endif // !__CUDACC__
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -54,7 +57,7 @@ struct Message
 };
 
 // Streaming types (StreamChannel, StreamChunk, SlotStreamState, FinishReason,
-// StreamChannelFinalizer, and the four streaming free functions) live in
+// StreamChannelFinalizer, and streaming free functions) live in
 // `runtime/streaming.h`. LLMGenerationRequest::streamChannels holds a vector
 // of shared_ptr<StreamChannel>, which only needs a forward declaration here —
 // consumers that actually manipulate channels include `runtime/streaming.h`.
@@ -124,12 +127,13 @@ struct LLMGenerationRequest
     //! \endcond
     std::vector<Request> requests; //!< Vector of requests for a batch
     mutable std::vector<FormattedRequest>
-        formattedRequests;           //!< Formatted requests (mutable to allow runtime modification)
-    float temperature;               //!< Temperature parameter for sampling
-    float topP;                      //!< Top-p (nucleus) sampling parameter
-    int64_t topK;                    //!< Top-k sampling parameter
-    int64_t maxGenerateLength;       //!< Max length of the generated tokens
-    std::string loraWeightsName{""}; //!< Name of the LoRA weights. Default to empty string for no LoRA weights
+        formattedRequests;                 //!< Formatted requests (mutable to allow runtime modification)
+    float temperature;                     //!< Temperature parameter for sampling
+    float topP;                            //!< Top-p (nucleus) sampling parameter
+    int64_t topK;                          //!< Top-k sampling parameter
+    int64_t maxGenerateLength;             //!< Max length of the generated tokens
+    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
+    std::string loraWeightsName{""};       //!< Name of the LoRA weights. Default to empty string for no LoRA weights
 
     // Whether to save system prompt KV cache of this request to be used by later requests
     bool saveSystemPromptKVCache{false};
@@ -140,7 +144,7 @@ struct LLMGenerationRequest
     bool addGenerationPrompt{true};
     // Whether to enable thinking mode for models that support it. Default is disabled.
     bool enableThinking{false};
-    // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
+    // Disable speculative decoding for this request when the loaded engine contract supports vanilla fallback.
     bool disableSpecDecode{false};
 
     //! Number of top log-probabilities to return per generated token (0 = disabled, max = kMaxLogprobsK).
@@ -164,6 +168,12 @@ struct LLMGenerationRequest
     //! Called after cudaStreamSynchronize inside the decode loop.
     //! When nullopt (default), zero overhead — no callback is invoked.
     std::optional<TokenCallback> onTokenGenerated;
+
+    //! Per-request context-cache lookup behavior. This is effective only when the runtime cache is enabled.
+    ContextCacheLookupPolicy contextCacheLookupPolicy{ContextCacheLookupPolicy::kUseCache};
+
+    //! Ready endpoints to retain when the context cache is enabled.
+    ContextCacheCommitPolicy contextCacheCommitPolicy{ContextCacheCommitPolicy::kIncludingGeneratedTokens};
 };
 
 /*! \brief LLM Generation Response structure
@@ -182,6 +192,9 @@ struct LLMGenerationResponse
 
     //! Why each request halted (EOS, length, stop string, cancel, error); see `runtime/streaming.h`.
     std::vector<FinishReason> finishReasons;
+
+    //! Prompt length per request, counted after chat templating and media expansion.
+    std::vector<int32_t> inputTokenCounts;
 };
 
 /*! \brief RoPE (Rotary Position Embedding) type enumeration
@@ -194,6 +207,7 @@ enum class RopeType
     kLongRope,     //!< Long RoPE type used by Phi-4
     kMRope,        //!< MRope type used by Qwen2-VL
     kNoRope,       //!< No positional encoding (e.g., Nemotron-Nano)
+    kYarn,         //!< YaRN NTK-by-parts scaling
 };
 
 /*! \brief Long-Rope specific parameters */
@@ -202,6 +216,16 @@ struct LongRopeParams
     int32_t originalMaxPositionEmbeddings{-1}; //!< Original maximum position embeddings from training
     std::vector<float> longFactor;             //!< Long factor array for each rotary dimension
     std::vector<float> shortFactor;            //!< Short factor array for each rotary dimension
+};
+
+/*! \brief YaRN specific parameters (NTK-by-parts interpolation) */
+struct YarnParams
+{
+    int32_t originalMaxPositionEmbeddings{-1}; //!< Pre-YaRN training length; the interpolation reference
+    float factor{1.0F};                        //!< Context-extension factor (rope_scaling.factor)
+    float betaFast{32.0F};                     //!< High-frequency correction boundary (rotations)
+    float betaSlow{1.0F};                      //!< Low-frequency correction boundary (rotations)
+    float mscale{1.0F};                        //!< Attention magnitude scale applied to cos/sin
 };
 
 /*! \brief RoPE configuration structure with optional Long-Rope parameters
@@ -216,8 +240,10 @@ struct RopeConfig
     float partialRotaryFactor{1.0F};          //!< Fraction of head angles rotated by proportional RoPE
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters
+    std::optional<YarnParams> yarn{};         //!< YaRN specific parameters
 };
 
+#ifndef __CUDACC__
 /*! \brief Collect rope configuration from the model config
  *
  *  Parses the common RoPE fields as well as LongRoPE-specific parameters when the
@@ -229,6 +255,7 @@ struct RopeConfig
  *  \throws nlohmann::json::type_error if JSON value types don't match expected types
  */
 RopeConfig collectRopeConfig(nlohmann::json const& config);
+#endif // !__CUDACC__
 
 /*! \brief Initialize the rope cos/sin cache tensor for persistent type of RoPE (default, longrope)
  *
@@ -352,7 +379,7 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
     int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength);
 
 /*!
- * @brief Generate multimodal indices for embeddingLookupMultimodal kernel
+ * @brief Generate multimodal indices for embeddingLookup kernel
  *
  * Scans input IDs and generates sequential indices for audio/image embeddings.
  * Audio and image indices are tracked independently, both globally across batches.
@@ -360,11 +387,10 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
  * @param inputIds Input token IDs on CPU [batchSize, seqLen]
  * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
  * @param imageTokenId Special token ID for image, or std::nullopt if no image
- * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
  * @return multimodalIndices tensor on CPU [batchSize, seqLen]
  */
-rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize);
+rt::Tensor generateMultimodalIndices(
+    rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId);
 
 /*! \brief Build Gemma4 block IDs from host token IDs.
  *

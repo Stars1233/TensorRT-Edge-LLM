@@ -38,7 +38,8 @@ bool needsBaseVerifyIntermediateStates(DeploymentConfig const& bundle)
     switch (bundle.base.specDecodeType)
     {
     case SpecDecodeMode::kMTP:
-    case SpecDecodeMode::kDFlash: return true;
+    case SpecDecodeMode::kDFlash:
+    case SpecDecodeMode::kDSpark: return true;
     case SpecDecodeMode::kGemma4MTP:
     case SpecDecodeMode::kEAGLE:
     case SpecDecodeMode::kNONE: return false;
@@ -74,6 +75,16 @@ void allocateZeroBuffer(SharedResources& res, int64_t bytes)
     CUDA_CHECK(cudaMemset(res.zeroBuffer.rawPointer(), 0, res.zeroBuffer.getMemoryCapacity()));
 }
 
+//! Build the initially identity-mapped page table sized from `kv`.
+std::unique_ptr<KVPageTable> makeIdentityPageTable(KVCacheManager const& kv, cudaStream_t stream)
+{
+    auto table
+        = std::make_unique<KVPageTable>(kv.getConfig().maxBatchSize, pagesPerSlot(kv.maxCapPadded()), kv.numPages());
+    table->setIdentity();
+    table->upload(stream);
+    return table;
+}
+
 std::unique_ptr<SharedResources> SharedResources::createForLLM(
     LLMEngineConfig const& cfg, std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
 {
@@ -88,6 +99,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxSequenceLength=*/cfg.maxKVCacheCapacity,
         /*.layerConfigs=*/cfg.kvLayerConfigs,
         /*.kvCacheType=*/cfg.kvCacheDtype,
+        /*.numPages=*/cfg.kvPoolPages,
     };
     rt::MambaCacheManager::Config mambaCfg{
         /*.numRecurrentLayers=*/cfg.numLinearAttnLayers,
@@ -100,6 +112,8 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxIntermediateSeqLen=*/0,
         /*.recurrentStateType=*/cfg.recurrentStateDtype,
         /*.convStateType=*/cfg.convStateDtype,
+        /*.recurrentStateNumGroups=*/cfg.recurrentStateNumGroups,
+        /*.specVerifyUsesReplay=*/cfg.recurrentSpecVerifyUsesReplay,
     };
     rt::HybridCacheManager::Config hybridCfg{
         /*.layerTypes=*/cfg.layerTypes,
@@ -108,6 +122,8 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         /*.maxBatchSize=*/cfg.maxSupportedBatchSize,
     };
     resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
+    resources->kvPageTables.push_back(
+        makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
 
     // RoPE cache
     // For MRope, the cache is stored in PipelineIO (initialized below).
@@ -156,7 +172,7 @@ std::unique_ptr<SharedResources> SharedResources::createForLLM(
         int64_t const maxBatch = cfg.maxSupportedBatchSize;
         int64_t const deepstackSeqLen = cfg.isSpecDecodeBase ? std::max(cfg.maxVerifyTreeSize, 1) : 1;
         int64_t deepstackSize = 0;
-        if (cfg.numDeepstackFeatures > 0)
+        if (!cfg.isDiffusionBackbone && cfg.numDeepstackFeatures > 0)
         {
             deepstackSize = maxBatch * deepstackSeqLen * cfg.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
         }
@@ -191,6 +207,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.base.maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.base.kvLayerConfigs,
             /*.kvCacheType=*/bundle.base.kvCacheDtype,
+            /*.numPages=*/bundle.base.kvPoolPages,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/bundle.base.numLinearAttnLayers,
@@ -203,6 +220,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxIntermediateSeqLen=*/baseMaxIntermediateSeqLen,
             /*.recurrentStateType=*/bundle.base.recurrentStateDtype,
             /*.convStateType=*/bundle.base.convStateDtype,
+            /*.recurrentStateNumGroups=*/bundle.base.recurrentStateNumGroups,
+            /*.specVerifyUsesReplay=*/bundle.base.recurrentSpecVerifyUsesReplay,
         };
         rt::HybridCacheManager::Config hybridCfg{
             /*.layerTypes=*/bundle.base.layerTypes,
@@ -211,6 +230,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxBatchSize=*/bundle.base.maxSupportedBatchSize,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
+        resources->kvPageTables.push_back(
+            makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
     }
 
     // Draft hybrid cache manager (index 1). Gemma4 MTP assistant reads the
@@ -228,6 +249,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxSequenceLength=*/bundle.draft->maxKVCacheCapacity,
             /*.layerConfigs=*/bundle.draft->kvLayerConfigs,
             /*.kvCacheType=*/bundle.draft->kvCacheDtype,
+            /*.numPages=*/bundle.draft->kvPoolPages,
         };
         rt::MambaCacheManager::Config mambaCfg{
             /*.numRecurrentLayers=*/0,
@@ -248,6 +270,8 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
             /*.maxBatchSize=*/bundle.draft->maxSupportedBatchSize,
         };
         resources->cacheManagers.push_back(std::make_unique<HybridCacheManager>(hybridCfg, stream));
+        resources->kvPageTables.push_back(
+            makeIdentityPageTable(resources->cacheManagers.back()->getKVCacheManager(), stream));
     }
 
     // RoPE cache (shared — base and draft use same RoPE config)
@@ -294,7 +318,7 @@ std::unique_ptr<SharedResources> SharedResources::createForSpecDecode(Deployment
         int64_t const maxBatch = maxRuntimeBatchSize;
         int64_t const verifySeqLen = bundle.specConfig->verifySize;
         int64_t deepstackSize = 0;
-        if (bundle.base.numDeepstackFeatures > 0)
+        if (!bundle.base.isDiffusionBackbone && bundle.base.numDeepstackFeatures > 0)
         {
             deepstackSize = maxBatch * verifySeqLen * bundle.base.hiddenSize * static_cast<int64_t>(sizeof(uint16_t));
         }

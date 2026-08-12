@@ -485,7 +485,7 @@ class Phi4MMVisualModel(nn.Module):
         """
         import os
 
-        from safetensors.torch import save_file
+        from tensorrt_edgellm._safetensors_io import save_file
         glb = self.glb_GN.view(1, -1).to(torch.float16)
         sub = self.sub_GN.view(1, -1).to(torch.float16)
         with torch.no_grad():

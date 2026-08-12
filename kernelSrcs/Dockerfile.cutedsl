@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Build with kernelSrcs/ as the context (keeps the context small — the repo
+# root drags in build trees and artifacts), then run with a GPU and an output
+# mount. Kernel generation happens at `docker run` time, not image-build time,
+# because AOT export needs a visible GPU (device tensor allocation + local
+# helper compiles):
+#   docker build -f kernelSrcs/Dockerfile.cutedsl -t edgellm-cutedsl-builder kernelSrcs
+#   docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+#     -v "$PWD/cutedsl-out:/out" edgellm-cutedsl-builder
+#
+# List the configured tarballs without a GPU:
+#   docker run --rm edgellm-cutedsl-builder --list
+#
+# Any x86_64 GPU new enough for the pinned CuTe DSL works as the build GPU;
+# the artifact SM/arch matrix is driven by CUTE_DSL_MATRIX (arch:sm_NN:cuda),
+# not by the local device. The cu12/cu13 flavor of each artifact is selected
+# per matrix row via the two isolated venvs baked into this image.
+
+ARG BASE_IMAGE=nvidia/cuda:13.0.1-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+ARG CUTE_DSL_BUILDER_VERSION=dev
+LABEL org.opencontainers.image.title="TensorRT Edge-LLM CuTe DSL Kernel Builder" \
+      org.opencontainers.image.version="${CUTE_DSL_BUILDER_VERSION}"
+
+ARG CUTE_DSL_VERSION=4.6.1
+ARG CUTE_DSL_RUNTIME_LIBS_VERSION=4.6.1
+ARG CUTE_DSL_CU12_REQUIREMENT=nvidia-cutlass-dsl[cu12]==4.6.1
+ARG CUTE_DSL_CU13_REQUIREMENT=nvidia-cutlass-dsl[cu13]==4.6.1
+ARG CUTE_DSL_CUPY_REQUIREMENT=cupy-cuda13x==13.6.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        binutils \
+        ca-certificates \
+        python3 \
+        python3-pip \
+        python3-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/cutedsl/venvs/cu12 && \
+    /opt/cutedsl/venvs/cu12/bin/pip install --no-cache-dir --upgrade pip wheel && \
+    /opt/cutedsl/venvs/cu12/bin/pip install --no-cache-dir \
+        "${CUTE_DSL_CU12_REQUIREMENT}" \
+        "${CUTE_DSL_CUPY_REQUIREMENT}"
+
+# The [cu13] extra also drags in nvidia-cutlass-dsl-libs-cu12 (an unconditional
+# dependency of the base package). The DSL's backend loader picks the newest
+# flavor the driver supports and offers no override, so the cu12 copy in this
+# venv is dead weight (~250 MB installed) — remove it to keep the venv
+# single-flavor and the image smaller. pip warns about the now-unsatisfied
+# dependency declaration; that is expected and harmless. The sanity check
+# asserts exactly one backend flavor (cu13) remains loadable.
+RUN python3 -m venv /opt/cutedsl/venvs/cu13 && \
+    /opt/cutedsl/venvs/cu13/bin/pip install --no-cache-dir --upgrade pip wheel && \
+    /opt/cutedsl/venvs/cu13/bin/pip install --no-cache-dir \
+        "${CUTE_DSL_CU13_REQUIREMENT}" \
+        "${CUTE_DSL_CUPY_REQUIREMENT}" && \
+    /opt/cutedsl/venvs/cu13/bin/pip uninstall -y nvidia-cutlass-dsl-libs-cu12 && \
+    /opt/cutedsl/venvs/cu13/bin/python -c "\
+import importlib.util, re; \
+from pathlib import Path; \
+pkg_dir = Path(next(iter(importlib.util.find_spec('nvidia_cutlass_dsl').submodule_search_locations))); \
+lib_dir = pkg_dir / 'dsl_packages' / 'cutlass' / '_mlir' / '_mlir_libs'; \
+flavors = sorted(m.group(1) for so in lib_dir.glob('_cutlass_ir.cu*.so') if (m := re.match(r'_cutlass_ir\.(cu\d+)\.', so.name))); \
+assert flavors == ['cu13'], f'cu13 venv must be single-flavor, found: {flavors}'; \
+assert (pkg_dir / 'cu13' / 'lib' / 'libcuda_dialect_runtime_static.a').is_file(); \
+print('cu13 venv OK: single-flavor backend', flavors)"
+
+# Pre-fetch the aarch64 runtime-libs wheels so cross builds resolve
+# libcuda_dialect_runtime_static.a offline at `docker run` time (consumed via
+# CUTE_DSL_RUNTIME_WHEELHOUSE by build_cutedsl.py). x86_64 targets need no
+# wheelhouse entry — they use the runtime archive from the installed venv
+# package. The Python tag is derived from the venv interpreter so a BASE_IMAGE
+# bump cannot desync the wheelhouse from the runtime lookup, and the layer
+# fails fast if either expected wheel is missing.
+RUN set -eu; \
+    mkdir -p /opt/cutedsl/runtime-wheels; \
+    for flavor in cu12 cu13; do \
+        py="/opt/cutedsl/venvs/${flavor}/bin/python"; \
+        pyver="$("${py}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"; \
+        pyabi="$("${py}" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"; \
+        "/opt/cutedsl/venvs/${flavor}/bin/pip" download \
+            "nvidia-cutlass-dsl-libs-${flavor}==${CUTE_DSL_RUNTIME_LIBS_VERSION}" \
+            --no-deps --only-binary=:all: --platform manylinux_2_28_aarch64 \
+            --python-version "${pyver}" --implementation cp --abi "${pyabi}" \
+            --dest /opt/cutedsl/runtime-wheels; \
+        ls /opt/cutedsl/runtime-wheels/nvidia_cutlass_dsl_libs_${flavor}-*aarch64.whl; \
+    done
+
+# Context is kernelSrcs/ (see header) — copy it to the path the tarball
+# builder expects (repo_root/kernelSrcs).
+COPY . /workspace/kernelSrcs/
+
+RUN mkdir -p /out /tmp/cutedsl-home && \
+    chmod 1777 /out /tmp/cutedsl-home
+
+WORKDIR /workspace
+
+ENV HOME=/tmp/cutedsl-home \
+    CUDA_CTK_VERSION=13.0 \
+    CUTE_DSL_VERSION=${CUTE_DSL_VERSION} \
+    CUTE_DSL_RUNTIME_LIBS_VERSION=${CUTE_DSL_RUNTIME_LIBS_VERSION} \
+    CUTE_DSL_CUPY_PACKAGE=${CUTE_DSL_CUPY_REQUIREMENT} \
+    CUTE_DSL_PACKAGE_CU12=${CUTE_DSL_CU12_REQUIREMENT} \
+    CUTE_DSL_PACKAGE_CU13=${CUTE_DSL_CU13_REQUIREMENT} \
+    CUTE_DSL_VENV_ROOT=/opt/cutedsl/venvs \
+    CUTE_DSL_RUNTIME_WHEELHOUSE=/opt/cutedsl/runtime-wheels \
+    CUTE_DSL_SKIP_DEPENDENCY_INSTALL=1 \
+    CUTE_DSL_KERNELS=ALL \
+    CUTE_DSL_OUTPUT_DIR=/out/artifacts \
+    CUTE_DSL_PREBUILT_DIR=/out \
+    CUTE_DSL_MATRIX=x86_64:sm_80:13,x86_64:sm_100:13,x86_64:sm_120:13,x86_64:sm_120:12,aarch64:sm_87:13,aarch64:sm_87:12,aarch64:sm_101:12,aarch64:sm_110:13,aarch64:sm_121:12,aarch64:sm_121:13
+
+ENTRYPOINT ["/workspace/kernelSrcs/build_cutedsl_tarballs.sh"]

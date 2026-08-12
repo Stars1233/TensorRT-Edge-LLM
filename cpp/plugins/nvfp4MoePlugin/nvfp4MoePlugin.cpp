@@ -746,12 +746,6 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
 #else
     try
     {
-        if (!CuteDslNvfp4MoeSm110Runner::loadKernelModules())
-        {
-            LOG_ERROR("Nvfp4MoePlugin: failed to load SM100/101/110 CuTe DSL AOT kernel modules");
-            return -1;
-        }
-
         PluginTensorDesc const& hiddenDesc = inputDesc[kIN_HIDDEN_STATES];
         if (hiddenDesc.dims.nbDims != 3)
         {
@@ -796,6 +790,13 @@ int32_t Nvfp4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorD
         }
         int32_t const maxRoutedRows
             = mMaxRoutedRows > 0 ? mMaxRoutedRows : computeProfileMaxRoutedRows(numTokens64, mTopK);
+        CuteDslNvfp4MoeSm110Params moduleParams{};
+        moduleParams.activationType = mActivationType;
+        if (!CuteDslNvfp4MoeSm110Runner::ensureKernelModules(moduleParams, stream))
+        {
+            LOG_ERROR("Nvfp4MoePlugin: failed to load the selected SM100/101/110 CuTe DSL AOT modules");
+            return -1;
+        }
 
         // ==== Workspace carving (order must match getWorkspaceSize) ====
         size_t const softmaxWs = trt_edgellm::kernel::getMoeTopkSoftmaxWorkspaceSize(numTokens, mNumExperts);
@@ -940,14 +941,6 @@ IPluginV3* Nvfp4MoePlugin::attachToContext(IPluginResourceContext* context) noex
         return nullptr;
     }
     (void) context;
-#ifdef CUTE_DSL_NVFP4_MOE_ENABLED
-    if (!CuteDslNvfp4MoeSm110Runner::loadKernelModules())
-    {
-        LOG_ERROR("Nvfp4MoePlugin: attachToContext failed to load SM100/101/110 CuTe DSL AOT kernel modules");
-        delete plugin;
-        return nullptr;
-    }
-#endif // CUTE_DSL_NVFP4_MOE_ENABLED
     return plugin;
 }
 

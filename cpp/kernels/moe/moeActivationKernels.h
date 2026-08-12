@@ -26,37 +26,35 @@ namespace trt_edgellm
 namespace kernel
 {
 
+// Kernel-level activation type IDs for moeActivation().
+enum MoeActivationType : int32_t
+{
+    kMoeSwiGlu = 2,
+    kMoeRelu2 = 4,
+    kMoeGeGlu = 5,
+};
+
 /**
- * @brief Apply SwiGLU activation: silu(gate) * up
+ * @brief Apply an FP16 or BF16 MoE activation.
  *
- * This kernel applies the SwiGLU (Swish-Gated Linear Unit) activation function,
- * commonly used in MoE models like Qwen, Llama, and Mistral.
+ * Supported activation types:
+ * - kMoeSwiGlu: SwiGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
+ * - kMoeRelu2: ReLU2. The input is [numTokens, intermediateDim].
+ * - kMoeGeGlu: GeGLU. The input is [numTokens, 2 * intermediateDim], with all gate values followed by all up values.
  *
- * Given an input of shape [N, 2*D], it:
- * 1. Splits the input into gate [N, D] and up [N, D]
- * 2. Applies SiLU (Swish) activation to gate: silu(x) = x * sigmoid(x)
- * 3. Multiplies element-wise: output = silu(gate) * up
+ * FP16 and BF16 support all activation types. The input and output data types must match.
  *
- * Optimizations:
- * - Vectorized 128-bit loads/stores (8 FP16 elements) for better memory bandwidth
- * - Fused split, activation, and multiplication in a single pass
- * - No intermediate storage required
+ * @param input Input tensor (FP16 or BF16, GPU).
+ * @param output Output tensor [numTokens, intermediateDim] with the same data type as input.
+ * @param numTokens Number of routed token slots.
+ * @param intermediateDim Intermediate dimension.
+ * @param activationType Activation type from MoeActivationType enum.
+ * @param stream CUDA stream.
  *
- * @param gateUpInput Input tensor [numTokens, 2*intermediateDim] (FP16, GPU)
- * @param output Output tensor [numTokens, intermediateDim] (FP16, GPU)
- * @param numTokens Number of tokens
- * @param intermediateDim Intermediate dimension (output will be this size)
- * @param stream CUDA stream
- *
- * @throws std::runtime_error If any of the following preconditions are violated:
- *   - gateUpInput is not 2D with shape [numTokens, 2*intermediateDim]
- *   - output is not 2D with shape [numTokens, intermediateDim]
- *   - Either tensor is not FP16 or not on GPU
- *   - intermediateDim is not a multiple of 8 (required for 128-bit vectorized access)
- *   - Data pointers are not 16-byte aligned
+ * @throws std::runtime_error If the tensor shapes, data types, devices, alignment, or activation type are invalid.
  */
-void swiGluActivation(
-    rt::Tensor const& gateUpInput, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim, cudaStream_t stream);
+void moeActivation(rt::Tensor const& input, rt::Tensor& output, int64_t numTokens, int64_t intermediateDim,
+    int32_t activationType, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

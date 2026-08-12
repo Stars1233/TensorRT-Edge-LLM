@@ -37,7 +37,8 @@ class MTPDecoder final : public DecodingStrategy
 {
 public:
     MTPDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream);
+        SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+        cudaStream_t stream);
 
     DecodingStrategyKind kind() const noexcept override
     {
@@ -68,11 +69,12 @@ public:
 
     void resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream) override;
     void onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch, int32_t newActiveBatch,
-        Tensor& deviceBatchMapping, cudaStream_t stream) override;
+        Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode) override;
 
 private:
     bool runDraftModelPrefill(DecodingInferenceContext& context);
     bool constructDraftProposal(DecodingInferenceContext& context);
+    bool buildTreeVerifyInputs(int32_t activeBatchSize, cudaStream_t stream);
     bool runBaseModelVerification(DecodingInferenceContext& context);
     bool runDraftModelAcceptToken(DecodingInferenceContext& context);
 
@@ -100,6 +102,17 @@ private:
     Tensor mAcceptLength;
     Tensor mHostAcceptLengths;
     Tensor mHostAcceptedTokenIds;
+
+    //! Tree drafting (draftingTopK > 1): the chain drafter keeps one full logits row
+    //! per proposal depth and the greedy tree builder grows a prefix-closed,
+    //! score-prioritized verify tree from them.
+    bool mUseTree{false};
+    Tensor mStackedDraftLogits; //!< [maxBatch, draftingStep+1, draftVocab] per-depth chain logits
+    Tensor mTreeTokenIds;       //!< [maxBatch, verifySize] flattened tree token ids
+    Tensor mTreeNodeScores;     //!< [maxBatch, verifySize] prefix log-prob scores
+    Tensor mValidCounts;        //!< [maxBatch] valid node counts
+    Tensor mVerifyTreeMask;     //!< [maxBatch, verifySize, verifySize] unpacked accept mask
+    Tensor mTreeBuildWorkspace; //!< ddtreeBuild temporary workspace
 
     hash_utils::HashMap<SystemPromptCacheKey, SystemPromptKVCache> mSystemPromptKVCacheDraft;
 };

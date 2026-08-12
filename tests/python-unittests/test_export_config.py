@@ -36,10 +36,17 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _LLM_EXPORT_PATH = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "checkpoint",
                  "checkpoint_utils.py"))
+_CONFIG_PATH = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "tensorrt_edgellm", "config.py"))
 
 
 def _load_source():
     with open(_LLM_EXPORT_PATH, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _load_config_source():
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
         return f.read()
 
 
@@ -199,3 +206,33 @@ def test_llm_export_hybrid_block_is_gated_on_num_linear_attn_layers():
     assert re.search(
         r"num_linear_attn_layers['\"][\s,)]+\s*,?\s*0\s*\)\s*>\s*0", src
     ), "Hybrid dtype block must be gated on `num_linear_attn_layers > 0`."
+
+
+def test_current_export_schema_uses_simple_tp_mapping_only():
+    config_src = _load_config_source()
+    mapping_match = re.search(
+        r"@dataclass\s+class Mapping:.*?(?=\n\n@dataclass)",
+        config_src,
+        re.DOTALL,
+    )
+    assert mapping_match is not None, "Expected Mapping dataclass in config.py."
+
+    mapping_fields = re.findall(
+        r"^    ([A-Za-z_][A-Za-z0-9_]*)\s*:",
+        mapping_match.group(0),
+        re.MULTILINE,
+    )
+    assert mapping_fields == ["world_size", "rank", "tp_size", "tp_rank"]
+
+
+def test_runtime_config_writer_stamps_tp_rank_fields_for_multi_rank_export():
+    export_src = _load_source()
+    assert re.search(r"tp_size\s*=\s*max\(1,\s*getattr\(config, ['\"]tp_size",
+                     export_src)
+    assert re.search(r"tp_rank\s*=\s*max\(0,\s*getattr\(config, ['\"]tp_rank",
+                     export_src)
+    assert re.search(
+        r"if\s+tp_size\s*>\s*1\s*:\s*out\[['\"]tp_size['\"]\]\s*=\s*tp_size\s*"
+        r"out\[['\"]tp_rank['\"]\]\s*=\s*tp_rank",
+        export_src,
+    )

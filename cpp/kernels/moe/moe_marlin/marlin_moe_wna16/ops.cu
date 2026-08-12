@@ -308,6 +308,66 @@ MarlinFuncPtr get_marlin_kernel(trt_edgellm::marlin_dtypes::ScalarType const a_t
     int num_bits = b_type.size_bits();
     auto kernel = MarlinDefault;
 
+#if SUPPORTS_FP8
+    // The NVFP4 A16 paths currently support only the four-stage pipeline instantiated below.
+    bool const isNvfp4Fp16 = a_type == trt_edgellm::marlin_dtypes::kFloat16
+        && b_type == trt_edgellm::marlin_dtypes::kFE2M1f && c_type == trt_edgellm::marlin_dtypes::kFloat16
+        && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn && !has_act_order && !has_zp && group_blocks == 1
+        && !is_zp_float && stages == 4;
+    bool const isNvfp4Bf16 = a_type == trt_edgellm::marlin_dtypes::kBFloat16
+        && b_type == trt_edgellm::marlin_dtypes::kFE2M1f && c_type == trt_edgellm::marlin_dtypes::kBFloat16
+        && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn && !has_act_order && !has_zp && group_blocks == 1
+        && !is_zp_float && stages == 4;
+    if (isNvfp4Fp16)
+    {
+#define SELECT_NVFP4_FP16(THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8)                  \
+    if (threads == THREADS && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS                 \
+        && thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8)                                     \
+    {                                                                                                                  \
+        return Marlin<trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kFE2M1f.id(),             \
+            trt_edgellm::marlin_dtypes::kFloat16.id(), trt_edgellm::marlin_dtypes::kFE4M3fn.id(), THREADS,             \
+            THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, 4, 1, false>;                           \
+    }
+
+        SELECT_NVFP4_FP16(256, 1, 8, 8, true)
+        SELECT_NVFP4_FP16(128, 1, 8, 4, true)
+        SELECT_NVFP4_FP16(256, 1, 8, 8, false)
+        SELECT_NVFP4_FP16(128, 1, 8, 4, false)
+        SELECT_NVFP4_FP16(256, 2, 16, 4, false)
+        SELECT_NVFP4_FP16(128, 2, 8, 4, false)
+        SELECT_NVFP4_FP16(256, 3, 16, 4, false)
+        SELECT_NVFP4_FP16(128, 3, 8, 4, false)
+        SELECT_NVFP4_FP16(256, 4, 16, 4, false)
+        SELECT_NVFP4_FP16(128, 4, 8, 4, false)
+
+#undef SELECT_NVFP4_FP16
+    }
+    if (isNvfp4Bf16)
+    {
+#define SELECT_NVFP4_BF16(THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8)                  \
+    if (threads == THREADS && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS                 \
+        && thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8)                                     \
+    {                                                                                                                  \
+        return Marlin<trt_edgellm::marlin_dtypes::kBFloat16.id(), trt_edgellm::marlin_dtypes::kFE2M1f.id(),            \
+            trt_edgellm::marlin_dtypes::kBFloat16.id(), trt_edgellm::marlin_dtypes::kFE4M3fn.id(), THREADS,            \
+            THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8, 4, 1, false>;                           \
+    }
+
+        SELECT_NVFP4_BF16(256, 1, 8, 8, true)
+        SELECT_NVFP4_BF16(128, 1, 8, 4, true)
+        SELECT_NVFP4_BF16(256, 1, 8, 8, false)
+        SELECT_NVFP4_BF16(128, 1, 8, 4, false)
+        SELECT_NVFP4_BF16(256, 2, 16, 4, false)
+        SELECT_NVFP4_BF16(128, 2, 8, 4, false)
+        SELECT_NVFP4_BF16(256, 3, 16, 4, false)
+        SELECT_NVFP4_BF16(128, 3, 8, 4, false)
+        SELECT_NVFP4_BF16(256, 4, 16, 4, false)
+        SELECT_NVFP4_BF16(128, 4, 8, 4, false)
+
+#undef SELECT_NVFP4_BF16
+    }
+#endif // SUPPORTS_FP8
+
 #include "kernel_selector.h"
 
     return kernel;

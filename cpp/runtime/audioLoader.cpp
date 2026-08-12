@@ -60,17 +60,29 @@ private:
     ma_decoder& mDecoder;
 };
 
+//! Longest decoded audio accepted, in seconds. Compressed containers can
+//! expand far beyond their byte size (a small FLAC can decode to GBs), so
+//! cap the decoded duration rather than the input bytes.
+constexpr ma_uint64 kMaxDecodedSeconds = 600;
+
 //! Drain an initialised decoder into ``out``.
 //!
 //! WAV / MP3 / FLAC headers advertise total frame count, so query it once
 //! and do a single allocation + read. Matches the HF / whisper.cpp /
 //! dr_wav pattern.
-bool drainDecoder(ma_decoder& decoder, AudioPCM& out)
+bool drainDecoder(ma_decoder& decoder, int32_t sampleRate, AudioPCM& out)
 {
     ma_uint64 totalFrames = 0;
     if (ma_decoder_get_length_in_pcm_frames(&decoder, &totalFrames) != MA_SUCCESS || totalFrames == 0)
     {
         LOG_ERROR("ma_decoder_get_length_in_pcm_frames returned 0 or failed");
+        return false;
+    }
+    if (totalFrames > kMaxDecodedSeconds * static_cast<ma_uint64>(sampleRate))
+    {
+        LOG_ERROR("audio decodes to %llu frames (> %llu s at %d Hz); refusing to buffer",
+            static_cast<unsigned long long>(totalFrames), static_cast<unsigned long long>(kMaxDecodedSeconds),
+            sampleRate);
         return false;
     }
     out.samples.resize(static_cast<size_t>(totalFrames));
@@ -114,7 +126,7 @@ bool loadAudioBytes(uint8_t const* bytes, size_t size, int32_t targetSampleRate,
     }
     DecoderGuard const guard(decoder);
 
-    if (!drainDecoder(decoder, out))
+    if (!drainDecoder(decoder, targetSampleRate, out))
     {
         return false;
     }
@@ -141,7 +153,7 @@ bool loadAudioFile(std::filesystem::path const& path, int32_t targetSampleRate, 
     }
     DecoderGuard const guard(decoder);
 
-    if (!drainDecoder(decoder, out))
+    if (!drainDecoder(decoder, targetSampleRate, out))
     {
         return false;
     }

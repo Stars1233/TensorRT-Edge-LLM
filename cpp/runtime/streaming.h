@@ -115,6 +115,11 @@ void decodePerSlot(DecodingInferenceContext& context, tokenizer::Tokenizer const
 //! raw token piece for per-token logprobs (LogprobEntry::piece).
 void emitChunks(DecodingInferenceContext& context, tokenizer::Tokenizer const& tokenizer);
 
+//! Fires `context.onTokenGenerated` for every token appended since the previous
+//! callback emission. Speculative decoders and DiffusionGemma can accept more
+//! than one token in a single decode iteration.
+void emitTokenCallbacks(DecodingInferenceContext& context);
+
 /*! @brief Result of applyStopStringMatch. */
 struct StopMatchOutcome
 {
@@ -260,6 +265,80 @@ void StreamChannel::consume(Handler&& handler, std::chrono::milliseconds poll)
         }
     }
 }
+
+//! One PCM chunk emitted by a streaming audio (TTS / Omni) pipeline.
+struct AudioChunk
+{
+    std::string pcm16;    //!< Little-endian int16 mono PCM samples.
+    bool isFinal{false};  //!< True on the last chunk of the request.
+    int32_t numFrames{0}; //!< Codec frames vocoded into this chunk.
+};
+
+//! Thread-safe MPSC queue carrying PCM chunks from the vocode callback to a
+//! single consumer. push()/finish() are public (unlike StreamChannel's
+//! friend-guarded producer API) because producers are pipeline callbacks
+//! composed outside the runtime.
+class AudioStreamChannel
+{
+public:
+    //! Blocking pop; nullopt on timeout or terminal wake — combine with
+    //! isFinished()/isCancelled(). A zero timeout is a non-blocking pop.
+    std::optional<AudioChunk> waitPop(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mCv.wait_for(lock, timeout, [this] {
+            return !mPending.empty() || mFinished.load(std::memory_order_acquire)
+                || mCancelled.load(std::memory_order_acquire);
+        });
+        if (mPending.empty())
+        {
+            return std::nullopt;
+        }
+        AudioChunk chunk = std::move(mPending.front());
+        mPending.pop_front();
+        return chunk;
+    }
+
+    bool isFinished() const noexcept
+    {
+        return mFinished.load(std::memory_order_acquire);
+    }
+
+    bool isCancelled() const noexcept
+    {
+        return mCancelled.load(std::memory_order_acquire);
+    }
+
+    //! Wakes a blocked waitPop; producers observe it via isCancelled().
+    void cancel() noexcept
+    {
+        mCancelled.store(true, std::memory_order_release);
+        mCv.notify_all();
+    }
+
+    void push(AudioChunk chunk)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mPending.push_back(std::move(chunk));
+        }
+        mCv.notify_all();
+    }
+
+    //! Idempotent end-of-stream marker.
+    void finish() noexcept
+    {
+        mFinished.store(true, std::memory_order_release);
+        mCv.notify_all();
+    }
+
+private:
+    mutable std::mutex mMutex;
+    std::condition_variable mCv;
+    std::deque<AudioChunk> mPending;
+    std::atomic<bool> mFinished{false};
+    std::atomic<bool> mCancelled{false};
+};
 
 /*!
  * @brief Per-slot detokenization and streaming state.

@@ -28,6 +28,13 @@ namespace trt_edgellm
 namespace rt
 {
 
+enum class DSparkSchedulerMode : int32_t
+{
+    kOff = 0,
+    kThreshold = 1,
+    kSPS = 2,
+};
+
 /*!
  * @brief User-supplied drafting parameters for speculative decoding.
  *
@@ -37,15 +44,23 @@ namespace rt
  */
 struct SpecDecodeDraftingConfig
 {
-    //! Tokens to select from one predecessor during draft expansion. For
-    //! DFlash, this is candidateTopK: 1 is a linear tree and >1 enables branching DDTree.
+    //! Tokens to select from one predecessor during draft expansion:
+    //! draftingTopK = 1 selects chain mode, draftingTopK > 1 selects tree
+    //! drafting with this candidate fanout. DSpark tree mode drafts the full
+    //! block and verifySize becomes the DDTree node budget.
     int32_t draftingTopK{0};
     int32_t draftingStep{0}; //!< Number of drafting steps with draft model
-    int32_t verifySize{0};   //!< Number of proposal tokens for base model verification
+    int32_t verifySize{0};   //!< Number of tokens in the base verification input
 
     //! Optional DFlash draft-forward horizon. 0 means infer from the DFlash
-    //! base/draft engine config.
+    //! base/draft engine config. Linear DFlash treats this as the base verify
+    //! window length and normalizes verifySize to this value.
     int32_t dflashBlockSize{0};
+
+    DSparkSchedulerMode dsparkSchedulerMode{DSparkSchedulerMode::kOff};
+    float dsparkConfidenceThreshold{0.0F};
+    int32_t dsparkMinProposalLen{1};
+    int32_t dsparkMaxProposalLen{0}; //!< 0 means use the DSpark block proposal length.
 };
 
 /*!
@@ -77,15 +92,23 @@ struct SpecDecodeConfig
     int32_t maxDraftProposalSize{}; //!< Max seq_len the draft engine accepts for proposal generation
 
     // --- User-supplied drafting parameters ---
-    //! Tokens to select from one predecessor during draft expansion. For
-    //! DFlash, this is candidateTopK: 1 is a linear tree and >1 enables branching DDTree.
+    //! Tokens to select from one predecessor during draft expansion:
+    //! draftingTopK = 1 selects chain mode, draftingTopK > 1 selects tree
+    //! drafting with this candidate fanout.
     int32_t draftingTopK{};
     int32_t draftingStep{}; //!< Number of drafting steps with draft model
-    int32_t verifySize{};   //!< Number of proposal tokens for base model verification
+    int32_t verifySize{};   //!< Number of tokens in the base verification input
 
     //! DFlash draft-forward horizon. This is independent from draftingStep:
     //! DFlash runs one draft forward per iteration and that forward emits a full block.
+    //! For linear DFlash, this is the base verify window length. DSpark uses
+    //! its own block size as proposal length and therefore verifies block + 1 tokens.
     int32_t dflashBlockSize{};
+
+    DSparkSchedulerMode dsparkSchedulerMode{DSparkSchedulerMode::kOff};
+    float dsparkConfidenceThreshold{0.0F};
+    int32_t dsparkMinProposalLen{1};
+    int32_t dsparkMaxProposalLen{0}; //!< 0 means use the DSpark block proposal length.
 };
 
 //! Complete deployment configuration: the base engine's config, optional draft
@@ -111,9 +134,9 @@ struct DeploymentConfig
     int32_t effectiveMaxDraftProposalSize() const;
 
     //! Maximum tokens a single decode round can accept per slot: 1 (vanilla, no specConfig),
-    //! draftingStep + 1 (chain/tree verify: EAGLE / MTP / Gemma4 MTP), or
-    //! min(dflashBlockSize, verifySize) (DFlash block verify). New speculative modes must add a case to the switch in
-    //! the implementation.
+    //! draftingStep + 1 (chain/tree verify: EAGLE / MTP / Gemma4 MTP), verifySize
+    //! for DSpark, or min(dflashBlockSize, verifySize) for DFlash block verify.
+    //! New speculative modes must add a case to the switch in the implementation.
     int32_t maxAcceptedTokensPerRound() const;
 
     //! Return the concrete speculative decoding mode declared by the engine bundle.
@@ -130,9 +153,15 @@ struct DeploymentConfig
 //!   against the engines' capacities:
 //!     - `specConfig->verifySize <= specConfig->maxVerifySize`
 //!     - non-DFlash: `specConfig->draftingStep * specConfig->draftingTopK <= specConfig->maxDraftProposalSize`
-//!     - MTP requires `draftingTopK == 1` and `verifySize == draftingStep + 1`
+//!     - MTP: `draftingStep + 1 <= 9` (EAGLE utility kernel depth limit);
+//!       `draftingTopK == 1` selects the linear chain and requires `verifySize == draftingStep + 1`,
+//!       while `draftingTopK > 1` selects tree drafting and requires
+//!       `draftingTopK < verifySize`, `draftingTopK <= 8`, and `verifySize <= 128`
+//!       (tree-build kernel limits; unfillable verify nodes become padding)
 //!     - DFlash: `draftingStep == 1`, `dflashBlockSize <= maxDraftProposalSize`, and
 //!       `draftingTopK` is candidateTopK: 1 uses the linear-tree fast path while >1 uses branching DDTree.
+//!       Linear DFlash normalizes `verifySize` to `dflashBlockSize` for compatibility with the historical API.
+//!     - DSpark: `verifySize == proposalLen + 1`; the DSpark block size/gamma denotes proposal tokens.
 //!   Throws with named-fields message on violation.
 //!
 //! @throws std::runtime_error on any validation failure or parse failure.

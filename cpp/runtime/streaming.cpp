@@ -415,6 +415,35 @@ void emitChunks(DecodingInferenceContext& context, tokenizer::Tokenizer const& t
     }
 }
 
+void emitTokenCallbacks(DecodingInferenceContext& context)
+{
+    if (!context.onTokenGenerated.has_value())
+    {
+        return;
+    }
+
+    auto const& callback = context.onTokenGenerated.value();
+    for (int32_t i = 0; i < context.activeBatchSize; ++i)
+    {
+        auto const& slotTokens = context.tokenIds[i];
+        if (slotTokens.empty() || static_cast<size_t>(i) >= context.callbackEmittedTokenCounts.size())
+        {
+            continue;
+        }
+
+        int32_t emittedCount = context.callbackEmittedTokenCounts[i];
+        emittedCount = std::clamp(emittedCount, 0, static_cast<int32_t>(slotTokens.size()));
+        bool const slotFinished = context.finishedStates[i] != 0;
+        for (int32_t tokenIdx = emittedCount; tokenIdx < static_cast<int32_t>(slotTokens.size()); ++tokenIdx)
+        {
+            bool const isLastNewToken = tokenIdx + 1 == static_cast<int32_t>(slotTokens.size());
+            callback(
+                TokenCallbackInfo{slotTokens[tokenIdx], i, context.generationRound, slotFinished && isLastNewToken});
+        }
+        context.callbackEmittedTokenCounts[i] = static_cast<int32_t>(slotTokens.size());
+    }
+}
+
 //=============================================================================
 // StreamChannelFinalizer — RAII terminal-chunk guarantee
 //=============================================================================

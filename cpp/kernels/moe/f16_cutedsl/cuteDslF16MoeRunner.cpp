@@ -34,44 +34,18 @@
 namespace trt_edgellm
 {
 
-namespace detail
-{
-
-thread_local cudaError_t gCuteDslF16MoeCudaError{cudaSuccess};
-
-void recordCuteDslF16MoeCudaError(cudaError_t error) noexcept
-{
-    if (error != cudaSuccess && gCuteDslF16MoeCudaError == cudaSuccess)
-    {
-        gCuteDslF16MoeCudaError = error;
-    }
-}
-
-void clearCuteDslF16MoeCudaError() noexcept
-{
-    gCuteDslF16MoeCudaError = cudaSuccess;
-}
-
-cudaError_t getCuteDslF16MoeCudaError() noexcept
-{
-    return gCuteDslF16MoeCudaError;
-}
-
-} // namespace detail
-
 #if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
-f16_moe_ampere_grouped_fp16_Kernel_Module_t CuteDslF16MoeRunner::sAmpereModule{};
+detail::LazyKernelModule<f16_moe_ampere_grouped_fp16_Kernel_Module_t> CuteDslF16MoeRunner::sAmpereModule{};
 #endif
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
-f16_moe_blackwell_grouped_fp16_Kernel_Module_t CuteDslF16MoeRunner::sBlackwellModule{};
+detail::LazyKernelModule<f16_moe_blackwell_grouped_fp16_Kernel_Module_t> CuteDslF16MoeRunner::sBlackwellModule{};
 #endif
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
-f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_t CuteDslF16MoeRunner::sBlackwellGeforceModule{};
+detail::LazyKernelModule<f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_t>
+    CuteDslF16MoeRunner::sBlackwellGeforceModule{};
 #endif
-CuteDslF16MoeRunner::Variant CuteDslF16MoeRunner::sActiveVariant{CuteDslF16MoeRunner::Variant::kNone};
 std::unordered_map<int32_t, int32_t> CuteDslF16MoeRunner::sPersistentBlockCounts;
-bool CuteDslF16MoeRunner::sLoaded{false};
-std::mutex CuteDslF16MoeRunner::sLoadMutex;
+std::mutex CuteDslF16MoeRunner::sPersistentBlockCountsMutex;
 
 namespace
 {
@@ -248,167 +222,82 @@ bool CuteDslF16MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSize,
         && fc1N % kFc1NAlignment == 0 && (activationType == kACT_SWIGLU || activationType == kACT_RELU2);
 }
 
-bool CuteDslF16MoeRunner::loadKernelModules() noexcept
+CuteDslF16MoeRunner::Variant CuteDslF16MoeRunner::selectVariant(int32_t smVersion) noexcept
 {
-    try
-    {
-        std::lock_guard<std::mutex> lock(sLoadMutex);
-        int32_t device{};
-        cudaDeviceProp properties{};
-        if (!checkCuda(cudaGetDevice(&device), "query current device")
-            || !checkCuda(cudaGetDeviceProperties(&properties, device), "query device properties"))
-        {
-            return false;
-        }
-        int32_t const smVersion = properties.major * 10 + properties.minor;
-        if (smVersion != kARTIFACT_SM)
-        {
-            LOG_ERROR("CuteDslF16MoeRunner: linked SM%d artifact cannot execute on SM%d", kARTIFACT_SM, smVersion);
-            return false;
-        }
-        Variant requestedVariant{Variant::kNone};
 #if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
-        if (isAmpereSm(smVersion))
-        {
-            requestedVariant = Variant::kAmpere;
-        }
+    if (isAmpereSm(smVersion))
+    {
+        return Variant::kAmpere;
+    }
 #endif
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
-        if (isBlackwellSm(smVersion))
-        {
-            requestedVariant = Variant::kBlackwell;
-        }
+    if (isBlackwellSm(smVersion))
+    {
+        return Variant::kBlackwell;
+    }
 #endif
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
-        if (isBlackwellGeforceSm(smVersion))
-        {
-            requestedVariant = Variant::kBlackwellGeforce;
-        }
+    if (isBlackwellGeforceSm(smVersion))
+    {
+        return Variant::kBlackwellGeforce;
+    }
 #endif
-        if (requestedVariant == Variant::kNone)
-        {
-            LOG_ERROR("CuteDslF16MoeRunner: no compiled f16_moe AOT variant matches SM%d", smVersion);
-            return false;
-        }
+    return Variant::kNone;
+}
 
-        if (sLoaded)
-        {
-            if (sActiveVariant != requestedVariant)
-            {
-                LOG_ERROR("CuteDslF16MoeRunner: the linked artifact pack cannot mix architecture families");
-                return false;
-            }
-            sPersistentBlockCounts.try_emplace(
-                device, std::min(kMAX_PERSISTENT_BLOCKS, properties.multiProcessorCount));
-            return true;
-        }
-
-        detail::clearCuteDslF16MoeCudaError();
-#if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
-        if (requestedVariant == Variant::kAmpere)
-        {
-            f16_moe_ampere_grouped_fp16_Kernel_Module_Load(&sAmpereModule);
-            sActiveVariant = Variant::kAmpere;
-        }
-#endif
-#if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
-        if (requestedVariant == Variant::kBlackwell)
-        {
-            f16_moe_blackwell_grouped_fp16_Kernel_Module_Load(&sBlackwellModule);
-            sActiveVariant = Variant::kBlackwell;
-        }
-#endif
-#if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
-        if (requestedVariant == Variant::kBlackwellGeforce)
-        {
-            f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_Load(&sBlackwellGeforceModule);
-            sActiveVariant = Variant::kBlackwellGeforce;
-        }
-#endif
-        cudaError_t const loadError = detail::getCuteDslF16MoeCudaError();
-        if (loadError != cudaSuccess)
-        {
-            LOG_ERROR("CuteDslF16MoeRunner: AOT module load failed: %s (%s)", cudaGetErrorName(loadError),
-                cudaGetErrorString(loadError));
-            detail::clearCuteDslF16MoeCudaError();
-            switch (requestedVariant)
-            {
-            case Variant::kAmpere:
-#if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
-                if (sAmpereModule.module != nullptr)
-                {
-                    f16_moe_ampere_grouped_fp16_Kernel_Module_Unload(&sAmpereModule);
-                    sAmpereModule = {};
-                }
-#endif
-                break;
-            case Variant::kBlackwell:
-#if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
-                if (sBlackwellModule.module != nullptr)
-                {
-                    f16_moe_blackwell_grouped_fp16_Kernel_Module_Unload(&sBlackwellModule);
-                    sBlackwellModule = {};
-                }
-#endif
-                break;
-            case Variant::kBlackwellGeforce:
-#if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
-                if (sBlackwellGeforceModule.module != nullptr)
-                {
-                    f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_Unload(&sBlackwellGeforceModule);
-                    sBlackwellGeforceModule = {};
-                }
-#endif
-                break;
-            case Variant::kNone: break;
-            }
-            cudaError_t const cleanupError = detail::getCuteDslF16MoeCudaError();
-            if (cleanupError != cudaSuccess)
-            {
-                LOG_ERROR("CuteDslF16MoeRunner: failed-load cleanup failed: %s (%s)", cudaGetErrorName(cleanupError),
-                    cudaGetErrorString(cleanupError));
-            }
-            sActiveVariant = Variant::kNone;
-            return false;
-        }
-        int32_t const persistentBlockCount = std::min(kMAX_PERSISTENT_BLOCKS, properties.multiProcessorCount);
-        if (persistentBlockCount <= 0)
-        {
-            LOG_ERROR("CuteDslF16MoeRunner: CUDA device %d has no multiprocessors", device);
-            sActiveVariant = Variant::kNone;
-            return false;
-        }
-        sPersistentBlockCounts.emplace(device, persistentBlockCount);
-        sLoaded = true;
-        LOG_DEBUG("CuteDslF16MoeRunner: loaded variant %d for SM%d with %d persistent blocks",
-            static_cast<int32_t>(sActiveVariant), smVersion, persistentBlockCount);
-        return true;
-    }
-    catch (std::exception const& error)
+bool CuteDslF16MoeRunner::ensureKernelModules(int32_t smVersion, cudaStream_t stream) noexcept
+{
+    if (smVersion != kARTIFACT_SM)
     {
-        LOG_ERROR("CuteDslF16MoeRunner module load failed: %s", error.what());
+        LOG_ERROR("CuteDslF16MoeRunner: linked SM%d artifact cannot execute on SM%d", kARTIFACT_SM, smVersion);
+        return false;
     }
-    catch (...)
+    switch (selectVariant(smVersion))
     {
-        LOG_ERROR("CuteDslF16MoeRunner module load failed: unknown error");
+    case Variant::kAmpere:
+#if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
+        return detail::ensureModuleLoaded<f16_moe_ampere_grouped_fp16_Kernel_Module_Load,
+            f16_moe_ampere_grouped_fp16_Kernel_Module_Unload>(sAmpereModule, "f16_moe_ampere_grouped_fp16", stream);
+#endif
+        break;
+    case Variant::kBlackwell:
+#if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
+        return detail::ensureModuleLoaded<f16_moe_blackwell_grouped_fp16_Kernel_Module_Load,
+            f16_moe_blackwell_grouped_fp16_Kernel_Module_Unload>(
+            sBlackwellModule, "f16_moe_blackwell_grouped_fp16", stream);
+#endif
+        break;
+    case Variant::kBlackwellGeforce:
+#if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
+        return detail::ensureModuleLoaded<f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_Load,
+            f16_moe_blackwell_geforce_grouped_fp16_Kernel_Module_Unload>(
+            sBlackwellGeforceModule, "f16_moe_blackwell_geforce_grouped_fp16", stream);
+#endif
+        break;
+    case Variant::kNone: break;
     }
+    LOG_ERROR("CuteDslF16MoeRunner: no compiled f16_moe AOT variant matches SM%d", smVersion);
     return false;
 }
 
 int32_t CuteDslF16MoeRunner::getPersistentBlockCount() noexcept
 {
-    if (!loadKernelModules())
-    {
-        return 0;
-    }
-    std::lock_guard<std::mutex> lock(sLoadMutex);
     int32_t device{};
-    if (!checkCuda(cudaGetDevice(&device), "query current device for persistent block count"))
+    cudaDeviceProp properties{};
+    if (!checkCuda(cudaGetDevice(&device), "query current device for persistent block count")
+        || !checkCuda(
+            cudaGetDeviceProperties(&properties, device), "query device properties for persistent block count"))
     {
         return 0;
     }
-    auto const found = sPersistentBlockCounts.find(device);
-    return found == sPersistentBlockCounts.end() ? 0 : found->second;
+    int32_t const persistentBlockCount = std::min(kMAX_PERSISTENT_BLOCKS, properties.multiProcessorCount);
+    if (persistentBlockCount <= 0)
+    {
+        LOG_ERROR("CuteDslF16MoeRunner: CUDA device %d has no multiprocessors", device);
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(sPersistentBlockCountsMutex);
+    return sPersistentBlockCounts.try_emplace(device, persistentBlockCount).first->second;
 }
 
 size_t CuteDslF16MoeRunner::getWorkspaceSize(int32_t maxRoutedRows, int32_t numExperts, int32_t hiddenSize,
@@ -454,6 +343,11 @@ int32_t CuteDslF16MoeRunner::run(CuteDslF16MoeParams const& params, void* worksp
             LOG_ERROR("CuteDslF16MoeRunner: invalid launch configuration");
             return -1;
         }
+        Variant const activeVariant = selectVariant(smVersion);
+        if (!ensureKernelModules(smVersion, stream))
+        {
+            return -1;
+        }
 
         int32_t const routedRows = params.numTokens * params.topK;
         int32_t const fc1N = static_cast<int32_t>(fc1N64);
@@ -497,25 +391,25 @@ int32_t CuteDslF16MoeRunner::run(CuteDslF16MoeParams const& params, void* worksp
         auto launchGrouped = [&](kernel::F16MoeGemmMetadata const& metadata, void* input, void const* weights,
                                  void* output, int32_t n, int32_t k, char const* stage) -> bool {
             int32_t result{-1};
-            switch (sActiveVariant)
+            switch (activeVariant)
             {
             case Variant::kAmpere:
 #if defined(CUTE_DSL_F16_MOE_AMPERE_ENABLED)
-                result = cute_dsl_f16_moe_ampere_grouped_fp16_wrapper(&sAmpereModule, input, const_cast<void*>(weights),
-                    output, metadata.problemShapes, metadata.strides, metadata.addresses, tensormapWorkspace,
-                    routedRows, n, k, params.numExperts, params.persistentBlockCount, stream);
+                result = cute_dsl_f16_moe_ampere_grouped_fp16_wrapper(&sAmpereModule.module, input,
+                    const_cast<void*>(weights), output, metadata.problemShapes, metadata.strides, metadata.addresses,
+                    tensormapWorkspace, routedRows, n, k, params.numExperts, params.persistentBlockCount, stream);
 #endif
                 break;
             case Variant::kBlackwell:
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_ENABLED)
-                result = cute_dsl_f16_moe_blackwell_grouped_fp16_wrapper(&sBlackwellModule, input,
+                result = cute_dsl_f16_moe_blackwell_grouped_fp16_wrapper(&sBlackwellModule.module, input,
                     const_cast<void*>(weights), output, metadata.problemShapes, metadata.strides, metadata.addresses,
                     tensormapWorkspace, routedRows, n, k, params.numExperts, params.persistentBlockCount, stream);
 #endif
                 break;
             case Variant::kBlackwellGeforce:
 #if defined(CUTE_DSL_F16_MOE_BLACKWELL_GEFORCE_ENABLED)
-                result = cute_dsl_f16_moe_blackwell_geforce_grouped_fp16_wrapper(&sBlackwellGeforceModule, input,
+                result = cute_dsl_f16_moe_blackwell_geforce_grouped_fp16_wrapper(&sBlackwellGeforceModule.module, input,
                     const_cast<void*>(weights), output, metadata.problemShapes, metadata.strides, metadata.addresses,
                     tensormapWorkspace, routedRows, n, k, params.numExperts, params.persistentBlockCount, stream);
 #endif

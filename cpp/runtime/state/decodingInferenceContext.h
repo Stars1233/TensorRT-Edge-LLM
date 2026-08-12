@@ -91,9 +91,10 @@ struct DecodingInferenceContext
     rt::OptionalInputTensors deepstackFeatures;                //!< Optional Deepstack features
     int32_t generationRound{};                                 //!< Current generation round
     int32_t maxGenerateLength{};                               //!< Maximum generation length
-    int32_t activeBatchSize{};                                 //!< Current active batch size
-    std::string loraWeightsName{""};                           //!< LoRA adapter name used by this request
-    cudaStream_t stream{};                                     //!< CUDA stream
+    int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
+    int32_t activeBatchSize{};             //!< Current active batch size
+    std::string loraWeightsName{""};       //!< LoRA adapter name used by this request
+    cudaStream_t stream{};                 //!< CUDA stream
 
     float temperature{1.0f}; //!< Temperature for sampling
     float topP{1.0f};        //!< Top-P sampling parameter
@@ -117,6 +118,7 @@ struct DecodingInferenceContext
 
     //! Optional per-token callback invoked after each accepted token update.
     std::optional<TokenCallback> onTokenGenerated;
+    std::vector<int32_t> callbackEmittedTokenCounts; //!< Per-slot count of tokenIds already sent to callback.
 
     //! Optional callback used by speculative decoders to stop appending accepted tokens.
     std::function<bool(int32_t, int32_t)> shouldStopAfterAcceptedToken;

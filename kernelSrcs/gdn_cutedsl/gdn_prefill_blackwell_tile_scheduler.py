@@ -94,13 +94,18 @@ class GdnStaticTileScheduler:
     @staticmethod
     def get_grid_shape(
         params: GdnStaticTileSchedulerParams,
+        sm_count=None,
         *,
         loc=None,
         ip=None,
     ) -> cute.Shape:
         if params.is_persistent:
-            hardware_info = cutlass.utils.HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
+            # sm_count is a runtime value supplied by the caller (AOT wrappers
+            # thread it from a kernel argument). HardwareInfo probe of the
+            # local device remains as a JIT-mode fallback only.
+            if sm_count is None:
+                hardware_info = cutlass.utils.HardwareInfo()
+                sm_count = hardware_info.get_device_multiprocessor_count()
             return (
                 cutlass.min(
                     sm_count, cute.size(params.problem_shape_mbh, loc=loc, ip=ip)

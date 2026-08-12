@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import pytest
 from test_attention_plugin import (BASE, DEPENDENCIES_AVAILABLE, IMPORT_ERROR,
-                                   AttentionParams, _run_rounds)
+                                   AttentionParams, _device_sm, _run_rounds)
 
 pytestmark = pytest.mark.skipif(
     not DEPENDENCIES_AVAILABLE,
@@ -54,6 +54,23 @@ def test_sliding_window_prefill_head256(num_kv_heads):
     cfg = dict(BASE)
     cfg["head_size"] = 256
     cfg["num_kv_heads"] = num_kv_heads
+    p = AttentionParams(batch_size=2,
+                        seq_len=8,
+                        is_prefill=True,
+                        sliding_window_size=4,
+                        **cfg)
+    _run_rounds(p, num_rounds=2, atol=1e-2, rtol=1e-2)
+
+
+# Head 512 sliding-window prefill routes to the optimized D512 CuTe DSL FMHA
+# sliding variant (fmha_d512_sw_paged) on SM100/101/110.
+@pytest.mark.skipif(_device_sm() not in (100, 101, 110),
+                    reason="D512 CuTe DSL sliding FMHA requires SM100/101/110")
+def test_sliding_window_prefill_head512():
+    cfg = dict(BASE)
+    cfg["head_size"] = 512
+    cfg["num_q_heads"] = 4
+    cfg["num_kv_heads"] = 2
     p = AttentionParams(batch_size=2,
                         seq_len=8,
                         is_prefill=True,

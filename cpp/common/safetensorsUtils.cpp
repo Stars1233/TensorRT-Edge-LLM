@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <set>
 
@@ -57,11 +58,26 @@ std::string dataTypeToString(nvinfer1::DataType dataType)
     }
 }
 
-//! @brief Helper function to convert safetensors dtype string to TensorRT data type
-//! @param dtype Safetensors dtype string
-//! @return TensorRT data type
-//! @throws std::runtime_error If data type is unsupported
-nvinfer1::DataType stringToDataType(std::string const& dtype)
+size_t nonnegativeSize(nlohmann::json const& value, std::string const& label)
+{
+    uint64_t result{0};
+    if (value.is_number_unsigned())
+    {
+        result = value.get<uint64_t>();
+    }
+    else
+    {
+        ELLM_CHECK(value.is_number_integer(), label + " must be an integer");
+        int64_t const signedResult = value.get<int64_t>();
+        ELLM_CHECK(signedResult >= 0, label + " must be nonnegative");
+        result = static_cast<uint64_t>(signedResult);
+    }
+    ELLM_CHECK(result <= std::numeric_limits<size_t>::max(), label + " exceeds the host size limit");
+    return static_cast<size_t>(result);
+}
+} // namespace
+
+nvinfer1::DataType dataTypeFromString(std::string_view dtype)
 {
     if (dtype == "F32")
         return nvinfer1::DataType::kFLOAT;
@@ -73,6 +89,8 @@ nvinfer1::DataType stringToDataType(std::string const& dtype)
         return nvinfer1::DataType::kINT8;
     if (dtype == "U8")
         return nvinfer1::DataType::kUINT8;
+    if (dtype == "BOOL")
+        return nvinfer1::DataType::kBOOL;
     if (dtype == "I32")
         return nvinfer1::DataType::kINT32;
     if (dtype == "I64")
@@ -80,9 +98,74 @@ nvinfer1::DataType stringToDataType(std::string const& dtype)
     if (dtype == "F8_E4M3")
         return nvinfer1::DataType::kFP8;
 
-    throw std::runtime_error("Unsupported data type: " + dtype);
+    throw std::runtime_error("Unsupported safetensors data type: " + std::string(dtype));
 }
-} // namespace
+
+FileMetadata parseMetadata(void const* data, size_t bytes, std::string_view source)
+{
+    std::string const sourceName = source.empty() ? std::string{"safetensors mapping"} : std::string{source};
+    ELLM_CHECK(data != nullptr, "Null " + sourceName);
+    ELLM_CHECK(bytes >= sizeof(uint64_t), "Truncated safetensors file: " + sourceName);
+
+    auto const* byteData = static_cast<int8_t const*>(data);
+    uint64_t headerBytesRaw{0};
+    std::memcpy(&headerBytesRaw, byteData, sizeof(headerBytesRaw));
+    ELLM_CHECK(headerBytesRaw <= bytes - sizeof(headerBytesRaw), "Invalid safetensors header size: " + sourceName);
+    size_t const headerBytes = static_cast<size_t>(headerBytesRaw);
+
+    FileMetadata result;
+    result.dataOffset = sizeof(headerBytesRaw) + headerBytes;
+    std::string const headerText(reinterpret_cast<char const*>(byteData + sizeof(headerBytesRaw)), headerBytes);
+    nlohmann::json const header = nlohmann::json::parse(headerText);
+    result.tensors.reserve(header.size());
+    for (auto const& [name, value] : header.items())
+    {
+        if (name == "__metadata__")
+        {
+            continue;
+        }
+        ELLM_CHECK(value.is_object() && value.contains("dtype") && value["dtype"].is_string() && value.contains("shape")
+                && value["shape"].is_array() && value.contains("data_offsets") && value["data_offsets"].is_array()
+                && value["data_offsets"].size() == 2,
+            "Malformed tensor entry " + name + " in " + sourceName);
+
+        std::vector<int64_t> dimensions;
+        dimensions.reserve(value["shape"].size());
+        for (auto const& dimension : value["shape"])
+        {
+            uint64_t dimensionValue{0};
+            if (dimension.is_number_unsigned())
+            {
+                dimensionValue = dimension.get<uint64_t>();
+            }
+            else
+            {
+                ELLM_CHECK(dimension.is_number_integer(),
+                    "Tensor dimension must be an integer for " + name + " in " + sourceName);
+                int64_t const signedDimension = dimension.get<int64_t>();
+                ELLM_CHECK(
+                    signedDimension >= 0, "Tensor dimension must be nonnegative for " + name + " in " + sourceName);
+                dimensionValue = static_cast<uint64_t>(signedDimension);
+            }
+            ELLM_CHECK(dimensionValue <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                "Tensor dimension exceeds INT64 for " + name + " in " + sourceName);
+            dimensions.push_back(static_cast<int64_t>(dimensionValue));
+        }
+
+        size_t const begin = nonnegativeSize(value["data_offsets"][0], "Tensor data offset");
+        size_t const end = nonnegativeSize(value["data_offsets"][1], "Tensor data offset");
+        ELLM_CHECK(begin <= end && end <= bytes - result.dataOffset,
+            "Invalid tensor offsets for " + name + " in " + sourceName);
+        result.tensors.push_back(TensorMetadata{
+            name,
+            dataTypeFromString(value["dtype"].get_ref<std::string const&>()),
+            Coords(dimensions),
+            begin,
+            end - begin,
+        });
+    }
+    return result;
+}
 
 bool saveSafetensors(std::filesystem::path const& filePath, std::vector<Tensor> const& tensors, cudaStream_t stream)
 {
@@ -202,77 +285,27 @@ bool loadSafetensors(std::filesystem::path const& filePath, std::vector<Tensor>&
         return false;
     }
 
-    // Read the header size (8 bytes)
-    uint64_t headerSize = *reinterpret_cast<uint64_t const*>(mmapReader->getByteData());
-
-    // Read the metadata JSON
-    std::string metadataStr(reinterpret_cast<char const*>(mmapReader->getByteData() + sizeof(headerSize)), headerSize);
-
-    // Parse the metadata
-    nlohmann::json header;
+    FileMetadata metadata;
     try
     {
-        header = nlohmann::json::parse(metadataStr);
+        metadata = parseMetadata(mmapReader->getData(), mmapReader->getSize(), filePath.string());
     }
-    catch (nlohmann::json::parse_error const& e)
+    catch (std::exception const& e)
     {
-        LOG_ERROR("Failed to parse JSON metadata: %s", e.what());
+        LOG_ERROR("Failed to parse safetensors metadata: %s", e.what());
         return false;
     }
 
-    // Validate tensor entries and create tensors
-    size_t tensorDataStart = sizeof(headerSize) + headerSize;
-
-    for (auto const& [key, value] : header.items())
+    for (TensorMetadata const& entry : metadata.tensors)
     {
-        if (key == "__metadata__")
-        {
-            LOG_DEBUG("Loading SafeTensor Header, Metadata: %s", value.dump().c_str());
-            continue;
-        }
-
-        // Validate tensor entry
-        if (!value.is_object() || !value.contains("dtype") || !value["dtype"].is_string() || !value.contains("shape")
-            || !value["shape"].is_array() || !value.contains("data_offsets") || !value["data_offsets"].is_array()
-            || value["data_offsets"].size() != 2)
-        {
-            LOG_ERROR("Malformed tensor entry of SafeTensor object: %s : %s", key.c_str(), value.dump().c_str());
-            return false;
-        }
-
-        // Extract tensor information
-        std::string dtype = value["dtype"].get<std::string>();
-        std::vector<size_t> shapeVec = value["shape"].get<std::vector<size_t>>();
-        size_t dataStart = value["data_offsets"][0].get<size_t>();
-        size_t dataEnd = value["data_offsets"][1].get<size_t>();
-        size_t dataSize = dataEnd - dataStart;
-
-        // Convert shape to Coords
-        std::vector<int64_t> shapeInt64;
-        for (size_t dim : shapeVec)
-        {
-            shapeInt64.push_back(static_cast<int64_t>(dim));
-        }
-        Coords shape(shapeInt64);
-
-        // Convert dtype to TensorRT data type
-        nvinfer1::DataType dataType;
-        try
-        {
-            dataType = stringToDataType(dtype);
-        }
-        catch (std::runtime_error const& e)
-        {
-            LOG_ERROR("Unsupported data type: %s", dtype.c_str());
-            return false;
-        }
-
         // Create tensor with owned memory
-        Tensor tensor(shape, DeviceType::kGPU, dataType, key);
+        Tensor tensor(entry.shape, DeviceType::kGPU, entry.dataType, entry.name);
+        ELLM_CHECK(static_cast<size_t>(tensor.getMemoryCapacity()) == entry.bytes,
+            "Safetensors byte count does not match tensor metadata: " + entry.name);
 
         // Copy data from file to GPU
-        int8_t const* tensorData = mmapReader->getByteData() + tensorDataStart + dataStart;
-        CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), tensorData, dataSize, cudaMemcpyHostToDevice, stream));
+        int8_t const* tensorData = mmapReader->getByteData() + metadata.dataOffset + entry.offset;
+        CUDA_CHECK(cudaMemcpyAsync(tensor.rawPointer(), tensorData, entry.bytes, cudaMemcpyHostToDevice, stream));
 
         tensors.push_back(std::move(tensor));
     }

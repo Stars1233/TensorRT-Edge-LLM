@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cuda_fp16.h>
 #include <gtest/gtest.h>
 #include <iostream>
@@ -30,7 +31,8 @@ using namespace nvinfer1;
 
 void runCausalConv1dReference(int32_t batch, int32_t seqLen, int32_t dim, int32_t width, int32_t padding,
     std::vector<half> const& x, std::vector<half> const& weight, std::vector<half> const& bias,
-    std::vector<half>& outRef, std::vector<int32_t> const* contextLens = nullptr)
+    std::vector<half>& outRef, std::vector<int32_t> const* contextLens = nullptr,
+    std::vector<half> const* initialState = nullptr)
 {
     for (int32_t b = 0; b < batch; ++b)
     {
@@ -56,6 +58,12 @@ void runCausalConv1dReference(int32_t batch, int32_t seqLen, int32_t dim, int32_
                             = static_cast<int64_t>(b) * seqLen * dim + static_cast<int64_t>(inPos) * dim + d;
                         int64_t const wIdx = static_cast<int64_t>(d) * width + k;
                         acc += __half2float(x[xIdx]) * __half2float(weight[wIdx]);
+                    }
+                    else if (initialState != nullptr && inPos < 0 && inPos >= -width)
+                    {
+                        int64_t const stateIdx = (static_cast<int64_t>(b) * dim + d) * width + width + inPos;
+                        int64_t const wIdx = static_cast<int64_t>(d) * width + k;
+                        acc += __half2float((*initialState)[stateIdx]) * __half2float(weight[wIdx]);
                     }
                 }
                 outRef[outIdx] = __float2half(acc);
@@ -98,7 +106,8 @@ void runCausalConv1dTest(
             clDevice.rawPointer(), contextLens->data(), contextLens->size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         clOpt = std::optional(std::cref(clDevice));
     }
-    mamba_ssm::invokeCausalConv1d(xDevice, weightDevice, biasOpt, outputDevice, 1, width - 1, 1, clOpt, nullptr);
+    mamba_ssm::invokeCausalConv1d(
+        xDevice, weightDevice, biasOpt, outputDevice, 1, width - 1, 1, std::nullopt, clOpt, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto const outputHost = copyDeviceToHost<half>(outputDevice);
@@ -131,7 +140,8 @@ TEST(MambaCausalConv1d, Width4)
 // ---------------------------------------------------------------------------
 
 void runCaptureConvStateReference(int32_t batch, int32_t seqLen, int32_t dim, int32_t width, std::vector<half> const& x,
-    std::vector<half>& convStateRef, std::vector<int32_t> const* contextLens = nullptr)
+    std::vector<half>& convStateRef, std::vector<int32_t> const* contextLens = nullptr,
+    std::vector<half> const* initialState = nullptr)
 {
     std::fill(convStateRef.begin(), convStateRef.end(), __float2half(0.F));
     for (int32_t b = 0; b < batch; ++b)
@@ -142,10 +152,18 @@ void runCaptureConvStateReference(int32_t batch, int32_t seqLen, int32_t dim, in
         int32_t const dstOffset = width - tailLen;
         for (int32_t d = 0; d < dim; ++d)
         {
+            int64_t const stateOffset = (static_cast<int64_t>(b) * dim + d) * width;
+            for (int32_t t = 0; t < dstOffset; ++t)
+            {
+                if (initialState != nullptr)
+                {
+                    convStateRef[stateOffset + t] = (*initialState)[stateOffset + tailLen + t];
+                }
+            }
             for (int32_t t = 0; t < tailLen; ++t)
             {
                 int64_t const srcIdx = (static_cast<int64_t>(b) * seqLen + tailStart + t) * dim + d;
-                int64_t const dstIdx = (static_cast<int64_t>(b) * dim + d) * width + dstOffset + t;
+                int64_t const dstIdx = stateOffset + dstOffset + t;
                 convStateRef[dstIdx] = x[srcIdx];
             }
         }
@@ -175,7 +193,7 @@ void runCaptureConvStateTest(
             clDevice.rawPointer(), contextLens->data(), contextLens->size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         clOpt = std::optional(std::cref(clDevice));
     }
-    mamba_ssm::invokeCaptureConvState(xDevice, convStateDevice, clOpt, nullptr);
+    mamba_ssm::invokeCaptureConvState(xDevice, std::nullopt, convStateDevice, clOpt, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto const convStateHost = copyDeviceToHost<half>(convStateDevice);
@@ -225,6 +243,78 @@ TEST(MambaCaptureConvStatePadding, ShortContext)
 {
     std::vector<int32_t> cl = {2};
     runCaptureConvStateTest(1, 16, 64, 4, &cl);
+}
+
+TEST(MambaCausalConv1dPadding, ZeroContextLength)
+{
+    std::vector<int32_t> const contextLengths{0, 7};
+    runCausalConv1dTest(2, 7, 64, 4, &contextLengths);
+    runCaptureConvStateTest(2, 7, 64, 4, &contextLengths);
+}
+
+TEST(MambaCausalConv1dContinuation, NonzeroState)
+{
+    constexpr int32_t batch = 2;
+    constexpr int32_t seqLen = 7;
+    constexpr int32_t dim = 64;
+    constexpr int32_t width = 4;
+    std::vector<half> xHost(batch * seqLen * dim);
+    std::vector<half> weightHost(dim * width);
+    std::vector<half> biasHost(dim);
+    std::vector<half> initialStateHost(batch * dim * width);
+    std::vector<half> outputRef(batch * seqLen * dim, __float2half(0.0F));
+    std::vector<half> finalStateRef(batch * dim * width, __float2half(0.0F));
+    std::vector<int32_t> const contextLengths{2, seqLen};
+
+    uniformFloatInitialization<half>(xHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(weightHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(biasHost, -0.5F, 0.5F);
+    uniformFloatInitialization<half>(initialStateHost, -0.5F, 0.5F);
+    runCausalConv1dReference(batch, seqLen, dim, width, width - 1, xHost, weightHost, biasHost, outputRef,
+        &contextLengths, &initialStateHost);
+    runCaptureConvStateReference(batch, seqLen, dim, width, xHost, finalStateRef, &contextLengths, &initialStateHost);
+
+    auto xDevice = rt::Tensor({batch, seqLen, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto weightDevice = rt::Tensor({dim, 1, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto biasDevice = rt::Tensor({dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto stateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto capturedStateDevice = rt::Tensor({batch, dim, width}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto outputDevice = rt::Tensor({batch, seqLen, dim}, rt::DeviceType::kGPU, DataType::kHALF);
+    auto contextLengthsDevice = rt::Tensor({batch}, rt::DeviceType::kGPU, DataType::kINT32);
+    copyHostToDevice(xDevice, xHost);
+    copyHostToDevice(weightDevice, weightHost);
+    copyHostToDevice(biasDevice, biasHost);
+    copyHostToDevice(stateDevice, initialStateHost);
+    CUDA_CHECK(cudaMemcpy(contextLengthsDevice.rawPointer(), contextLengths.data(),
+        contextLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    rt::OptionalInputTensor const biasOpt = std::optional(std::cref(biasDevice));
+    rt::OptionalInputTensor const initialStateOpt = std::optional(std::cref(stateDevice));
+    rt::OptionalInputTensor const contextLengthsOpt = std::optional(std::cref(contextLengthsDevice));
+    mamba_ssm::invokeCausalConv1d(
+        xDevice, weightDevice, biasOpt, outputDevice, 1, width - 1, 1, initialStateOpt, contextLengthsOpt, nullptr);
+    mamba_ssm::invokeCaptureConvState(xDevice, initialStateOpt, capturedStateDevice, contextLengthsOpt, nullptr);
+    mamba_ssm::invokeCaptureConvState(xDevice, initialStateOpt, stateDevice, contextLengthsOpt, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto const outputHost = copyDeviceToHost<half>(outputDevice);
+    auto const capturedStateHost = copyDeviceToHost<half>(capturedStateDevice);
+    auto const finalStateHost = copyDeviceToHost<half>(stateDevice);
+    for (size_t i = 0; i < outputRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(outputHost[i], outputRef[i], 1e-3F, 1e-3F))
+            << "Continuation output mismatch at index " << i << ": got " << __half2float(outputHost[i]) << ", expected "
+            << __half2float(outputRef[i]);
+    }
+    for (size_t i = 0; i < finalStateRef.size(); ++i)
+    {
+        EXPECT_TRUE(isclose(capturedStateHost[i], finalStateRef[i], 1e-3F, 1e-3F))
+            << "Separate continuation state mismatch at index " << i << ": got " << __half2float(capturedStateHost[i])
+            << ", expected " << __half2float(finalStateRef[i]);
+        EXPECT_TRUE(isclose(finalStateHost[i], finalStateRef[i], 1e-3F, 1e-3F))
+            << "Continuation state mismatch at index " << i << ": got " << __half2float(finalStateHost[i])
+            << ", expected " << __half2float(finalStateRef[i]);
+    }
 }
 
 // ---------------------------------------------------------------------------

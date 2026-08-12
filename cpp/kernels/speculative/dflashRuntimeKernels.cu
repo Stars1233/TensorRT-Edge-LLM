@@ -22,6 +22,8 @@
 #include <cassert>
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <stdexcept>
+#include <string>
 
 namespace trt_edgellm
 {
@@ -41,8 +43,8 @@ static constexpr int32_t kVecSize = 8; // half8
 
 __global__ void dflashTargetKVCacheUpdateKernel(half const* __restrict__ kDelta, half const* __restrict__ vDelta,
     half* __restrict__ kvCache, float const* __restrict__ cosSinCache, int32_t const* __restrict__ deltaStartPositions,
-    int32_t const* __restrict__ deltaLengths, int32_t deltaLen, int32_t numKVHeads, int32_t headDim, int32_t maxSeqLen,
-    int32_t rotaryDim, int32_t cosSinBatch, int32_t cosSinSeqLen)
+    int32_t const* __restrict__ deltaLengths, int32_t deltaLen, int32_t numKVHeads, int32_t headDim, int32_t rotaryDim,
+    int32_t cosSinBatch, int32_t cosSinSeqLen, int32_t maxBatch, int32_t kvCapacity)
 {
     int32_t const t = blockIdx.x;  // token index within delta [0, deltaLen)
     int32_t const h = blockIdx.y;  // KV head index
@@ -69,8 +71,9 @@ __global__ void dflashTargetKVCacheUpdateKernel(half const* __restrict__ kDelta,
     int32_t const deltaStart = deltaStartPositions[b];
     int32_t const pos = deltaStart + t; // absolute position in the cache
 
-    // OOB guard: skip if position exceeds cache capacity
-    if (pos >= maxSeqLen)
+    // OOB guard: skip if position exceeds the physical slot capacity (kvCapacity = capPadded, the real
+    // per-request slot size in the two-pool NHD allocation), not the runtime maxSeqLen descriptor.
+    if (pos >= kvCapacity)
     {
         return;
     }
@@ -140,13 +143,17 @@ __global__ void dflashTargetKVCacheUpdateKernel(half const* __restrict__ kDelta,
         }
     }
 
-    // --- Write to KV cache ---
-    // KV cache layout: [B, 2, numKVHeads, maxSeqLen, headDim]
-    // K: offset at [b, 0, h, pos, d]
-    // V: offset at [b, 1, h, pos, d]
-    int64_t const cacheBase = static_cast<int64_t>(b) * 2 * numKVHeads * maxSeqLen * headDim;
-    int64_t const kCacheOffset = cacheBase + static_cast<int64_t>(h) * maxSeqLen * headDim + pos * headDim;
-    int64_t const vCacheOffset = cacheBase + static_cast<int64_t>(numKVHeads + h) * maxSeqLen * headDim + pos * headDim;
+    // --- Write to KV cache (canonical two-pool NHD layout) ---
+    // Buffer: [2, maxBatch, kvCapacity, numKVHeads, headDim], token-major within a slot.
+    //   K-pool at base; V-pool at maxBatch*kvCapacity*numKVHeads*headDim (split outermost).
+    //   request b at b*kvCapacity*tokenStride within each pool; token pos at pos*tokenStride;
+    //   head h at h*headDim. Strides use the allocation kvCapacity (NOT runtime maxSeqLen).
+    int64_t const tokenStride = static_cast<int64_t>(numKVHeads) * headDim; // NHD per-token stride (H*D)
+    int64_t const kBase = static_cast<int64_t>(b) * kvCapacity * tokenStride + static_cast<int64_t>(h) * headDim
+        + static_cast<int64_t>(pos) * tokenStride;
+    int64_t const vPoolOffset
+        = static_cast<int64_t>(maxBatch) * kvCapacity * tokenStride; // V-half = maxBatch*kvCapacity*H*D
+    int64_t const vBase = vPoolOffset + kBase;
 
 #pragma unroll
     for (int32_t i = 0; i < kVecSize; ++i)
@@ -154,16 +161,16 @@ __global__ void dflashTargetKVCacheUpdateKernel(half const* __restrict__ kDelta,
         int32_t const idx = elemOffset + i;
         if (idx < headDim)
         {
-            kvCache[kCacheOffset + idx] = kRoped[i];
-            kvCache[vCacheOffset + idx] = vVals[i];
+            kvCache[kBase + idx] = kRoped[i];
+            kvCache[vBase + idx] = vVals[i];
         }
     }
 }
 
 void launchDFlashTargetKVCacheUpdate(half const* kDelta, half const* vDelta, half* kvCache, float const* cosSinCache,
     int32_t const* deltaStartPositions, int32_t const* deltaLengths, int32_t batchSize, int32_t deltaLen,
-    int32_t numKVHeads, int32_t headDim, int32_t maxSeqLen, int32_t rotaryDim, int32_t cosSinBatch,
-    int32_t cosSinSeqLen, cudaStream_t stream)
+    int32_t numKVHeads, int32_t headDim, int32_t rotaryDim, int32_t cosSinBatch, int32_t cosSinSeqLen, int32_t maxBatch,
+    int32_t kvCapacity, cudaStream_t stream)
 {
     if (deltaLen == 0 || batchSize == 0)
     {
@@ -172,13 +179,35 @@ void launchDFlashTargetKVCacheUpdate(half const* kDelta, half const* vDelta, hal
 
     int32_t const threadsPerToken = (headDim + kVecSize - 1) / kVecSize;
     assert(threadsPerToken <= 1024 && "DFlash KV cache update exceeds CUDA max threads per block");
+    // Grid uses the ACTIVE batchSize (which requests to process); the two-pool V-pool offset and
+    // per-request slot stride use the ALLOCATION maxBatch/kvCapacity passed separately.
     dim3 const grid(deltaLen, numKVHeads, batchSize);
     dim3 const block(threadsPerToken);
 
     dflashTargetKVCacheUpdateKernel<<<grid, block, 0, stream>>>(kDelta, vDelta, kvCache, cosSinCache,
-        deltaStartPositions, deltaLengths, deltaLen, numKVHeads, headDim, maxSeqLen, rotaryDim, cosSinBatch,
-        cosSinSeqLen);
+        deltaStartPositions, deltaLengths, deltaLen, numKVHeads, headDim, rotaryDim, cosSinBatch, cosSinSeqLen,
+        maxBatch, kvCapacity);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void checkDFlashPageTableIdentity(int32_t const* hostKRow, int32_t slot, int32_t maxPagesPerSeq)
+{
+    for (int32_t j = 0; j < maxPagesPerSeq; ++j)
+    {
+        ELLM_CHECK(hostKRow[j] == slot * maxPagesPerSeq + j,
+            "checkDFlashPageTableIdentity: page table for slot " + std::to_string(slot)
+                + " is not identity at logical page " + std::to_string(j) + " (expected "
+                + std::to_string(slot * maxPagesPerSeq + j) + ", got " + std::to_string(hostKRow[j])
+                + "); DFlash's target-KV update requires identity-mapped slots (no reuse).");
+    }
+}
+
+void checkDFlashRopeCapacity(int32_t cosSinSeqLen, int32_t kvCapacity)
+{
+    ELLM_CHECK(cosSinSeqLen <= kvCapacity,
+        "checkDFlashRopeCapacity: rope_cos_sin sequence length (" + std::to_string(cosSinSeqLen)
+            + ") exceeds the KV pool's padded per-slot capacity (" + std::to_string(kvCapacity)
+            + "); the rope cache cannot cover a position the KV pool has no room for.");
 }
 
 // -----------------------------------------------------------------------
@@ -323,42 +352,50 @@ void launchDFlashPrepareBaseVerifyInputs(int32_t const* baseKVCacheLengths, int3
 
 __global__ void dflashBuildLinearVerifyInputsKernel(int32_t const* __restrict__ lastAcceptedTokens,
     int32_t const* __restrict__ draftTokenIds, int32_t* __restrict__ verifyTokenIds,
-    int8_t* __restrict__ verifyTreeMask, int32_t blockSize, int32_t tokenElements, int32_t maskElements)
+    int8_t* __restrict__ verifyTreeMask, int32_t proposalLen, int32_t draftTokenStride, int32_t verifySize,
+    int32_t tokenElements, int32_t maskElements)
 {
     int32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < tokenElements)
     {
-        int32_t const batchIdx = idx / blockSize;
-        int32_t const posIdx = idx % blockSize;
-        verifyTokenIds[idx] = posIdx == 0 ? lastAcceptedTokens[batchIdx] : draftTokenIds[idx];
+        int32_t const batchIdx = idx / verifySize;
+        int32_t const posIdx = idx % verifySize;
+        // DFlash draft output at position 0 predicts the current token (t_last),
+        // not the next token. Real draft proposals start at position 1.
+        // DDTree explicitly skips depthIdx==0 for the same reason (see ddtreeKernels.cu).
+        verifyTokenIds[idx]
+            = posIdx == 0 ? lastAcceptedTokens[batchIdx] : draftTokenIds[batchIdx * draftTokenStride + posIdx];
     }
 
     // Token ids and mask entries are independent output buffers, so one flat
     // launch can populate both ranges without cross-thread ordering.
     if (idx < maskElements)
     {
-        int32_t const localIdx = idx % (blockSize * blockSize);
-        int32_t const rowIdx = localIdx / blockSize;
-        int32_t const colIdx = localIdx % blockSize;
+        int32_t const localIdx = idx % (verifySize * verifySize);
+        int32_t const rowIdx = localIdx / verifySize;
+        int32_t const colIdx = localIdx % verifySize;
         verifyTreeMask[idx] = colIdx <= rowIdx ? int8_t{1} : int8_t{0};
     }
 }
 
 void launchDFlashBuildLinearVerifyInputs(int32_t const* lastAcceptedTokens, int32_t const* draftTokenIds,
-    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t blockSize, cudaStream_t stream)
+    int32_t* verifyTokenIds, int8_t* verifyTreeMask, int32_t batchSize, int32_t proposalLen, int32_t draftTokenStride,
+    int32_t verifySize, cudaStream_t stream)
 {
-    if (batchSize == 0 || blockSize == 0)
+    if (batchSize == 0 || proposalLen == 0 || verifySize == 0)
     {
         return;
     }
 
-    int32_t const tokenElements = batchSize * blockSize;
-    int32_t const maskElements = batchSize * blockSize * blockSize;
+    assert(verifySize == proposalLen + 1 && "DFlash linear verify expects [anchor] + proposal tokens");
+    assert(draftTokenStride >= proposalLen && "DFlash draft token stride must cover proposalLen tokens");
+    int32_t const tokenElements = batchSize * verifySize;
+    int32_t const maskElements = batchSize * verifySize * verifySize;
     constexpr int32_t kThreadsPerBlock{256};
     int32_t const blocks = (std::max(tokenElements, maskElements) + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
-    dflashBuildLinearVerifyInputsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-        lastAcceptedTokens, draftTokenIds, verifyTokenIds, verifyTreeMask, blockSize, tokenElements, maskElements);
+    dflashBuildLinearVerifyInputsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(lastAcceptedTokens, draftTokenIds,
+        verifyTokenIds, verifyTreeMask, proposalLen, draftTokenStride, verifySize, tokenElements, maskElements);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -27,22 +27,25 @@ namespace multimodal
 //! Enum for supported multimodal model types
 enum class ModelType
 {
-    QWEN2_VL,                     //!< Qwen2-VL model
-    QWEN2_5_VL,                   //!< Qwen2.5-VL model
-    QWEN3_VL,                     //!< Qwen3-VL model
-    QWEN3_5,                      //!< Qwen3.5 model
-    QWEN3_OMNI_AUDIO_ENCODER,     //!< Qwen3-Omni audio encoder (speech-to-embeddings)
-    QWEN3_OMNI_VISION_ENCODER,    //!< Qwen3-Omni vision encoder (image-to-embeddings)
-    QWEN3_OMNI_CODE2WAV,          //!< Qwen3-Omni Code2Wav vocoder (codes-to-waveform)
-    INTERNVL,                     //!< InternVL model
-    PHI4MM,                       //!< Phi-4MM model
-    GEMMA4_VISION,                //!< Gemma4 vision encoder
-    GEMMA4_UNIFIED_VISION,        //!< Encoder-free Gemma4 Unified vision embedder
-    GEMMA4_UNIFIED_AUDIO,         //!< Encoder-free Gemma4 Unified audio embedder
-    NEMOTRON_OMNI_VISION_ENCODER, //!< Nemotron-Omni vision encoder
-    NEMOTRON_OMNI_AUDIO_ENCODER,  //!< Nemotron-Omni audio encoder
-    GEMMA4_AUDIO_ENCODER,         //!< Gemma4 audio encoder
-    UNKNOWN                       //!< Unknown or unsupported model type
+    QWEN2_VL,                      //!< Qwen2-VL model
+    QWEN2_5_VL,                    //!< Qwen2.5-VL model
+    QWEN3_VL,                      //!< Qwen3-VL model
+    QWEN3_5,                       //!< Qwen3.5 model
+    QWEN3_OMNI_AUDIO_ENCODER,      //!< Qwen3-Omni audio encoder (3-stage CNN, 4x downsample)
+    QWEN3_OMNI_NEXT_AUDIO_ENCODER, //!< Qwen3-Next Omni audio encoder (4-stage CNN, 8x downsample)
+    QWEN3_OMNI_VISION_ENCODER,     //!< Qwen3-Omni / Qwen3-Next Omni vision encoder (image-to-embeddings)
+    QWEN3_OMNI_CODE2WAV,           //!< Qwen3-Omni Code2Wav vocoder (codes-to-waveform)
+    INTERNVL,                      //!< InternVL model
+    PHI4MM,                        //!< Phi-4MM model
+    GEMMA4_VISION,                 //!< Gemma4 vision encoder
+    GEMMA4_UNIFIED_VISION,         //!< Encoder-free Gemma4 Unified vision embedder
+    GEMMA4_UNIFIED_AUDIO,          //!< Encoder-free Gemma4 Unified audio embedder
+    NEMOTRON_OMNI_VISION_ENCODER,  //!< Nemotron-Omni vision encoder
+    NEMOTRON_OMNI_AUDIO_ENCODER,   //!< Nemotron-Omni audio encoder
+    NEMOTRON3_5_ASR_AUDIO_ENCODER, //!< Nemotron-3.5-ASR FastConformer encoder (RNN-T)
+    GEMMA4_AUDIO_ENCODER,          //!< Gemma4 audio encoder
+    COSMOS3_EDGE,                  //!< Cosmos3-Edge reasoner vision encoder (SigLIP2 + PatchMerger)
+    UNKNOWN                        //!< Unknown or unsupported model type
 };
 
 //! Convert string to ModelType enum
@@ -61,9 +64,12 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
     if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text"
         || modelTypeStr == "qwen3_asr_thinker" || modelTypeStr == "qwen3_omni_audio_encoder")
         return ModelType::QWEN3_OMNI_AUDIO_ENCODER;
-    if (modelTypeStr == "qwen3_omni_vision_encoder")
+    if (modelTypeStr == "qwen3_omni_next_audio_encoder")
+        return ModelType::QWEN3_OMNI_NEXT_AUDIO_ENCODER;
+    if (modelTypeStr == "qwen3_omni_vision_encoder" || modelTypeStr == "qwen3_omni_next_vision_encoder")
         return ModelType::QWEN3_OMNI_VISION_ENCODER;
-    if (modelTypeStr == "qwen3_omni_code2wav" || modelTypeStr == "qwen3_tts_code2wav")
+    if (modelTypeStr == "qwen3_omni_code2wav" || modelTypeStr == "qwen3_tts_code2wav"
+        || modelTypeStr == "qwen3_omni_next_code2wav")
         return ModelType::QWEN3_OMNI_CODE2WAV;
     if (modelTypeStr == "internvl" || modelTypeStr == "internvl_vision")
         return ModelType::INTERNVL;
@@ -79,8 +85,12 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::NEMOTRON_OMNI_VISION_ENCODER;
     if (modelTypeStr == "parakeet")
         return ModelType::NEMOTRON_OMNI_AUDIO_ENCODER;
+    if (modelTypeStr == "nemotron3_5_asr")
+        return ModelType::NEMOTRON3_5_ASR_AUDIO_ENCODER;
     if (modelTypeStr == "gemma4_audio")
         return ModelType::GEMMA4_AUDIO_ENCODER;
+    if (modelTypeStr == "cosmos3_edge" || modelTypeStr == "cosmos3_edge_vision")
+        return ModelType::COSMOS3_EDGE;
     return ModelType::UNKNOWN;
 }
 

@@ -98,11 +98,9 @@ class Gemma4UnifiedMultimodalEmbedder(nn.Module):
 class Gemma4UnifiedVisionEmbedder(nn.Module):
     """Project merged RGB patches and add factorized 2-D position embeddings."""
 
-    def __init__(self, vision_config: dict,
-                 model_config: "ModelConfig") -> None:
+    def __init__(self, vision_config: dict, model_config: "ModelConfig",
+                 patch_dim: int) -> None:
         super().__init__()
-        model_patch_size = int(vision_config["model_patch_size"])
-        patch_dim = model_patch_size * model_patch_size * 3
         mm_embed_dim = int(vision_config["mm_embed_dim"])
         output_proj_dims = int(vision_config["output_proj_dims"])
         if mm_embed_dim != output_proj_dims:
@@ -139,7 +137,8 @@ class Gemma4UnifiedVisionEmbedder(nn.Module):
 class Gemma4UnifiedVisualModel(nn.Module):
     """Packed-patch Gemma 4 Unified visual graph used for ONNX export."""
 
-    def __init__(self, config: dict, model_config: "ModelConfig") -> None:
+    def __init__(self, config: dict, model_config: "ModelConfig",
+                 patch_dim: int) -> None:
         super().__init__()
         vision_config = config.get("vision_config", config)
         text_config = config.get("text_config") or {}
@@ -148,7 +147,7 @@ class Gemma4UnifiedVisualModel(nn.Module):
                 "Gemma4 Unified visual export requires text_config.hidden_size"
             )
         self.vision_embedder = Gemma4UnifiedVisionEmbedder(
-            vision_config, model_config)
+            vision_config, model_config, patch_dim)
         self.embed_vision = Gemma4UnifiedMultimodalEmbedder(
             vision_config,
             text_config,
@@ -173,8 +172,7 @@ class Gemma4UnifiedVisualModel(nn.Module):
           - ``output``: ``[num_patches, text_hidden_size]`` FP16
         """
         vision_config = config.get("vision_config", config)
-        model_patch_size = int(vision_config["model_patch_size"])
-        patch_dim = model_patch_size * model_patch_size * 3
+        patch_dim = self.vision_embedder.patch_dense.in_features
         num_patches = min(4, int(vision_config.get("num_soft_tokens", 4)))
         pixel_values = torch.zeros(num_patches,
                                    patch_dim,
@@ -241,7 +239,23 @@ def build_gemma4_unified_visual(
     ``dtype`` remains part of the common encoder factory API, but this model's
     runtime input and output are always FP16 and its internal math is FP32.
     """
-    model = Gemma4UnifiedVisualModel(config, model_config=model_config)
+    vision_config = config.get("vision_config", config)
+    if "model_patch_size" in vision_config:
+        ps = int(vision_config["model_patch_size"])
+        patch_dim = ps * ps * 3
+    else:
+        # Infer patch_dim from the checkpoint weight rather than hard-coding an
+        # architectural constant.  patch_dense maps [num_patches, patch_dim] →
+        # [num_patches, mm_embed_dim], so weight shape is [mm_embed_dim, patch_dim].
+        _key = "model.vision_embedder.patch_dense.weight"
+        if _key not in weights:
+            raise KeyError(
+                f"Cannot infer patch_dim: '{_key}' absent from weights and "
+                "'model_patch_size' is not in vision_config.")
+        patch_dim = int(weights[_key].shape[1])
+    model = Gemma4UnifiedVisualModel(config,
+                                     model_config=model_config,
+                                     patch_dim=patch_dim)
     # The checkpoint is trained in BF16 and its visual patch projection has a
     # much larger dynamic range than ordinary transformer weights.  Converting
     # it to FP16 can overflow patch_dense on non-uniform images; the following

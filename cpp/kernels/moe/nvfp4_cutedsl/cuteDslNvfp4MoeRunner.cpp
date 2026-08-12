@@ -20,6 +20,7 @@
 #include "cuteDslNvfp4MoeRunner.h"
 
 #include "common/checkMacros.h"
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 
 #include <algorithm>
@@ -30,20 +31,24 @@ namespace trt_edgellm
 {
 
 // AOT module handles -- 2 backends x 6 activations x n128 = 12.
-nvfp4_fused_moe_decode_identity_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeIdentity_n128 = {};
-nvfp4_fused_moe_decode_silu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeSiLU_n128 = {};
-nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeSwiGLU_n128 = {};
-nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeGeLU_n128 = {};
-nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeReLU2_n128 = {};
-nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sDecodeGeGLU_n128 = {};
-nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillIdentity_n128 = {};
-nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillSiLU_n128 = {};
-nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillSwiGLU_n128 = {};
-nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillGeLU_n128 = {};
-nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillReLU2_n128 = {};
-nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_t CuteDslNvfp4MoeRunner::sPrefillGeGLU_n128 = {};
-bool CuteDslNvfp4MoeRunner::sLoaded = false;
-std::mutex CuteDslNvfp4MoeRunner::sLoadMutex;
+detail::LazyKernelModule<nvfp4_fused_moe_decode_identity_n128_Kernel_Module_t>
+    CuteDslNvfp4MoeRunner::sDecodeIdentity_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_decode_silu_n128_Kernel_Module_t> CuteDslNvfp4MoeRunner::sDecodeSiLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_t>
+    CuteDslNvfp4MoeRunner::sDecodeSwiGLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_t> CuteDslNvfp4MoeRunner::sDecodeGeLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_t> CuteDslNvfp4MoeRunner::sDecodeReLU2_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_t> CuteDslNvfp4MoeRunner::sDecodeGeGLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_t>
+    CuteDslNvfp4MoeRunner::sPrefillIdentity_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_t> CuteDslNvfp4MoeRunner::sPrefillSiLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_t>
+    CuteDslNvfp4MoeRunner::sPrefillSwiGLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_t> CuteDslNvfp4MoeRunner::sPrefillGeLU_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_t>
+    CuteDslNvfp4MoeRunner::sPrefillReLU2_n128{};
+detail::LazyKernelModule<nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_t>
+    CuteDslNvfp4MoeRunner::sPrefillGeGLU_n128{};
 
 bool CuteDslNvfp4MoeRunner::canImplement(int32_t hiddenSize, int32_t moeInterSize, int32_t numExperts, int32_t topK,
     int32_t smVersion, CuteDslMoeActivation activation, CuteDslMoeIoDtype ioDtype, CuteDslMoeBackend backend)
@@ -108,63 +113,71 @@ int32_t CuteDslNvfp4MoeRunner::selectMmaTilerN(int32_t moeInterSize)
     // return (moeInterSize % kLevelTileNLarge == 0) ? kLevelTileNLarge : kLevelTileN;
 }
 
-bool CuteDslNvfp4MoeRunner::loadKernelModules()
+bool CuteDslNvfp4MoeRunner::ensureKernelModules(CuteDslNvfp4MoeParams const& params, cudaStream_t stream)
 {
-    std::lock_guard<std::mutex> lock(sLoadMutex);
-    if (sLoaded)
+    CuteDslMoeBackend const backend = resolveBackend(params.backend, params.numTokens, params.topK);
+    if (backend == CuteDslMoeBackend::kDecode)
     {
-        return true;
+        switch (params.activation)
+        {
+        case CuteDslMoeActivation::kIdentity:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_decode_identity_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_decode_identity_n128_Kernel_Module_Unload>(
+                sDecodeIdentity_n128, "nvfp4_fused_moe_decode_identity_n128", stream);
+        case CuteDslMoeActivation::kSiLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_decode_silu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_decode_silu_n128_Kernel_Module_Unload>(
+                sDecodeSiLU_n128, "nvfp4_fused_moe_decode_silu_n128", stream);
+        case CuteDslMoeActivation::kSwiGLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_Unload>(
+                sDecodeSwiGLU_n128, "nvfp4_fused_moe_decode_swiglu_n128", stream);
+        case CuteDslMoeActivation::kGeLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_Unload>(
+                sDecodeGeLU_n128, "nvfp4_fused_moe_decode_gelu_n128", stream);
+        case CuteDslMoeActivation::kReLU2:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_Unload>(
+                sDecodeReLU2_n128, "nvfp4_fused_moe_decode_relu2_n128", stream);
+        case CuteDslMoeActivation::kGeGLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_Unload>(
+                sDecodeGeGLU_n128, "nvfp4_fused_moe_decode_geglu_n128", stream);
+        }
     }
-    try
+    if (backend == CuteDslMoeBackend::kPrefill)
     {
-        // Decode backend: 5 activations x n128 = 5 modules.
-        nvfp4_fused_moe_decode_identity_n128_Kernel_Module_Load(&sDecodeIdentity_n128);
-        nvfp4_fused_moe_decode_silu_n128_Kernel_Module_Load(&sDecodeSiLU_n128);
-        nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_Load(&sDecodeSwiGLU_n128);
-        nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_Load(&sDecodeGeLU_n128);
-        nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_Load(&sDecodeReLU2_n128);
-        nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_Load(&sDecodeGeGLU_n128);
-        // Prefill backend: 5 activations x n128 = 5 modules.
-        nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_Load(&sPrefillIdentity_n128);
-        nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_Load(&sPrefillSiLU_n128);
-        nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_Load(&sPrefillSwiGLU_n128);
-        nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_Load(&sPrefillGeLU_n128);
-        nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_Load(&sPrefillReLU2_n128);
-        nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_Load(&sPrefillGeGLU_n128);
-
-        sLoaded = true;
-        LOG_DEBUG(
-            "CuTe DSL NVFP4 fused MoE kernel modules loaded "
-            "(FP16: identity/silu/swiglu/gelu/relu2 x decode/prefill x n128 = 10)");
-        return true;
+        switch (params.activation)
+        {
+        case CuteDslMoeActivation::kIdentity:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_Unload>(
+                sPrefillIdentity_n128, "nvfp4_fused_moe_prefill_identity_n128", stream);
+        case CuteDslMoeActivation::kSiLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_Unload>(
+                sPrefillSiLU_n128, "nvfp4_fused_moe_prefill_silu_n128", stream);
+        case CuteDslMoeActivation::kSwiGLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_Unload>(
+                sPrefillSwiGLU_n128, "nvfp4_fused_moe_prefill_swiglu_n128", stream);
+        case CuteDslMoeActivation::kGeLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_Unload>(
+                sPrefillGeLU_n128, "nvfp4_fused_moe_prefill_gelu_n128", stream);
+        case CuteDslMoeActivation::kReLU2:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_Unload>(
+                sPrefillReLU2_n128, "nvfp4_fused_moe_prefill_relu2_n128", stream);
+        case CuteDslMoeActivation::kGeGLU:
+            return detail::ensureModuleLoaded<nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_Load,
+                nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_Unload>(
+                sPrefillGeGLU_n128, "nvfp4_fused_moe_prefill_geglu_n128", stream);
+        }
     }
-    catch (...)
-    {
-        LOG_ERROR("Failed to load CuTe DSL NVFP4 fused MoE kernel modules");
-        return false;
-    }
-}
-
-void CuteDslNvfp4MoeRunner::unloadKernelModules()
-{
-    std::lock_guard<std::mutex> lock(sLoadMutex);
-    if (!sLoaded)
-    {
-        return;
-    }
-    nvfp4_fused_moe_decode_identity_n128_Kernel_Module_Unload(&sDecodeIdentity_n128);
-    nvfp4_fused_moe_decode_silu_n128_Kernel_Module_Unload(&sDecodeSiLU_n128);
-    nvfp4_fused_moe_decode_swiglu_n128_Kernel_Module_Unload(&sDecodeSwiGLU_n128);
-    nvfp4_fused_moe_decode_gelu_n128_Kernel_Module_Unload(&sDecodeGeLU_n128);
-    nvfp4_fused_moe_decode_relu2_n128_Kernel_Module_Unload(&sDecodeReLU2_n128);
-    nvfp4_fused_moe_decode_geglu_n128_Kernel_Module_Unload(&sDecodeGeGLU_n128);
-    nvfp4_fused_moe_prefill_identity_n128_Kernel_Module_Unload(&sPrefillIdentity_n128);
-    nvfp4_fused_moe_prefill_silu_n128_Kernel_Module_Unload(&sPrefillSiLU_n128);
-    nvfp4_fused_moe_prefill_swiglu_n128_Kernel_Module_Unload(&sPrefillSwiGLU_n128);
-    nvfp4_fused_moe_prefill_gelu_n128_Kernel_Module_Unload(&sPrefillGeLU_n128);
-    nvfp4_fused_moe_prefill_relu2_n128_Kernel_Module_Unload(&sPrefillReLU2_n128);
-    nvfp4_fused_moe_prefill_geglu_n128_Kernel_Module_Unload(&sPrefillGeGLU_n128);
-    sLoaded = false;
+    LOG_ERROR("CuteDslNvfp4MoeRunner: unsupported activation/backend module selection");
+    return false;
 }
 
 namespace
@@ -465,7 +478,7 @@ int32_t CuteDslNvfp4MoeRunner::decodeCapRoutedRows(CuteDslMoeBackend backend, in
         _barrierEpoch.data = barrierEpochT;                                                                            \
         PREFIX##_Tensor_active_expert_count_t _activeExpertCount{};                                                    \
         _activeExpertCount.data = activeExpertCountT;                                                                  \
-        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE),                                                                   \
+        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE).module,                                                            \
             const_cast<void*>(static_cast<void const*>(params.hiddenStates)),                                          \
             const_cast<void*>(static_cast<void const*>(params.topkIds)),                                               \
             const_cast<void*>(static_cast<void const*>(params.topkWeights)),                                           \
@@ -480,7 +493,8 @@ int32_t CuteDslNvfp4MoeRunner::decodeCapRoutedRows(CuteDslMoeBackend backend, in
             const_cast<void*>(static_cast<void const*>(params.fc2Alpha)),                                              \
             const_cast<void*>(static_cast<void const*>(params.downInputScale)),                                        \
             params.output, tokenMapPtr, tokenWeightsPtr,                                                               \
-            numTokens, maxRows, stateE, weightE, rowsPadded, K, N, numTopk, stream);                                   \
+            numTokens, maxRows, stateE, weightE, rowsPadded, K, N, numTopk,                                               \
+            trt_edgellm::getDeviceMultiProcessorCount(), stream);                                                                  \
     } while (0)
 // clang-format on
 
@@ -642,7 +656,7 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
         _taskHead.data = taskHeadT;                                                                                    \
         PREFIX##_Tensor_task_tail_t _taskTail{};                                                                       \
         _taskTail.data = taskTailT;                                                                                    \
-        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE),                                                                   \
+        ret = cute_dsl_##PREFIX##_wrapper(&(MODULE).module,                                                            \
             const_cast<void*>(static_cast<void const*>(params.hiddenStates)),                                          \
             const_cast<void*>(static_cast<void const*>(params.topkIds)),                                               \
             const_cast<void*>(static_cast<void const*>(params.topkWeights)),                                           \
@@ -662,7 +676,7 @@ int32_t CuteDslNvfp4MoeRunner::runDecode(CuteDslNvfp4MoeParams const& params, vo
             const_cast<void*>(static_cast<void const*>(params.downInputScale)),                                        \
             params.output, tokenMapPtr, tokenWeightsPtr,                                                               \
             numTokens, maxRows, rowsPadded, maxTasks, physicalTiles,                                                   \
-            K, N, weightE, numTopk, stream);                                                                           \
+            K, N, weightE, numTopk, trt_edgellm::getDeviceMultiProcessorCount(), stream);                                          \
     } while (0)
 // clang-format on
 
@@ -786,11 +800,6 @@ int32_t CuteDslNvfp4MoeRunner::runPrefill(CuteDslNvfp4MoeParams const& params, v
 
 int32_t CuteDslNvfp4MoeRunner::run(CuteDslNvfp4MoeParams const& params, void* workspace, cudaStream_t stream)
 {
-    if (!sLoaded)
-    {
-        LOG_ERROR("CuteDslNvfp4MoeRunner: kernel modules not loaded; call loadKernelModules() first");
-        return -1;
-    }
     if (workspace == nullptr)
     {
         LOG_ERROR("CuteDslNvfp4MoeRunner: null workspace pointer");
@@ -805,6 +814,10 @@ int32_t CuteDslNvfp4MoeRunner::run(CuteDslNvfp4MoeParams const& params, void* wo
     // resolveBackend picks decode or prefill based on routed-row count (for kAuto) or
     // honors an explicit override. Both backends are supported.
     auto const backend = resolveBackend(params.backend, params.numTokens, params.topK);
+    if (!ensureKernelModules(params, stream))
+    {
+        return -1;
+    }
     if (backend == CuteDslMoeBackend::kPrefill)
     {
         return runPrefill(params, workspace, stream);

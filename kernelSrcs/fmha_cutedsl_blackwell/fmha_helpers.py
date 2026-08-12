@@ -143,6 +143,7 @@ class FmhaStaticTileScheduler:
     @staticmethod
     def get_grid_shape(
         params: FmhaStaticTileSchedulerParams,
+        sm_count: Optional[Int32] = None,
         *,
         loc=None,
         ip=None,
@@ -161,10 +162,15 @@ class FmhaStaticTileScheduler:
         :rtype: cute.Shape
         """
         if params.is_persistent:
-            hardware_info = HardwareInfo()
-            sm_count = hardware_info.get_device_multiprocessor_count()
+            # sm_count is a runtime value supplied by the caller (AOT wrappers
+            # thread it from a kernel argument so the persistent grid is sized
+            # for the GPU the kernel actually launches on). The HardwareInfo
+            # probe of the local device remains as a JIT-mode fallback only.
+            if sm_count is None:
+                hardware_info = HardwareInfo()
+                sm_count = hardware_info.get_device_multiprocessor_count()
             return (
-                min(sm_count,
+                cutlass.min(sm_count,
                     cute.size(params.problem_shape_mbh, loc=loc, ip=ip)),
                 1,
                 1,
@@ -309,6 +315,8 @@ def compute_grid(
     o_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
+    sm_count: Optional[Int32] = None,
+    head_dim_ctas: int = 1,
 ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """
     Compute grid parameters for FMHA operation.
@@ -330,6 +338,9 @@ def compute_grid(
     :type cta_tiler: Tuple[int, int, int]
     :param is_persistent: Whether to use persistent kernel mode.
     :type is_persistent: bool
+    :param head_dim_ctas: Number of independent CTAs that split each attention
+        head along the V/O head dimension.
+    :type head_dim_ctas: int
 
     :return: Tuple of (scheduler_params, grid_shape).
     :rtype: Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]
@@ -338,11 +349,11 @@ def compute_grid(
         is_persistent,
         (
             cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
-            cute.size(o_shape[2][0]),
+            cute.size(o_shape[2][0]) * head_dim_ctas,
             cute.size(o_shape[2][1]),
         ),
     )
-    grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
+    grid = FmhaStaticTileScheduler.get_grid_shape(tile_sched_params, sm_count)
 
     return tile_sched_params, grid
 
@@ -358,6 +369,8 @@ class MaskEnum(enum.Enum):
     - RESIDUAL_MASK: Residual mask for handling variable sequence lengths
     - WINDOW_MASK: Window mask for attention which also includes causal and no mask
     - WINDOW_MASK_INFERENCE: Same as the window mask, but has the limitation that the end of q is aligned with the end of k
+    - BIDIRECTIONAL: Bottom-right-aligned window mask unioned with an optional
+      inclusive bidirectional interval for each query row
     - WINDOW_MASK_BWD: Window mask for backward pass
     - WINDOW_MASK_BWD_INFERENCE: Same as the window mask for backward pass, but has the limitation that the end of q is aligned with the end of k
     """
@@ -366,6 +379,7 @@ class MaskEnum(enum.Enum):
     RESIDUAL_MASK_BWD = enum.auto()
     WINDOW_MASK = enum.auto()
     WINDOW_MASK_INFERENCE = enum.auto()
+    BIDIRECTIONAL = enum.auto()
     WINDOW_MASK_BWD = enum.auto()
     WINDOW_MASK_BWD_INFERENCE = enum.auto()
 
@@ -418,7 +432,8 @@ class FusedMask:
         """
         result = 0
         offset = 0
-        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type is MaskEnum.BIDIRECTIONAL):
             offset = seqlen_k - seqlen_q
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
             offset = seqlen_q - seqlen_k
@@ -427,7 +442,8 @@ class FusedMask:
         if cutlass.const_expr(mask_type is MaskEnum.RESIDUAL_MASK_BWD):
             result = cute.ceil_div(seqlen_q, tile_shape[0])
         if cutlass.const_expr(mask_type == MaskEnum.WINDOW_MASK
-                              or mask_type == MaskEnum.WINDOW_MASK_INFERENCE):
+                              or mask_type == MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type == MaskEnum.BIDIRECTIONAL):
             if cutlass.const_expr(window_size_right is None):
                 result = cute.ceil_div(seqlen_k, tile_shape[1])
             else:
@@ -489,17 +505,26 @@ class FusedMask:
         """
         result = 0
         offset = 0
-        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+        if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type is MaskEnum.BIDIRECTIONAL):
             offset = seqlen_k - seqlen_q
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
             offset = seqlen_q - seqlen_k
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK
-                              or mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
+                              or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+                              or mask_type is MaskEnum.BIDIRECTIONAL):
             if cutlass.const_expr(window_size_left is not None):
-                min_idx_q = blk_coord[0] * tile_shape[0]
-                idx_k = min_idx_q + offset - window_size_left
-                tmp_blocks_k = idx_k // tile_shape[1]
-                result = max(tmp_blocks_k, result)
+                if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+                    if window_size_left < seqlen_k:
+                        min_idx_q = blk_coord[0] * tile_shape[0]
+                        idx_k = min_idx_q + offset - window_size_left
+                        tmp_blocks_k = idx_k // tile_shape[1]
+                        result = max(tmp_blocks_k, result)
+                else:
+                    min_idx_q = blk_coord[0] * tile_shape[0]
+                    idx_k = min_idx_q + offset - window_size_left
+                    tmp_blocks_k = idx_k // tile_shape[1]
+                    result = max(tmp_blocks_k, result)
         if cutlass.const_expr(
                 mask_type is MaskEnum.WINDOW_MASK_BWD
                 or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
@@ -509,6 +534,64 @@ class FusedMask:
                 tmp_blocks_q = idx_q // tile_shape[0]
                 result = max(tmp_blocks_q, result)
         return result
+
+    @cute.jit
+    def get_trip_span(
+        mask_type: MaskEnum,
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
+        bidirectional_begin: Optional[Int32] = None,
+        bidirectional_end: Optional[Int32] = None,
+    ) -> Tuple[Int32, Int32]:
+        """Return the KV tile start and count for one query tile.
+
+        BIDIRECTIONAL starts from the bottom-right-aligned causal/sliding span,
+        then unions it with the optional block interval. The begin and end
+        values may come from different query rows: the first row in a query
+        tile is sufficient to extend traversal left, and the last valid row is
+        sufficient to extend it right.
+        """
+        start = FusedMask.get_trip_start(
+            mask_type,
+            blk_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        count = FusedMask.get_trip_count(
+            mask_type,
+            blk_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            if cutlass.const_expr(bidirectional_begin is None
+                                  or bidirectional_end is None):
+                raise ValueError(
+                    "BIDIRECTIONAL requires bidirectional_begin and bidirectional_end"
+                )
+            end = start + count
+            if bidirectional_begin >= 0:
+                start = min(start, bidirectional_begin // tile_shape[1])
+            if bidirectional_end >= 0:
+                end = max(
+                    end,
+                    cute.ceil_div(bidirectional_end + 1, tile_shape[1]),
+                )
+            max_k_tiles = cute.ceil_div(seqlen_k, tile_shape[1])
+            start = max(start, Int32(0))
+            end = min(end, max_k_tiles)
+            count = max(end - start, Int32(0))
+        return start, count
 
     @cute.jit
     def get_leading_mask_id(
@@ -541,6 +624,10 @@ class FusedMask:
         :return: Tuple of (begin, end) tile idx for the leading mask.
         :rtype: Tuple[Int32, Int32]
         """
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            raise ValueError(
+                "BIDIRECTIONAL requires get_trip_span and per-score apply_mask"
+            )
         offset = 0
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -619,6 +706,10 @@ class FusedMask:
         :return: Tuple of (begin, end) tile idx for the trailing mask.
         :rtype: Tuple[Int32, Int32]
         """
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            raise ValueError(
+                "BIDIRECTIONAL requires get_trip_span and per-score apply_mask"
+            )
         offset = 0
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -878,6 +969,9 @@ class FusedMask:
             index_q,
             index_k,
         ),
+        assume_fragment_single_row: cutlass.Constexpr = False,
+        bidirectional_begin: Optional[Int32] = None,
+        bidirectional_end: Optional[Int32] = None,
     ):
         """
         Apply the appropriate mask to the attention scores.
@@ -899,37 +993,180 @@ class FusedMask:
         :type window_size_left: Optional[int]
         :param window_size_right: Right-side sliding window size for attention masking.
         :type window_size_right: Optional[int]
+        :param assume_fragment_single_row: UNCHECKED caller promise that this
+            thread's whole fragment lies in a single S-matrix row, i.e. index_q
+            is identical for every element.
+        :type assume_fragment_single_row: cutlass.Constexpr
+        :param bidirectional_begin: Inclusive per-row block begin for
+            BIDIRECTIONAL.
+        :type bidirectional_begin: Optional[Int32]
+        :param bidirectional_end: Inclusive per-row block end for
+            BIDIRECTIONAL.
+        :type bidirectional_end: Optional[Int32]
         """
 
         tidx, tidy, tidx = cute.arch.thread_idx()
         offset = 0
         offset = (seqlen_k - seqlen_q if cutlass.const_expr(
             mask_type is MaskEnum.WINDOW_MASK_INFERENCE
-            or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE) else 0)
-        for i in cutlass.range_constexpr(cute.size(acc_qk)):
-            index_q, index_k = index_transform(*index_qk[i])
+            or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            or mask_type is MaskEnum.BIDIRECTIONAL) else 0)
+        if cutlass.const_expr(mask_type is MaskEnum.BIDIRECTIONAL):
+            if cutlass.const_expr(bidirectional_begin is None
+                                  or bidirectional_end is None):
+                raise ValueError(
+                    "BIDIRECTIONAL requires bidirectional_begin and bidirectional_end"
+                )
+            # The runtime-window artifact also serves global layers. Hoist the
+            # uniform full-left-window decision outside the per-score loop so
+            # global layers retain the causal-only fast path.
             if cutlass.const_expr(window_size_left is not None
-                                  or window_size_right is not None):
-                if cutlass.const_expr(window_size_left is None):
-                    if index_q + offset + window_size_right < index_k:
-                        acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
-                        acc_qk[i] = -Float32.inf
-                elif cutlass.const_expr(window_size_right is None):
-                    if index_q + offset - window_size_left > index_k:
-                        acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
-                        acc_qk[i] = -Float32.inf
+                                  and window_size_right is not None):
+                if window_size_left >= seqlen_k:
+                    if cutlass.const_expr(assume_fragment_single_row):
+                        index_q0, _k0 = index_transform(*index_qk[0])
+                        if index_q0 >= seqlen_q:
+                            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                                acc_qk[i] = -Float32.inf
+                        else:
+                            k_bound = min(
+                                index_q0 + offset + window_size_right,
+                                seqlen_k - 1,
+                            )
+                            bounded_bidirectional_end = min(
+                                bidirectional_end, seqlen_k - 1
+                            )
+                            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                                _q, index_k = index_transform(*index_qk[i])
+                                if index_k > k_bound:
+                                    if (
+                                        bidirectional_begin < 0
+                                        or index_k < bidirectional_begin
+                                        or index_k > bounded_bidirectional_end
+                                    ):
+                                        acc_qk[i] = -Float32.inf
+                    else:
+                        for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                            index_q, index_k = index_transform(*index_qk[i])
+                            if index_k >= seqlen_k or index_q >= seqlen_q:
+                                acc_qk[i] = -Float32.inf
+                            elif (
+                                index_k
+                                > index_q + offset + window_size_right
+                            ):
+                                if (
+                                    bidirectional_begin < 0
+                                    or index_k < bidirectional_begin
+                                    or index_k > bidirectional_end
+                                ):
+                                    acc_qk[i] = -Float32.inf
                 else:
-                    max_K_index = min(index_q + offset + window_size_right,
-                                      seqlen_k)
-                    min_K_index = max(0, index_q + offset - window_size_left)
-                    if index_k > max_K_index or index_k < min_K_index:
+                    for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                        index_q, index_k = index_transform(*index_qk[i])
+                        if index_k >= seqlen_k or index_q >= seqlen_q:
+                            acc_qk[i] = -Float32.inf
+                        else:
+                            max_k_index = min(
+                                index_q + offset + window_size_right, seqlen_k
+                            )
+                            min_k_index = max(
+                                0, index_q + offset - window_size_left
+                            )
+                            if (
+                                index_k > max_k_index
+                                or index_k < min_k_index
+                            ):
+                                if (
+                                    bidirectional_begin < 0
+                                    or index_k < bidirectional_begin
+                                    or index_k > bidirectional_end
+                                ):
+                                    acc_qk[i] = -Float32.inf
+            else:
+                for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                    index_q, index_k = index_transform(*index_qk[i])
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
                         acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
-                        acc_qk[i] = -Float32.inf
-
-            if cutlass.const_expr(mask_type == MaskEnum.RESIDUAL_MASK
-                                  or mask_type == MaskEnum.RESIDUAL_MASK_BWD):
-                if index_k >= seqlen_k or index_q >= seqlen_q:
+                    else:
+                        outside_window = False
+                        if cutlass.const_expr(window_size_left is None
+                                              and window_size_right is not None):
+                            outside_window = (
+                                index_q + offset + window_size_right < index_k
+                            )
+                        elif cutlass.const_expr(
+                            window_size_left is not None
+                            and window_size_right is None
+                        ):
+                            outside_window = (
+                                index_q + offset - window_size_left > index_k
+                            )
+                        if outside_window:
+                            if (
+                                bidirectional_begin < 0
+                                or index_k < bidirectional_begin
+                                or index_k > bidirectional_end
+                            ):
+                                acc_qk[i] = -Float32.inf
+        elif cutlass.const_expr(assume_fragment_single_row
+                                and window_size_left is None
+                                and window_size_right is not None):
+            # Hoisted scalar causal fast path. index_q is constant across the
+            # fragment (caller-promised, see the parameter doc), which lets
+            # the generic path's per-element work collapse three times:
+            # (1) hoist q: the row coordinate is read once (index_qk[0]) and
+            #     the causal right boundary k_bound is computed once per row;
+            # (2) absorb the residual checks into k_bound: clamping to
+            #     seqlen_k - 1 makes an OOB column (index_k >= seqlen_k)
+            #     automatically fail index_k <= k_bound, and an OOB row
+            #     (index_q >= seqlen_q) sets k_bound = -1 so every element
+            #     masks -- both residual compares vanish from the loop;
+            # (3) the loop body reduces to one compare per element, replacing
+            #     the generic path's two-coordinate read + add + 3 compares.
+            # Alignment follows mask_type: WINDOW_MASK_INFERENCE =
+            # bottom-right (offset = seqlen_k - seqlen_q); WINDOW_MASK =
+            # top-left (offset 0). Bit-identical to the generic path.
+            index_q0, _k0 = index_transform(*index_qk[0])  # hoist q
+            k_bound = index_q0 + offset + window_size_right
+            # Clamp absorbs the OOB-column residual check. Fires whenever the
+            # causal boundary reaches past the key sequence -- routine for
+            # rows near the end once window_size_right > 0; with wsr == 0 it
+            # only fires for OOB rows (top-left: s_q > s_k).
+            if k_bound > seqlen_k - 1:
+                k_bound = seqlen_k - 1
+            # OOB-row sentinel: valid index_k is always >= 0, so k_bound = -1
+            # guarantees index_k > k_bound and every element masks.
+            if index_q0 >= seqlen_q:
+                k_bound = Int32(-1)
+            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                _q, index_k = index_transform(*index_qk[i])
+                if index_k > k_bound: # one compare per element
                     acc_qk[i] = -Float32.inf
+        else:
+            for i in cutlass.range_constexpr(cute.size(acc_qk)):
+                index_q, index_k = index_transform(*index_qk[i])
+                if cutlass.const_expr(window_size_left is not None
+                                      or window_size_right is not None):
+                    if cutlass.const_expr(window_size_left is None):
+                        if index_q + offset + window_size_right < index_k:
+                            acc_qk[i] = -Float32.inf
+                        if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                            acc_qk[i] = -Float32.inf
+                    elif cutlass.const_expr(window_size_right is None):
+                        if index_q + offset - window_size_left > index_k:
+                            acc_qk[i] = -Float32.inf
+                        if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                            acc_qk[i] = -Float32.inf
+                    else:
+                        max_K_index = min(index_q + offset + window_size_right,
+                                          seqlen_k)
+                        min_K_index = max(0, index_q + offset - window_size_left)
+                        if index_k > max_K_index or index_k < min_K_index:
+                            acc_qk[i] = -Float32.inf
+                        if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                            acc_qk[i] = -Float32.inf
+
+                if cutlass.const_expr(mask_type == MaskEnum.RESIDUAL_MASK
+                                      or mask_type == MaskEnum.RESIDUAL_MASK_BWD):
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
+                        acc_qk[i] = -Float32.inf

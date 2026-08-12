@@ -154,6 +154,9 @@ def test_checkpoint_export(test_param: str, test_logger,
         if extw_kinds:
             export_cmd += ["--externalize-weights", *extw_kinds]
 
+        if config.int4_gemm_plugin_v1:
+            export_cmd += ["--int4-gemm-plugin-version", "1"]
+
         env_vars = {}
         if config.trt_native_attn:
             env_vars["USE_TRT_NATIVE_ATTN"] = "1"
@@ -489,6 +492,97 @@ def test_checkpoint_dflash_export(test_param: str, test_logger,
     draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
     if not os.path.exists(draft_onnx):
         pytest.fail(f"DFlash draft ONNX not found: {draft_onnx}")
+
+
+def test_checkpoint_dspark_export(test_param: str, test_logger,
+                                  env_config: EnvironmentConfig):
+    """Export DSpark base + draft models via tensorrt_edgellm.scripts.export."""
+
+    config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                          TaskType.EXPORT, env_config)
+
+    base_torch_dir = config.get_torch_model_dir()
+    if not os.path.exists(base_torch_dir):
+        raise FileNotFoundError(
+            f"Base model checkpoint not found: {base_torch_dir}")
+
+    draft_torch_dir = config.get_dspark_draft_model_dir()
+    if not os.path.exists(draft_torch_dir):
+        raise FileNotFoundError(
+            f"DSpark draft model checkpoint not found: {draft_torch_dir}")
+
+    # Export test params may include a quantized checkpoint suffix in the model
+    # name. Normalize the output path after checkpoint resolution so downstream
+    # build/inference tests use the canonical base model name plus precision.
+    config.model_name = strip_model_quant_suffixes(config.model_name)
+
+    llm_onnx_dir = config.get_llm_onnx_dir()
+    draft_onnx_dir = config.get_draft_onnx_dir()
+    os.makedirs(llm_onnx_dir, exist_ok=True)
+    os.makedirs(draft_onnx_dir, exist_ok=True)
+
+    tmp_base = tempfile.mkdtemp(prefix="dspark_base_export_")
+    tmp_draft = tempfile.mkdtemp(prefix="dspark_draft_export_")
+
+    try:
+        base_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            base_torch_dir,
+            tmp_base,
+            "--dspark-base",
+            "--dspark-draft-dir",
+            draft_torch_dir,
+        ]
+        _run_checkpoint_export(
+            base_cmd, 1200, test_logger,
+            f"Exporting DSpark base {config.model_name} via the checkpoint exporter"
+        )
+
+        base_llm_out = os.path.join(tmp_base, "llm")
+        if not os.path.isdir(base_llm_out):
+            pytest.fail(
+                f"DSpark base export did not produce llm/ in {tmp_base}")
+        shutil.copytree(base_llm_out, llm_onnx_dir, dirs_exist_ok=True)
+
+        draft_cmd = [
+            "python3",
+            "-m",
+            "tensorrt_edgellm.scripts.export",
+            base_torch_dir,
+            tmp_draft,
+            "--dspark-draft",
+            "--dspark-draft-dir",
+            draft_torch_dir,
+        ]
+        _run_checkpoint_export(
+            draft_cmd, 1200, test_logger,
+            f"Exporting DSpark draft {config.draft_model_id} via the checkpoint exporter"
+        )
+
+        draft_output = os.path.join(tmp_draft, "dspark_draft")
+        if not os.path.isdir(draft_output):
+            pytest.fail(
+                f"DSpark draft export did not produce dspark_draft/ in {tmp_draft}"
+            )
+        shutil.copytree(draft_output, draft_onnx_dir, dirs_exist_ok=True)
+
+    finally:
+        shutil.rmtree(tmp_base, ignore_errors=True)
+        shutil.rmtree(tmp_draft, ignore_errors=True)
+
+    base_onnx = os.path.join(llm_onnx_dir, "model.onnx")
+    if not os.path.exists(base_onnx):
+        pytest.fail(f"DSpark base ONNX not found: {base_onnx}")
+
+    draft_onnx = os.path.join(draft_onnx_dir, "model.onnx")
+    if not os.path.exists(draft_onnx):
+        pytest.fail(f"DSpark draft ONNX not found: {draft_onnx}")
+
+    heads_path = os.path.join(draft_onnx_dir, "dspark_heads.safetensors")
+    if not os.path.exists(heads_path):
+        pytest.fail(f"DSpark draft sidecar not found: {heads_path}")
 
 
 def test_checkpoint_mtp_export(test_param: str, test_logger,

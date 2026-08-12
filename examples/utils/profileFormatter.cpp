@@ -22,6 +22,7 @@
 #include "memoryMonitor.h"
 #include "profiling/layerProfiler.h"
 #include "profiling/timer.h"
+#include "runtime/state/contextCache/contextCacheMetrics.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -214,6 +215,12 @@ float getSpecDecodeOverallTokensPerSecond(metrics::SpecDecodeGenerationMetrics c
         totalTimeMs += baseVerificationData->getTotalGpuTimeMs();
     }
 
+    auto draftAcceptData = gTimer.getTimingData(metrics::StageNames::kSPEC_DECODE_DRAFT_ACCEPT);
+    if (draftAcceptData)
+    {
+        totalTimeMs += draftAcceptData->getTotalGpuTimeMs();
+    }
+
     if (totalTimeMs > 0.0f)
     {
         return static_cast<float>(specDecodeGenerationMetrics.totalGeneratedTokens) / (totalTimeMs / 1000.0f);
@@ -304,6 +311,33 @@ void outputPrefillProfile(std::ostream& output, metrics::LLMPrefillMetrics const
     }
 }
 
+void outputContextCacheProfile(std::ostream& output, rt::ContextCacheMetrics const& cacheMetrics)
+{
+    output << "=== Context Cache ===" << std::endl;
+    output << "Sequences: admitted=" << cacheMetrics.admittedSequences << ", hits=" << cacheMetrics.hitSequences
+           << ", media_aware=" << cacheMetrics.mediaAwareSequences
+           << ", lookup_bypass=" << cacheMetrics.lookupBypassSequences
+           << ", forced_cold=" << cacheMetrics.forcedColdSequences << std::endl;
+    output << "Tokens: matched=" << cacheMetrics.matchedTokens << ", reused=" << cacheMetrics.reusedTokens << std::endl;
+    output << "Plans: standard=" << cacheMetrics.standardPlans
+           << ", no_reusable_prefix=" << cacheMetrics.noReusablePrefixPlans
+           << ", full_input_rewind=" << cacheMetrics.fullInputRewindPlans << std::endl;
+    output << "Publications: attempts=" << cacheMetrics.publicationAttempts
+           << ", committed=" << cacheMetrics.committedPublications << ", existing=" << cacheMetrics.existingPublications
+           << std::endl;
+    output << "Records: current=" << cacheMetrics.currentRecords << ", evicted=" << cacheMetrics.evictedRecords
+           << std::endl;
+    output << "Base KV pages: free=" << cacheMetrics.baseKvPages.free
+           << ", capacity=" << cacheMetrics.baseKvPages.capacity << std::endl;
+    output << "Draft KV pages: free=" << cacheMetrics.draftKvPages.free
+           << ", capacity=" << cacheMetrics.draftKvPages.capacity << std::endl;
+    output << "Recurrent snapshots: free=" << cacheMetrics.recurrentSnapshots.free
+           << ", capacity=" << cacheMetrics.recurrentSnapshots.capacity << std::endl;
+    output << "Partial KV snapshots: free=" << cacheMetrics.partialKvSnapshots.free
+           << ", capacity=" << cacheMetrics.partialKvSnapshots.capacity << std::endl;
+    output << "Degradation: hybrid_snapshot_pressure_skips=" << cacheMetrics.hybridSnapshotPressureSkips << std::endl;
+}
+
 void outputGenerationProfile(std::ostream& output, metrics::LLMGenerationMetrics const& generationMetrics)
 {
     output << "=== LLM Generation (Excluding sampling after prefill) ===" << std::endl;
@@ -346,6 +380,7 @@ void outputSpecDecodeGenerationProfile(std::ostream& output,
         appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_PREFILL, "Draft Model Prefill");
         appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_PROPOSAL, "Construct Draft Proposal");
         appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_BASE_VERIFICATION, "Base Model Verification");
+        appendStageTimingData(output, metrics::StageNames::kSPEC_DECODE_DRAFT_ACCEPT, "Draft Model Accept Token");
     }
 }
 
@@ -478,6 +513,43 @@ void addJsonPrefillSummary(nlohmann::json& summary, metrics::LLMPrefillMetrics c
             {"tokens_per_second", getPrefillTokensPerSecond(prefillMetrics)},
             {"average_time_per_token_ms", getPrefillAverageTimePerToken(prefillMetrics)}};
     }
+}
+
+void addJsonContextCacheSummary(nlohmann::json& summary, rt::ContextCacheMetrics const& cacheMetrics)
+{
+    auto pool = [](rt::ContextCachePoolMetrics const& metrics) {
+        return nlohmann::json{{"free", metrics.free}, {"capacity", metrics.capacity}};
+    };
+    summary["context_cache"] = {{"admitted_sequences", cacheMetrics.admittedSequences},
+        {"hit_sequences", cacheMetrics.hitSequences}, {"media_aware_sequences", cacheMetrics.mediaAwareSequences},
+        {"lookup_bypass_sequences", cacheMetrics.lookupBypassSequences},
+        {"forced_cold_sequences", cacheMetrics.forcedColdSequences}, {"matched_tokens", cacheMetrics.matchedTokens},
+        {"reused_tokens", cacheMetrics.reusedTokens},
+        {"plans",
+            {{"standard", cacheMetrics.standardPlans}, {"no_reusable_prefix", cacheMetrics.noReusablePrefixPlans},
+                {"full_input_rewind", cacheMetrics.fullInputRewindPlans}}},
+        {"publications",
+            {{"attempts", cacheMetrics.publicationAttempts}, {"committed", cacheMetrics.committedPublications},
+                {"existing", cacheMetrics.existingPublications},
+                {"successful_endpoints", cacheMetrics.publishedEndpoints}}},
+        {"hybrid",
+            {{"restores", cacheMetrics.hybridRestores},
+                {"snapshot_pressure_skips", cacheMetrics.hybridSnapshotPressureSkips},
+                {"capture_synchronizations", cacheMetrics.hybridCaptureSynchronizations}}},
+        {"speculative",
+            {{"full_page_replays", cacheMetrics.specFullPageReplays},
+                {"pair_publications", cacheMetrics.specPairPublications}}},
+        {"planning_nanoseconds", cacheMetrics.planningNanoseconds},
+        {"records", {{"current", cacheMetrics.currentRecords}, {"evicted", cacheMetrics.evictedRecords}}},
+        {"resource_pools",
+            {{"base_kv_pages", pool(cacheMetrics.baseKvPages)}, {"draft_kv_pages", pool(cacheMetrics.draftKvPages)},
+                {"recurrent_snapshots", pool(cacheMetrics.recurrentSnapshots)},
+                {"partial_kv_snapshots", pool(cacheMetrics.partialKvSnapshots)}}},
+        {"reclaimed_resources",
+            {{"base_kv_pages", cacheMetrics.reclaimedBaseKvPages},
+                {"draft_kv_pages", cacheMetrics.reclaimedDraftKvPages},
+                {"recurrent_snapshots", cacheMetrics.reclaimedRecurrentSnapshots},
+                {"partial_kv_snapshots", cacheMetrics.reclaimedPartialKvSnapshots}}}};
 }
 
 void addJsonGenerationSummary(nlohmann::json& summary, metrics::LLMGenerationMetrics const& generationMetrics)

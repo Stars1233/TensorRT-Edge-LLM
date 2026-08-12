@@ -501,7 +501,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tile_idx_to_mn_limit: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
         down_input_scale: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
@@ -534,7 +534,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :param down_input_scale: Per-expert FC2 activation global scale tensor
         :type down_input_scale: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param permuted_idx_to_expanded_idx: Mapping from permuted index to expanded index, shape (permuted_m,)
@@ -2464,7 +2464,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         gemm_shape: Tuple[int, int, int],
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         raster_along_m: bool,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size based on GEMM shape.
@@ -2476,7 +2476,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type cluster_shape_mn: tuple[int, int]
         :param max_active_clusters: Maximum number of active clusters.
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
 
@@ -2809,7 +2809,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         top_k: cutlass.Int64,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):

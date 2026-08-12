@@ -42,8 +42,23 @@ namespace trt_edgellm
 {
 namespace rt
 {
+namespace
+{
 
-Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream)
+std::filesystem::path resolveCheckpointDir(std::filesystem::path const& checkpointDir)
+{
+    if (checkpointDir.empty())
+    {
+        return checkpointDir;
+    }
+
+    std::filesystem::path const speechTokenizerDir = checkpointDir / "speech_tokenizer";
+    return std::filesystem::is_directory(speechTokenizerDir) ? speechTokenizerDir : checkpointDir;
+}
+
+} // namespace
+
+Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream, std::string const& checkpointDir)
 {
     bool const configValid = validateAndFillConfig(engineDir);
     ELLM_CHECK(configValid, "Failed to validate and fill config");
@@ -65,6 +80,10 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
         ELLM_CHECK(profileSet, "Failed to set optimization profile");
 
         setNonBlockingAuxStreams(mCode2WavContext.get(), mCode2WavEngine.get(), mAuxStreams);
+
+        mExternalWeights.load(std::filesystem::path(engineDir), std::filesystem::path(engineDir) / "config.json",
+            stream, resolveCheckpointDir(checkpointDir));
+        mExternalWeights.bindToContext(*mCode2WavEngine, *mCode2WavContext, "code2wav");
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }

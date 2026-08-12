@@ -92,6 +92,96 @@ bool initializeNormalRopeCosSinCacheHost(
     return true;
 }
 
+// Compute the YaRN per-dimension inverse frequency (NTK-by-parts blend) and the
+// attention mscale. invFreq has rotaryDim/2 entries. Position-independent, so it
+// is computed once on the host and then consumed by the device fill kernel below.
+bool computeYarnInvFreq(
+    RopeConfig const& config, int64_t rotaryDim, std::vector<float>& invFreq, float& mscale) noexcept
+{
+    constexpr float kPi = 3.14159265358979323846F;
+
+    if (rotaryDim <= 0 || rotaryDim % 2 != 0)
+    {
+        LOG_ERROR("YaRN RoPE requires a positive, even rotaryDim; got %lld.", static_cast<long long>(rotaryDim));
+        return false;
+    }
+    if (!config.yarn.has_value() || config.yarn->originalMaxPositionEmbeddings <= 0 || config.yarn->factor <= 0.0F)
+    {
+        LOG_ERROR("YaRN RoPE requires factor>0 and original_max_position_embeddings>0.");
+        return false;
+    }
+
+    YarnParams const& yarn = config.yarn.value();
+    int64_t const halfDim = rotaryDim / 2;
+    float const base = config.rotaryTheta;
+    float const factor = yarn.factor;
+    float const origMax = static_cast<float>(yarn.originalMaxPositionEmbeddings);
+    mscale = yarn.mscale;
+
+    // find_correction_dim(nr) = rotaryDim * ln(origMax / (nr * 2pi)) / (2 * ln(base))
+    auto correctionDim = [&](float numRotations) {
+        return (static_cast<float>(rotaryDim) * std::log(origMax / (numRotations * 2.0F * kPi)))
+            / (2.0F * std::log(base));
+    };
+    float low = std::max(std::floor(correctionDim(yarn.betaFast)), 0.0F);
+    float high = std::min(std::ceil(correctionDim(yarn.betaSlow)), static_cast<float>(rotaryDim - 1));
+    float denom = high - low;
+    if (denom == 0.0F)
+    {
+        denom = 0.001F; // matches HF/vLLM linear_ramp guard against min==max
+    }
+
+    // Per-dimension inverse frequency: blend extrapolation (1/posFreq) and
+    // interpolation (1/(factor*posFreq)) by the NTK-by-parts ramp.
+    invFreq.resize(static_cast<size_t>(halfDim));
+    for (int64_t d = 0; d < halfDim; ++d)
+    {
+        float const posFreq = std::pow(base, 2.0F * static_cast<float>(d) / static_cast<float>(rotaryDim));
+        float const invFreqExtrap = 1.0F / posFreq;
+        float const invFreqInterp = 1.0F / (factor * posFreq);
+        float const ramp = std::clamp((static_cast<float>(d) - low) / denom, 0.0F, 1.0F);
+        float const extrapFactor = 1.0F - ramp; // inv_freq_extrapolation_factor
+        invFreq[static_cast<size_t>(d)] = invFreqInterp * (1.0F - extrapFactor) + invFreqExtrap * extrapFactor;
+    }
+    return true;
+}
+
+bool initializeYarnRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept
+{
+    int64_t const maxLength = cosSinCache.getShape()[1];
+    int64_t const rotaryDim = cosSinCache.getShape()[2];
+
+    if (rotaryDim != 64 && rotaryDim != 128)
+    {
+        LOG_ERROR("YaRN RoPE supports rotaryDim 64 or 128 only; got %lld.", static_cast<long long>(rotaryDim));
+        return false;
+    }
+
+    std::vector<float> invFreq;
+    float mscale = 1.0F;
+    if (!computeYarnInvFreq(config, rotaryDim, invFreq, mscale))
+    {
+        return false;
+    }
+    int64_t const halfDim = rotaryDim / 2;
+
+    try
+    {
+        rt::Tensor invFreqDevice({halfDim}, DeviceType::kGPU, DataType::kFLOAT, "YarnRope::invFreq");
+        CUDA_CHECK(cudaMemcpyAsync(invFreqDevice.rawPointer(), invFreq.data(),
+            static_cast<size_t>(halfDim) * sizeof(float), cudaMemcpyHostToDevice, stream));
+        kernel::initializeYarnCosSin(cosSinCache.dataPointer<float>(), invFreqDevice.dataPointer<float>(), mscale,
+            static_cast<int32_t>(rotaryDim), static_cast<int32_t>(maxLength), stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("initializeYarnCosSin kernel launch failed: %s", e.what());
+        return false;
+    }
+    return true;
+}
+
 bool canUseOptimizedNormalRopeKernel(RopeConfig const& config, int64_t rotaryDim)
 {
     if (config.type == RopeType::kProportional)
@@ -123,6 +213,7 @@ std::ostream& operator<<(std::ostream& os, RopeType const& type)
     case RopeType::kLongRope: os << "LongRope"; break;
     case RopeType::kMRope: os << "MRope"; break;
     case RopeType::kNoRope: os << "NoRope"; break;
+    case RopeType::kYarn: os << "YaRN"; break;
     }
     return os;
 }
@@ -137,6 +228,13 @@ std::string formatRopeConfig(RopeConfig const& config)
     {
         ss << "LongRopeConfig:" << "  originalMaxPositionEmbeddings: "
            << config.longRope.value().originalMaxPositionEmbeddings;
+    }
+    if (config.type == RopeType::kYarn && config.yarn.has_value())
+    {
+        ss << "  YarnConfig:" << "  factor: " << config.yarn->factor
+           << "  originalMaxPositionEmbeddings: " << config.yarn->originalMaxPositionEmbeddings
+           << "  betaFast: " << config.yarn->betaFast << "  betaSlow: " << config.yarn->betaSlow
+           << "  mscale: " << config.yarn->mscale;
     }
     return ss.str();
 }
@@ -193,6 +291,10 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
             {
                 ropeConfig.type = RopeType::kLongRope;
             }
+            else if (ropeTypeStr == "yarn")
+            {
+                ropeConfig.type = RopeType::kYarn;
+            }
         }
 
         // Parse long rope scaling parameters when requested
@@ -217,6 +319,54 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
             params.originalMaxPositionEmbeddings = config["original_max_position_embeddings"].get<int32_t>();
 
             ropeConfig.longRope = std::move(params);
+        }
+
+        if (ropeConfig.type == RopeType::kYarn)
+        {
+            YarnParams params{};
+
+            auto factorIt = ropeScalingIt->find("factor");
+            check::check(factorIt != ropeScalingIt->end() && factorIt->get<float>() > 0.0F,
+                "rope_scaling.factor must be a positive number for yarn");
+            params.factor = factorIt->get<float>();
+
+            // original_max_position_embeddings may live in rope_scaling (transformers v5
+            // rope_parameters) or at the top level (older configs); accept either.
+            auto origMaxIt = ropeScalingIt->find("original_max_position_embeddings");
+            if (origMaxIt != ropeScalingIt->end())
+            {
+                params.originalMaxPositionEmbeddings = origMaxIt->get<int32_t>();
+            }
+            else if (config.contains("original_max_position_embeddings"))
+            {
+                params.originalMaxPositionEmbeddings = config["original_max_position_embeddings"].get<int32_t>();
+            }
+            check::check(
+                params.originalMaxPositionEmbeddings > 0, "yarn requires a positive original_max_position_embeddings");
+
+            auto betaFastIt = ropeScalingIt->find("beta_fast");
+            if (betaFastIt != ropeScalingIt->end())
+            {
+                params.betaFast = betaFastIt->get<float>();
+            }
+            auto betaSlowIt = ropeScalingIt->find("beta_slow");
+            if (betaSlowIt != ropeScalingIt->end())
+            {
+                params.betaSlow = betaSlowIt->get<float>();
+            }
+
+            // mscale (attention_factor): explicit if provided, else HF default 0.1*ln(factor)+1.
+            auto attnFactorIt = ropeScalingIt->find("attention_factor");
+            if (attnFactorIt != ropeScalingIt->end() && !attnFactorIt->is_null())
+            {
+                params.mscale = attnFactorIt->get<float>();
+            }
+            else
+            {
+                params.mscale = params.factor > 1.0F ? 0.1F * std::log(params.factor) + 1.0F : 1.0F;
+            }
+
+            ropeConfig.yarn = params;
         }
 
         if (ropeConfig.type == RopeType::kProportional)
@@ -294,6 +444,10 @@ bool initializeRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& config
     }
     int64_t ropeMaxLength = cosSinCache.getShape()[1];
     int64_t rotaryDim = cosSinCache.getShape()[2];
+    if (config.type == RopeType::kYarn)
+    {
+        return initializeYarnRopeCosSinCache(cosSinCache, config, stream);
+    }
     if (config.type == RopeType::kDefault || config.type == RopeType::kDynamic
         || config.type == RopeType::kProportional)
     {
@@ -581,8 +735,8 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
     return clampedMaxGenerateLength;
 }
 
-rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
-    std::optional<int32_t> imageTokenId, int32_t vocabSize)
+rt::Tensor generateMultimodalIndices(
+    rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId, std::optional<int32_t> imageTokenId)
 {
     auto const shape = inputIds.getShape();
     check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
@@ -608,7 +762,7 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
             {
                 indicesPtr[pos] = audioIndex++;
             }
-            else if ((imageTokenId.has_value() && tokenId == *imageTokenId) || tokenId >= vocabSize)
+            else if (imageTokenId.has_value() && tokenId == *imageTokenId)
             {
                 indicesPtr[pos] = imageIndex++;
             }

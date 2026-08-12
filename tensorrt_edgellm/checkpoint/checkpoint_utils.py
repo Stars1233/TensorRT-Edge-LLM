@@ -48,6 +48,8 @@ RUNTIME_TOKENIZER_FILENAMES: Tuple[str, ...] = (
     "tokenizer.model",
     "special_tokens_map.json",
     "processed_chat_template.json",
+    "chat_template.jinja",
+    "chat_template.json",
 )
 
 
@@ -130,16 +132,11 @@ def _promote_llm_subconfig(config: Any, root: Dict[str,
     if root.get("num_attention_heads") is not None:
         return root
 
-    for name in ("llm_config", "text_config", "language_config"):
-        sub = getattr(config, name, None)
-        if sub is None and name in root:
-            sub = root[name]
-        sub_dict = _nested_config_to_dict(sub)
-        if (sub_dict.get("hidden_size") is not None
-                and sub_dict.get("num_attention_heads") is not None):
-            return sub_dict
-
-    # Qwen3-ASR / Qwen3-Omni: LLM lives at thinker_config.text_config
+    # Qwen3-ASR / Qwen3-Omni: LLM lives at thinker_config.text_config.
+    # Resolve the thinker/talker wrappers BEFORE the generic top-level loop:
+    # newer transformers can expose a spurious top-level ``text_config`` (with
+    # the wrong hidden_size) alongside the real thinker_config.text_config, and
+    # the generic loop would otherwise pick that wrong one.
     thinker = root.get("thinker_config")
     if isinstance(thinker, dict):
         for name in ("text_config", "llm_config", "language_config"):
@@ -154,6 +151,16 @@ def _promote_llm_subconfig(config: Any, root: Dict[str,
         if (talker.get("hidden_size") is not None
                 and talker.get("num_attention_heads") is not None):
             return talker
+
+    # Standard VLMs (e.g. Qwen2.5-VL): LLM is a top-level sub-config.
+    for name in ("llm_config", "text_config", "language_config"):
+        sub = getattr(config, name, None)
+        if sub is None and name in root:
+            sub = root[name]
+        sub_dict = _nested_config_to_dict(sub)
+        if (sub_dict.get("hidden_size") is not None
+                and sub_dict.get("num_attention_heads") is not None):
+            return sub_dict
 
     return root
 
@@ -307,6 +314,8 @@ def _determine_spec_decode_type(config) -> str:
         return "eagle3"
     if config.is_dflash_draft or config.dflash_base:
         return "dflash"
+    if config.is_dspark_draft or config.dspark_base:
+        return "dspark"
     if config.is_mtp_draft or config.mtp_base:
         return "mtp"
     return "none"
@@ -314,11 +323,12 @@ def _determine_spec_decode_type(config) -> str:
 
 def _determine_engine_role(config) -> str:
     """Return the engine role within the speculative decoding deployment."""
-    if (config.is_eagle3_draft or config.is_dflash_draft or config.is_mtp_draft
+    if (config.is_eagle3_draft or config.is_dflash_draft
+            or config.is_dspark_draft or config.is_mtp_draft
             or config.gemma4_mtp_draft):
         return "draft"
-    if (config.eagle_base or config.dflash_base or config.mtp_base
-            or config.gemma4_mtp_base):
+    if (config.eagle_base or config.dflash_base or config.dspark_base
+            or config.mtp_base or config.gemma4_mtp_base):
         return "base"
     return "llm"
 
@@ -337,13 +347,17 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
     tp_size = max(1, getattr(config, "tp_size", 1))
     tp_rank = max(0, getattr(config, "tp_rank", 0))
 
+    diffusion_engine_role = getattr(model, "diffusion_engine_role", None)
+    if config.is_diffusion_gemma and diffusion_engine_role is None:
+        diffusion_engine_role = "dllm"
+
     out: Dict[str, Any] = {
-        "model":
-        config.model_type,
+        "model": ("diffusion_gemma_text"
+                  if config.is_diffusion_gemma else config.model_type),
         "spec_decode_type":
         _determine_spec_decode_type(config),
         "engine_role":
-        _determine_engine_role(config),
+        diffusion_engine_role or _determine_engine_role(config),
         "edgellm_version":
         _export_tool_version(),
         "vocab_size":
@@ -371,11 +385,68 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         "num_deepstack_features":
         config.num_deepstack_features,
         "use_vision_bidirectional_attention":
-        config.use_vision_bidirectional_attention,
+        bool(config.use_vision_bidirectional_attention
+             and not (config.eagle_base or config.dflash_base
+                      or config.dspark_base or config.mtp_base
+                      or config.gemma4_mtp_base or config.is_eagle3_draft
+                      or config.is_dflash_draft or config.is_dspark_draft
+                      or config.is_mtp_draft or config.gemma4_mtp_draft)),
+        "rms_norm_eps":
+        float(config.rms_norm_eps),
     }
+    if config.attention_scaling:
+        out["attention_scaling"] = float(config.attention_scaling)
+    if config.final_logit_softcapping is not None:
+        out["final_logit_softcapping"] = float(config.final_logit_softcapping)
+    if config.attention_layer_types:
+        out["attention_layer_types"] = list(config.attention_layer_types)
+    if config.sliding_window_size >= 0:
+        out["sliding_window_size"] = int(config.sliding_window_size)
+    if config.attention_k_eq_v:
+        out["attention_k_eq_v"] = True
+    if config.num_global_key_value_heads:
+        out["num_global_key_value_heads"] = int(
+            config.num_global_key_value_heads)
+
+    if config.num_experts > 0:
+        out.update({
+            "num_experts": int(config.num_experts),
+            "num_experts_per_tok": int(config.num_experts_per_tok),
+            "moe_intermediate_size": int(config.moe_intermediate_size),
+            "enable_moe_block": bool(config.enable_moe_block),
+        })
+
     if tp_size > 1:
         out["tp_size"] = tp_size
         out["tp_rank"] = tp_rank
+
+    if config.is_diffusion_gemma:
+        diffusion_cfg = (config.diffusion.to_dict()
+                         if config.diffusion is not None else {})
+        diffusion_unified_conditioning = bool(
+            getattr(model, "diffusion_unified_conditioning", False))
+        if diffusion_engine_role == "dllm" and not diffusion_unified_conditioning:
+            raise ValueError(
+                "DiffusionGemma dllm export requires unified self-conditioning. "
+                "Use DiffusionGemmaBackbone so the self-conditioning module is "
+                "created with the backbone before writing runtime config.")
+        out.update({
+            "decoding_strategy":
+            "block_diffusion",
+            "diffusion_config":
+            diffusion_cfg,
+            "self_conditioning_size":
+            config.self_conditioning_size,
+            "diffusion_unified_conditioning":
+            diffusion_unified_conditioning,
+            "context_mask_selector_enabled": (diffusion_engine_role == "dllm"),
+            "diffusion_engines": {
+                "dllm": {
+                    "path": "dllm.engine",
+                    "role": "dllm",
+                },
+            },
+        })
 
     # Heterogeneous head dimensions (e.g. Gemma4: sliding=256, global=512)
     if config.global_head_dim and config.global_head_dim != config.head_dim:
@@ -468,6 +539,10 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             mc.head_dim,
             "recurrent_state_size":
             mc.ssm_state_size,
+            "recurrent_state_num_groups":
+            mc.n_groups,
+            "recurrent_spec_verify_mode":
+            "replay",
             "conv_dim":
             mc.conv_dim,
             "conv_kernel":
@@ -485,15 +560,22 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             "recurrent_state_num_heads": gc.num_value_heads,
             "recurrent_state_head_dim": gc.key_head_dim,
             "recurrent_state_size": gc.value_head_dim,
+            "recurrent_spec_verify_mode": "snapshot",
             "conv_dim": gc.conv_dim,
             "conv_kernel": gc.conv_kernel,
             "use_rope": config.num_attn_layers > 0,
         })
 
+    if (not config.is_hybrid
+            and config.num_attn_layers != config.num_hidden_layers):
+        out["num_attention_layers"] = config.num_attn_layers
+
     # Emit canonical per-layer config consumed by the C++ HybridCacheManager.
     # Only attention and linear-attention layers carry KV/recurrent state and
-    # must appear in the per-layer routing table. MLP layers are skipped.
-    if config.is_hybrid and config.layer_types:
+    # must appear in the per-layer routing table. MLP/MoE layers are skipped.
+    _emit_kv_table = config.layer_types and (
+        config.is_hybrid or config.num_attn_layers != config.num_hidden_layers)
+    if _emit_kv_table:
         from ..config import (_VALID_ATTENTION_LAYER_TYPES, LAYER_ATTN,
                               LAYER_GDN, LAYER_MAMBA)
 
@@ -506,12 +588,23 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         attention_types = (LAYER_ATTN, ) + _VALID_ATTENTION_LAYER_TYPES
         normalized_layer_types: list = []
         kv_layer_configs: list = []
-        for lt in config.layer_types:
+        for layer_idx, lt in enumerate(config.layer_types):
             if lt in attention_types:
                 normalized_layer_types.append("attention")
+                num_kv_heads = config.num_key_value_heads
+                head_dim = config.head_dim
+                if (str(config.model_type).startswith("gemma4")
+                        and config.attention_layer_types):
+                    attention_type = config.attention_layer_types[layer_idx]
+                    if attention_type == "full_attention":
+                        if config.global_head_dim:
+                            head_dim = config.global_head_dim
+                        if (config.attention_k_eq_v
+                                and config.num_global_key_value_heads):
+                            num_kv_heads = config.num_global_key_value_heads
                 kv_layer_configs.append({
-                    "num_kv_heads": config.num_key_value_heads,
-                    "head_dim": config.head_dim,
+                    "num_kv_heads": num_kv_heads,
+                    "head_dim": head_dim,
                 })
             elif lt in (LAYER_MAMBA, LAYER_GDN):
                 normalized_layer_types.append("mamba")
@@ -526,7 +619,12 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
         target_hidden = config.eagle3_target_hidden_size
         out.update({
             "draft_vocab_size": draft_vocab,
-            "base_model_hidden_size": target_hidden * 3,
+            "base_model_hidden_size":
+            target_hidden * config.eagle3_num_target_layers,
+            "eagle3_config": {
+                "target_layer_ids": list(config.eagle3_target_layer_ids),
+                "num_target_layers": config.eagle3_num_target_layers,
+            },
         })
 
     if config.is_mtp_draft:
@@ -603,8 +701,6 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             config.vocab_size,
             "base_model_hidden_size":
             len(config.dflash_target_layer_ids) * config.hidden_size,
-            "block_size":
-            config.dflash_block_size,
             "dflash_config": {
                 "target_layer_ids": list(config.dflash_target_layer_ids),
                 "block_size": config.dflash_block_size,
@@ -621,10 +717,49 @@ def build_runtime_llm_config_dict(model: "CausalLM") -> Dict[str, Any]:
             },
         })
 
+    if config.is_dspark_draft:
+        dspark_cfg = {
+            "target_layer_ids": list(config.dspark_target_layer_ids),
+            "block_size": config.dspark_block_size,
+            "mask_token_id": config.dspark_mask_token_id,
+            "enable_confidence_head": config.dspark_enable_confidence_head,
+            "confidence_head_with_markov":
+            config.dspark_confidence_head_with_markov,
+            "markov_head_type": config.dspark_markov_head_type,
+            "markov_rank": config.dspark_markov_rank,
+            "heads_file": "dspark_heads.safetensors",
+            "heads_info_file": "dspark_heads_info.json",
+        }
+        out.update({
+            "draft_vocab_size":
+            config.vocab_size,
+            "base_model_hidden_size":
+            len(config.dspark_target_layer_ids) * config.hidden_size,
+            "dspark_config":
+            dspark_cfg,
+        })
+
+    if config.dspark_base:
+        out.update({
+            "dspark_config": {
+                "target_layer_ids": list(config.dspark_target_layer_ids),
+                "block_size": config.dspark_block_size,
+                "mask_token_id": config.dspark_mask_token_id,
+                "enable_confidence_head": config.dspark_enable_confidence_head,
+                "confidence_head_with_markov":
+                config.dspark_confidence_head_with_markov,
+                "markov_head_type": config.dspark_markov_head_type,
+                "markov_rank": config.dspark_markov_rank,
+            },
+        })
+
     if config.eagle_base:
         # EAGLE3 base: record which layers provide hidden states to the draft.
-        n_layers = config.num_hidden_layers
-        out["eagle_hidden_state_layers"] = [2, n_layers // 2, n_layers - 4]
+        target_layers = list(config.eagle3_target_layer_ids)
+        if not target_layers:
+            n_layers = config.num_hidden_layers
+            target_layers = [2, n_layers // 2, n_layers - 4]
+        out["eagle_hidden_state_layers"] = target_layers
 
     if config.reduced_vocab_size:
         out["reduced_vocab_size"] = config.reduced_vocab_size
@@ -770,7 +905,8 @@ def write_runtime_artifacts(model: "CausalLM",
     ``"config_tp{N}_rank{R}.json"`` for per-rank TP exports.
     """
     import torch
-    from safetensors.torch import save_file
+
+    from tensorrt_edgellm._safetensors_io import save_file
 
     from ..chat_template import (process_chat_template,
                                  write_fallback_processed_chat_template)

@@ -20,6 +20,7 @@
 #include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "runtime/audioUtils.h"
+#include "runtime/state/externalWeightManager.h"
 #include <cuda_fp16.h>
 #include <memory>
 #include <string>
@@ -60,7 +61,8 @@ public:
     //! \brief Constructor for Code2WavRunner
     //! \param[in] engineDir Directory containing the Code2Wav engine
     //! \param[in] stream CUDA stream for execution
-    Code2WavRunner(std::string const& engineDir, cudaStream_t stream);
+    //! \param[in] checkpointDir Original checkpoint for runtime weight inputs
+    Code2WavRunner(std::string const& engineDir, cudaStream_t stream, std::string const& checkpointDir = "");
 
     ~Code2WavRunner() noexcept = default;
 
@@ -121,6 +123,7 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                  //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mCode2WavEngine;        //!< Code2Wav TensorRT engine
     std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Code2Wav execution context
+    ExternalWeightManager mExternalWeights{};                      //!< Checkpoint-backed engine weights
     rt::Tensor mInputCodesDevice{};                                //!< [1, numQuantizers, seqLen] Input codes on GPU
     rt::Tensor mOutputWaveform{};                                  //!< [1, 1, waveformLen] Output waveform
     nvinfer1::DataType mWaveformDtype{nvinfer1::DataType::kHALF};  //!< Engine's actual waveform output dtype

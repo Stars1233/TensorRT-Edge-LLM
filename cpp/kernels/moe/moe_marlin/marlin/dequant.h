@@ -89,6 +89,7 @@ where `scale_factor * multiplier` can be computed at weight loading.
 #include "common/cudaMacros.h"
 
 #include "marlin_dtypes.cuh"
+#include "nvfp4_scale.cuh"
 
 namespace MARLIN_NAMESPACE_NAME
 {
@@ -333,37 +334,42 @@ __device__ inline void dequant<__nv_fp8x4_e4m3, trt_edgellm::marlin_dtypes::kU4B
 }
 
 template <typename scalar_t2, trt_edgellm::marlin_dtypes::ScalarTypeId s_type_id>
-__device__ inline void dequant_fp8_scales(int q, scalar_t2* frag_b);
+__device__ inline void dequant_fp8_scales(int32_t const q, scalar_t2* frag_b);
 
 template <>
-__device__ inline void dequant_fp8_scales<half2, trt_edgellm::marlin_dtypes::kFE4M3fn.id()>(int q, half2* frag_b)
+__device__ inline void dequant_fp8_scales<half2, trt_edgellm::marlin_dtypes::kFE4M3fn.id()>(
+    int32_t const q, half2* frag_b)
 {
-    int Out1 = (q & 0xFF00FF00) >> 1;
-    ;
-    q <<= 8;
-    int Out2 = (q & 0xFF00FF00) >> 1;
+    uint32_t const scales = static_cast<uint32_t>(q);
+    constexpr uint32_t kPAIR_SCALE_BYTES{0x3120U};
+    // Reorder [b0, b1, b2, b3] to [b0, b2, b1, b3] so each packed
+    // conversion produces one Marlin FP16 scale fragment.
+    uint32_t const pairedScales = __byte_perm(scales, scales, kPAIR_SCALE_BYTES);
+    uint32_t const out2 = trt_edgellm::kernel::nvfp4::e4m3x2ToFloat16x2Times128(static_cast<uint16_t>(pairedScales));
+    uint32_t const out1
+        = trt_edgellm::kernel::nvfp4::e4m3x2ToFloat16x2Times128(static_cast<uint16_t>(pairedScales >> 16));
 
     // Note: reverse indexing is intentional because weights are permuted
-    frag_b[1] = *reinterpret_cast<half2 const*>(&Out1);
-    frag_b[0] = *reinterpret_cast<half2 const*>(&Out2);
+    frag_b[1] = *reinterpret_cast<half2 const*>(&out1);
+    frag_b[0] = *reinterpret_cast<half2 const*>(&out2);
 };
 
 template <>
 __device__ inline void dequant_fp8_scales<nv_bfloat162, trt_edgellm::marlin_dtypes::kFE4M3fn.id()>(
-    int q, nv_bfloat162* frag_b)
+    int32_t const q, nv_bfloat162* frag_b)
 {
-    constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
-    constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
-    constexpr int MASK = 0x7F007F00;
-
-    // Extract and shift FP8 values to BF16 format
-    int Out1 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
-    q <<= 8;
-    int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
+    uint32_t const scales = static_cast<uint32_t>(q);
+    constexpr uint32_t kPAIR_SCALE_BYTES{0x3120U};
+    // Reorder [b0, b1, b2, b3] to [b0, b2, b1, b3] so each packed
+    // conversion produces one Marlin BF16 scale fragment.
+    uint32_t const pairedScales = __byte_perm(scales, scales, kPAIR_SCALE_BYTES);
+    uint32_t const out2 = trt_edgellm::kernel::nvfp4::e4m3x2ToBfloat16x2Times128(static_cast<uint16_t>(pairedScales));
+    uint32_t const out1
+        = trt_edgellm::kernel::nvfp4::e4m3x2ToBfloat16x2Times128(static_cast<uint16_t>(pairedScales >> 16));
 
     // Note: reverse indexing is intentional because weights are permuted
-    frag_b[1] = *reinterpret_cast<nv_bfloat162 const*>(&Out1);
-    frag_b[0] = *reinterpret_cast<nv_bfloat162 const*>(&Out2);
+    frag_b[1] = *reinterpret_cast<nv_bfloat162 const*>(&out1);
+    frag_b[0] = *reinterpret_cast<nv_bfloat162 const*>(&out2);
 }
 
 #endif

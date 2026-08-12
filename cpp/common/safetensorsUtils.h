@@ -17,13 +17,11 @@
 
 #pragma once
 
-#include "logger.h"
 #include "tensor.h"
+#include <cstddef>
 #include <filesystem>
-#include <fstream>
-#include <nlohmann/json.hpp>
-#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace trt_edgellm
@@ -32,6 +30,30 @@ namespace rt
 {
 namespace safetensors
 {
+
+//! Metadata for one tensor stored in a safetensors payload.
+struct TensorMetadata
+{
+    std::string name;
+    nvinfer1::DataType dataType{};
+    Coords shape;
+    size_t offset{0}; //!< Byte offset relative to FileMetadata::dataOffset.
+    size_t bytes{0};
+};
+
+//! Parsed safetensors header. Parsing touches only the fixed prefix and JSON
+//! header; tensor payload pages remain demand-paged.
+struct FileMetadata
+{
+    size_t dataOffset{0}; //!< Byte offset of the tensor payload in the file.
+    std::vector<TensorMetadata> tensors;
+};
+
+//! Convert a safetensors dtype name to the corresponding TensorRT type.
+nvinfer1::DataType dataTypeFromString(std::string_view dtype);
+
+//! Parse and validate a safetensors header from an existing file mapping.
+FileMetadata parseMetadata(void const* data, size_t bytes, std::string_view source);
 
 /*!
  * @brief Save tensors to a safetensors file

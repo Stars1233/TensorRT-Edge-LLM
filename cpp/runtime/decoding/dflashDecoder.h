@@ -19,6 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "runtime/decoding/decodingStrategy.h"
+#include "runtime/state/externalWeightManager.h"
 
 #include <filesystem>
 #include <memory>
@@ -32,7 +33,8 @@ class DFlashDecoder final : public DecodingStrategy
 {
 public:
     DFlashDecoder(DecodingRuntimeContext& runtime, std::filesystem::path const& engineDir,
-        SpecDecodeDraftingConfig const& draftingConfig, cudaStream_t stream);
+        SpecDecodeDraftingConfig const& draftingConfig, std::unique_ptr<EngineExecutor> draftExecutor,
+        cudaStream_t stream);
 
     DecodingStrategyKind kind() const noexcept override
     {
@@ -63,7 +65,7 @@ public:
 
     void resetForNewSequences(Tensor& reuseLengths, cudaStream_t stream) override;
     void onBatchEvict(std::vector<int32_t> const& batchMapping, int32_t oldActiveBatch, int32_t newActiveBatch,
-        Tensor& deviceBatchMapping, cudaStream_t stream) override;
+        Tensor& deviceBatchMapping, cudaStream_t stream, BatchCompactionMode mode) override;
 
 private:
     bool runDraftForward(DecodingInferenceContext& context);
@@ -88,6 +90,7 @@ private:
 
     std::unique_ptr<EngineExecutor> mDraftExecutor;
     TensorMap mDraftTensorMap;
+    ExternalWeightManager mDraftExternalWeightManager;
 
     Tensor mDraftInputsEmbeds;        //!< [B, blockSize, draftHiddenSize] FP16
     Tensor mDraftTargetHidden;        //!< Compact scratch for [B, <= blockSize, baseOutputHiddenDim] FP16
@@ -113,18 +116,18 @@ private:
     Tensor mValidCounts;          //!< [B] INT32, DDTree valid node counts
     Tensor mVerifyTokenIds;       //!< [B, verifyTokenCount] INT32
     Tensor mVerifyTreeMask;       //!< [B, verifyTokenCount, verifyTokenCount] INT8
-    Tensor mAcceptedTokenIds;     //!< [B, dflashBlockSize] INT32
-    Tensor mAcceptedTokenIndices; //!< [B, dflashBlockSize] INT32, verify logits/KV indices
+    Tensor mAcceptedTokenIds;     //!< [B, maxAcceptBufferSize] INT32
+    Tensor mAcceptedTokenIndices; //!< [B, maxAcceptBufferSize] INT32, verify logits/KV indices
     Tensor mAcceptLength;         //!< [B] INT32
     Tensor mHostAcceptLengths;    //!< [B] INT32 (CPU)
-    Tensor mHostAcceptedTokenIds; //!< [B, dflashBlockSize] INT32 (CPU)
+    Tensor mHostAcceptedTokenIds; //!< [B, maxAcceptBufferSize] INT32 (CPU)
     Tensor mBuildWorkspace;       //!< DDTree build workspace bytes
 
-    //! DFlash-specific parameters
-    //! Linear DFlash proposal/verify chain length. This comes from the shared
-    //! DFlash runtime block-size helper rather than treating verifySize as the
-    //! permanent block horizon.
+    //! DFlash-specific parameters. Linear DFlash treats mBlockSize as the base
+    //! verify window length and copies mProposalLen = mVerifySize - 1 draft tokens
+    //! after the anchor. DDTree uses mBlockSize as the draft block horizon.
     int32_t mBlockSize{16};
+    int32_t mProposalLen{15};
     int32_t mVerifySize{16};
     int32_t mCandidateTopK{1};
     int32_t mMaskTokenId{0};

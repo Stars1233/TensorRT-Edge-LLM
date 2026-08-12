@@ -60,10 +60,10 @@ namespace plugins
 //!   [0]  o               [n, seq_len, hv, v]   FP16  output
 //!   [1]  h0_out          [n, hv, k, v]         FP32  recurrent state out
 //!   [2]  intermediate_states [n, seq_len, hv, k, v] FP32  (spec-verify only, optional)
-//!        Per-step recurrent state cache for speculative-decoding rollback.
-//!        Present when spec-verify state checkpoints are enabled (legacy use_mtp or use_ddtree).
-//!        DDTree verify keeps h0_source read-only. The runtime commits accepted
-//!        recurrent state from intermediate_states by accepted tree node id.
+//!        Per-step recurrent state cache for linear speculative-decoding rollback.
+//!        Present when spec-verify state tracking is enabled (legacy use_mtp or use_ddtree).
+//!        DDTree verify keeps h0_source read-only and stores replay data here
+//!        for accepted-state commit.
 class GatedDeltaNetPlugin : public nvinfer1::IPluginV3,
                             public nvinfer1::IPluginV3OneCore,
                             public nvinfer1::IPluginV3OneBuildV2,

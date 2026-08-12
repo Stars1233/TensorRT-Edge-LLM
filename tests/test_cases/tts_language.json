@@ -1,0 +1,26 @@
+{
+    "talker_temperature": 0.9,
+    "talker_top_k": 50,
+    "talker_top_p": 1.0,
+    "repetition_penalty": 1.05,
+    "max_audio_length": 4096,
+    "speaker": "ryan",
+    "requests": [
+        {
+            "messages": [{"role": "assistant", "content": "Hello, how can I help you today?"}]
+        },
+        {
+            "language": "english",
+            "messages": [{"role": "assistant", "content": "The weather is sunny and warm."}]
+        },
+        {
+            "speaker": "serena",
+            "language": "chinese",
+            "messages": [{"role": "assistant", "content": "今天天气很好。"}]
+        },
+        {
+            "speaker": "dylan",
+            "messages": [{"role": "assistant", "content": "今儿天气真不错。"}]
+        }
+    ]
+}

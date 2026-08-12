@@ -211,7 +211,7 @@ int32_t CausalConv1dPlugin::getOutputDataTypes(DataType* outputTypes, [[maybe_un
 
 int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs,
     DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs,
-    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& /* exprBuilder */) noexcept
+    [[maybe_unused]] int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
 {
     try
     {
@@ -228,10 +228,11 @@ int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, [[maybe_unu
         outputs[kOUT_CONV_STATE_IDX] = inputs[kIN_CONV_STATE_IDX];
         if (mUseSpecVerifyState)
         {
-            // Per-token decode checkpoints: [batch, seq_len, dim, kernel_size].
+            // Only spec-verify produces conv checkpoints; normal prefill uses a zero-length marker.
             outputs[kOUT_INTERMEDIATE_CONV_STATES].nbDims = 4;
             outputs[kOUT_INTERMEDIATE_CONV_STATES].d[0] = inputs[kIN_X_IDX].d[0];
-            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[1] = inputs[kIN_X_IDX].d[1];
+            outputs[kOUT_INTERMEDIATE_CONV_STATES].d[1] = exprBuilder.operation(
+                DimensionOperation::kPROD, *inputs[kIN_X_IDX].d[1], *inputs[kIN_SPEC_VERIFY_PHASE_MARKER_IDX].d[0]);
             outputs[kOUT_INTERMEDIATE_CONV_STATES].d[2] = inputs[kIN_CONV_STATE_IDX].d[1];
             outputs[kOUT_INTERMEDIATE_CONV_STATES].d[3] = inputs[kIN_CONV_STATE_IDX].d[2];
         }
@@ -457,16 +458,20 @@ int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTen
         auto contextLengthsTensor = rt::Tensor{const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]), rt::Coords{batch},
             rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
         trt_edgellm::rt::OptionalInputTensor contextLengthsOpt = std::optional(std::cref(contextLengthsTensor));
+        auto initialStateTensor = rt::Tensor{const_cast<void*>(inputs[kIN_CONV_STATE_IDX]),
+            rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
+        trt_edgellm::rt::OptionalInputTensor initialStateOpt = std::optional(std::cref(initialStateTensor));
 
         trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasTensor));
-        mamba_ssm::invokeCausalConv1d(
-            xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation, contextLengthsOpt, stream);
+        mamba_ssm::invokeCausalConv1d(xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation,
+            initialStateOpt, contextLengthsOpt, stream);
 
         auto captureXTensor = rt::Tensor{
             const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
         auto captureStateTensor
             = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
-        mamba_ssm::invokeCaptureConvState(captureXTensor, captureStateTensor, contextLengthsOpt, stream);
+        mamba_ssm::invokeCaptureConvState(
+            captureXTensor, initialStateOpt, captureStateTensor, contextLengthsOpt, stream);
     }
     else
     {

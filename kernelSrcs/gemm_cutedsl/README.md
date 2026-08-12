@@ -1,9 +1,14 @@
 # CuTe DSL GEMM Kernels (Ampere / Blackwell / Blackwell GeForce)
 
-FP16 GEMM kernels compiled ahead-of-time from CuTe DSL Python source for
-replacing Qwen3-Omni Talker-side cuBLAS GEMM (`cublasGemmEx`).
+This directory hosts two CuTe DSL GEMM artifact groups, both compiled
+ahead-of-time from Python source:
 
-These kernels implement:
+- **`gemm`** — FP16 GEMM that replaces the Qwen3-Omni Talker-side cuBLAS GEMM
+  (`cublasGemmEx`). Documented in the sections below.
+- **`gemm_nvfp4`** — NVFP4 blockscaled GEMM for Blackwell datacenter / Thor.
+  See [NVFP4 Blockscaled GEMM](#nvfp4-blockscaled-gemm).
+
+The FP16 `gemm` kernels implement:
 
 `C = A @ B^T`
 
@@ -17,69 +22,14 @@ with:
 Kernel artifacts (static library + headers) are generated locally by
 `kernelSrcs/build_cutedsl.py`. CMake links those local artifacts directly.
 
-## Quick Start: Building the Kernel Library
+## Artifact Development
 
-Run on a machine with a supported GPU and CUDA 12.x or 13.x.
-
-### 1. Create a virtual environment and install dependencies
-
-```bash
-python3 -m venv build_kernel_venv
-source build_kernel_venv/bin/activate
-
-# Pick cuda-python and cupy variant that matches your CUDA version
-# before installing `nvidia-cutlass-dsl`:
-pip install cuda-python==12.8.* cupy-cuda12x==12.3.0 # CUDA 12.x
-# or
-pip install cuda-python cupy-cuda13x==13.6.0 # CUDA 13.x
-
-# CUDA 13: install the [cu13] extra. CUDA 12: install the base package.
-pip install 'nvidia-cutlass-dsl[cu13]==4.6.0'  # CUDA 13.x
-# CUDA 12.x: pip install 'nvidia-cutlass-dsl==4.6.0'
-```
-
-If your environment hits a `ModuleNotFoundError` while importing CUTLASS DSL,
-install:
-
-```bash
-pip install "jax[cpu]"
-```
-
-This is an environment workaround, not a GEMM kernel requirement.
-
-### 2. Compile GEMM variants into a static library
-
-```bash
-cd tensorrt-edge-llm
-
-# Build the GEMM variant(s) supported by the current GPU
-python kernelSrcs/build_cutedsl.py --kernels gemm
-
-# Or compile explicitly for a target SM
-python kernelSrcs/build_cutedsl.py --kernels gemm --gpu_arch sm_80
-python kernelSrcs/build_cutedsl.py --kernels gemm --gpu_arch sm_110
-python kernelSrcs/build_cutedsl.py --kernels gemm --gpu_arch sm_121
-```
-
-This produces artifacts under:
-
-`cpp/kernels/cuteDSLArtifact/{arch}/{artifact_tag}/`
-
-where `artifact_tag` is currently `sm_<NN>` (for example `sm_80`, `sm_110`,
-or `sm_121`).
-
-```text
-libcutedsl_{arch}.a          — merged static library (kernel .o + DSL runtime)
-metadata.json                — build provenance and compiled variants
-include/
-    cutedsl_all.h            — umbrella header
-    gemm_ampere_fp16.h
-    gemm_blackwell_fp16.h
-    gemm_bw_geforce_fp16.h
-```
-
-Keep the generated `cuteDSLArtifact/{arch}/{artifact_tag}/` directory locally so
-subsequent CMake builds can reuse it. No git check-in is required.
+If you modify this kernel or its registry entries, manually regenerate the
+`gemm` group before running CMake. Otherwise, CMake uses the matching prebuilt
+tarball by default. Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow)
+for the supported Docker and local-venv commands, dependency versions,
+cross-compilation, artifact layout, and CMake configuration.
 
 ## Supported Variants
 
@@ -99,39 +49,9 @@ The current implementation has been validated on:
 | `gemm_blackwell_fp16` | Thor (`SM110`) | Python run + AOT export passed |
 | `gemm_bw_geforce_fp16` | n1auto / GB10 (`SM121`) | Python run + AOT export passed |
 
-## CMake Configuration
-
-Enable GEMM CuTe DSL support via:
-
-```bash
-cmake -DENABLE_CUTE_DSL=gemm \
-      -DTRT_PACKAGE_DIR=/path/to/TensorRT \
-      ..
-```
-
-To enable multiple CuTe DSL groups together:
-
-```bash
-cmake -DENABLE_CUTE_DSL=ALL ...
-cmake -DENABLE_CUTE_DSL="fmha;gdn;gemm" ...
-```
-
-`cmake/CuteDsl.cmake`:
-
-1. Detects host CPU architecture.
-2. Resolves the artifact tag (for example `sm_110` or `sm_121`) from
-   `CUTE_DSL_ARTIFACT_TAG` or the target platform when unambiguous.
-3. Reads `metadata.json`.
-4. Validates that `libcutedsl_{arch}.a` and `include/cutedsl_all.h` exist under
-   `cuteDSLArtifact/{arch}/{artifact_tag}/`.
-5. Links the static library and defines:
-   - `CUTE_DSL_GEMM_ENABLED`
-   - `CUTE_DSL_GEMM_AMPERE_ENABLED`
-   - `CUTE_DSL_GEMM_BLACKWELL_ENABLED`
-   - `CUTE_DSL_GEMM_BLACKWELL_GEFORCE_ENABLED`
-
-If multiple artifact tags exist for the same CPU architecture, pass
-`-DCUTE_DSL_ARTIFACT_TAG=<tag>` explicitly.
+CMake derives the available GEMM implementation families from generated
+metadata and defines `CUTE_DSL_GEMM_ENABLED` plus the applicable Ampere,
+Blackwell, or Blackwell GeForce family definition.
 
 ## Standalone Kernel Testing
 
@@ -191,10 +111,6 @@ Uses `tcgen05.mma` (UMMA) + TMA. Exported ABI is 3D with batch `L=1`:
 - `B`: `[N, K, 1]`
 - `C`: `[M, N, 1]`
 
-Thor (`SM110`) requires explicitly using Blackwell-family shared-memory
-capacity in the kernel because cuTe DSL 4.5.2 does not auto-detect it
-reliably.
-
 ### Blackwell GeForce / GB10
 
 Uses the `Sm120` / WGMMA-style path with TMA. Exported ABI is also 3D with
@@ -224,19 +140,41 @@ It dispatches by runtime SM version:
 
 replacing the old cuBLAS-based path.
 
-## Dependency Summary
+## NVFP4 Blockscaled GEMM
 
-### Required
+The `gemm_nvfp4` group is a warp-specialized NVFP4 (blockscaled,
+`sf_vec_size = 16`) GEMM for Blackwell datacenter and Thor, sourced from
+`gemm_blackwell_nvfp4_ws.py`. It is kept in its own group so
+`build_cutedsl.py --kernels gemm_nvfp4` builds independently of the FP16 `gemm`
+variants. `M`, `N`, and `K` are runtime dimensions.
 
-| Dependency | Version |
-|---|---|
-| `nvidia-cutlass-dsl` | `4.6.0` (CUDA 13: `[cu13]` extra; CUDA 12: base package) |
-| `cuda-python` | compatible with local CUDA |
-| `cupy-cuda12x` | `12.3.0` for CUDA 12.x |
-| `cupy-cuda13x` | `13.6.0` for CUDA 13.x |
+| Variant | Output dtype | MMA N-tile | Supported SMs |
+|---|---|---|---|
+| `gemm_blackwell_nvfp4_ws_fp16_tn64`  | FP16     | 64  | 100 / 101 / 103 / 110 |
+| `gemm_blackwell_nvfp4_ws_fp16_tn128` | FP16     | 128 | 100 / 101 / 103 / 110 |
+| `gemm_blackwell_nvfp4_ws_fp16_tn256` | FP16     | 256 | 100 / 101 / 103 / 110 |
+| `gemm_blackwell_nvfp4_ws_fp8_tn64`   | FP8-E4M3 | 64  | 100 / 101 / 103 / 110 |
+| `gemm_blackwell_nvfp4_ws_fp8_tn128`  | FP8-E4M3 | 128 | 100 / 101 / 103 / 110 |
 
-### Optional
+The kernel body splits load / MMA / store across warp roles (epilogue warps
+0–3, MMA warp 4, TMA-load warp 5) to hide TMA latency behind MMA issue; `tn256`
+pairs the larger N-tile with the persistent tile scheduler.
 
-| Dependency | Purpose |
-|---|---|
-| `jax[cpu]` | Workaround if the installed CUTLASS DSL package import path requires `jax` |
+CMake sets the umbrella `CUTE_DSL_GEMM_NVFP4_ENABLED` when the group is active,
+plus a per-variant `CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_<DTYPE>_TN<N>_ENABLED`
+define for each exported variant.
+
+### Building
+
+Follow the shared
+[CuTe DSL kernel development workflow](../README.md#cute-dsl-kernel-development-workflow),
+substituting `gemm_nvfp4` for the group name. Single-variant export:
+
+```bash
+cd kernelSrcs/gemm_cutedsl
+python gemm_blackwell_nvfp4_ws.py --mnk 128,512,128 \
+  --mma_tiler_n 128 --sf_vec_size 16 --c_dtype fp16 \
+  --export_only --output_dir ./out \
+  --file_name gemm_blackwell_nvfp4_ws_fp16_tn128 \
+  --function_prefix gemm_blackwell_nvfp4_ws_fp16_tn128
+```

@@ -29,6 +29,14 @@ namespace trt_edgellm
 namespace plugins
 {
 
+//! Internal ViT attention implementation selected from build artifacts and runtime capabilities.
+enum class ViTFMHABackend
+{
+    kNONE,
+    kCUTE_DSL_FMHA_BLACKWELL,
+    kCUTE_DSL_FMHA_V2
+};
+
 //! \brief TensorRT plugin for ViT attention operations (V3 — IPluginV3).
 //!
 //! This plugin implements efficient attention mechanisms for ViT.
@@ -95,11 +103,7 @@ protected:
     //! Datatype of attention. Only supports FP16 as of now.
     nvinfer1::DataType const mDataType{nvinfer1::DataType::kHALF};
     int32_t mSMVersion; //!< CUDA SM version
-#ifdef CUTE_DSL_FMHA_ENABLED
-    bool mUseCuteDslFMHA{true};
-#else
-    bool mUseCuteDslFMHA{false};
-#endif
+    ViTFMHABackend mFMHABackend{ViTFMHABackend::kNONE};
 
     std::vector<nvinfer1::PluginField> mDataToSerialize;
     nvinfer1::PluginFieldCollection mFCToSerialize{};

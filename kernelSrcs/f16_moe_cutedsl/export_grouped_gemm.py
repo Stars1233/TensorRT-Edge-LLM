@@ -138,6 +138,8 @@ def export_grouped_gemm(args: argparse.Namespace) -> tuple[str, str]:
     cupy.cuda.Device(0).use()
     kernel = _make_kernel(args.family)
     export_wrapper = ExportWrapper(kernel)
+    # This value only seeds the runtime-typed compile argument. Deployment
+    # passes the target GPU's persistent block count through the exported ABI.
     max_active_clusters = export_common.get_max_active_clusters(args.family)
     if max_active_clusters <= 0:
         raise RuntimeError("No active CTA clusters are available for f16_moe")

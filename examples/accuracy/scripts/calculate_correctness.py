@@ -18,6 +18,8 @@ import json
 import re
 from collections import defaultdict
 
+MULTI_CHOICE_LETTERS = "ABCDEFGHIJ"
+
 
 def _apply_byte_fallback(text):
     """
@@ -93,19 +95,22 @@ def clean_text(text):
         text = text[text.rfind("<|channel>response") +
                     len("<|channel>response"):]
     elif "<|channel>thought" in text:
-        # Gemma4 alternate format: ``<|channel>thought\n...<channel|>ANSWER<turn|>``
-        # The closing ``<channel|>`` ends the thought block; answer follows immediately.
+        # DiffusionGemma/Gemma4 can emit a thought channel followed directly by
+        # the short answer without an explicit response marker, e.g.
+        # ``<|channel>thought\n<channel|>B<turn|>``.
         if "<channel|>" in text:
             text = text[text.rfind("<channel|>") + len("<channel|>"):]
         else:
-            # Truncated thinking (hit max-length) — try last 500 chars for heuristic
+            # Truncated thinking (hit max-length): inspect only the tail for
+            # the conservative answer parser below.
             text = text[-500:]
     # Drop chat / tokenizer special tokens (e.g. <|endoftext|>, <|im_end|>, <turn|>,
     # <end_of_turn>) so MCQ output like "C<|im_end|>" or "C<turn|>" still scores.
     # Replace with space (not empty) so "C<turn|>The..." → "C The..." preserves boundary.
     text = re.sub(r"<\|.*?\|>", " ", text)
     text = re.sub(r"<[a-z_]+\|>", " ", text)
-    text = re.sub(r"<end_of_turn>", " ", text)
+    text = re.sub(r"<(?:eos|bos|pad|unk|mask|start_of_turn|end_of_turn)>", " ",
+                  text)
     text = text.strip().strip("().,")
     return text
 
@@ -119,40 +124,55 @@ def parse_multi_choice_response(text):
     """
     Parse multiple choice answer from text that may be in various formats.
     Handles "A. xxx", "A", "(A)", "**Answer: A**", "the answer is A", or just
-    returns the first letter if it's A-H.
+    returns the first letter if it's A-J.
 
     Args:
         text: Input text string potentially containing a multiple choice answer.
     Returns:
-        Single letter (A-H) if found, otherwise returns the original cleaned text.
+        Single letter (A-J) if found, otherwise returns the original cleaned text.
     """
     text = _strip_markdown(text.strip())
 
-    # Anchor on an explicit ``Answer: X`` / ``answer is X`` form.
-    m = re.search(r"\banswer\s*(?:is|:)?\s*\(?([A-H])\b", text, re.IGNORECASE)
-    if m:
-        return m.group(1).upper()
-
-    # If text is already just a single letter A-H, return it
-    if len(text) == 1 and text in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+    # If text is already just a single choice letter, return it.
+    if len(text) == 1 and text in MULTI_CHOICE_LETTERS:
         return text
 
-    # Try to match pattern like "A." or "A)" or "(A)" at the start
-    match = re.match(r'^[\(]?([A-H])[\.\):\s]', text)
+    explicit_answer_patterns = [
+        r"\b(?:final\s+answer|answer|correct\s+(?:answer|option)|correct\s+choice|letter|matches?\s+option)\s*(?:is|:)?\s*\(?([A-J])\b",
+        r"\boption\s*(?:is|:)\s*\(?([A-J])\b",
+        r"\boption\s+\(?([A-J])\)?(?:[\.\)]\s*|$)",
+        r"\b(?:the\s+)?(?:answer|letter)\s+is\s+\(?([A-J])\b",
+        r"\bresult\s*(?:is|:)?\s*\(?([A-J])\b",
+    ]
+    for pattern in explicit_answer_patterns:
+        matches = list(re.finditer(pattern, text,
+                                   re.IGNORECASE | re.MULTILINE))
+        if matches:
+            return matches[-1].group(1).upper()
+
+    # Try to match pattern like "A." or "A)" or "(A)" at the start.
+    match = re.match(r'^[\(]?([A-J])[\.\):\s]', text)
     if match:
         return match.group(1)
 
-    # Handle short responses that start with a valid letter (e.g. "A\n" or "B.")
-    if len(text) <= 3 and text and text[0] in 'ABCDEFGH':
+    # Handle short responses that start with a valid letter (e.g. "A\n" or "B.").
+    if len(text) <= 3 and text and text[0] in MULTI_CHOICE_LETTERS:
         return text[0]
 
-    # For long thinking outputs: search the last 500 chars for "answer is X" pattern
-    if len(text) > 100:
-        tail = text[-500:]
-        m = re.search(r"\b(?:answer|correct)\s*(?:is|:)?\s*\(?([A-H])\b", tail,
-                      re.IGNORECASE)
-        if m:
-            return m.group(1).upper()
+    # Search the tail for an explicit final answer/option/letter marker. Some
+    # thinking outputs finish with a single letter on the final line instead of
+    # emitting a response-channel marker. Keep these patterns conservative: broad
+    # connectors like "so X" can appear in rejected alternatives such as
+    # "So B is wrong, leaving C."
+    tail = text[-800:]
+    tail_patterns = [
+        r"(?:^|[\n\r])\s*([A-J])\s*(?:\.\s*)?$",
+    ]
+    for pattern in tail_patterns:
+        matches = list(re.finditer(pattern, tail,
+                                   re.IGNORECASE | re.MULTILINE))
+        if matches:
+            return matches[-1].group(1).upper()
 
     # If no match found, return the original text
     return text
@@ -172,7 +192,7 @@ def is_correct(pred, ref):
     pred_clean = clean_text(pred)
     ref_clean = clean_text(ref)
 
-    if ref_clean in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+    if ref_clean in MULTI_CHOICE_LETTERS:
         pred_clean = parse_multi_choice_response(pred_clean)
 
     return pred_clean == ref_clean

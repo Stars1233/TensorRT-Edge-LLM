@@ -17,6 +17,8 @@
 
 #include "runtime/exec/registryBuilder.h"
 #include "common/bindingNames.h"
+#include "common/checkMacros.h"
+#include "common/pagedKvTypes.h"
 #include "runtime/hybridCacheManager.h"
 #include "runtime/kvCacheManager.h"
 #include <algorithm>
@@ -71,6 +73,9 @@ LLMEngineConfig makeBasicLLMConfig()
     cfg.maxSupportedBatchSize = 4;
     cfg.maxSupportedInputLength = 2048;
     cfg.maxKVCacheCapacity = 4096;
+    int64_t const minimumActivePages = computeMinimumKvPoolPages(cfg.maxSupportedBatchSize, cfg.maxKVCacheCapacity);
+    ELLM_CHECK(minimumActivePages <= kMAX_KV_POOL_PAGES, "Test KV pool page count must fit int32.");
+    cfg.kvPoolPages = static_cast<int32_t>(minimumActivePages);
     populateHybridFieldsFromScalars(cfg);
     return cfg;
 }
@@ -97,6 +102,7 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     // kvcache_start_index is registered with a symbolic `start_index_len` dim
     // (0 for initial-prefill sentinel, batch otherwise). See registryBuilder.
     EXPECT_TRUE(hasName(names, "kvcache_start_index"));
+    EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kKVPageTable));
     EXPECT_TRUE(hasName(names, "rope_rotary_cos_sin"));
 
     // KV cache: 32 layers x 2 (past + present) = 64 entries
@@ -105,8 +111,102 @@ TEST(RegistryBuilderTest, StandardLLMHasExpectedTensors)
     EXPECT_TRUE(hasName(names, "present_key_values_0"));
     EXPECT_TRUE(hasName(names, "present_key_values_31"));
 
-    // Total: 6 core (incl. kvcache_start_index) + 64 KV = 70
-    EXPECT_EQ(names.size(), 70u);
+    // Total: 7 core (incl. kvcache_start_index and kv_page_table) + 64 KV = 71
+    EXPECT_EQ(names.size(), 71u);
+}
+
+TEST(RegistryBuilderTest, DiffusionBackboneHasSelectorAndPhaseTensors)
+{
+    namespace bn = trt_edgellm::binding_names;
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.isDiffusionBackbone = true;
+    cfg.contextMaskSelectorEnabled = true;
+
+    populateHybridFieldsFromScalars(cfg);
+    auto reg = buildRegistryForLLM(cfg);
+    auto names = reg.allTensorNames();
+
+    EXPECT_TRUE(hasName(names, bn::kInputsEmbeds));
+    EXPECT_TRUE(hasName(names, bn::kLogits));
+    EXPECT_TRUE(hasName(names, bn::kPhaseIsEncoder));
+    EXPECT_TRUE(hasName(names, bn::kSelectTokenIndices));
+    EXPECT_TRUE(hasName(names, bn::kContextMaskSelector));
+    EXPECT_TRUE(hasName(names, bn::kKVPageTable));
+    EXPECT_FALSE(hasName(names, bn::kLastTokenIds));
+
+    auto specs = reg.allExpandedSpecs();
+    auto const logits
+        = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kLogits; });
+    ASSERT_NE(logits, specs.end());
+    EXPECT_EQ(logits->io, TensorIO::kOutput);
+    EXPECT_EQ(logits->dtype, nvinfer1::DataType::kFLOAT);
+    ASSERT_EQ(logits->shape.size(), 3u);
+    EXPECT_TRUE(logits->shape[1].isSymbolic());
+    EXPECT_EQ(logits->shape[1].symbol, &InferenceDims::selectLen);
+
+    auto const selector = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kContextMaskSelector; });
+    ASSERT_NE(selector, specs.end());
+    ASSERT_EQ(selector->shape.size(), 1u);
+    EXPECT_TRUE(selector->shape[0].isSymbolic());
+    EXPECT_EQ(selector->shape[0].symbol, &InferenceDims::contextMaskSelectorLen);
+}
+
+TEST(RegistryBuilderTest, DiffusionBackboneUnifiedConditioningAddsInputs)
+{
+    namespace bn = trt_edgellm::binding_names;
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.isDiffusionBackbone = true;
+    cfg.contextMaskSelectorEnabled = true;
+    cfg.diffusionUnifiedConditioning = true;
+
+    populateHybridFieldsFromScalars(cfg);
+    auto reg = buildRegistryForLLM(cfg);
+    auto names = reg.allTensorNames();
+
+    EXPECT_TRUE(hasName(names, bn::kCanvasIds));
+    EXPECT_TRUE(hasName(names, bn::kPrevSelfConditioningEmbeds));
+    EXPECT_TRUE(hasName(names, bn::kSelfConditioningTemperature));
+    EXPECT_TRUE(hasName(names, bn::kNextSelfConditioningEmbeds));
+    EXPECT_FALSE(hasName(names, "prev_logits"));
+    EXPECT_FALSE(hasName(names, "temperature"));
+    EXPECT_FALSE(hasName(names, "prev_logits_valid"));
+    EXPECT_FALSE(hasName(names, "conditioned_inputs_embeds"));
+
+    auto specs = reg.allExpandedSpecs();
+    auto const prevFeedback = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kPrevSelfConditioningEmbeds; });
+    ASSERT_NE(prevFeedback, specs.end());
+    EXPECT_EQ(prevFeedback->io, TensorIO::kInput);
+    EXPECT_EQ(prevFeedback->dtype, nvinfer1::DataType::kHALF);
+    ASSERT_EQ(prevFeedback->shape.size(), 3u);
+    EXPECT_EQ(prevFeedback->shape[0].symbol, &InferenceDims::batch);
+    EXPECT_EQ(prevFeedback->shape[1].symbol, &InferenceDims::seqLen);
+    EXPECT_EQ(prevFeedback->shape[2].value, cfg.hiddenSize);
+
+    auto const nextFeedback = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == bn::kNextSelfConditioningEmbeds; });
+    ASSERT_NE(nextFeedback, specs.end());
+    EXPECT_EQ(nextFeedback->io, TensorIO::kOutput);
+    EXPECT_EQ(nextFeedback->dtype, nvinfer1::DataType::kHALF);
+    ASSERT_EQ(nextFeedback->shape.size(), 3u);
+    EXPECT_EQ(nextFeedback->shape[0].symbol, &InferenceDims::batch);
+    EXPECT_EQ(nextFeedback->shape[1].symbol, &InferenceDims::selectLen);
+    EXPECT_EQ(nextFeedback->shape[2].value, cfg.hiddenSize);
+}
+
+TEST(RegistryBuilderTest, KVCacheBindingUsesEnginePoolPages)
+{
+    LLMEngineConfig cfg = makeBasicLLMConfig();
+    cfg.kvPoolPages += 7;
+
+    auto const specs = buildRegistryForLLM(cfg).allExpandedSpecs();
+    auto const it = std::find_if(
+        specs.begin(), specs.end(), [](TensorSpec const& spec) { return spec.name == "past_key_values_0"; });
+
+    ASSERT_NE(it, specs.end());
+    ASSERT_EQ(it->shape.size(), 5U);
+    EXPECT_EQ(it->shape[1].value, cfg.kvPoolPages);
 }
 
 TEST(RegistryBuilderTest, StandardLLMHasCorrectSpecAttributes)
@@ -152,8 +252,8 @@ TEST(RegistryBuilderTest, DeepstackAddsExtraTensors)
     EXPECT_TRUE(hasName(names, "deepstack_embeds_1"));
     EXPECT_TRUE(hasName(names, "deepstack_embeds_2"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers * 2) + 3 deepstack = 13
-    EXPECT_EQ(names.size(), 13u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV (2 layers * 2) + 3 deepstack = 14
+    EXPECT_EQ(names.size(), 14u);
 }
 
 TEST(RegistryBuilderTest, DeepstackShapeMatchesConfig)
@@ -213,8 +313,8 @@ TEST(RegistryBuilderTest, SpecDecodeBaseAddsProposalTensors)
     EXPECT_TRUE(hasName(names, "attention_mask"));
     EXPECT_TRUE(hasName(names, "attention_pos_id"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV + 3 SpecDecode = 13
-    EXPECT_EQ(names.size(), 13u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV + 3 SpecDecode = 14
+    EXPECT_EQ(names.size(), 14u);
 }
 
 TEST(RegistryBuilderTest, SpecDecodeBaseUsesConfiguredOutputHiddenDim)
@@ -284,8 +384,8 @@ TEST(RegistryBuilderTest, MambaStateAddsRecurrentAndConvTensors)
     EXPECT_TRUE(hasName(names, "present_conv_state_0"));
     EXPECT_TRUE(hasName(names, "present_conv_state_1"));
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 attn layers) + 4 recurrent + 4 conv = 18
-    EXPECT_EQ(names.size(), 18u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV (2 attn layers) + 4 recurrent + 4 conv = 19
+    EXPECT_EQ(names.size(), 19u);
 }
 
 TEST(RegistryBuilderTest, RecurrentStateShapeMatchesConfig)
@@ -360,10 +460,10 @@ TEST(RegistryBuilderTest, AllFeaturesEnabled)
     auto reg = buildRegistryForLLM(cfg);
     auto names = reg.allTensorNames();
 
-    // 6 core (incl. kvcache_start_index) + 4 KV (2 layers) + 2 deepstack + 4 SpecDecode
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 4 KV (2 layers) + 2 deepstack + 4 SpecDecode
     //   + 4 recurrent + 4 conv + 4 intermediate (2 layers × {recurrent, conv})
-    // = 28. The extra 4 intermediate-state outputs and phase marker come from the MTP-base path.
-    EXPECT_EQ(names.size(), 28u);
+    // = 29. The extra 4 intermediate-state outputs and phase marker come from the MTP-base path.
+    EXPECT_EQ(names.size(), 29u);
     EXPECT_TRUE(hasName(names, trt_edgellm::binding_names::kSpecVerifyPhaseMarker));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_0"));
     EXPECT_TRUE(hasName(names, "intermediate_recurrent_state_1"));
@@ -554,12 +654,12 @@ TEST(RegistryBuilderTest, DraftEngineKVCacheUsesPluginPath)
     auto reg = buildRegistryForSpecDecodeDraft(bundle);
     auto specs = reg.allExpandedSpecs();
 
-    // KV cache should be 5D (plugin path)
+    // KV cache should be 5D paged-pool shape [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]
     auto kvIt
         = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "past_key_values_0"; });
     ASSERT_NE(kvIt, specs.end());
     EXPECT_EQ(kvIt->shape.size(), 5u);
-    EXPECT_EQ(kvIt->shape[1].value, 2); // combined K+V dimension
+    EXPECT_EQ(kvIt->shape[0].value, 2); // combined K+V dimension (leading, pool contract)
 }
 
 // =====================================================================
@@ -580,8 +680,8 @@ TEST(RegistryBuilderTest, HybridModelKVCacheCountMatchesAttentionLayers)
     EXPECT_TRUE(hasName(names, "past_key_values_9"));
     EXPECT_FALSE(hasName(names, "past_key_values_10"));
 
-    // 6 core (incl. kvcache_start_index) + 20 KV (10 layers * 2) = 26
-    EXPECT_EQ(names.size(), 26u);
+    // 7 core (incl. kvcache_start_index and kv_page_table) + 20 KV (10 layers * 2) = 27
+    EXPECT_EQ(names.size(), 27u);
 }
 
 // Heterogeneous-KV models (Gemma-4, Qwen3-Next, etc.) give each attention
@@ -607,12 +707,12 @@ TEST(RegistryBuilderTest, HeterogeneousKVLayerEmitsPerLayerSpecs)
     auto reg = buildRegistryForLLM(cfg);
     auto specs = reg.allExpandedSpecs();
 
-    // past_key_values_0: plugin combined KV shape [batch, 2, numKVHeads, kv_len, headDim]
+    // past_key_values_0: plugin paged-pool shape [2, numPages, kTOKENS_PER_PAGE, numKVHeads, headDim]
     auto layer0
         = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "past_key_values_0"; });
     ASSERT_NE(layer0, specs.end());
     ASSERT_EQ(layer0->shape.size(), 5u);
-    EXPECT_EQ(layer0->shape[2].value, 8);  // numKVHeads for layer 0
+    EXPECT_EQ(layer0->shape[3].value, 8);  // numKVHeads for layer 0
     EXPECT_EQ(layer0->shape[4].value, 64); // headDim for layer 0
 
     // past_key_values_1: different KV config
@@ -620,11 +720,11 @@ TEST(RegistryBuilderTest, HeterogeneousKVLayerEmitsPerLayerSpecs)
         = std::find_if(specs.begin(), specs.end(), [](TensorSpec const& s) { return s.name == "past_key_values_1"; });
     ASSERT_NE(layer1, specs.end());
     ASSERT_EQ(layer1->shape.size(), 5u);
-    EXPECT_EQ(layer1->shape[2].value, 4);   // numKVHeads for layer 1
+    EXPECT_EQ(layer1->shape[3].value, 4);   // numKVHeads for layer 1
     EXPECT_EQ(layer1->shape[4].value, 128); // headDim for layer 1
 
     // Sanity: the two specs must differ on the fixed dims.
-    EXPECT_NE(layer0->shape[2].value, layer1->shape[2].value);
+    EXPECT_NE(layer0->shape[3].value, layer1->shape[3].value);
     EXPECT_NE(layer0->shape[4].value, layer1->shape[4].value);
 }
 

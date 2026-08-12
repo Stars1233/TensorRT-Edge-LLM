@@ -27,6 +27,10 @@ Public API::
     llm.serve(port=8000)
 """
 
-from .engine import LLM, CompletionOutput, SamplingParams, StreamDelta
+from .engine import (LLM, TTS, AudioParams, CompletionOutput, SamplingParams,
+                     StreamDelta)
 
-__all__ = ["LLM", "SamplingParams", "CompletionOutput", "StreamDelta"]
+__all__ = [
+    "LLM", "TTS", "SamplingParams", "CompletionOutput", "StreamDelta",
+    "AudioParams"
+]

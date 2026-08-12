@@ -33,11 +33,11 @@ tarball_path="${prebuilt_dir}/${tarball_name}"
 
 case "${cuda_major}" in
     13)
-        : "${CUTE_DSL_PACKAGE:=nvidia-cutlass-dsl[cu13]==4.6.0}"
+        : "${CUTE_DSL_PACKAGE:=nvidia-cutlass-dsl[cu13]==4.6.1}"
         : "${CUTE_DSL_CUPY_PACKAGE:=cupy-cuda13x==13.6.0}"
         ;;
     12)
-        : "${CUTE_DSL_PACKAGE:=nvidia-cutlass-dsl[cu12]==4.6.0}"
+        : "${CUTE_DSL_PACKAGE:=nvidia-cutlass-dsl[cu12]==4.6.1}"
         : "${CUTE_DSL_CUPY_PACKAGE:=cupy-cuda12x==12.3.0}"
         ;;
     *)
@@ -54,12 +54,6 @@ require_tool() {
 }
 
 build_cutedsl_tarball() {
-    require_tool python3
-    require_tool tar
-    require_tool sha256sum
-
-    local cache_dir="${HOME:-/tmp}/.cache/tensorrt-edge-llm"
-    local venv_dir="${CUTE_DSL_VENV:-${cache_dir}/cutedsl-venv-cuda${cuda_major}}"
     local output_dir
     output_dir="$(mktemp -d)"
 
@@ -71,26 +65,12 @@ build_cutedsl_tarball() {
     echo "No CuteDSL tarball found at ${tarball_path}"
     echo "Building CuteDSL artifact before docker build."
 
-    mkdir -p "${cache_dir}" "${prebuilt_dir}"
-    python3 -m venv "${venv_dir}"
-    "${venv_dir}/bin/pip" install -q --upgrade pip wheel
-    "${venv_dir}/bin/pip" install -q "${CUTE_DSL_PACKAGE}" "${CUTE_DSL_CUPY_PACKAGE}"
+    CUTE_DSL_OUTPUT_DIR="${output_dir}" \
+        CUTE_DSL_PREBUILT_DIR="${prebuilt_dir}" \
+        CUTE_DSL_TARGETS="${CUTE_DSL_ARCH}:${CUTE_DSL_GPU_ARCH}" \
+        kernelSrcs/build_cutedsl_tarballs.sh
 
-    "${venv_dir}/bin/python" kernelSrcs/build_cutedsl.py \
-        --kernels "${CUTE_DSL_KERNELS}" \
-        --gpu_arch "${CUTE_DSL_GPU_ARCH}" \
-        --arch "${CUTE_DSL_ARCH}" \
-        --output_dir "${output_dir}" \
-        --clean
-
-    local artifact_dir="${output_dir}/${CUTE_DSL_ARCH}/${CUTE_DSL_ARTIFACT_TAG}"
-    test -f "${artifact_dir}/metadata.json"
-    test -f "${artifact_dir}/libcutedsl_${CUTE_DSL_ARCH}.a"
-    test -f "${artifact_dir}/include/cutedsl_all.h"
-
-    tar -C "${output_dir}/${CUTE_DSL_ARCH}" -czf "${tarball_path}" "${CUTE_DSL_ARTIFACT_TAG}"
-    (cd "${prebuilt_dir}" && sha256sum "${tarball_name}" > "${tarball_name}.sha256")
-    echo "Wrote ${tarball_path}"
+    test -f "${tarball_path}"
 }
 
 cd "${repo_root}"

@@ -292,7 +292,7 @@ def _get_decode_kernel(
     """Compile (or retrieve cached) the SM120 decode MoE kernel."""
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
-    mac = min(get_max_active_clusters(1), sm_count)
+    max_active_clusters = min(get_max_active_clusters(1), sm_count)
 
     routed_rows = m * num_topk
     mma_tiler_mn = (128, 128)
@@ -308,7 +308,7 @@ def _get_decode_kernel(
         n,
         num_topk,
         max_rows,
-        mac,
+        max_active_clusters,
         mma_tiler_mn,
         topk_ids_dtype,
         input_scales_are_reciprocal,
@@ -435,12 +435,12 @@ def _get_decode_kernel(
         scatter_fake,
         token_map_fake,
         token_weights_fake,
-        mac,
+        max_active_clusters,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
-    result = (compiled, mac)
+    result = (compiled, max_active_clusters)
     _DECODE_KERNEL_CACHE[cache_key] = result
     return result
 
@@ -847,7 +847,7 @@ def _get_prefill_kernel(
     """Compile (or retrieve cached) the SM120 prefill MoE kernel."""
     sf_vec_size = 16
     sm_count = get_num_sm(torch.device("cuda"))
-    mac = min(get_max_active_clusters(1), sm_count)
+    max_active_clusters = min(get_max_active_clusters(1), sm_count)
 
     cache_key = (
         "prefill",
@@ -855,7 +855,7 @@ def _get_prefill_kernel(
         k,
         n,
         num_topk,
-        mac,
+        max_active_clusters,
         topk_ids_dtype,
         input_scales_are_reciprocal,
         fast_math,
@@ -1028,12 +1028,12 @@ def _get_prefill_kernel(
         1,
         1,
         1,  # runtime Int32 placeholders
-        mac,
+        max_active_clusters,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
-    result = (compiled, mac)
+    result = (compiled, max_active_clusters)
     _PREFILL_KERNEL_CACHE[cache_key] = result
     return result
 

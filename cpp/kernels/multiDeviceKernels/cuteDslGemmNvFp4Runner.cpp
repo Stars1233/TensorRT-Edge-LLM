@@ -17,6 +17,7 @@
 
 #include "cuteDslGemmNvFp4Runner.h"
 
+#include "common/cudaUtils.h"
 #include "common/logger.h"
 
 #include <cstdint>
@@ -31,6 +32,7 @@ namespace trt_edgellm
 namespace kernels
 {
 
+#ifdef CUTE_DSL_GEMM_NVFP4_ENABLED
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED
 gemm_blackwell_nvfp4_fp16_tn64_Kernel_Module_t CuteDslGemmNvFp4Runner::sModFp16Tn64{};
 #endif
@@ -55,6 +57,7 @@ gemm_blackwell_nvfp4_ws_fp8_tn64_Kernel_Module_t CuteDslGemmNvFp4Runner::sModWsF
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED
 gemm_blackwell_nvfp4_ws_fp8_tn128_Kernel_Module_t CuteDslGemmNvFp4Runner::sModWsFp8Tn128{};
 #endif
+#endif // CUTE_DSL_GEMM_NVFP4_ENABLED
 std::mutex CuteDslGemmNvFp4Runner::sMutex{};
 bool CuteDslGemmNvFp4Runner::sLoaded = false;
 
@@ -218,6 +221,10 @@ cudaError_t CuteDslGemmNvFp4Runner::run(void const* a, void const* b, void const
     int64_t const m64 = static_cast<int64_t>(M);
     int64_t const n64 = static_cast<int64_t>(N);
     int64_t const k64 = static_cast<int64_t>(K);
+#if defined(CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN64_ENABLED)                                                        \
+    || defined(CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN128_ENABLED)
+    int32_t const maxActiveClusters = trt_edgellm::getDeviceMultiProcessorCount();
+#endif
 
     int32_t launchRet = 0;
     switch (mMmaTilerN)
@@ -225,7 +232,7 @@ cudaError_t CuteDslGemmNvFp4Runner::run(void const* a, void const* b, void const
     case 64:
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN64_ENABLED
         launchRet = cute_dsl_gemm_blackwell_nvfp4_ws_fp16_tn64_wrapper(
-            &sModWsFp16Tn64, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, stream);
+            &sModWsFp16Tn64, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, maxActiveClusters, stream);
         break;
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN64_ENABLED
@@ -238,7 +245,7 @@ cudaError_t CuteDslGemmNvFp4Runner::run(void const* a, void const* b, void const
     case 128:
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP16_TN128_ENABLED
         launchRet = cute_dsl_gemm_blackwell_nvfp4_ws_fp16_tn128_wrapper(
-            &sModWsFp16Tn128, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, stream);
+            &sModWsFp16Tn128, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, maxActiveClusters, stream);
         break;
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP16_TN128_ENABLED
@@ -295,6 +302,10 @@ cudaError_t CuteDslGemmNvFp4Runner::runFp8(void const* a, void const* b, void co
     int64_t const m64 = static_cast<int64_t>(M);
     int64_t const n64 = static_cast<int64_t>(N);
     int64_t const k64 = static_cast<int64_t>(K);
+#if defined(CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN64_ENABLED)                                                         \
+    || defined(CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED)
+    int32_t const maxActiveClusters = trt_edgellm::getDeviceMultiProcessorCount();
+#endif
 
     int32_t launchRet = 0;
     switch (mMmaTilerN)
@@ -302,7 +313,7 @@ cudaError_t CuteDslGemmNvFp4Runner::runFp8(void const* a, void const* b, void co
     case 64:
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN64_ENABLED
         launchRet = cute_dsl_gemm_blackwell_nvfp4_ws_fp8_tn64_wrapper(
-            &sModWsFp8Tn64, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, stream);
+            &sModWsFp8Tn64, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, maxActiveClusters, stream);
         break;
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN64_ENABLED
@@ -315,7 +326,7 @@ cudaError_t CuteDslGemmNvFp4Runner::runFp8(void const* a, void const* b, void co
     case 128:
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_WS_FP8_TN128_ENABLED
         launchRet = cute_dsl_gemm_blackwell_nvfp4_ws_fp8_tn128_wrapper(
-            &sModWsFp8Tn128, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, stream);
+            &sModWsFp8Tn128, aMut, bMut, sfaMut, sfbMut, dPtr, m64, n64, k64, maxActiveClusters, stream);
         break;
 #endif
 #ifdef CUTE_DSL_GEMM_BLACKWELL_NVFP4_FP8_TN128_ENABLED

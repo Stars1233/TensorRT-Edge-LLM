@@ -44,10 +44,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...config import ModelConfig
+from ...config import ModelConfig, _is_gemma4_model_type
 from ..default.modeling_default import OnnxSpec, RMSNorm
+# yapf: disable
+from ..gemma4.modeling_gemma4_text import (Gemma4MLP, Gemma4RMSNorm,
+                                           Gemma4ValueRMSNorm,
+                                           _attention_type_for_layer,
+                                           _head_dim_for_attention_type,
+                                           _num_kv_heads_for_attention_type,
+                                           _rotary_dim_from_rope_config,
+                                           _uses_attention_k_eq_v)
+# yapf: enable
 from ..linear import make_linear
-from ..ops import attention_plugin
+from ..ops import KV_PAGE_SIZE, attention_plugin
 
 __all__ = ["Eagle3DraftModel"]
 
@@ -75,40 +84,56 @@ class Eagle3Attention(nn.Module):
 
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
-        num_attention_heads = config.num_attention_heads
-        num_key_value_heads = config.num_key_value_heads
-        head_dim = config.head_dim
         hidden_size = config.hidden_size
         qkv_in_features = hidden_size * 2
 
         self.layer_idx = layer_idx
-        self.num_heads = num_attention_heads
-        self.num_kv_heads = num_key_value_heads
-        self.head_dim = head_dim
+        self.is_gemma4 = _is_gemma4_model_type(config.model_type)
+        if self.is_gemma4:
+            self.attention_type = _attention_type_for_layer(config, layer_idx)
+            self.attention_k_eq_v = _uses_attention_k_eq_v(
+                config, self.attention_type)
+            self.num_heads = int(config.num_attention_heads)
+            self.num_kv_heads = _num_kv_heads_for_attention_type(
+                config, self.attention_type)
+            self.head_dim = _head_dim_for_attention_type(
+                config, self.attention_type)
+            self.sliding_window_size = (config.sliding_window_size
+                                        if self.attention_type
+                                        == "sliding_attention" else -1)
+        else:
+            self.attention_k_eq_v = False
+            self.num_heads = config.num_attention_heads
+            self.num_kv_heads = config.num_key_value_heads
+            self.head_dim = config.head_dim
+            self.sliding_window_size = -1
         self.attention_scale = config.attention_scaling
-        self.sliding_window_size = -1
 
         self.q_proj = make_linear(config,
                                   qkv_in_features,
-                                  num_attention_heads * head_dim,
+                                  self.num_heads * self.head_dim,
                                   bias=config.attention_bias)
         self.k_proj = make_linear(config,
                                   qkv_in_features,
-                                  num_key_value_heads * head_dim,
+                                  self.num_kv_heads * self.head_dim,
                                   bias=config.attention_bias)
-        self.v_proj = make_linear(config,
-                                  qkv_in_features,
-                                  num_key_value_heads * head_dim,
-                                  bias=config.attention_bias)
-        self.o_proj = make_linear(config, num_attention_heads * head_dim,
+        if not self.attention_k_eq_v:
+            self.v_proj = make_linear(config,
+                                      qkv_in_features,
+                                      self.num_kv_heads * self.head_dim,
+                                      bias=config.attention_bias)
+        self.o_proj = make_linear(config, self.num_heads * self.head_dim,
                                   hidden_size)
 
         if config.has_qk_norm:
-            self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+            norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
+            self.q_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = norm_cls(self.head_dim, eps=config.rms_norm_eps)
         else:
             self.q_norm = None
             self.k_norm = None
+        self.v_norm = (Gemma4ValueRMSNorm(self.head_dim, config.rms_norm_eps)
+                       if self.is_gemma4 and config.has_value_norm else None)
 
     def forward(
         self,
@@ -117,14 +142,17 @@ class Eagle3Attention(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         attention_mask: torch.Tensor,
         attention_pos_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
 
         query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        key_states_raw = self.k_proj(hidden_states)
+        value_states = (key_states_raw if self.attention_k_eq_v else
+                        self.v_proj(hidden_states))
+        key_states = key_states_raw
 
         if self.q_norm is not None:
             query_states = self.q_norm(
@@ -138,15 +166,20 @@ class Eagle3Attention(nn.Module):
                                    self.head_dim)).reshape(
                                        batch_size, seq_len,
                                        self.num_kv_heads * self.head_dim)
+        if self.v_norm is not None:
+            value_states = self.v_norm(
+                value_states.reshape(batch_size, seq_len, self.num_kv_heads,
+                                     self.head_dim)).reshape(
+                                         batch_size, seq_len,
+                                         self.num_kv_heads * self.head_dim)
 
         attn_output, present_key_value = attention_plugin(
-            query_states,
-            key_states,
-            value_states,
+            torch.cat([query_states, key_states, value_states], dim=-1),
             past_key_value,
             context_lengths,
             rope_rotary_cos_sin,
             kvcache_start_index,
+            kv_page_table,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -154,7 +187,9 @@ class Eagle3Attention(nn.Module):
             enable_tree_attention=True,
             enable_fp8_kv_cache=False,
             attention_scale=self.attention_scale,
+            enable_context_mask_selector=False,
             enable_vision_block_attention=False,
+            skip_softmax_scale_factor=0.0,
             attention_mask=attention_mask,
             attention_pos_id=attention_pos_id,
             qkv_scales=[1.0, 1.0, 1.0],
@@ -206,12 +241,22 @@ class Eagle3DecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.is_gemma4 = _is_gemma4_model_type(config.model_type)
         self.self_attn = Eagle3Attention(config, layer_idx=layer_idx)
-        self.mlp = MLP(config)
-        self.hidden_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                config.rms_norm_eps)
+        self.mlp = (Gemma4MLP(config, layer_idx=layer_idx)
+                    if self.is_gemma4 else MLP(config))
+        norm_cls = Gemma4RMSNorm if self.is_gemma4 else RMSNorm
+        self.hidden_norm = norm_cls(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = norm_cls(config.hidden_size,
+                                        config.rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(config.hidden_size,
+                                                 config.rms_norm_eps)
+        if self.is_gemma4:
+            self.pre_feedforward_layernorm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.post_feedforward_layernorm = Gemma4RMSNorm(
+                config.hidden_size, config.rms_norm_eps)
+            self.register_buffer("layer_scalar", torch.ones(1))
 
     def forward(
         self,
@@ -221,6 +266,7 @@ class Eagle3DecoderLayer(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         attention_mask: torch.Tensor,
         attention_pos_id: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -237,14 +283,27 @@ class Eagle3DecoderLayer(nn.Module):
             rope_rotary_cos_sin,
             context_lengths,
             kvcache_start_index,
+            kv_page_table,
             attention_mask,
             attention_pos_id,
         )
-        hidden_states = residual + attn_output
+        if self.is_gemma4:
+            hidden_states = self.post_attention_layernorm(attn_output)
+            hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = residual + self.mlp(
-            self.post_attention_layernorm(hidden_states))
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            hidden_states = hidden_states * self.layer_scalar.to(
+                dtype=hidden_states.dtype)
+        else:
+            hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hidden_states = residual + self.mlp(
+                self.post_attention_layernorm(hidden_states))
 
         return hidden_states, present_key_value
 
@@ -262,7 +321,7 @@ def _make_flat_wrapper_eagle3(model: nn.Module, Na: int) -> nn.Module:
     param_names: List[str] = (
         ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
             "rope_rotary_cos_sin", "context_lengths", "kvcache_start_index",
-            "last_token_ids", "hidden_states_input",
+            "kv_page_table", "last_token_ids", "hidden_states_input",
             "hidden_states_from_draft", "attention_pos_id", "attention_mask"
         ])
 
@@ -272,7 +331,8 @@ def _make_flat_wrapper_eagle3(model: nn.Module, Na: int) -> nn.Module:
     body = (
         f"    logits, hidden_states, present_key_values = self._model(\n"
         f"        inputs_embeds, {past_kv_tuple}, rope_rotary_cos_sin, "
-        f"context_lengths, kvcache_start_index, last_token_ids, "
+        f"context_lengths, kvcache_start_index, kv_page_table, "
+        f"last_token_ids, "
         f"hidden_states_input, hidden_states_from_draft, "
         f"attention_pos_id, attention_mask)\n"
         f"    return (logits, hidden_states) + tuple(present_key_values)\n")
@@ -306,6 +366,8 @@ class Eagle3DraftModel(nn.Module):
     The C++ builder already skips ``embedding.safetensors`` for draft models.
     """
 
+    match_fp32_elementwise_initializers = True
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
@@ -314,7 +376,7 @@ class Eagle3DraftModel(nn.Module):
         draft_vocab_size = config.draft_vocab_size or config.vocab_size
 
         self.fc = make_linear(config,
-                              target_hidden * 3,
+                              target_hidden * config.eagle3_num_target_layers,
                               hidden_size,
                               module_name="fc")
 
@@ -322,7 +384,9 @@ class Eagle3DraftModel(nn.Module):
             Eagle3DecoderLayer(config, layer_idx=i)
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(hidden_size, config.rms_norm_eps)
+        norm_cls = Gemma4RMSNorm if _is_gemma4_model_type(
+            config.model_type) else RMSNorm
+        self.norm = norm_cls(hidden_size, config.rms_norm_eps)
         # Always pass module_name="lm_head" so that the excluded list and
         # tie_word_embeddings overrides work correctly (both force FP16).
         self.lm_head = make_linear(config,
@@ -331,8 +395,10 @@ class Eagle3DraftModel(nn.Module):
                                    bias=False,
                                    module_name="lm_head")
 
-        self.register_buffer("d2t",
-                             torch.zeros(draft_vocab_size, dtype=torch.int32))
+        d2t = (torch.arange(draft_vocab_size, dtype=torch.int32)
+               if draft_vocab_size == config.vocab_size else torch.zeros(
+                   draft_vocab_size, dtype=torch.int32))
+        self.register_buffer("d2t", d2t)
 
     def forward(
         self,
@@ -341,6 +407,7 @@ class Eagle3DraftModel(nn.Module):
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
+        kv_page_table: torch.Tensor,
         last_token_ids: torch.Tensor,
         hidden_states_from_base: torch.Tensor,
         hidden_states_from_draft: torch.Tensor,
@@ -368,6 +435,7 @@ class Eagle3DraftModel(nn.Module):
                 rope_rotary_cos_sin,
                 context_lengths,
                 kvcache_start_index,
+                kv_page_table,
                 attention_mask,
                 attention_pos_id,
             )
@@ -377,6 +445,11 @@ class Eagle3DraftModel(nn.Module):
         hidden_states = torch.ops.trt.gather_nd(hidden_states, last_token_ids)
         hidden_states_normed = self.norm(hidden_states)
         logits = self.lm_head(hidden_states_normed).to(torch.float32)
+        final_logit_softcapping = getattr(self.config,
+                                          "final_logit_softcapping", None)
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(
+                logits / final_logit_softcapping) * final_logit_softcapping
         logits = F.log_softmax(logits, dim=-1)
 
         return logits, hidden_states, tuple(present_key_values)
@@ -401,16 +474,20 @@ class Eagle3DraftModel(nn.Module):
                                     config.hidden_size,
                                     dtype=dtype16,
                                     device=device)
+        # Paged KV pool binding: [2, num_pages, KV_PAGE_SIZE, num_kv_heads, head_dim].
         past_key_values_list: List[torch.Tensor] = [
-            torch.zeros(batch_size,
-                        2,
+            torch.zeros(2,
+                        1,
+                        KV_PAGE_SIZE,
                         config.num_key_value_heads,
-                        past_len,
                         config.head_dim,
                         dtype=dtype16,
                         device=device) for _ in range(Na)
         ]
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        if _is_gemma4_model_type(config.model_type):
+            rotary_dim = _rotary_dim_from_rope_config(config, None,
+                                                      config.head_dim)
         rope_rotary_cos_sin = torch.zeros(batch_size,
                                           max_pos,
                                           rotary_dim,
@@ -422,13 +499,19 @@ class Eagle3DraftModel(nn.Module):
         kvcache_start_index = torch.zeros(batch_size,
                                           dtype=torch.int32,
                                           device=device)
+        kv_page_table = torch.zeros(batch_size,
+                                    2,
+                                    1,
+                                    dtype=torch.int32,
+                                    device=device)
         last_token_ids = torch.zeros(batch_size,
                                      1,
                                      dtype=torch.int64,
                                      device=device)
         hidden_states_input = torch.zeros(batch_size,
                                           seq_len,
-                                          target_hidden * 3,
+                                          target_hidden *
+                                          config.eagle3_num_target_layers,
                                           dtype=dtype16,
                                           device=device)
         hidden_states_from_draft = torch.zeros(batch_size,
@@ -447,36 +530,40 @@ class Eagle3DraftModel(nn.Module):
                                      device=device)
 
         args = (inputs_embeds, *past_key_values_list, rope_rotary_cos_sin,
-                context_lengths, kvcache_start_index, last_token_ids,
-                hidden_states_input, hidden_states_from_draft,
+                context_lengths, kvcache_start_index, kv_page_table,
+                last_token_ids, hidden_states_input, hidden_states_from_draft,
                 attention_pos_id, attention_mask)
 
-        input_names = (["inputs_embeds"] +
-                       [f"past_key_values_{i}" for i in range(Na)] + [
-                           "rope_rotary_cos_sin", "context_lengths",
-                           "kvcache_start_index", "last_token_ids",
-                           "hidden_states_input", "hidden_states_from_draft",
-                           "attention_pos_id", "attention_mask"
-                       ])
+        input_names = (
+            ["inputs_embeds"] + [f"past_key_values_{i}" for i in range(Na)] + [
+                "rope_rotary_cos_sin", "context_lengths",
+                "kvcache_start_index", "kv_page_table", "last_token_ids",
+                "hidden_states_input", "hidden_states_from_draft",
+                "attention_pos_id", "attention_mask"
+            ])
         output_names = (["logits", "hidden_states"] +
                         [f"present_key_values_{i}" for i in range(Na)])
 
         batch = torch.export.Dim("batch", min=1, max=256)
         seq = torch.export.Dim("seq_len", min=1, max=32768)
         pos = torch.export.Dim("max_pos", min=1, max=32768)
-        past = torch.export.Dim("past_len", min=1, max=32768)
         rope_batch = torch.export.Dim("rope_batch", min=1, max=256)
         kv_batch = torch.export.Dim("kv_batch", min=1, max=256)
+        page_batch = torch.export.Dim("page_batch", min=1, max=256)
+        max_pages = torch.export.Dim("max_pages_per_seq", min=1, max=32768)
+        num_pages = torch.export.Dim("num_pages", min=1, max=1048576)
         eagle_seq = torch.export.Dim("eagle_seq_len", min=1, max=32768)
         mask_kv_len = torch.export.Dim("mask_kv_len", min=1, max=65536)
         num_selected = torch.export.Dim("num_selected", min=1, max=256)
 
         all_shapes: list = [{0: batch, 1: seq}]  # inputs_embeds
         for _ in range(Na):
-            all_shapes.append({0: batch, 3: past})  # past_key_values_i
+            all_shapes.append({1:
+                               num_pages})  # past_key_values_i (pool-shaped)
         all_shapes.append({0: rope_batch, 1: pos})  # rope_rotary_cos_sin
         all_shapes.append({0: batch})  # context_lengths
         all_shapes.append({0: kv_batch})  # kvcache_start_index
+        all_shapes.append({0: page_batch, 2: max_pages})  # kv_page_table
         all_shapes.append({0: batch, 1: num_selected})  # last_token_ids
         all_shapes.append({0: batch, 1: seq})  # hidden_states_input
         all_shapes.append({0: batch, 1: seq})  # hidden_states_from_draft

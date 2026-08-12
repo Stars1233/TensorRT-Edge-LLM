@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #include "profiling/metrics.h"
 #include "runtime/config/llmEngineConfig.h"
 #include "runtime/exec/engineExecutor.h"
@@ -28,9 +29,11 @@
 #include "runtime/state/pipelineIO.h"
 #include "runtime/state/sharedResources.h"
 #include "tokenizer/tokenizer.h"
+#include <cuda_fp16.h>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace trt_edgellm
@@ -42,6 +45,8 @@ struct SamplingParams;
 namespace rt
 {
 
+class CloneEncoderRunner;
+
 // ========== Constants ==========
 
 namespace talker_constants
@@ -51,30 +56,53 @@ constexpr int32_t kAssistantPrefixLen = 3;   //!< Assistant prefix tokens ([:3])
 constexpr int32_t kAssistantTrailingSuffix
     = 5; //!< Trailing tokens to strip from end of sequence ("<|im_end|>\n<|im_start|>assistant\n")
 constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non-streaming prefill (rows 0-7)
+constexpr int32_t kPrefixRowsWithLanguage = 9;     //!< Prefix rows with CustomVoice language conditioning
 constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
 constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
 
-// CodePredictor sampling defaults (hardcoded across all Qwen3-Omni/TTS
-// families by ``code_predictor.generate(top_k=50, top_p=0.8)`` and HF
-// ``GenerationConfig``'s temperature default):
+// CodePredictor sampling defaults. Qwen3-Omni dense/MoE hardcode
+// ``code_predictor.generate(top_k=50, top_p=0.8)`` with the HF
+// ``GenerationConfig`` temperature default (1.0):
 //   https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni/modeling_qwen3_omni.py#L3408
 //   https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py#L3184
+// Qwen3-Omni Next routes the ``subtalker_*`` generate kwargs instead
+// (defaults: temperature=0.9, top_k=50, top_p=1.0).
 constexpr float kCPSamplingTemperature = 1.0f;
 constexpr int32_t kCPSamplingTopK = 50;
 constexpr float kCPSamplingTopP = 0.8f;
+constexpr float kCPSamplingTemperatureNext = 0.9f;
+constexpr float kCPSamplingTopPNext = 1.0f;
 
 // Audio output constants (Qwen3-Omni codec: 12.5 Hz frame rate, 24 kHz mono PCM output)
 constexpr int32_t kAudioSampleRate = 24000;     //!< Output PCM sample rate (Hz)
 constexpr int32_t kAudioSamplesPerFrame = 1920; //!< Samples produced per codec frame (24000 / 12.5)
 
-// Chat-template token IDs (from Qwen3-Omni tokenizer vocabulary)
-constexpr int32_t kImStartTokenId = 151644; //!< <|im_start|>
-constexpr int32_t kAssistantRoleId = 77091; //!< "assistant" role token
-constexpr int32_t kUserRoleId = 872;        //!< "user" role token
-constexpr int32_t kSystemRoleId = 8948;     //!< "system" role token
-constexpr int32_t kAudioTokenId = 151675;   //!< Audio placeholder token
-constexpr int32_t kImageTokenId = 151655;   //!< Image placeholder token
-constexpr int32_t kVideoTokenId = 151656;   //!< Video placeholder token
+// Default chat-template token IDs (Qwen3-Omni tokenizer). Variant-specific engines
+// override via talker config.json; TalkerConfig picks up the actual values there.
+constexpr int32_t kImStartTokenId = 151644;
+constexpr int32_t kAssistantRoleId = 77091;
+constexpr int32_t kUserRoleId = 872;
+constexpr int32_t kSystemRoleId = 8948;
+constexpr int32_t kAudioTokenId = 151675;
+constexpr int32_t kImageTokenId = 151655;
+constexpr int32_t kVideoTokenId = 151656;
+
+// Qwen3-Next Omni tokenizer (vocab 248320).
+constexpr int32_t kImStartTokenIdNext = 248045;
+constexpr int32_t kImEndTokenIdNext = 248046;
+constexpr int32_t kNlTokenIdNext = 198;
+constexpr int32_t kDoubleNlTokenIdNext = 271; //!< "\n\n" — trails the template's empty think block
+constexpr int32_t kThinkOpenTokenIdNext = 248068;
+constexpr int32_t kThinkCloseTokenIdNext = 248069;
+constexpr int32_t kAssistantRoleIdNext = 74455;
+constexpr int32_t kUserRoleIdNext = 846;
+constexpr int32_t kSystemRoleIdNext = 8678;
+constexpr int32_t kAudioTokenIdNext = 248076;
+constexpr int32_t kImageTokenIdNext = 248056;
+constexpr int32_t kVideoTokenIdNext = 248057;
+
+//! OmniNext Talker text-chunk size (talker_text_in_chunk_n).
+constexpr int32_t kTextInChunkN = 4;
 } // namespace talker_constants
 
 /*!
@@ -103,11 +131,16 @@ public:
      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
      * @param codePredictorEngineDir Directory containing code_predictor engine and codec embeddings
      * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
+     * @param checkpointDir HF/ModelOpt checkpoint used by checkpoint-backed Talker weights
      * @param stream CUDA stream for operations
      * @throws std::runtime_error on any initialization failure
      */
+    //! @param cloneEncoderDir Optional directory with the voice-clone reference encoder
+    //!        engines (speaker_encoder.engine / speech_tokenizer_encoder.engine, Base
+    //!        checkpoints). Empty disables voice cloning.
     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
-        std::string const& tokenizerDir, cudaStream_t stream);
+        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
+        std::string const& checkpointDir = "");
 
     //! @brief Destructor
     ~Qwen3OmniTTSRuntime();
@@ -131,9 +164,60 @@ public:
         float talkerTopP{0};            //!< Talker top-P (0 = default 1.0)
         float repetitionPenalty{1.05f}; //!< Repetition penalty applied to seen codec tokens (1.0 = disabled)
 
+        // CodePredictor (sub-talker) sampling parameters, independent from the Talker.
+        // Sub-talker == CodePredictor (CP). Naming follows HF's ``subtalker_*`` generate kwargs.
+        // 0 = use HF's hardcoded code_predictor.generate defaults (kCPSampling*: 1.0/50/0.8, or the
+        // Next per-arch defaults); these do NOT inherit the talker* request values.
+        float subtalkerTemperature{0}; //!< CP (sub-talker) temperature (0 = arch default)
+        int32_t subtalkerTopK{0};      //!< CP (sub-talker) top-K (0 = kCPSamplingTopK)
+        float subtalkerTopP{0};        //!< CP (sub-talker) top-P (0 = arch default)
+
         // Speaker selection (optional, defaults to config default)
         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
+
+        // ---- Voice conditioning ----
+        // Two prefill paths consume disjoint subsets of these fields, dispatched by
+        // isOmniNext(): the legacy Qwen3-TTS path (prepareTalkerInput) uses
+        // languageName / instructText / refAudioPath; the Qwen3-Omni Next path
+        // (buildQwen3OmniNextTalkerPrefill) uses talkerLanguage / assistantInstruct /
+        // promptSpeakerCodes / systemInstruct. CodePredictor sampling (subtalker*
+        // above) is shared by both.
+
+        //!< [Qwen3-TTS] CustomVoice language conditioning (optional). Empty or "auto" keeps the
+        //!< historical no-language prefill. A known language name (e.g. "chinese", "english";
+        //!< matched case-insensitively against the engine config codec_language_id map) switches
+        //!< the Talker prefill to the 9-row language-conditioned layout. Unknown names fall back
+        //!< to no-language with a warning. Dialect speakers (spk_is_dialect in config) override
+        //!< this automatically when language is "auto" or "chinese", matching the PyTorch reference.
+        std::string languageName{""};
+
+        //!< [Qwen3-TTS] CustomVoice/VoiceDesign instruction control (optional). Natural-language
+        //!< style instruction (e.g. "Speak in a whisper"). Wrapped as a user turn, projected
+        //!< through text_projection, and prepended to the Talker prefill. Empty = no instruction.
+        std::string instructText{""};
+
+        //!< [Qwen3-TTS] Voice clone (Base checkpoints, optional): reference audio file (wav/mp3/flac).
+        //!< The reference encoders run on-device (requires cloneEncoderDir at construction).
+        //!< With refText set, ICL mode conditions on (transcript, codec codes) of the
+        //!< reference; without it, x-vector-only mode clones timbre alone.
+        std::string refAudioPath{""};
+        std::string refText{""}; //!< Reference transcript (enables ICL mode)
+
+        //! [Qwen3-Omni Next] Custom voice: reference-voice codec codes, [frames][num_code_groups].
+        //! When non-empty, replaces the built-in speaker codec rows and skips the
+        //! per-speaker system prompt (HF ``prompt_speaker_codes`` semantics).
+        std::vector<std::vector<int32_t>> promptSpeakerCodes;
+
+        //! [Qwen3-Omni Next] Style/emotion instruction name resolved via config
+        //! ``talker_assistant_prompt_id_mapping`` (e.g. "cheerful"); empty = none.
+        std::string assistantInstruct{""};
+        //! [Qwen3-Omni Next] Target language resolved via config ``talker_language_id``
+        //! (e.g. "chinese"); empty or "auto" = model decides (codec_nothink path).
+        std::string talkerLanguage{""};
+        //! [Qwen3-Omni Next] Free-text system instruction inserted after the system role trio
+        //! (HF ``talker_system_instruct_ids``); tokenized by the runtime. Empty = none.
+        std::string systemInstruct{""};
 
         // Input: conversation messages for this request (runtime tokenizes internally)
         std::vector<Message> messages;
@@ -174,6 +258,8 @@ public:
      *        portal. Layer 0 is the input embedding; the second index is the
      *        decoder layer whose pre-norm hidden_states the Talker consumes,
      *        sourced from the Talker config's ``accept_hidden_layer`` field.
+     *        Must match the layer the Thinker engine was exported to emit on
+     *        its ``hidden_states`` output.
      */
     std::vector<int32_t> getThinkerHiddenLayerIndices() const
     {
@@ -357,6 +443,37 @@ public:
      */
     int32_t getSpeakerIdByName(std::string const& speakerName) const;
 
+    /*!
+     * @brief Resolve the language codec token ID for a request (CustomVoice language conditioning)
+     *
+     * Mirrors the PyTorch reference (modeling_qwen3_tts.py):
+     *   1. Empty / "auto" language → -1 (no-language path), unless step 3 overrides.
+     *   2. Known language name (case-insensitive lookup in codecLanguageIdMap) → its codec ID.
+     *      Unknown names log a warning and fall back to -1.
+     *   3. Dialect override: when the resolved language is "auto" or "chinese" and the speaker
+     *      is a dialect speaker (spkDialectMap), the dialect's codec ID wins.
+     *
+     * Always returns -1 when the engine config has no codec_think_id / codec_language_id
+     * (e.g. Qwen3-Omni checkpoints or engines exported before language support).
+     *
+     * @param languageName Request language name ("" = auto)
+     * @param speakerName  Request speaker name (for dialect override; "" = default speaker)
+     * @return Language codec token ID, or -1 for the no-language 8-row prefill
+     */
+    int32_t resolveLanguageId(std::string const& languageName, std::string const& speakerName) const;
+
+    //! Speaker names accepted by TalkerGenerationRequest::speakerName.
+    std::vector<std::string> getSpeakerNames() const
+    {
+        std::vector<std::string> names;
+        names.reserve(mSpeakerIdMap.size());
+        for (auto const& entry : mSpeakerIdMap)
+        {
+            names.push_back(entry.first);
+        }
+        return names;
+    }
+
 private:
     // ========== Internal Methods ==========
 
@@ -439,15 +556,16 @@ private:
     };
 
     //! @param prefillSeqLens Per-batch prefill sequence lengths for correct hidden-state extraction
-    //!        after batched prefill with padding. Empty for single-batch callers.
+    //!        after batched prefill with padding. Empty for single-batch callers. Mutable: the
+    //!        Qwen3.5 chunked re-prefill path grows this in-place after each re-prefill so the
+    //!        next iteration's extractTalkerLastHidden sees the updated cumulative seqLen.
     //! @param streamingHandlers Optional per-batch streaming chunk emitters. Empty disables streaming
     //!        globally; otherwise must be sized to activeBatchSize (per-batch entries can still be
     //!        no-ops via chunkFrames==0 / null onChunk).
     bool runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize, int32_t maxFrames,
         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
         float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
-        std::vector<int64_t> const& prefillSeqLens = {},
-        std::vector<PerBatchStreamingHandler> const& streamingHandlers = {});
+        std::vector<int64_t>& prefillSeqLens, std::vector<PerBatchStreamingHandler> const& streamingHandlers = {});
 
     /*!
      * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
@@ -497,6 +615,69 @@ private:
         rt::Tensor const* prefillHiddenPtr, int32_t prefillLen, rt::Tensor const& thinkerEmbedTable, int32_t speakerId,
         rt::Tensor& trailingTextHidden, int32_t& trailingCount, int64_t& outSeqLen, cudaStream_t stream);
 
+    //! Assemble the Qwen3-Next Omni Talker prefill (system + user + assistant parts) into
+    //! ``mTalkerInputEmbeds``. Mirrors HF ``_get_talker_{system,user,assistant}_parts``. Kept
+    //! separate from ``buildTalkerPrefillFromSegments`` because the row sequence, projection
+    //! kernels, and assistant handoff all differ.
+    bool buildQwen3OmniNextTalkerPrefill(std::vector<int32_t> const& textTokenIds, rt::Tensor const* prefillHiddenPtr,
+        int32_t prefillLen, int32_t speakerId, rt::Tensor& trailingTextHidden, int32_t& trailingCount,
+        int64_t& outSeqLen, cudaStream_t stream, std::vector<std::vector<int32_t>> const* promptSpeakerCodes = nullptr,
+        std::string const& assistantInstruct = "", std::string const& talkerLanguage = "",
+        std::vector<int32_t> const* systemInstructIds = nullptr);
+
+    //! Run one Qwen3-Next Omni chunked re-prefill round: append ``codecEmbedFrames`` codec-sum
+    //! rows for the previous call's frames, then up to ``chunkTokensPerCall`` text rows (plus
+    //! optional trailing tts_eos), then re-execute the prefill and sample the first codec token
+    //! of the new call. Consumes ``mQwen3OmniNextChunkStates[batchIdx]``.
+    bool reprefillQwen3OmniNextChunk(int32_t batchIdx, std::vector<std::vector<int32_t>> const& rvqCodes,
+        int32_t& outFirstCodecTok, SamplingParams const& talkerSamplingParams, float repetitionPenalty,
+        int32_t& numSeenTokens, std::unordered_set<int32_t>& seenTokenSet, cudaStream_t stream);
+
+    //! Fire re-prefill for any batch that has accumulated ``framesPerCall`` new frames. Called
+    //! once per iteration of ``runTalkerGenerationLoop``. No-op for legacy Qwen3-Omni engines
+    //! (their chunk states stay inactive). Returns false on unrecoverable batch failure.
+    bool driveOmniNextChunkReprefills(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
+        int32_t globalFrame, SamplingParams const& talkerSamplingParams, float repetitionPenalty, int32_t& unfinished,
+        cudaStream_t stream);
+
+    //! Single-batch re-prefill trigger. Returns 0 (no action — inactive or not enough frames),
+    //! 1 (re-prefilled and updated ``codecTokenInOut``), -1 (reprefill failed).
+    int32_t maybeReprefillOmniNextChunkForBatch(int32_t batchIdx, std::vector<std::vector<int32_t>> const& rvqCodes,
+        int32_t& codecTokenInOut, SamplingParams const& talkerSamplingParams, float repetitionPenalty,
+        int32_t& numSeenTokens, std::unordered_set<int32_t>& seenTokenSet, cudaStream_t stream);
+
+    //! Append a Thinker-emitted token to the OmniNext chunk stream's ``remainingTextTokens`` so
+    //! the next re-prefill picks it up. Used by Thinker-Talker streaming instead of the legacy
+    //! per-decode-step trailing-text injection.
+    void appendOmniNextChunkStreamToken(int32_t batchIdx, int32_t tokenId);
+
+    //! Mark the OmniNext chunk stream as awaiting a final tts_eos row. Called when the Thinker
+    //! signals its last token so the trailing tts_eos is emitted by the next re-prefill.
+    void finalizeOmniNextChunkStream(int32_t batchIdx);
+
+    //! Force ``mTalkerLogits[batchIdx, codecEosId] = -INF`` before sampling. Enforces HF's
+    //! ``min_new_tokens = chunk_m + 1`` during non-last chunked-streaming calls.
+    void suppressTalkerEosLogit(int32_t batchIdx, int32_t batchVocabSize, cudaStream_t stream);
+    void trackSeenToken(std::unordered_set<int32_t>& seenSet, int32_t& numSeen, int32_t batchIdx, int32_t token,
+        int32_t const* tokenDev, cudaStream_t stream);
+
+    //! Copy one embedding table row into ``dstBase[dstRow]``. Fails on OOB tokenId.
+    bool copyEmbedRow(rt::Tensor const& table, int32_t tokenId, __half* dstBase, int64_t dstRow, cudaStream_t stream);
+
+    //! Copy an ``[hiddenSize]`` FP16 tensor into ``dstBase[dstRow]``.
+    void copyRawRow(rt::Tensor const& src, __half* dstBase, int64_t dstRow, cudaStream_t stream);
+
+    //! Fill codec pointer/vocab tables once after weights load.
+    bool buildCodecEmbedPointerTable(cudaStream_t stream);
+
+    //! Write one per-position speaker-codec sum row via ``invokeSpeakerCodecSum``.
+    void sumSpeakerCodecRow(int64_t const* hostCodes, __half* dstBase, int64_t dstRow, cudaStream_t stream);
+
+    //! Project ``prefillHidden[srcRow]`` through the single Linear ``mHiddenProjLinear*`` into
+    //! ``dstBase[dstRow]``.
+    void projectHiddenRow(
+        rt::Tensor const& prefillHidden, int64_t srcRow, __half* dstBase, int64_t dstRow, cudaStream_t stream);
+
     // ========== Configuration Structure ==========
 
     /*!
@@ -519,23 +700,62 @@ private:
         int32_t ttsEosTokenId{}; //!< TTS end-of-sequence (151673)
 
         // Codec special tokens (from talker vocab, used directly)
-        int32_t codecNothinkId{};  //!< Codec no-think control token (2155)
+        int32_t codecNothinkId{}; //!< Codec no-think control token (2155)
+        //! Codec think control token (OmniNext: 4202; Qwen3-TTS CustomVoice: 2154). Used
+        //! instead of codecNothinkId when language conditioning is active; sentinel -1 means
+        //! the checkpoint has no think token and language conditioning stays disabled.
+        int32_t codecThinkId{-1};
         int32_t codecThinkBosId{}; //!< Codec think begin-of-sequence (2156)
         int32_t codecThinkEosId{}; //!< Codec think end-of-sequence (2157)
         int32_t codecPadId{};      //!< Codec padding token (2148)
         int32_t codecBosId{};      //!< Codec begin-of-sequence (2149)
         int32_t codecEosId{};      //!< Codec end-of-sequence
 
+        //! Language name (lower-case) → codec token ID map from config `codec_language_id`
+        //! (falls back to `talker_language_id` at export time). Empty for checkpoints without
+        //! language conditioning (e.g. the dense Qwen3-Omni checkpoint) — resolveLanguageId then always returns -1.
+        std::unordered_map<std::string, int32_t> codecLanguageIdMap;
+
+        //! Speaker name (lower-case) → dialect language name from config `spk_is_dialect`.
+        //! Only speakers whose value is a dialect string are present (e.g. eric → sichuan_dialect,
+        //! dylan → beijing_dialect); non-dialect speakers (JSON false) are omitted.
+        std::unordered_map<std::string, std::string> spkDialectMap;
+
+        //! Checkpoint family from config `tts_model_type`: "custom_voice" (preset speakers),
+        //! "voice_design" (no speaker row, instruction-driven), "base" (voice clone), or ""
+        //! (Qwen3-Omni / legacy configs).
+        std::string ttsModelType;
+
         // Speaker configuration (read from config)
         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
 
-        //! Decoder layer index whose pre-norm hidden_states the Talker
-        //! consumes from the Thinker, copied from the Talker config's
-        //! `accept_hidden_layer` field. Must match the layer the Thinker
-        //! engine was exported to emit on its `hidden_states` output.
-        //! Sentinel -1 means "unconfigured" — standalone TTS configs with
-        //! no Thinker leave this unset and never invoke the streaming path.
+        //! Decoder layer the Talker consumes Thinker hidden_states from. Must match the
+        //! Thinker engine's exported hidden_states layer. -1 = unconfigured (TTS-only).
         int32_t acceptHiddenLayer{-1};
+
+        //! Chat-template / placeholder token IDs. Filled from talker config.json;
+        //! defaults are Qwen3-Omni values, patched to ``kXxxNext`` by loadTalkerWeights
+        //! for OmniNext engines whose config predates the export-side field write.
+        int32_t imStartTokenId{talker_constants::kImStartTokenId};
+        int32_t assistantRoleId{talker_constants::kAssistantRoleId};
+        int32_t userRoleId{talker_constants::kUserRoleId};
+        int32_t systemRoleId{talker_constants::kSystemRoleId};
+        int32_t audioTokenId{talker_constants::kAudioTokenId};
+        int32_t imageTokenId{talker_constants::kImageTokenId};
+        int32_t videoTokenId{talker_constants::kVideoTokenId};
+
+        //! <think>/</think> IDs (Qwen3-Omni: 151648/151649; OmniNext: 248068/248069).
+        int32_t thinkOpenTokenId{151648};
+        int32_t thinkCloseTokenId{151649};
+
+        //! PT _get_talker_user_parts subsamples mm positions to at most this many
+        //! via torch.linspace(0,N-1,M).long(). 0 disables.
+        int32_t maxThinkerToTalkerMmTokens{16};
+
+        //! HF ``talker_suppressed_tokens`` range start ``[vocab_size - K, vocab_size)``.
+        //! K is 1024 for Qwen3-Omni, 3072 for OmniNext; ``loadTalkerWeights`` fills the
+        //! final value once the variant is known.
+        int32_t talkerSuppressStart{};
     };
 
     // ========== Configuration and Initialization ==========
@@ -553,7 +773,8 @@ private:
      * @param codePredictorEngineDir Directory containing code predictor engine files
      * @return True on success, false on failure
      */
-    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+        std::string const& checkpointDir);
 
     /*!
      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
@@ -570,6 +791,45 @@ private:
 
     TalkerConfig mTalkerConfig{};                           //!< Talker configuration
     std::unordered_map<std::string, int32_t> mSpeakerIdMap; //!< Speaker name to ID mapping
+    //! Friendly-name → internal speaker-name aliases from voice_map.json (keys lowercased).
+    std::unordered_map<std::string, std::string> mVoiceAliasMap;
+    //! Style/emotion instruction name → token ids (config ``talker_assistant_prompt_id_mapping``).
+    std::unordered_map<std::string, std::vector<int32_t>> mAssistantPromptIds;
+    //! Language name → codec-side language id (config ``talker_language_id``).
+    std::unordered_map<std::string, int32_t> mLanguageIds;
+
+    //! Qwen3-Next Omni speaker_system_prompt_id map (speaker_id → text-token-list). HF emits these
+    //! tokens between [im_start, system, nl] and the codec_bos when building the Talker system
+    //! prefill section (modeling_qwen3_omni_next.py:_get_talker_system_parts).
+    std::unordered_map<int32_t, std::vector<int32_t>> mSpeakerSystemPromptIds;
+
+    // Descriptor-driven prefill assembly (instruction / VoiceDesign / voice-clone layouts).
+    // Rows are queued host-side as (srcA, optional srcB) device-pointer pairs and assembled
+    // in one invokePrefillRowAssemble launch; per-row math matches the fused
+    // invokeAssistantPreamble kernel bit-exactly (see talkerMLPKernelTests).
+    std::vector<kernel::PrefillRowDesc> mPrefillRows; //!< Queued row descriptors (reused per prefill)
+    rt::Tensor mPrefillDescsHost;                     //!< Pinned host staging for descriptors
+    rt::Tensor mPrefillDescsDevice;                   //!< Device descriptor buffer
+
+    //! Talker codec-embedding-table row pointer for a token ID.
+    half const* talkerEmbRow(int32_t tokenId) const;
+    //! Queue one prefill row: srcA (+ srcB when non-null), both device pointers to [H] rows.
+    void pushPrefillRow(half const* srcA, half const* srcB);
+    //! Upload queued descriptors and assemble rows into output[0..numRows). Returns numRows.
+    int64_t flushPrefillRows(rt::Tensor& output, cudaStream_t stream);
+
+    // Voice clone workspace (loaded per request from voiceClonePromptPath)
+    rt::Tensor mVoiceCloneXVector;       //!< [talkerH] FP16 GPU x-vector
+    rt::Tensor mIclFrameSumBuffer;       //!< [maxRefFrames, talkerH] FP16 GPU summed codec embeddings
+    rt::Tensor mIclTablePtrsGpu;         //!< [numGroups] device pointer array for sum kernel
+    std::vector<int32_t> mIclRefTextIds; //!< Host reference transcript token IDs (assistant-wrapped)
+
+    std::unique_ptr<CloneEncoderRunner> mCloneEncoders; //!< Reference encoders (null unless cloneEncoderDir given)
+
+    //! Run the reference encoders on refAudioPath and fill the clone workspace. Returns false
+    //! on error; iclFrames receives the reference frame count (0 = x-vector-only mode).
+    bool encodeVoiceCloneReference(
+        std::string const& refAudioPath, std::string const& refText, int32_t& iclFrames, cudaStream_t stream);
     int32_t mMaxBatchSize{1}; //!< Maximum batch size from Talker engine config (min of Talker and CodePredictor)
 
     int32_t mNumRvqLayers{talker_constants::kDefaultNumRvqLayers};
@@ -590,7 +850,7 @@ private:
     std::unique_ptr<EngineExecutor> mCodePredictorExec;       //!< CodePredictor engine executor
     std::unique_ptr<SharedResources> mCodePredictorSharedRes; //!< CodePredictor cache + RoPE + zero buffer
     std::unique_ptr<PipelineIO> mCodePredictorPipelineIO;     //!< CodePredictor per-step pipeline buffers
-    TensorMap mCodePredictorTensorMap; //!< CodePredictor engine binding map (lm_head_weight rewired per RVQ head)
+    TensorMap mCodePredictorTensorMap;                        //!< CodePredictor engine binding map (step-invariant)
     std::unique_ptr<StepPreparer> mCodePredictorStepPreparer; //!< CodePredictor prefill/decode metadata preparer
 
     //! Shared GPU execution context memory for Talker and CodePredictor (kUSER_MANAGED).
@@ -616,22 +876,81 @@ private:
     bool mUseSmallToMtpProjection{false};
     bool mIsOmni{false}; //!< True for Omni family checkpoints
 
+    //! Talker family. Filled by ``loadTalkerWeights`` from the engine config's
+    //! ``model_type``; enum (not bool) leaves room for a third variant.
+    //! Runtime differences: Omni projects text/mm via 2-layer MLPs; OmniNext
+    //! uses direct text embed lookup + a single-Linear ``hidden_projection``.
+    enum class TalkerVariant
+    {
+        Omni,
+        OmniNext
+    };
+    TalkerVariant mTalkerVariant{TalkerVariant::Omni};
+
+    bool isOmniNext() const noexcept
+    {
+        return mTalkerVariant == TalkerVariant::OmniNext;
+    }
+    rt::Tensor mHiddenProjLinearWeight; //!< OmniNext: single-Linear weight [talkerHidden, thinkerHidden] FP16
+    rt::Tensor mHiddenProjLinearBias;   //!< OmniNext: single-Linear bias [talkerHidden] FP16
+    //! OmniNext Talker codec embed table [codecVocab, talkerHidden] (distinct from
+    //! mTextEmbeddingTable, which is text-vocab). From codec_embedding.safetensors.
+    rt::Tensor mTalkerCodecEmbedTable;
+    //! OmniNext per-speaker codec template [maxSpeakerNum, numCodeGroups, speakerEmbedLen] INT64
+    //! (padded with -1). From speaker_codec_embeddings.safetensors.
+    rt::Tensor mSpeakerCodecEmbeddings;
+
+    //! invokeSpeakerCodecSum workspace (INT8 tensor carries `__half const*[]`).
+    rt::Tensor mCodecEmbPtrTable;
+    rt::Tensor mCodecEmbVocabSizes;
+    rt::Tensor mCodecRowCodes;
+
+    //! OmniNext chunked-streaming per-batch state. HF ``generate_talker`` interleaves
+    //! ``chunkTokensPerCall`` text tokens with ``framesPerCall`` codec frames via
+    //! repeated KV-reset prefills; pure autoregressive decode past chunk 0 degenerates.
+    //! Entries stay inactive for legacy Qwen3-Omni engines.
+    struct Qwen3OmniNextChunkStreamState
+    {
+        bool active{false};
+        std::vector<int32_t> remainingTextTokens; //!< Token IDs for chunks[1..].
+        bool hasTrailingTtsEos{false};            //!< tts_eos row still owed after all text chunks.
+        int32_t chunkTokensPerCall{4};            //!< talker_text_in_chunk_n
+        int32_t framesPerCall{4};                 //!< talker_codec_output_chunk_m. HF runs m+1 forwards per
+                                                  //!< forced call but its lagged-CP design emits only m frames;
+                                                  //!< the (m+1)-th sample is a discarded lookahead. Emitting it
+                                                  //!< (the old {5}) rendered one text-starved orphan frame per
+                                                  //!< chunk into the audio.
+        int32_t codecEmbedFrames{4};              //!< frames fed back as codec_embeds (last frame is lookahead-only)
+        int64_t cumulativeSeqLen{0};              //!< Rows written into mTalkerInputEmbeds so far.
+        int32_t cursorToken{0};                   //!< Next index in remainingTextTokens.
+        int32_t framesSinceLastPrefill{0};
+        int32_t firstFrameOfCallIdx{0}; //!< rvqCodes index of the first frame of the current call.
+    };
+    std::vector<Qwen3OmniNextChunkStreamState> mQwen3OmniNextChunkStates;
+
     // ========== Embedding Tables ==========
     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)
     rt::Tensor mTalkerEmbeddingTable; //!< Talker LLM embedding table [vocabSize, hiddenSize]
     std::vector<rt::Tensor>
         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (mNumRvqLayers) [codebookSize, hiddenSize]
 
-    // CodePredictor LM Heads (bound via setLmHeadWeight before each decode step)
-    // ONNX has lm_head_weight as a dynamic input tensor, switched per RVQ layer
-    std::vector<rt::Tensor>
-        mCodePredictorLmHeadWeights; //!< CodePredictor lm_head weights (mNumRvqLayers) [vocabSize, hiddenSize]
+    // CodePredictor lm_heads stacked [mNumRvqLayers, vocabSize, hiddenSize]; the engine
+    // gathers the active head by the device lm_head_idx, so bindings stay step-invariant.
+    rt::Tensor mCodePredictorLmHeads;
+    rt::Tensor mCpLmHeadIdx; //!< Device head index [1] INT32 (0 = prefill, then 1..mNumRvqLayers-1)
 
     // TTS special token embeddings (initialized from thinker embedding table)
     // Initialized in constructor from Thinker embedding table
     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
+    //! Zero row used as the residual addend on the OmniNext decode step (pure
+    //! autoregressive, no per-frame text addend). Legacy Qwen3-Omni uses mTtsPadEmbed.
+    rt::Tensor mQwen3OmniNextZeroResidualAddend;
+
+    //! Persistent FP32 -INF on device; source for suppressTalkerEosLogit's async D2D copy.
+    //! Avoids sourcing an async memcpy from a stack variable.
+    rt::Tensor mNegInfConst;
 
     // ========== Workspace Tensors (allocated at maxBatchSize) ==========
     // Buffers used for per-batch prefill (not batched engine execution, reused per-batch)
@@ -647,11 +966,10 @@ private:
     rt::Tensor mTalkerSelectedIndices; //!< Selected token indices [maxBS, 1] INT32
     rt::Tensor mHostSelectedTokenIds;  //!< Host selected tokens [maxBS] INT32
     rt::Tensor mSeenCodecTokensBuf;    //!< Per-batch seen codec tokens [maxBS, maxKVCacheCapacity] INT32
+    rt::Tensor mSeenSeedHostScratch;   //!< Pinned host scratch [maxBS] for async H2D seeding of the seen buffer
 
     // CodePredictor workspace (batch=1 for per-batch CodePredictor calls)
-    rt::Tensor mCodePredictorLogits; //!< CodePredictor output logits [1, codebookSize] FP32
-    std::vector<rt::Tensor>
-        mCodePredictorLogitsPerHead;            //!< Per-lm_head logits (distinct buffers → distinct graph-cache slots)
+    rt::Tensor mCodePredictorLogits;            //!< CodePredictor output logits [maxBS, codebookSize] FP32
     rt::Tensor mCodePredictorSelectedIndices;   //!< Selected code indices [1, 1] INT32
     rt::Tensor mCodePredictorPrefillInput;      //!< Prefill input [1, 2, cpHidden] FP16
     rt::Tensor mCodePredictorCodecIds;          //!< Codec token IDs [1, 1] INT32
@@ -695,17 +1013,19 @@ private:
      *
      * @param thinkerEmbed Embedded token sequence [seqLen, thinkerHiddenSize]
      * @param speakerId Speaker ID for codec embedding
-     * @param output Projected talker input embeddings [seqLen+2, talkerHiddenSize]
-     * @param outputSeqLen seqLen + 2
+     * @param languageId Language codec token ID (-1 = no-language 8-row prefix; >= 0 = 9-row
+     *        CustomVoice language-conditioned prefix)
+     * @param output Projected talker input embeddings [outputSeqLen, talkerHiddenSize]
+     * @param outputSeqLen seqLen + 2 (no language) or seqLen + 3 (with language)
      * @param stream CUDA stream
      * @return True on success, false on failure
      */
-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
+    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t languageId, rt::Tensor& output,
         int64_t& outputSeqLen, cudaStream_t stream);
 
     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.
-    //! \param[out] outSeqLen  seqLen + 2 (non-streaming prefill length)
+    //! \param[out] outSeqLen  non-streaming prefill length (seqLen + 2, or seqLen + 3 with language)
     bool prepareTalkerInput(std::vector<int32_t> const& textTokenIds, TalkerGenerationRequest const& request,
         int64_t& outSeqLen, cudaStream_t stream);
 
@@ -716,7 +1036,7 @@ private:
      * Resets CP KV cache and stages per-batch context lengths.
      *
      * @param inputsEmbeds Codec token embeddings [batch, seqLen, cpHidden] — caller builds the batched buffer.
-     * @param lmHeadIdx Which lm_head_weight to bind (0..mNumRvqLayers-1).
+     * @param lmHeadIdx Must be 0 (prefill always predicts with head 0).
      * @param outputLogits Output logits [batch, codebookSize] (engine output).
      * @param outputHiddenStates Output hidden states for residual / next step.
      * @param stream CUDA stream.
@@ -725,19 +1045,11 @@ private:
         rt::Tensor& outputHiddenStates, cudaStream_t stream);
 
     /*!
-     * @brief Execute CodePredictor decoding step (single token per batch).
-     *
-     * Pure engine wrapper. Batch dim derived from inputsEmbeds.getShape()[0]. Caller is
-     * responsible for embedding lookup / projection before calling.
-     *
-     * @param inputsEmbeds [batch, 1, cpHidden] codec embedding for current step.
-     * @param lmHeadIdx Which lm_head_weight to bind (0..mNumRvqLayers-1).
-     * @param outputLogits [batch, codebookSize] (engine output).
-     * @param outputHiddenStates Output hidden states for next step.
-     * @param stream CUDA stream.
+     * @brief Set the step-invariant CP decode bindings (stacked lm_heads + device
+     *        lm_head_idx + shared logits) and switch to the decode profile. One call
+     *        covers the whole per-frame decode loop.
      */
-    bool executeCodePredictorDecodingStep(rt::Tensor const& inputsEmbeds, int32_t lmHeadIdx, rt::Tensor& outputLogits,
-        rt::Tensor& outputHiddenStates, cudaStream_t stream);
+    bool prepareCpDecodeBindings(int32_t activeBatchSize, cudaStream_t stream);
 
     /*!
      * @brief Load Talker weights from safetensors files
