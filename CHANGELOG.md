@@ -1,6 +1,7 @@
 # Release Notes
 
 ## 0.10.0
+- Added Day-0 support for Qwen3.8-27B
 - Added NVIDIA Nemotron-3.5 Lightning support with MTP and DFlash speculative decoding
 - Added an experimental ONNX-less workflow to build TensorRT engines directly from supported checkpoints
 - Added Cosmos3-Edge multimodal reasoning and experimental policy/action-generation support

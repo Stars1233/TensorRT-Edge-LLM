@@ -15,6 +15,7 @@
 
 ## Latest News
 
+- **[2026/08]** TensorRT Edge-LLM **0.10.0** adds Day-0 support for [**Qwen3.8-27B**](https://huggingface.co/Qwen/Qwen3.8-27B).
 - **[2026/08]** Release **0.10.0** adds support for [**NVIDIA Nemotron-3.5 Lightning**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) with **MTP** and **DFlash**, [**Cosmos3-Edge**](https://huggingface.co/nvidia/Cosmos3-Edge), [**DiffusionGemma**](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4), [**Nemotron-3.5-ASR**](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b), and [**DSpark**](docs/source/user_guide/examples/speculative-decoding.md#dspark) speculative decoding, alongside an experimental [direct TensorRT engine builder](docs/source/user_guide/getting_started/direct-engine-builder.md) without ONNX export, multi-turn KV-cache reuse, and video input for the experimental OpenAI-compatible server.
 - **[2026/07]** Support for the full **Gemma 4** family (E2B / E4B / 12B / 26B-A4B / 31B — multimodal text + image + audio, with MTP), **Qwen3-Omni** and **Nemotron-3** NVFP4, and **DFlash** speculative decoding (with DDTree for Qwen3 / Qwen3.5) landed across releases 0.9.0 and 0.9.1.
 
